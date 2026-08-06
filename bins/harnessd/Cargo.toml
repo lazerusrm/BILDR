@@ -1,0 +1,23 @@
+[package]
+name = "harnessd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+harness-api = { path = "../../crates/harness-api" }
+harness-codex = { path = "../../crates/harness-codex" }
+harness-orchestrator = { path = "../../crates/harness-orchestrator" }
+harness-profile = { path = "../../crates/harness-profile" }
+harness-store = { path = "../../crates/harness-store" }
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+mime_guess.workspace = true
+rust-embed.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

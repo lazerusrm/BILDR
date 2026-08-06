@@ -1,0 +1,27 @@
+[package]
+name = "harness-orchestrator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+harness-codex = { path = "../harness-codex" }
+harness-context = { path = "../harness-context" }
+harness-domain = { path = "../harness-domain" }
+harness-evidence = { path = "../harness-evidence" }
+harness-git = { path = "../harness-git" }
+harness-profile = { path = "../harness-profile" }
+harness-runner = { path = "../harness-runner" }
+harness-store = { path = "../harness-store" }
+harness-usage = { path = "../harness-usage" }
+async-trait.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+ulid.workspace = true

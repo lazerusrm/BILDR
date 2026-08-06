@@ -1,0 +1,1071 @@
+openapi: 3.1.0
+info:
+  title: Harness Console Local API
+  version: 1.0.0-draft
+  description: >-
+    Localhost-only API for the Harness Console UI and harnessctl. This contract
+    does not expose Codex App Server directly; harnessd projects it into durable
+    repository/run/task/agent/evidence resources.
+servers:
+  - url: http://127.0.0.1:7310/api/v1
+security:
+  - LocalSession: []
+tags:
+  - name: Runtime
+  - name: Repositories
+  - name: Runs
+  - name: Tasks
+  - name: Agents
+  - name: Approvals
+  - name: Worktrees
+  - name: Evidence
+  - name: Usage
+  - name: Events
+paths:
+  /health:
+    get:
+      tags: [Runtime]
+      security: []
+      operationId: getHealth
+      responses:
+        '200':
+          description: Process health; not execution readiness.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Health'}
+  /session:
+    post:
+      tags: [Runtime]
+      security: []
+      operationId: createLocalSession
+      responses:
+        '201':
+          description: Creates an HttpOnly same-origin session and returns its CSRF token.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LocalSession'}
+  /runtime:
+    get:
+      tags: [Runtime]
+      operationId: getRuntime
+      responses:
+        '200':
+          description: Runtime and App Server readiness.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RuntimeStatus'}
+  /repositories:
+    get:
+      tags: [Repositories]
+      operationId: listRepositories
+      responses:
+        '200':
+          description: Registered repositories.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Repository'}
+    post:
+      tags: [Repositories]
+      operationId: registerRepository
+      parameters:
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RegisterRepositoryRequest'}
+      responses:
+        '201':
+          description: Repository registered.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Repository'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /repositories/{repositoryId}:
+    get:
+      tags: [Repositories]
+      operationId: getRepository
+      parameters:
+        - {$ref: '#/components/parameters/RepositoryId'}
+      responses:
+        '200':
+          description: Repository details and health.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Repository'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /repositories/{repositoryId}/inspect:
+    post:
+      tags: [Repositories]
+      operationId: inspectRepository
+      parameters:
+        - {$ref: '#/components/parameters/RepositoryId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      responses:
+        '202':
+          description: Inspection started.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+  /runs:
+    get:
+      tags: [Runs]
+      operationId: listRuns
+      parameters:
+        - name: repository_id
+          in: query
+          schema: {type: string}
+        - name: state
+          in: query
+          schema: {type: string}
+        - name: cursor
+          in: query
+          schema: {type: string}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Runs.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RunPage'}
+    post:
+      tags: [Runs]
+      operationId: createRun
+      parameters:
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateRunRequest'}
+      responses:
+        '201':
+          description: Prepared or preparing run.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Run'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /runs/{runId}:
+    get:
+      tags: [Runs]
+      operationId: getRun
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+      responses:
+        '200':
+          description: Full run summary.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RunDetail'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /runs/{runId}/start-architecture:
+    post:
+      tags: [Runs]
+      operationId: startArchitecture
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      responses:
+        '202':
+          description: Architect session queued.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /runs/{runId}/plan/approve:
+    post:
+      tags: [Runs]
+      operationId: approvePlan
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [task_graph_digest]
+              properties:
+                task_graph_digest: {type: string}
+                note: {type: string, maxLength: 4000}
+      responses:
+        '202':
+          description: Scheduling enabled for approved graph.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /runs/{runId}/scheduler/pause:
+    post:
+      tags: [Runs]
+      operationId: pauseRunScheduler
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      responses:
+        '202':
+          description: Scheduler paused.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Run'}
+  /runs/{runId}/scheduler/resume:
+    post:
+      tags: [Runs]
+      operationId: resumeRunScheduler
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      responses:
+        '202':
+          description: Scheduler resumed and ready tasks dispatched.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Run'}
+  /runs/{runId}/stop:
+    post:
+      tags: [Runs]
+      operationId: stopRun
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [mode]
+              properties:
+                mode:
+                  enum: [after_current_commands, interrupt_turns, cancel]
+                preserve_all_worktrees: {type: boolean, default: true}
+      responses:
+        '202':
+          description: Updated terminal or stopping run.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Run'}
+  /runs/{runId}/approve-integration:
+    post:
+      tags: [Runs]
+      operationId: approveIntegration
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expected_head_sha]
+              properties:
+                expected_head_sha: {$ref: '#/components/schemas/GitSha'}
+                note: {type: string, maxLength: 4000}
+      responses:
+        '202':
+          description: Integration validation/final audit queued.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /runs/{runId}/publish-draft-pr:
+    post:
+      tags: [Runs]
+      operationId: publishDraftPr
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expected_head_sha, title]
+              properties:
+                expected_head_sha: {$ref: '#/components/schemas/GitSha'}
+                title: {type: string, minLength: 1, maxLength: 240}
+                body_appendix: {type: string, maxLength: 20000}
+      responses:
+        '202':
+          description: Explicit external publication operation accepted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /runs/{runId}/tasks:
+    get:
+      tags: [Tasks]
+      operationId: listRunTasks
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+      responses:
+        '200':
+          description: Tasks and attempts.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Task'}
+  /tasks/{taskId}:
+    get:
+      tags: [Tasks]
+      operationId: getTask
+      parameters:
+        - {$ref: '#/components/parameters/TaskId'}
+      responses:
+        '200':
+          description: Task detail.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TaskDetail'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /tasks/{taskId}/retry:
+    post:
+      tags: [Tasks]
+      operationId: retryTask
+      parameters:
+        - {$ref: '#/components/parameters/TaskId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [reason]
+              properties:
+                reason: {type: string, minLength: 1, maxLength: 4000}
+                revised_objective: {type: string, maxLength: 4000}
+                model_route:
+                  enum: [same, escalate_terra]
+                additional_token_budget: {type: integer, minimum: 0}
+      responses:
+        '202':
+          description: New immutable attempt created.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /tasks/{taskId}/request-review:
+    post:
+      tags: [Tasks]
+      operationId: requestTaskReview
+      parameters:
+        - {$ref: '#/components/parameters/TaskId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      responses:
+        '202':
+          description: Independent verifier queued.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+  /tasks/{taskId}/validate/{validatorId}:
+    post:
+      tags: [Tasks]
+      operationId: runTaskValidator
+      parameters:
+        - {$ref: '#/components/parameters/TaskId'}
+        - {$ref: '#/components/parameters/ValidatorId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      responses:
+        '202':
+          description: Validator completed with controller-custodied output.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ValidationOutcome'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /agents/{agentId}:
+    get:
+      tags: [Agents]
+      operationId: getAgent
+      parameters:
+        - {$ref: '#/components/parameters/AgentId'}
+      responses:
+        '200':
+          description: Agent session and current thread/turn.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AgentSummary'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /agents/{agentId}/steer:
+    post:
+      tags: [Agents]
+      operationId: steerAgent
+      parameters:
+        - {$ref: '#/components/parameters/AgentId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [message]
+              properties:
+                message: {type: string, minLength: 1, maxLength: 12000}
+                update_goal: {type: boolean, default: false}
+      responses:
+        '202':
+          description: Steering accepted for delivery.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /agents/{agentId}/interrupt:
+    post:
+      tags: [Agents]
+      operationId: interruptAgent
+      parameters:
+        - {$ref: '#/components/parameters/AgentId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      responses:
+        '202':
+          description: Interrupt requested.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+  /agents/{agentId}/activity:
+    get:
+      tags: [Agents]
+      operationId: listAgentActivity
+      parameters:
+        - {$ref: '#/components/parameters/AgentId'}
+        - name: after
+          in: query
+          schema: {type: integer, minimum: 0}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 1000, default: 200}
+      responses:
+        '200':
+          description: Projected activity page.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ActivityPage'}
+  /approvals:
+    get:
+      tags: [Approvals]
+      operationId: listApprovals
+      parameters:
+        - name: state
+          in: query
+          schema: {enum: [pending, resolved, expired]}
+        - name: run_id
+          in: query
+          schema: {type: string}
+      responses:
+        '200':
+          description: Approval requests.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Approval'}
+  /approvals/{approvalId}/decision:
+    post:
+      tags: [Approvals]
+      operationId: decideApproval
+      parameters:
+        - {$ref: '#/components/parameters/ApprovalId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [decision]
+              properties:
+                decision: {enum: [accept, decline, cancel, approve_once, deny]}
+                note: {type: string, maxLength: 4000}
+                expected_version: {type: integer, minimum: 1}
+      responses:
+        '202':
+          description: Decision recorded and queued for runtime delivery.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Approval'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /worktrees:
+    get:
+      tags: [Worktrees]
+      operationId: listWorktrees
+      parameters:
+        - name: run_id
+          in: query
+          schema: {type: string}
+        - name: state
+          in: query
+          schema: {type: string}
+      responses:
+        '200':
+          description: Managed worktrees.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Worktree'}
+  /worktrees/{worktreeId}/preserve:
+    post:
+      tags: [Worktrees]
+      operationId: preserveWorktree
+      parameters:
+        - {$ref: '#/components/parameters/WorktreeId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason: {type: string, maxLength: 4000}
+      responses:
+        '200':
+          description: Worktree preservation updated.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Worktree'}
+  /runs/{runId}/evidence:
+    get:
+      tags: [Evidence]
+      operationId: listRunEvidence
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+      responses:
+        '200':
+          description: Evidence and claim matrix.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EvidenceSummary'}
+  /runs/{runId}/evidence/export:
+    post:
+      tags: [Evidence]
+      operationId: exportRunEvidence
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                include_full_command_logs: {type: boolean, default: false}
+      responses:
+        '202':
+          description: Export operation accepted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+  /runs/{runId}/usage:
+    get:
+      tags: [Usage]
+      operationId: getRunUsage
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+      responses:
+        '200':
+          description: Usage and API-equivalent cost summary.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UsageSummary'}
+  /events:
+    get:
+      tags: [Events]
+      operationId: streamEvents
+      description: Durable Server-Sent Events stream. Use Last-Event-ID or `cursor` to resume.
+      parameters:
+        - name: cursor
+          in: query
+          schema: {type: integer, minimum: 0}
+        - name: run_id
+          in: query
+          schema: {type: string}
+      responses:
+        '200':
+          description: text/event-stream with durable event IDs.
+          content:
+            text/event-stream:
+              schema: {type: string}
+components:
+  securitySchemes:
+    LocalSession:
+      type: apiKey
+      in: cookie
+      name: harness_session
+  parameters:
+    CsrfToken:
+      name: X-Harness-CSRF
+      in: header
+      required: true
+      schema: {type: string, minLength: 16}
+    RepositoryId:
+      name: repositoryId
+      in: path
+      required: true
+      schema: {type: string}
+    RunId:
+      name: runId
+      in: path
+      required: true
+      schema: {type: string}
+    TaskId:
+      name: taskId
+      in: path
+      required: true
+      schema: {type: string}
+    ValidatorId:
+      name: validatorId
+      in: path
+      required: true
+      schema: {type: string}
+    AgentId:
+      name: agentId
+      in: path
+      required: true
+      schema: {type: string}
+    ApprovalId:
+      name: approvalId
+      in: path
+      required: true
+      schema: {type: string}
+    WorktreeId:
+      name: worktreeId
+      in: path
+      required: true
+      schema: {type: string}
+  responses:
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Conflict:
+      description: State or optimistic-concurrency conflict.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    ValidationError:
+      description: Request or profile validation error.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Problem'}
+  schemas:
+    GitSha:
+      type: string
+      pattern: '^[0-9a-f]{40}$'
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status, version, uptime_seconds, time]
+      properties:
+        status: {const: ok}
+        version: {type: string}
+        uptime_seconds: {type: integer, minimum: 0}
+        time: {type: integer}
+    LocalSession:
+      type: object
+      additionalProperties: false
+      required: [csrf_token, expires_at_ms]
+      properties:
+        csrf_token: {type: string, minLength: 16}
+        expires_at_ms: {type: integer}
+    RuntimeStatus:
+      type: object
+      additionalProperties: false
+      required: [daemon, codex, database, scheduler]
+      properties:
+        daemon: {$ref: '#/components/schemas/ComponentStatus'}
+        codex: {$ref: '#/components/schemas/CodexRuntime'}
+        database: {$ref: '#/components/schemas/ComponentStatus'}
+        scheduler: {$ref: '#/components/schemas/SchedulerStatus'}
+    ComponentStatus:
+      type: object
+      additionalProperties: false
+      required: [state]
+      properties:
+        state: {enum: [ready, degraded, unavailable, disabled]}
+        detail: {type: string}
+    CodexRuntime:
+      allOf:
+        - {$ref: '#/components/schemas/ComponentStatus'}
+        - type: object
+          properties:
+            version: {type: string}
+            required_version: {type: string}
+            protocol_schema_sha256: {type: string}
+            schema_match: {type: boolean}
+            pid: {type: integer}
+            restart_count: {type: integer}
+    SchedulerStatus:
+      type: object
+      additionalProperties: false
+      required: [paused, active_total, max_total, active_mutable, max_mutable, active_verifiers, max_verifiers, queued_tasks]
+      properties:
+        paused: {type: boolean}
+        active_total: {type: integer}
+        max_total: {type: integer}
+        active_mutable: {type: integer}
+        max_mutable: {type: integer}
+        active_verifiers: {type: integer}
+        max_verifiers: {type: integer}
+        queued_tasks: {type: integer}
+    RegisterRepositoryRequest:
+      type: object
+      additionalProperties: false
+      required: [profile_id, root_path]
+      properties:
+        profile_id: {type: string}
+        root_path: {type: string}
+        expected_origin: {type: string}
+    Repository:
+      type: object
+      additionalProperties: false
+      required: [id, profile_id, display_name, root_path, default_branch, health]
+      properties:
+        id: {type: string}
+        profile_id: {type: string}
+        display_name: {type: string}
+        root_path: {type: string}
+        origin_url: {type: string}
+        default_branch: {type: string}
+        primary_branch: {type: string}
+        primary_head: {$ref: '#/components/schemas/GitSha'}
+        primary_clean: {type: boolean}
+        health: {enum: [ready, blocked, degraded]}
+        blockers:
+          type: array
+          items: {type: string}
+        managed_worktree_count: {type: integer}
+        authority_digest: {type: string}
+    CreateRunRequest:
+      type: object
+      additionalProperties: false
+      required: [repository_id, objective, base_ref, mode]
+      properties:
+        repository_id: {type: string}
+        objective: {type: string, minLength: 1, maxLength: 50000}
+        title: {type: string, maxLength: 240}
+        base_ref: {type: string, default: origin/main}
+        mode: {enum: [plan_only, plan_and_implement]}
+        publication: {enum: [local_only, draft_pr_after_approval], default: local_only}
+        run_token_budget: {type: integer, minimum: 1000}
+    Run:
+      type: object
+      additionalProperties: false
+      required: [id, repository_id, title, objective, mode, publication_mode, state, phase, base_ref, base_sha, authority_digest, created_at, scheduler_paused, version]
+      properties:
+        id: {type: string}
+        repository_id: {type: string}
+        title: {type: string}
+        objective: {type: string}
+        mode: {enum: [plan_only, plan_and_implement]}
+        publication_mode: {enum: [local_only, draft_pr_after_approval]}
+        state: {type: string}
+        phase: {type: string}
+        base_ref: {type: string}
+        base_sha: {$ref: '#/components/schemas/GitSha'}
+        integration_branch: {type: string}
+        integration_sha: {$ref: '#/components/schemas/GitSha'}
+        authority_digest: {type: string}
+        created_at: {type: string, format: date-time}
+        started_at: {type: string, format: date-time}
+        completed_at: {type: string, format: date-time}
+        scheduler_paused: {type: boolean}
+        run_token_budget: {type: integer, minimum: 1000}
+        version: {type: integer}
+    RunDetail:
+      type: object
+      additionalProperties: false
+      required: [run, tasks, agents, worktrees, approvals]
+      properties:
+        run: {$ref: '#/components/schemas/Run'}
+        tasks: {type: array, items: {$ref: '#/components/schemas/Task'}}
+        agents: {type: array, items: {$ref: '#/components/schemas/AgentSummary'}}
+        worktrees: {type: array, items: {$ref: '#/components/schemas/Worktree'}}
+        approvals: {type: array, items: {$ref: '#/components/schemas/Approval'}}
+        plan: {type: object}
+        plan_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+    RunPage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Run'}
+        next_cursor: {type: string}
+    Task:
+      type: object
+      additionalProperties: false
+      required: [id, run_id, external_task_id, title, objective, state, attempt, base_sha, version]
+      properties:
+        id: {type: string}
+        run_id: {type: string}
+        external_task_id: {type: string}
+        title: {type: string}
+        objective: {type: string}
+        state: {type: string}
+        priority: {type: string}
+        owner_profile: {type: string}
+        reviewer_profile: {type: string}
+        attempt: {type: integer}
+        base_sha: {$ref: '#/components/schemas/GitSha'}
+        head_sha: {$ref: '#/components/schemas/GitSha'}
+        token_budget: {type: integer}
+        dependencies:
+          type: array
+          items: {type: string}
+        version: {type: integer}
+    TaskDetail:
+      type: object
+      additionalProperties: false
+      required: [task]
+      properties:
+        task: {$ref: '#/components/schemas/Task'}
+        attempt_packet:
+          description: Current attempt id and immutable task packet, or null before dispatch.
+    AgentSummary:
+      type: object
+      additionalProperties: false
+      required: [id, role, state, requested_model, requested_reasoning_effort, cwd]
+      properties:
+        id: {type: string}
+        parent_agent_id: {type: string}
+        task_id: {type: string}
+        role: {type: string}
+        nickname: {type: string}
+        state: {type: string}
+        requested_model: {type: string}
+        effective_model: {type: string}
+        requested_reasoning_effort: {type: string}
+        effective_reasoning_effort: {type: string}
+        sandbox_mode: {type: string}
+        cwd: {type: string}
+        current_goal: {type: string}
+        current_action: {type: string}
+        token_budget: {type: integer}
+        tokens_used: {type: integer}
+        estimated_cost_lower: {type: string}
+        estimated_cost_upper: {type: string}
+        heartbeat_at: {type: string, format: date-time}
+        thread_id: {type: string}
+        active_turn_id: {type: string}
+        version: {type: integer}
+    AgentDetail:
+      allOf:
+        - {$ref: '#/components/schemas/AgentSummary'}
+        - type: object
+          properties:
+            thread_id: {type: string}
+            active_turn_id: {type: string}
+            worktree: {$ref: '#/components/schemas/Worktree'}
+            children:
+              type: array
+              items: {$ref: '#/components/schemas/AgentSummary'}
+            usage: {$ref: '#/components/schemas/UsageSummary'}
+            context: {type: object}
+            version: {type: integer}
+    ActivityPage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/ActivityItem'}
+        next_cursor: {type: integer}
+    ActivityItem:
+      type: object
+      additionalProperties: false
+      required: [id, sequence, kind, state, occurred_at]
+      properties:
+        id: {type: string}
+        sequence: {type: integer}
+        kind: {type: string}
+        state: {type: string}
+        summary: {type: string}
+        payload: {type: object}
+        occurred_at: {type: string, format: date-time}
+    Approval:
+      type: object
+      additionalProperties: false
+      required: [id, run_id, thread_id, approval_type, risk_level, request, state, created_at, version]
+      properties:
+        id: {type: string}
+        run_id: {type: string}
+        agent_id: {type: string}
+        task_id: {type: string}
+        thread_id: {type: string}
+        turn_id: {type: string}
+        approval_type: {type: string}
+        risk_level: {enum: [low, medium, high, critical]}
+        request: {type: object}
+        state: {enum: [pending, delivering, resolved, expired]}
+        decision: {type: string}
+        created_at: {type: string, format: date-time}
+        resolved_at: {type: string, format: date-time}
+        version: {type: integer}
+    Worktree:
+      type: object
+      additionalProperties: false
+      required: [id, kind, path, base_sha, state]
+      properties:
+        id: {type: string}
+        run_id: {type: string}
+        task_id: {type: string}
+        kind: {enum: [inspection, task, verifier, integration]}
+        path: {type: string}
+        branch: {type: string}
+        base_sha: {$ref: '#/components/schemas/GitSha'}
+        head_sha: {$ref: '#/components/schemas/GitSha'}
+        state: {type: string}
+        preserved_reason: {type: string}
+        dirty: {type: boolean}
+        files_changed: {type: integer}
+        additions: {type: integer}
+        deletions: {type: integer}
+        version: {type: integer}
+    Finding:
+      type: object
+      additionalProperties: false
+      required: [id, severity, title, status]
+      properties:
+        id: {type: string}
+        severity: {enum: [critical, high, medium, low]}
+        title: {type: string}
+        invariant: {type: string}
+        file: {type: string}
+        line: {type: integer}
+        details: {type: string}
+        required_correction: {type: string}
+        status: {enum: [open, accepted, fixed, rejected_with_rationale]}
+    Validation:
+      type: object
+      additionalProperties: false
+      required: [id, validator_id, proof_tier, source_sha, state]
+      properties:
+        id: {type: string}
+        validator_id: {type: string}
+        proof_tier: {enum: [T0, T1, T2, T3, T4, T5, T6]}
+        source_sha: {$ref: '#/components/schemas/GitSha'}
+        state: {type: string}
+        result_class:
+          enum: [success, not_selected, source_failure, infrastructure_unavailable, inconclusive, cancelled_superseded, skipped_draft, quarantined_failure]
+        command_run_id: {type: string}
+        evidence_ids:
+          type: array
+          items: {type: string}
+    EvidenceSummary:
+      type: object
+      additionalProperties: false
+      required: [schema, run, tasks, agents, evidence, artifacts]
+      properties:
+        schema: {const: harness-evidence-snapshot/v1}
+        run: {$ref: '#/components/schemas/Run'}
+        tasks: {type: array, items: {$ref: '#/components/schemas/Task'}}
+        agents: {type: array, items: {$ref: '#/components/schemas/AgentSummary'}}
+        evidence:
+          type: array
+          items: {type: object}
+        artifacts:
+          type: array
+          items: {type: object}
+    UsageSummary:
+      type: object
+      additionalProperties: false
+      required: [input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens, cost, by_model]
+      properties:
+        input_tokens: {type: integer}
+        cached_input_tokens: {type: integer}
+        cache_write_input_tokens: {type: integer}
+        output_tokens: {type: integer}
+        reasoning_output_tokens: {type: integer}
+        total_tokens: {type: integer}
+        cost:
+          $ref: '#/components/schemas/CostEstimate'
+        by_model:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [model, turns, usage, cost]
+            properties:
+              model: {type: string}
+              turns: {type: integer}
+              usage: {$ref: '#/components/schemas/TokenUsage'}
+              cost: {$ref: '#/components/schemas/CostEstimate'}
+    TokenUsage:
+      type: object
+      additionalProperties: false
+      required: [input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens]
+      properties:
+        input_tokens: {type: integer}
+        cached_input_tokens: {type: integer}
+        cache_write_input_tokens: {type: integer}
+        output_tokens: {type: integer}
+        reasoning_output_tokens: {type: integer}
+        total_tokens: {type: integer}
+        model_context_window: {type: integer}
+    CostEstimate:
+      type: object
+      additionalProperties: false
+      required: [lower_microusd, upper_microusd, confidence, pricing_snapshot_ids, explanation]
+      properties:
+        lower_microusd: {type: integer}
+        upper_microusd: {type: integer}
+        confidence: {enum: [exact, bounded, unknown]}
+        pricing_snapshot_ids: {type: array, items: {type: string}}
+        explanation: {type: string}
+    ValidationOutcome:
+      type: object
+      additionalProperties: false
+      required: [validation_id, command_id, validator_id, source_sha, proof_tier, result]
+      properties:
+        validation_id: {type: string}
+        command_id: {type: string}
+        validator_id: {type: string}
+        source_sha: {$ref: '#/components/schemas/GitSha'}
+        proof_tier: {enum: [T0, T1, T2, T3, T4, T5, T6]}
+        result: {type: object}
+    OperationAccepted:
+      type: object
+      additionalProperties: false
+      required: [operation_id, state, target_id]
+      properties:
+        operation_id: {type: string}
+        state: {const: accepted}
+        target_id: {type: string}
+    Problem:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, request_id]
+          properties:
+            code: {type: string}
+            message: {type: string}
+            request_id: {type: string}

@@ -1,0 +1,971 @@
+//! Same-origin localhost REST API and durable SSE stream.
+
+use std::{convert::Infallible, sync::Arc, time::Duration};
+
+use async_stream::stream;
+use axum::{
+    Json, Router,
+    extract::{Path, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response, Sse, sse::Event},
+    routing::{get, post},
+};
+use harness_domain::{AgentSessionId, ApprovalId, RepositoryId, RunId, TaskId, WorktreeId};
+use harness_orchestrator::{
+    ApprovalDecisionRequest, CreateRunRequest, Orchestrator, OrchestratorError,
+    PublishDraftPrRequest, RegisterRepositoryRequest, RetryTaskRequest,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+use time::OffsetDateTime;
+use tokio::time::{Instant, interval};
+use uuid::Uuid;
+
+const SESSION_COOKIE: &str = "harness_session";
+const CSRF_HEADER: &str = "x-harness-csrf";
+const SESSION_TTL_SECONDS: u64 = 12 * 60 * 60;
+
+#[derive(Clone)]
+pub struct ApiState {
+    orchestrator: Arc<Orchestrator>,
+    started: Instant,
+    event_replay_limit: u32,
+}
+
+pub fn router(orchestrator: Arc<Orchestrator>) -> Router {
+    let state = ApiState {
+        event_replay_limit: orchestrator.ui_event_replay_limit(),
+        orchestrator,
+        started: Instant::now(),
+    };
+    Router::new()
+        .route("/api/v1/health", get(health))
+        .route("/api/v1/session", post(create_session))
+        .route("/api/v1/runtime", get(runtime))
+        .route(
+            "/api/v1/repositories",
+            get(list_repositories).post(register_repository),
+        )
+        .route("/api/v1/repositories/{repository_id}", get(get_repository))
+        .route(
+            "/api/v1/repositories/{repository_id}/inspect",
+            post(inspect_repository),
+        )
+        .route("/api/v1/runs", get(list_runs).post(create_run))
+        .route("/api/v1/runs/{run_id}", get(get_run))
+        .route(
+            "/api/v1/runs/{run_id}/start-architecture",
+            post(start_architecture),
+        )
+        .route("/api/v1/runs/{run_id}/plan/approve", post(approve_plan))
+        .route(
+            "/api/v1/runs/{run_id}/scheduler/pause",
+            post(pause_scheduler),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/scheduler/resume",
+            post(resume_scheduler),
+        )
+        .route("/api/v1/runs/{run_id}/stop", post(stop_run))
+        .route(
+            "/api/v1/runs/{run_id}/approve-integration",
+            post(approve_integration),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/publish-draft-pr",
+            post(publish_draft_pr),
+        )
+        .route("/api/v1/runs/{run_id}/tasks", get(list_tasks))
+        .route("/api/v1/tasks/{task_id}", get(get_task))
+        .route("/api/v1/tasks/{task_id}/retry", post(retry_task))
+        .route(
+            "/api/v1/tasks/{task_id}/request-review",
+            post(request_task_review),
+        )
+        .route(
+            "/api/v1/tasks/{task_id}/validate/{validator_id}",
+            post(run_validator),
+        )
+        .route("/api/v1/agents/{agent_id}", get(get_agent))
+        .route("/api/v1/agents/{agent_id}/steer", post(steer_agent))
+        .route("/api/v1/agents/{agent_id}/interrupt", post(interrupt_agent))
+        .route("/api/v1/agents/{agent_id}/activity", get(agent_activity))
+        .route("/api/v1/approvals", get(list_approvals))
+        .route(
+            "/api/v1/approvals/{approval_id}/decision",
+            post(decide_approval),
+        )
+        .route("/api/v1/worktrees", get(list_worktrees))
+        .route(
+            "/api/v1/worktrees/{worktree_id}/preserve",
+            post(preserve_worktree),
+        )
+        .route("/api/v1/runs/{run_id}/evidence", get(run_evidence))
+        .route(
+            "/api/v1/runs/{run_id}/evidence/export",
+            post(export_evidence),
+        )
+        .route("/api/v1/runs/{run_id}/usage", get(run_usage))
+        .route("/api/v1/events", get(events))
+        .with_state(state)
+}
+
+async fn health(State(state): State<ApiState>) -> Json<Value> {
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_seconds": state.started.elapsed().as_secs(),
+        "time": OffsetDateTime::now_utc().unix_timestamp(),
+    }))
+}
+
+#[derive(Serialize)]
+struct SessionResponse {
+    csrf_token: String,
+    expires_at_ms: i64,
+}
+
+async fn create_session(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    validate_origin(&headers)?;
+    let session_id = Uuid::new_v4().simple().to_string();
+    let csrf_token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let csrf_hash = sha256(csrf_token.as_bytes());
+    let session = state.orchestrator.store().create_api_session(
+        &session_id,
+        &csrf_hash,
+        SESSION_TTL_SECONDS,
+    )?;
+    let cookie = format!(
+        "{SESSION_COOKIE}={session_id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECONDS}"
+    );
+    let mut response = (
+        StatusCode::CREATED,
+        Json(SessionResponse {
+            csrf_token,
+            expires_at_ms: session.expires_at,
+        }),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie)
+            .map_err(|_| ApiError::internal("failed to construct session cookie"))?,
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+async fn runtime(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<harness_domain::RuntimeStatus>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(state.orchestrator.runtime_status().await))
+}
+
+async fn list_repositories(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<harness_domain::RepositorySummary>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(state.orchestrator.store().list_repositories()?))
+}
+
+async fn register_repository(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<RegisterRepositoryRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    let repository = state.orchestrator.register_repository(request).await?;
+    Ok((StatusCode::CREATED, Json(repository)))
+}
+
+async fn get_repository(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(repository_id): Path<String>,
+) -> Result<Json<harness_domain::RepositorySummary>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .store()
+            .repository(&RepositoryId::from(repository_id))?,
+    ))
+}
+
+async fn inspect_repository(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(repository_id): Path<String>,
+) -> Result<Json<harness_domain::RepositorySummary>, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .inspect_repository(&RepositoryId::from(repository_id))
+            .await?,
+    ))
+}
+
+#[derive(Default, Deserialize)]
+struct RunsQuery {
+    repository_id: Option<String>,
+    #[allow(dead_code)]
+    state: Option<String>,
+    #[allow(dead_code)]
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn list_runs(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<RunsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    let repository_id = query.repository_id.as_deref().map(RepositoryId::from);
+    let mut runs = state
+        .orchestrator
+        .store()
+        .list_runs(repository_id.as_ref(), true)?;
+    if let Some(filter) = query.state {
+        runs.retain(|run| run.state.to_string() == filter);
+    }
+    runs.truncate(query.limit.unwrap_or(50).clamp(1, 200));
+    Ok(Json(json!({"items": runs, "next_cursor": null})))
+}
+
+async fn create_run(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateRunRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    let run = state.orchestrator.create_run(request).await?;
+    Ok((StatusCode::CREATED, Json(run)))
+}
+
+async fn get_run(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<Json<harness_orchestrator::RunDetail>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(state.orchestrator.run_detail(&RunId::from(run_id))?))
+}
+
+async fn start_architecture(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            state
+                .orchestrator
+                .start_architecture(&RunId::from(run_id))
+                .await?,
+        ),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovePlanBody {
+    task_graph_digest: String,
+    note: Option<String>,
+}
+
+async fn approve_plan(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Json(body): Json<ApprovePlanBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    reject_long_note(body.note.as_deref())?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            state
+                .orchestrator
+                .approve_plan(&RunId::from(run_id), &body.task_graph_digest, "local-user")
+                .await?,
+        ),
+    ))
+}
+
+async fn pause_scheduler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<Json<harness_domain::RunSummary>, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok(Json(state.orchestrator.set_scheduler_paused(
+        &RunId::from(run_id),
+        true,
+        "local-user",
+    )?))
+}
+
+async fn resume_scheduler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<Json<harness_domain::RunSummary>, ApiError> {
+    authenticate(&state, &headers, true)?;
+    let run_id = RunId::from(run_id);
+    state
+        .orchestrator
+        .set_scheduler_paused(&run_id, false, "local-user")?;
+    let _ = state.orchestrator.tick(&run_id).await?;
+    Ok(Json(state.orchestrator.store().run(&run_id)?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StopBody {
+    mode: String,
+    preserve_all_worktrees: Option<bool>,
+}
+
+async fn stop_run(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Json(body): Json<StopBody>,
+) -> Result<Json<harness_domain::RunSummary>, ApiError> {
+    authenticate(&state, &headers, true)?;
+    if !matches!(
+        body.mode.as_str(),
+        "after_current_commands" | "interrupt_turns" | "cancel"
+    ) {
+        return Err(OrchestratorError::Validation(
+            "stop mode must be after_current_commands, interrupt_turns, or cancel".to_owned(),
+        )
+        .into());
+    }
+    if body.preserve_all_worktrees == Some(false) {
+        return Err(OrchestratorError::Validation(
+            "failed and stopped worktrees are always preserved in v1".to_owned(),
+        )
+        .into());
+    }
+    let interrupt = matches!(body.mode.as_str(), "interrupt_turns" | "cancel");
+    Ok(Json(
+        state
+            .orchestrator
+            .stop_run(&RunId::from(run_id), interrupt, "local-user")
+            .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApproveIntegrationBody {
+    expected_head_sha: String,
+    note: Option<String>,
+}
+
+async fn approve_integration(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Json(body): Json<ApproveIntegrationBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    reject_long_note(body.note.as_deref())?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            state
+                .orchestrator
+                .approve_integration(&RunId::from(run_id), &body.expected_head_sha, "local-user")
+                .await?,
+        ),
+    ))
+}
+
+async fn publish_draft_pr(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Json(body): Json<PublishDraftPrRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            state
+                .orchestrator
+                .publish_draft_pr(&RunId::from(run_id), body, "local-user")
+                .await?,
+        ),
+    ))
+}
+
+async fn list_tasks(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<Json<Vec<harness_domain::TaskSummary>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .store()
+            .list_tasks(&RunId::from(run_id))?,
+    ))
+}
+
+async fn get_task(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    let task_id = TaskId::from(task_id);
+    let task = state.orchestrator.store().task(&task_id)?;
+    let packet = state.orchestrator.store().task_packet(&task_id)?;
+    Ok(Json(json!({"task": task, "attempt_packet": packet})))
+}
+
+async fn retry_task(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+    Json(body): Json<RetryTaskRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            state
+                .orchestrator
+                .retry_task(&TaskId::from(task_id), body, "local-user")
+                .await?,
+        ),
+    ))
+}
+
+async fn request_task_review(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            state
+                .orchestrator
+                .request_task_review(&TaskId::from(task_id), "local-user")
+                .await?,
+        ),
+    ))
+}
+
+async fn run_validator(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path((task_id, validator_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            state
+                .orchestrator
+                .run_validator(&TaskId::from(task_id), &validator_id)
+                .await?,
+        ),
+    ))
+}
+
+async fn get_agent(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+) -> Result<Json<harness_domain::AgentSummary>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .store()
+            .agent(&AgentSessionId::from(agent_id))?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SteerBody {
+    message: String,
+    #[allow(dead_code)]
+    update_goal: Option<bool>,
+}
+
+async fn steer_agent(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+    Json(body): Json<SteerBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    state
+        .orchestrator
+        .steer_agent(
+            &AgentSessionId::from(agent_id.clone()),
+            &body.message,
+            "local-user",
+        )
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({"state": "accepted", "target_id": agent_id})),
+    ))
+}
+
+async fn interrupt_agent(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    state
+        .orchestrator
+        .interrupt_agent(&AgentSessionId::from(agent_id.clone()), "local-user")
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({"state": "accepted", "target_id": agent_id})),
+    ))
+}
+
+#[derive(Default, Deserialize)]
+struct ActivityQuery {
+    after: Option<i64>,
+    limit: Option<u32>,
+}
+
+async fn agent_activity(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+    Query(query): Query<ActivityQuery>,
+) -> Result<Json<Value>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    let items = state.orchestrator.store().list_activity(
+        &AgentSessionId::from(agent_id),
+        query.after.unwrap_or_default().max(0),
+        query.limit.unwrap_or(200).clamp(1, 1_000),
+    )?;
+    let next = items.last().map(|item| item.sequence);
+    Ok(Json(json!({"items": items, "next_cursor": next})))
+}
+
+#[derive(Default, Deserialize)]
+struct ApprovalQuery {
+    state: Option<String>,
+    run_id: Option<String>,
+}
+
+async fn list_approvals(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<ApprovalQuery>,
+) -> Result<Json<Vec<harness_domain::ApprovalSummary>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    let run_id = query.run_id.as_deref().map(RunId::from);
+    Ok(Json(
+        state
+            .orchestrator
+            .store()
+            .list_approvals(run_id.as_ref(), query.state.as_deref())?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApiApprovalDecision {
+    decision: String,
+    note: Option<String>,
+    expected_version: Option<u64>,
+}
+
+async fn decide_approval(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(approval_id): Path<String>,
+    Json(body): Json<ApiApprovalDecision>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    let decision = match body.decision.as_str() {
+        "approve_once" => "accept",
+        "deny" => "decline",
+        other => other,
+    };
+    let approval = state
+        .orchestrator
+        .decide_approval(
+            &ApprovalId::from(approval_id),
+            ApprovalDecisionRequest {
+                decision: decision.to_owned(),
+                note: body.note,
+                expected_version: body.expected_version,
+            },
+            "local-user",
+        )
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(approval)))
+}
+
+#[derive(Default, Deserialize)]
+struct WorktreeQuery {
+    run_id: Option<String>,
+    state: Option<String>,
+}
+
+async fn list_worktrees(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<WorktreeQuery>,
+) -> Result<Json<Vec<harness_domain::WorktreeSummary>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    let run_id = query.run_id.as_deref().map(RunId::from);
+    let mut worktrees = state.orchestrator.store().list_worktrees(run_id.as_ref())?;
+    if let Some(filter) = query.state {
+        worktrees.retain(|worktree| worktree.state == filter);
+    }
+    Ok(Json(worktrees))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreserveBody {
+    reason: Option<String>,
+}
+
+async fn preserve_worktree(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(worktree_id): Path<String>,
+    Json(body): Json<PreserveBody>,
+) -> Result<Json<harness_domain::WorktreeSummary>, ApiError> {
+    authenticate(&state, &headers, true)?;
+    reject_long_note(body.reason.as_deref())?;
+    Ok(Json(state.orchestrator.preserve_worktree(
+        &WorktreeId::from(worktree_id),
+        body.reason.as_deref(),
+    )?))
+}
+
+async fn run_evidence(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(
+        state.orchestrator.evidence_snapshot(&RunId::from(run_id))?,
+    ))
+}
+
+async fn export_evidence(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    let run_id = RunId::from(run_id);
+    let output = state.orchestrator.default_export_path(&run_id);
+    let export = state.orchestrator.export_evidence(&run_id, &output)?;
+    Ok((StatusCode::ACCEPTED, Json(export)))
+}
+
+async fn run_usage(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<Json<harness_domain::UsageSummary>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(
+        state.orchestrator.usage_summary(&RunId::from(run_id))?,
+    ))
+}
+
+#[derive(Default, Deserialize)]
+struct EventsQuery {
+    cursor: Option<i64>,
+    run_id: Option<String>,
+}
+
+async fn events(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<EventsQuery>,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    let header_cursor = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok());
+    let mut cursor = header_cursor.or(query.cursor).unwrap_or_default().max(0);
+    let run_id = query.run_id.map(RunId::from);
+    let store = state.orchestrator.store().clone();
+    let replay_limit = state.event_replay_limit;
+    let stream = stream! {
+        let mut heartbeat = interval(Duration::from_secs(15));
+        loop {
+            match store.list_domain_events(cursor, run_id.as_ref(), replay_limit) {
+                Ok(events) if !events.is_empty() => {
+                    for item in events {
+                        cursor = item.id;
+                        let event = Event::default()
+                            .id(item.id.to_string())
+                            .event("domain")
+                            .json_data(&item)
+                            .unwrap_or_else(|_| Event::default().event("serialization_error").data("{}"));
+                        yield Ok(event);
+                    }
+                }
+                Ok(_) => {
+                    heartbeat.tick().await;
+                    yield Ok(Event::default().event("heartbeat").data(cursor.to_string()));
+                }
+                Err(error) => {
+                    yield Ok(Event::default().event("stream_error").data(error.to_string()));
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    };
+    Ok(Sse::new(stream))
+}
+
+fn authenticate(state: &ApiState, headers: &HeaderMap, mutation: bool) -> Result<(), ApiError> {
+    if mutation {
+        validate_origin(headers)?;
+    }
+    let session_id = cookie(headers, SESSION_COOKIE)
+        .ok_or_else(|| ApiError::unauthorized("local session cookie is missing"))?;
+    let session = state
+        .orchestrator
+        .store()
+        .api_session(&session_id)?
+        .filter(|session| !session.revoked)
+        .ok_or_else(|| ApiError::unauthorized("local session expired or was revoked"))?;
+    if mutation {
+        let supplied = headers
+            .get(CSRF_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| ApiError::forbidden("CSRF token is missing"))?;
+        let supplied_hash = sha256(supplied.as_bytes());
+        if supplied_hash
+            .as_bytes()
+            .ct_eq(session.csrf_secret_hash.as_bytes())
+            .unwrap_u8()
+            != 1
+        {
+            return Err(ApiError::forbidden("CSRF token is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_origin(headers: &HeaderMap) -> Result<(), ApiError> {
+    let origin = headers
+        .get(header::ORIGIN)
+        .ok_or_else(|| ApiError::forbidden("Origin header is required"))?
+        .to_str()
+        .map_err(|_| ApiError::forbidden("Origin header is invalid"))?;
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::forbidden("Host header is missing"))?;
+    let authority = host
+        .parse::<http::uri::Authority>()
+        .map_err(|_| ApiError::forbidden("Host header is invalid"))?;
+    let hostname = authority.host().trim_matches(['[', ']']);
+    if !hostname.eq_ignore_ascii_case("localhost") && hostname != "127.0.0.1" && hostname != "::1" {
+        return Err(ApiError::forbidden(
+            "Host must identify the local loopback listener",
+        ));
+    }
+    if origin != format!("http://{host}") && origin != format!("https://{host}") {
+        return Err(ApiError::forbidden("cross-origin request rejected"));
+    }
+    if headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !matches!(value, "same-origin" | "same-site" | "none"))
+    {
+        return Err(ApiError::forbidden("cross-site request rejected"));
+    }
+    Ok(())
+}
+
+fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .filter_map(|pair| pair.trim().split_once('='))
+        .find_map(|(key, value)| (key == name).then(|| value.to_owned()))
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn reject_long_note(value: Option<&str>) -> Result<(), ApiError> {
+    if value.is_some_and(|value| value.chars().count() > 4_000) {
+        return Err(OrchestratorError::Validation(
+            "operator note exceeds 4,000 characters".to_owned(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct ApiError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+}
+
+impl ApiError {
+    fn unauthorized(message: &str) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized",
+            message: message.to_owned(),
+        }
+    }
+
+    fn forbidden(message: &str) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "forbidden",
+            message: message.to_owned(),
+        }
+    }
+
+    fn internal(message: &str) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal",
+            message: message.to_owned(),
+        }
+    }
+}
+
+impl From<OrchestratorError> for ApiError {
+    fn from(error: OrchestratorError) -> Self {
+        let (status, code) = match &error {
+            OrchestratorError::Validation(_) => (StatusCode::UNPROCESSABLE_ENTITY, "validation"),
+            OrchestratorError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
+            OrchestratorError::Blocked(_) => (StatusCode::CONFLICT, "blocked"),
+            OrchestratorError::Store(harness_store::StoreError::NotFound(_)) => {
+                (StatusCode::NOT_FOUND, "not_found")
+            }
+            OrchestratorError::Store(harness_store::StoreError::Conflict(_)) => {
+                (StatusCode::CONFLICT, "conflict")
+            }
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        };
+        Self {
+            status,
+            code,
+            message: error.to_string(),
+        }
+    }
+}
+
+impl From<harness_store::StoreError> for ApiError {
+    fn from(error: harness_store::StoreError) -> Self {
+        Self::from(OrchestratorError::from(error))
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(json!({
+                "error": {
+                    "code": self.code,
+                    "message": self.message,
+                    "request_id": Uuid::new_v4().to_string()
+                }
+            })),
+        )
+            .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cookie_parser_uses_exact_name() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("other=x; harness_session=abc"),
+        );
+        assert_eq!(cookie(&headers, SESSION_COOKIE).as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn csrf_digest_comparison_is_stable() {
+        assert_eq!(sha256(b"token"), sha256(b"token"));
+        assert_ne!(sha256(b"token"), sha256(b"other"));
+    }
+
+    #[test]
+    fn mutation_origin_is_required_and_must_match_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:7310"));
+        assert!(validate_origin(&headers).is_err());
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:7310"),
+        );
+        assert!(validate_origin(&headers).is_ok());
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://attacker.invalid"),
+        );
+        assert!(validate_origin(&headers).is_err());
+
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("attacker.invalid:7310"),
+        );
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://attacker.invalid:7310"),
+        );
+        assert!(validate_origin(&headers).is_err());
+    }
+
+    #[test]
+    fn operator_notes_are_bounded() {
+        assert!(reject_long_note(Some(&"x".repeat(4_000))).is_ok());
+        assert!(reject_long_note(Some(&"x".repeat(4_001))).is_err());
+    }
+}

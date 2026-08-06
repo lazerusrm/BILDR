@@ -1,0 +1,113 @@
+schema_version = 1
+
+[server]
+bind = "127.0.0.1:7310"
+open_browser_on_start = true
+ui_event_replay_limit = 10000
+
+[paths]
+# Empty values resolve through the Linux XDG base-directory rules.
+data_dir = ""
+cache_dir = ""
+config_dir = ""
+worktree_root = ""
+artifact_root = ""
+
+[codex]
+binary = "codex"
+transport = "stdio"
+service_name = "harness_console"
+experimental_api = false
+# Release validated by generated/CODEX_COMPATIBILITY.json. Update both pins with
+# `cargo xtask codex-schema` when intentionally upgrading Codex.
+required_version = "0.146.0"
+# Generated with: codex app-server generate-json-schema --out <dir>
+required_protocol_schema_sha256 = "4e5515cf5ec697e85c16a627a49cf5759f5f102a5a770456d546670effee26fa"
+execution_on_schema_mismatch = "disabled"
+reasoning_summary = "concise"
+
+[orchestration]
+max_total_agent_threads = 6
+max_mutable_tasks = 3
+max_independent_verifiers = 1
+max_read_only_discovery = 2
+max_automatic_remediation_rounds = 2
+default_task_token_budget = 80000
+default_turn_timeout_seconds = 3600
+lease_ttl_seconds = 900
+heartbeat_interval_seconds = 30
+
+[git]
+primary_checkout_must_remain_clean = true
+fetch_before_run = true
+base_ref = "origin/main"
+auto_push = false
+auto_create_pr = false
+auto_mark_pr_ready = false
+auto_merge = false
+preserve_failed_worktrees = true
+
+[security]
+bind_localhost_only = true
+network_default = "disabled"
+approval_policy = "untrusted"
+store_raw_reasoning = false
+store_reasoning_summaries = true
+redact_environment_values = true
+redact_probable_secrets = true
+allow_agent_full_access = false
+allow_automatic_external_writes = false
+
+[storage]
+sqlite_wal = true
+raw_event_retention_days = 90
+command_log_retention_days = 30
+artifact_retention_days = 180
+compress_raw_events = true
+hash_algorithm = "sha256"
+
+[usage]
+label_subscription_costs_as_api_equivalent = true
+show_reasoning_tokens_separately = true
+never_double_count_reasoning_output = true
+cost_when_cache_write_missing = "range"
+
+# Price snapshots are versioned. Never rewrite historical snapshots after use.
+[[pricing.snapshots]]
+id = "openai-2026-08-05-gpt-5.6-sol"
+effective_at = "2026-08-05T00:00:00Z"
+model = "gpt-5.6-sol"
+currency = "USD"
+input_per_million = 5.00
+cached_input_per_million = 0.50
+output_per_million = 30.00
+cache_write_multiplier = 1.25
+long_context_threshold_tokens = 272000
+long_context_input_multiplier = 2.0
+long_context_output_multiplier = 1.5
+
+[[pricing.snapshots]]
+id = "openai-2026-08-05-gpt-5.6-terra"
+effective_at = "2026-08-05T00:00:00Z"
+model = "gpt-5.6-terra"
+currency = "USD"
+input_per_million = 2.00
+cached_input_per_million = 0.20
+output_per_million = 12.00
+cache_write_multiplier = 1.25
+long_context_threshold_tokens = 272000
+long_context_input_multiplier = 2.0
+long_context_output_multiplier = 1.5
+
+[[pricing.snapshots]]
+id = "openai-2026-08-05-gpt-5.6-luna"
+effective_at = "2026-08-05T00:00:00Z"
+model = "gpt-5.6-luna"
+currency = "USD"
+input_per_million = 0.20
+cached_input_per_million = 0.02
+output_per_million = 1.20
+cache_write_multiplier = 1.25
+long_context_threshold_tokens = 272000
+long_context_input_multiplier = 2.0
+long_context_output_multiplier = 1.5

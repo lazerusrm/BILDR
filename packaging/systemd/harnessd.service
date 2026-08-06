@@ -1,0 +1,23 @@
+[Unit]
+Description=Harness Console local Codex control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/harnessd serve
+Restart=on-failure
+RestartSec=2
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+Environment=RUST_LOG=harnessd=info
+Environment=RUST_BACKTRACE=1
+LimitNOFILE=65536
+
+# A hardened installation may add ProtectSystem/ProtectHome and explicit
+# ReadWritePaths after the repository and XDG roots are known. Do not add a
+# blanket home-directory write grant merely to avoid defining those roots.
+
+[Install]
+WantedBy=default.target

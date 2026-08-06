@@ -1,0 +1,22 @@
+[package]
+name = "harness-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+harness-domain = { path = "../harness-domain" }
+harness-profile = { path = "../harness-profile" }
+fs2.workspace = true
+globset.workspace = true
+hex.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

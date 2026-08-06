@@ -1,0 +1,9 @@
+{
+  "schema": "harness-codex-compatibility/v1",
+  "codex_cli_version": "0.146.0",
+  "transport": "stdio-jsonl",
+  "generated_schema_root": "generated/codex-app-server-schema",
+  "root_schema": "codex_app_server_protocol.v2.schemas.json",
+  "root_schema_sha256": "4e5515cf5ec697e85c16a627a49cf5759f5f102a5a770456d546670effee26fa",
+  "generated_at": "2026-08-05"
+}

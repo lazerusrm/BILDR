@@ -1,0 +1,26 @@
+/.idea/
+/.vscode/
+/.env
+/.env.*
+!/ui/.env.example
+/coverage/
+/playwright-report/
+/test-results/
+/ui/coverage/
+/ui/playwright-report/
+/ui/test-results/
+/dist/
+*.tsbuildinfo
+*.sqlite
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.log
+
+# These are bulk-backed symlinks on development hosts.
+/target
+/ui/node_modules
+
+# Local Harness state belongs under XDG directories, never in the repo.
+/.harness-runtime/
+/.omx/

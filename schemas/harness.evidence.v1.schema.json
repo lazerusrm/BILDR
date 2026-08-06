@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:harness:evidence.v1",
+  "title": "Harness evidence record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "evidence_id", "run_id", "task_id", "source_sha", "claim_ids",
+    "proof_tier", "command_or_workflow", "started_at", "completed_at",
+    "result_class", "artifacts", "unproved_claims"
+  ],
+  "properties": {
+    "schema": { "const": "harness.evidence.v1" },
+    "evidence_id": { "type": "string", "minLength": 1 },
+    "run_id": { "type": "string", "minLength": 1 },
+    "task_id": { "type": ["string", "null"] },
+    "source_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "base_sha_or_release_candidate": { "type": ["string", "null"] },
+    "claim_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+    "proof_tier": { "enum": ["T0", "T1", "T2", "T3", "T4", "T5", "T6"] },
+    "command_or_workflow": { "type": "string", "minLength": 1 },
+    "toolchain_and_lock": { "type": ["string", "null"] },
+    "target_and_profile": { "type": ["string", "null"] },
+    "runner_or_device_identity": { "type": ["string", "null"] },
+    "fixture_or_dataset_digest": { "type": ["string", "null"] },
+    "started_at": { "type": "string", "format": "date-time" },
+    "completed_at": { "type": "string", "format": "date-time" },
+    "result_class": {
+      "enum": [
+        "success", "not_selected", "source_failure",
+        "infrastructure_unavailable", "inconclusive",
+        "cancelled_superseded", "skipped_draft", "quarantined_failure"
+      ]
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256", "media_type", "bytes"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "media_type": { "type": "string", "minLength": 1 },
+          "bytes": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "unproved_claims": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "invalidated_by": { "type": ["string", "null"] }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "tsBuildInfoFile": "../target/ui-tsconfig.node.tsbuildinfo",
+    "allowImportingTsExtensions": true
+  },
+  "include": ["vite.config.ts"]
+}
