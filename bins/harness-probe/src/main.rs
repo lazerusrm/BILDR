@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 #[command(
     name = "harness-probe",
     version,
-    about = "Bounded, read-only repository probes for Harness Console agents"
+    about = "Bounded, read-only repository probes for BILDR roles"
 )]
 struct Cli {
     /// Repository root. Defaults to the current directory.

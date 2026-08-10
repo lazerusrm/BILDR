@@ -1,80 +1,58 @@
-# Harness Console v0.1.0 Validation Report
+# BILDR validation report
 
-**Validated:** 2026-08-06
+**Validated:** August 10, 2026
 **Platform:** Linux x86_64
-**Protocol target:** Codex CLI/App Server 0.146.0
-**Protocol schema SHA-256:** `4e5515cf5ec697e85c16a627a49cf5759f5f102a5a770456d546670effee26fa`
+**Release candidate:** 0.1.0
 
 ## Result
 
-Harness Console is implemented as a buildable local application rather than a
-design-only blueprint. The Rust daemon, CLI, probe utility, embedded React UI,
-durable SQLite store, Codex App Server adapter, Git custody layer, bounded
-runner, orchestrator, evidence exporter, and release tooling all passed their
-acceptance checks.
+The local release candidate passes the repository's build, contract, lint, unit,
+and browser acceptance gates.
 
-## Automated verification
+Planning certification now fails closed around a structured certificate. The
+certificate binds the plan, base, profile, authority set, reviewer, feasibility
+assessment, and review evidence. Human findings use the same revision path as
+reviewer findings. Blocking findings trigger revision; advisory findings remain
+in execution context without forcing another full planning cycle. Repeated,
+oscillating, or nonshrinking blockers stop for an explicit decision instead of
+consuming the remaining run budget.
 
-- `cargo fmt --all -- --check`: passed.
-- `cargo check --workspace --all-targets --locked`: passed.
-- `cargo test --workspace --all-targets --locked`: passed, 40 tests.
-- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`:
-  passed with no warnings.
-- `npm --prefix ui run typecheck`: passed.
-- `npm --prefix ui test`: passed, 3 component/contract tests.
-- `npm --prefix ui run build`: passed; production assets were emitted and
-  embedded by the daemon.
-- `npm --prefix ui run test:e2e`: passed, 1 browser workflow in Chromium.
-- `cargo xtask schema-check`: passed for all seven JSON/TOML contracts.
-- `cargo xtask openapi-check`: passed; 38 local references resolved and all 32
-  router paths are represented in the OpenAPI contract.
-- `cargo xtask app-server-bindings-check`: passed against the pinned generated
-  App Server v2 schema.
-- `cargo xtask dist --check`: passed.
-- `cargo xtask dist`: passed; emitted the optimized Linux x86_64 distribution
-  with its SHA-256 sidecar. The checksum, gzip/tar structure, and packaged ELF
-  binaries were verified, and the packaged `harnessd doctor --without-codex`
-  preflight passed against clean XDG directories.
-- SQLite migration smoke: passed with WAL mode, schema version 3, 42
-  application tables, the approval worktree-binding column, and a clean
-  `PRAGMA foreign_key_check`.
-- Credential-pattern and archive-integrity audits: passed.
+Execution completion now depends on controller-owned evidence from the exact
+integrated head. Profiles bind validators to lifecycle gates and changed paths.
+Code changes require behavioral proof. Automated acceptance and operator
+attestations bind to the integrated SHA and deterministic signoff packet. Human
+review is a resting state with approve and request-changes paths. Required
+draft-PR checks prove only the expected remote head; incomplete, stale, or
+malformed check results cannot advance the run.
 
-## End-to-end runtime verification
+The public repository uses neutral orchestration schemas, examples, role names,
+and profile shapes. The strict BILDR profile validates Rust, browser, contract,
+and delivery paths without importing policy from another repository. Public
+change metadata rejects automation attribution, and the repository policy check
+rejects tool-specific root instruction files.
 
-A clean temporary Git repository and bare `origin` were registered through the
-real daemon/API. The deterministic fake App Server then exercised the same
-JSONL protocol path used by Codex:
+## Verification
 
-1. Runtime preflight accepted version 0.146.0 and the pinned schema digest.
-2. Architecture produced a bounded plan, which was digest-bound and approved.
-3. A worker changed its leased path in a dedicated worktree.
-4. The controller custodied and committed the change.
-5. An independent verifier accepted the exact task SHA.
-6. The controller integrated the commit and required integration approval.
-7. A final auditor accepted the exact integration SHA.
-8. The run reached `COMPLETED`; usage/cost projections and exact-SHA evidence
-   were queryable.
-9. A deterministic `tar.zst` evidence bundle passed checksum, decompression,
-   and archive-content checks.
-10. After a clean daemon restart, the completed run, evidence, runtime status,
-    WAL database, and zero projection lag were recovered successfully.
+The following checks passed on the final local code shape:
 
-The served production UI returned HTTP 200 after restart. The Playwright flow
-covered session bootstrap, repository/run navigation, responsive workspace
-layout, inspector tabs, command controls, and compact/mobile behavior.
+- `cargo xtask check`
+  - 8 JSON schema and example files parsed.
+  - 59 OpenAPI references resolved.
+  - 50 API routes matched their implementations.
+  - The pinned protocol schema digest matched.
+  - The production browser application built.
+  - All 77 Rust tests passed.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `npm --prefix ui run typecheck`
+- `npm --prefix ui test -- --run`: 7 tests passed.
+- `npm --prefix ui run test:e2e`: 2 browser flows passed.
+- `bash .github/scripts/check-repository-policy.sh`
+- Positive and negative contribution-metadata policy checks.
+- `git diff --check`
 
-## UI acceptance
+## Proof limits
 
-The production UI was reviewed at the supplied 1440 x 960 reference size
-against `mockups/run-workspace.html`. It preserves the specified dense dark
-three-pane console, status/header hierarchy, activity workspace, inspector,
-navigation, typography, spacing, state colors, responsive collapse behavior,
-keyboard focus, semantic landmarks, and reduced-motion support.
-
-## Operational note
-
-The end-to-end acceptance run uses `fake-app-server` so it is deterministic and
-does not consume an external Codex turn. Normal operation requires an
-authenticated Codex CLI 0.146.0; `harnessd doctor` refuses mutable execution if
-the installed version or generated protocol digest differs from the pin.
+This local report does not claim hosted CI, release publication, or live
+deployment proof. The draft pull request must run the public workflow on the
+published head before the controller can record CI proof. BILDR never merges
+automatically.

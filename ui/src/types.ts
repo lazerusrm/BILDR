@@ -3,6 +3,8 @@ export type RunState =
   | "PREPARING"
   | "READY_FOR_ARCHITECTURE"
   | "ARCHITECTING"
+  | "PLAN_ADVERSARIAL_REVIEW"
+  | "PLAN_REVISION_REQUIRED"
   | "PLAN_REVIEW_REQUIRED"
   | "READY_TO_EXECUTE"
   | "EXECUTING"
@@ -36,6 +38,8 @@ export interface RuntimeStatus {
     required_version?: string;
     protocol_schema_sha256?: string;
     schema_match: boolean;
+    native_multi_agent: boolean;
+    native_multi_agent_feature?: string;
     pid?: number;
     restart_count: number;
   };
@@ -67,6 +71,76 @@ export interface Repository {
   managed_worktree_count: number;
   authority_digest?: string;
   version: number;
+}
+
+export interface RepositoryDiscovery {
+  root_path: string;
+  display_name: string;
+  origin_url?: string;
+  is_github: boolean;
+  compatible: boolean;
+  registered: boolean;
+}
+
+export interface OperatorSettings {
+  store_reasoning_summaries: boolean;
+  store_raw_reasoning: boolean;
+  yolo_mode: boolean;
+  allow_automatic_external_writes: boolean;
+  automatic_external_writes_locked: boolean;
+  automatic_account_handoff: boolean;
+  adaptive_governor_budgets: boolean;
+  automatic_governor_continuation: boolean;
+  automatic_plan_approval: boolean;
+  governor_goal_token_budget: number;
+  governor_attempt_token_ceiling: number;
+  recommended_governor_attempt_tokens: number;
+  governor_budget_sample_count: number;
+  governor_budget_reason: string;
+}
+
+export interface CodexRateLimitWindow {
+  kind: "primary" | "secondary";
+  used_percent: number;
+  remaining_percent: number;
+  window_duration_mins?: number;
+  resets_at?: number;
+}
+
+export interface CodexRateLimit {
+  limit_id: string;
+  limit_name?: string;
+  plan_type?: string;
+  windows: CodexRateLimitWindow[];
+}
+
+export interface CodexAccountProfile {
+  id: string;
+  label: string;
+  codex_home: string;
+  selected: boolean;
+  state: "detected" | "ready" | "signed_out" | "unavailable";
+  account_type?: string;
+  email?: string;
+  plan_type?: string;
+  rate_limits: CodexRateLimit[];
+  observed_at?: number;
+  detail?: string;
+  managed?: boolean;
+}
+
+export interface CodexAccountsSnapshot {
+  selected_account_id?: string;
+  accounts: CodexAccountProfile[];
+}
+
+export interface CodexAccountLoginStatus {
+  id: string;
+  label: string;
+  state: "waiting_for_user" | "completed" | "failed" | "canceling" | "canceled";
+  verification_url?: string;
+  user_code?: string;
+  detail?: string;
 }
 
 export interface Run {
@@ -114,6 +188,7 @@ export interface Agent {
   parent_agent_id?: string;
   task_id?: string;
   role: string;
+  codex_account_id?: string;
   nickname?: string;
   state: string;
   requested_model: string;
@@ -126,11 +201,15 @@ export interface Agent {
   current_action?: string;
   token_budget?: number;
   tokens_used: number;
+  budget_tokens_used?: number;
   estimated_cost_lower: string;
   estimated_cost_upper: string;
   heartbeat_at?: string;
   thread_id?: string;
   active_turn_id?: string;
+  context_strategy?: string;
+  context_source_attempt_id?: string;
+  context_reuse_reason?: string;
   version: number;
 }
 
@@ -150,6 +229,18 @@ export interface Worktree {
   additions: number;
   deletions: number;
   version: number;
+}
+
+export interface WorktreeDiffSummary {
+  worktree_id: string;
+  state: "clean" | "uncommitted" | "committed" | "committed_and_uncommitted";
+  dirty: boolean;
+  head_changed: boolean;
+  files_changed: number;
+  additions: number;
+  deletions: number;
+  changed_paths: string[];
+  changed_paths_truncated: boolean;
 }
 
 export interface Approval {
@@ -179,6 +270,20 @@ export interface ActivityItem {
   occurred_at: string;
 }
 
+export interface LatestAgentMessage {
+  id: string;
+  text: string;
+  phase?: string;
+  occurred_at: string;
+}
+
+export interface ActivityPage {
+  items: ActivityItem[];
+  latest_message?: LatestAgentMessage | null;
+  messages?: LatestAgentMessage[];
+  next_cursor?: number;
+}
+
 export interface CostEstimate {
   lower_microusd: number;
   upper_microusd: number;
@@ -203,10 +308,187 @@ export interface Usage {
   }>;
 }
 
+export interface UsageGroup {
+  id: string;
+  label: string;
+  detail: string;
+  turns: number;
+  usage: Omit<Usage, "cost" | "by_model">;
+  cost: CostEstimate;
+}
+
+export interface UsageBreakdown {
+  total: Usage;
+  by_account: UsageGroup[];
+  by_repository: UsageGroup[];
+  by_agent: UsageGroup[];
+}
+
 export interface RunPlan {
   schema: string;
   summary: string;
-  tasks: unknown[];
+  tasks: Array<{
+    task_id: string;
+    title: string;
+    objective: string;
+    depends_on: string[];
+    success_criteria: string[];
+    milestones?: TaskMilestone[];
+  }>;
+}
+
+export interface TaskMilestone {
+  id: string;
+  title: string;
+  objective: string;
+  success_criteria: string[];
+}
+
+export interface PlanReviewFinding {
+  severity: "blocking" | "advisory";
+  file?: string | null;
+  line?: number | null;
+  description: string;
+  required_correction: string;
+}
+
+export interface PlanReviewEvidence {
+  inspected_files: string[];
+  critical_path: Array<{
+    task_id: string;
+    why_critical: string;
+    behavioral_proof: string;
+  }>;
+  failure_modes: Array<{
+    failure_mode: string;
+    mitigation: string;
+  }>;
+}
+
+export interface PlanCertificate {
+  schema: string;
+  run_id: string;
+  revision: number;
+  plan_digest: string;
+  base_sha: string;
+  profile_digest: string;
+  authority_digest: string;
+  reviewer_agent_id: string;
+  reviewer: {
+    architect_model: string;
+    reviewer_model: string;
+    reviewer_reasoning_effort: string;
+    same_model_family: boolean;
+  };
+  summary: string;
+  evidence: PlanReviewEvidence;
+  advisory_findings: PlanReviewFinding[];
+  budget: {
+    planning_tokens_used: number;
+    run_token_ceiling: number;
+    remaining_run_tokens: number;
+    planned_task_tokens: number;
+    verifier_reserve_tokens: number;
+    final_audit_reserve_tokens: number;
+    contingency_tokens: number;
+    required_execution_tokens: number;
+    feasible: boolean;
+  };
+  risk: {
+    high_risk_tasks: string[];
+    serial_tasks: string[];
+    automatic_approval_token_threshold: number;
+  };
+  automatic_approval_eligible: boolean;
+  automatic_approval_blockers: string[];
+  certified_at: string;
+}
+
+export interface PlanReviewRecord {
+  revision: number;
+  plan_digest: string;
+  source: "agent" | "human";
+  reviewer_agent_id?: string | null;
+  verdict: "accept" | "changes_requested";
+  summary: string;
+  findings: PlanReviewFinding[];
+  evidence?: PlanReviewEvidence | null;
+  blocking_fingerprint?: string | null;
+  blocking_count: number;
+  recorded_at: string;
+}
+
+export interface SignoffPacket {
+  schema: string;
+  packet_digest: string;
+  run_id: string;
+  objective: string;
+  plan_digest: string;
+  plan_revision: number;
+  plan_review_history: PlanReviewRecord[];
+  integration_sha: string;
+  profile_digest: string;
+  authority_digest: string;
+  task_reviews: Array<{
+    task: Task;
+    verifier_verdict?: Record<string, unknown> | null;
+  }>;
+  integration_validation: {
+    source_sha?: string;
+    behavioral_required?: boolean;
+    changed_paths?: string[];
+    results?: Array<{
+      validator_id: string;
+      validation_id: string;
+      proof_tier: string;
+      evidence_class: "custody" | "contract" | "behavioral";
+      result_class: string;
+      exit_code?: number | null;
+      timed_out: boolean;
+    }>;
+  };
+  acceptance: Array<{
+    id: string;
+    kind: "automated" | "attested";
+    required: boolean;
+    status: "not_selected" | "passed" | "failed" | "pending_attestation" | "attested";
+    instructions: string;
+    proof_tier: string;
+    result?: Record<string, unknown> | null;
+    attestation?: Record<string, unknown> | null;
+  }>;
+  exact_head_evidence: Array<Record<string, unknown>>;
+  unproved_claims: string[];
+  total_tokens_used: number;
+  final_audit?: Record<string, unknown> | null;
+  human_decision?: Record<string, unknown> | null;
+}
+
+export interface GovernorMilestone {
+  id: string;
+  title: string;
+  status: "pending" | "in_progress" | "completed" | "blocked";
+  outcome: string;
+  acceptance: string[];
+}
+
+export interface GovernorCheckpoint {
+  schema: "harness.governor-checkpoint.v1";
+  revision: number;
+  status: "progressing" | "blocked" | "complete";
+  operator_update: string;
+  milestones: GovernorMilestone[];
+  current_milestone_id?: string | null;
+  next_action?: string | null;
+  blocked_on?: string | null;
+  durable_artifacts: Array<{
+    kind: string;
+    locator: string;
+    summary: string;
+    base_sha?: string | null;
+    digest?: string | null;
+  }>;
+  workspace_state: string;
 }
 
 export interface RunDetail {
@@ -217,6 +499,20 @@ export interface RunDetail {
   approvals: Approval[];
   plan?: RunPlan;
   plan_digest?: string;
+  plan_certificate?: PlanCertificate;
+  plan_review_history?: PlanReviewRecord[];
+  planning_tokens_used?: number;
+  signoff_packet?: SignoffPacket;
+  draft_pr_ci?: {
+    status?: string;
+    checked_at?: number;
+    head_sha?: string;
+    checks?: Array<Record<string, unknown>>;
+    error?: string;
+  };
+  automatic_plan_approval: boolean;
+  preferred_codex_account_id?: string;
+  governor_progress?: Record<string, GovernorCheckpoint>;
 }
 
 export interface EvidenceSnapshot {

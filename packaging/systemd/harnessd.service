@@ -1,5 +1,5 @@
 [Unit]
-Description=Harness Console local Codex control plane
+Description=BILDR local control plane
 After=network-online.target
 Wants=network-online.target
 
@@ -8,6 +8,8 @@ Type=simple
 ExecStart=%h/.local/bin/harnessd serve
 Restart=on-failure
 RestartSec=2
+KillMode=mixed
+TimeoutStopSec=10
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

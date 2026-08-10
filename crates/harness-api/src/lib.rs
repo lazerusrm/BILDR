@@ -10,10 +10,15 @@ use axum::{
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
 };
-use harness_domain::{AgentSessionId, ApprovalId, RepositoryId, RunId, TaskId, WorktreeId};
+use harness_domain::{
+    AgentRole, AgentSessionId, ApprovalId, RepositoryId, RunId, TaskId, WorktreeId,
+};
 use harness_orchestrator::{
-    ApprovalDecisionRequest, CreateRunRequest, Orchestrator, OrchestratorError,
-    PublishDraftPrRequest, RegisterRepositoryRequest, RetryTaskRequest,
+    ApprovalDecisionRequest, ApproveSignoffRequest, AttestAcceptanceRequest, CreateRunRequest,
+    OperatorSettings, Orchestrator, OrchestratorError, PlanReviewFinding,
+    PrepareCoordinationCheckoutRequest, PublishDraftPrRequest, RegisterRepositoryRequest,
+    RenameCodexAccountRequest, RepositoryDiscovery, RequestSignoffChanges, RetryTaskRequest,
+    StartCodexAccountLoginRequest, UpdateOperatorSettingsRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -21,6 +26,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use tokio::time::{Instant, interval};
+use tracing::warn;
 use uuid::Uuid;
 
 const SESSION_COOKIE: &str = "harness_session";
@@ -44,14 +50,44 @@ pub fn router(orchestrator: Arc<Orchestrator>) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/session", post(create_session))
         .route("/api/v1/runtime", get(runtime))
+        .route("/api/v1/codex/accounts", get(codex_accounts))
+        .route(
+            "/api/v1/codex/accounts/{account_id}/select",
+            post(select_codex_account),
+        )
+        .route(
+            "/api/v1/codex/accounts/login",
+            post(start_codex_account_login),
+        )
+        .route(
+            "/api/v1/codex/accounts/login/{login_id}",
+            get(codex_account_login_status),
+        )
+        .route(
+            "/api/v1/codex/accounts/login/{login_id}/cancel",
+            post(cancel_codex_account_login),
+        )
+        .route(
+            "/api/v1/codex/accounts/{account_id}/rename",
+            post(rename_codex_account),
+        )
+        .route(
+            "/api/v1/codex/accounts/{account_id}/remove",
+            post(remove_codex_account),
+        )
         .route(
             "/api/v1/repositories",
             get(list_repositories).post(register_repository),
         )
+        .route("/api/v1/repositories/discover", get(discover_repositories))
         .route("/api/v1/repositories/{repository_id}", get(get_repository))
         .route(
             "/api/v1/repositories/{repository_id}/inspect",
             post(inspect_repository),
+        )
+        .route(
+            "/api/v1/repositories/{repository_id}/prepare-clean-checkout",
+            post(prepare_coordination_checkout),
         )
         .route("/api/v1/runs", get(list_runs).post(create_run))
         .route("/api/v1/runs/{run_id}", get(get_run))
@@ -61,6 +97,10 @@ pub fn router(orchestrator: Arc<Orchestrator>) -> Router {
         )
         .route("/api/v1/runs/{run_id}/plan/approve", post(approve_plan))
         .route(
+            "/api/v1/runs/{run_id}/plan/request_changes",
+            post(request_plan_changes),
+        )
+        .route(
             "/api/v1/runs/{run_id}/scheduler/pause",
             post(pause_scheduler),
         )
@@ -69,13 +109,30 @@ pub fn router(orchestrator: Arc<Orchestrator>) -> Router {
             post(resume_scheduler),
         )
         .route("/api/v1/runs/{run_id}/stop", post(stop_run))
+        .route("/api/v1/runs/{run_id}/archive", post(archive_run))
         .route(
             "/api/v1/runs/{run_id}/approve-integration",
             post(approve_integration),
         )
         .route(
+            "/api/v1/runs/{run_id}/signoff/approve",
+            post(approve_signoff),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/signoff/request_changes",
+            post(request_signoff_changes),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/signoff/acceptance/{acceptance_id}/attest",
+            post(attest_acceptance),
+        )
+        .route(
             "/api/v1/runs/{run_id}/publish-draft-pr",
             post(publish_draft_pr),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/draft-pr/refresh-ci",
+            post(refresh_draft_pr_ci),
         )
         .route("/api/v1/runs/{run_id}/tasks", get(list_tasks))
         .route("/api/v1/tasks/{task_id}", get(get_task))
@@ -98,6 +155,7 @@ pub fn router(orchestrator: Arc<Orchestrator>) -> Router {
             post(decide_approval),
         )
         .route("/api/v1/worktrees", get(list_worktrees))
+        .route("/api/v1/worktrees/{worktree_id}/diff", get(worktree_diff))
         .route(
             "/api/v1/worktrees/{worktree_id}/preserve",
             post(preserve_worktree),
@@ -108,7 +166,12 @@ pub fn router(orchestrator: Arc<Orchestrator>) -> Router {
             post(export_evidence),
         )
         .route("/api/v1/runs/{run_id}/usage", get(run_usage))
+        .route("/api/v1/usage", get(usage_breakdown))
         .route("/api/v1/events", get(events))
+        .route(
+            "/api/v1/settings",
+            get(operator_settings).post(update_operator_settings),
+        )
         .with_state(state)
 }
 
@@ -170,6 +233,93 @@ async fn runtime(
     Ok(Json(state.orchestrator.runtime_status().await))
 }
 
+async fn codex_accounts(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(state.orchestrator.codex_accounts().await?))
+}
+
+async fn select_codex_account(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(account_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok(Json(
+        state.orchestrator.select_codex_account(&account_id).await?,
+    ))
+}
+
+async fn start_codex_account_login(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<StartCodexAccountLoginRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .start_codex_account_login(request)
+            .await?,
+    ))
+}
+
+async fn codex_account_login_status(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(login_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .codex_account_login_status(&login_id)
+            .await?,
+    ))
+}
+
+async fn cancel_codex_account_login(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(login_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .cancel_codex_account_login(&login_id)
+            .await?,
+    ))
+}
+
+async fn rename_codex_account(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(account_id): Path<String>,
+    Json(request): Json<RenameCodexAccountRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .rename_codex_account(&account_id, request)
+            .await?,
+    ))
+}
+
+async fn remove_codex_account(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(account_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok(Json(
+        state.orchestrator.remove_codex_account(&account_id).await?,
+    ))
+}
+
 async fn list_repositories(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -186,6 +336,31 @@ async fn register_repository(
     authenticate(&state, &headers, true)?;
     let repository = state.orchestrator.register_repository(request).await?;
     Ok((StatusCode::CREATED, Json(repository)))
+}
+
+async fn discover_repositories(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<RepositoryDiscovery>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(state.orchestrator.discover_repositories().await?))
+}
+
+async fn operator_settings(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<OperatorSettings>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(state.orchestrator.operator_settings()))
+}
+
+async fn update_operator_settings(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateOperatorSettingsRequest>,
+) -> Result<Json<OperatorSettings>, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok(Json(state.orchestrator.update_operator_settings(request)?))
 }
 
 async fn get_repository(
@@ -212,6 +387,21 @@ async fn inspect_repository(
         state
             .orchestrator
             .inspect_repository(&RepositoryId::from(repository_id))
+            .await?,
+    ))
+}
+
+async fn prepare_coordination_checkout(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(repository_id): Path<String>,
+    Json(request): Json<PrepareCoordinationCheckoutRequest>,
+) -> Result<Json<harness_domain::RepositorySummary>, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .prepare_coordination_checkout(&RepositoryId::from(repository_id), request)
             .await?,
     ))
 }
@@ -285,6 +475,8 @@ async fn start_architecture(
 struct ApprovePlanBody {
     task_graph_digest: String,
     note: Option<String>,
+    #[serde(default)]
+    allow_budget_override: bool,
 }
 
 async fn approve_plan(
@@ -300,7 +492,46 @@ async fn approve_plan(
         Json(
             state
                 .orchestrator
-                .approve_plan(&RunId::from(run_id), &body.task_graph_digest, "local-user")
+                .approve_plan(
+                    &RunId::from(run_id),
+                    &body.task_graph_digest,
+                    body.allow_budget_override,
+                    body.note.as_deref(),
+                    "local-user",
+                )
+                .await?,
+        ),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestPlanChangesBody {
+    task_graph_digest: String,
+    summary: Option<String>,
+    findings: Vec<PlanReviewFinding>,
+}
+
+async fn request_plan_changes(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Json(body): Json<RequestPlanChangesBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    reject_long_note(body.summary.as_deref())?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            state
+                .orchestrator
+                .request_plan_changes(
+                    &RunId::from(run_id),
+                    &body.task_graph_digest,
+                    body.summary.as_deref(),
+                    body.findings,
+                    "local-user",
+                )
                 .await?,
         ),
     ))
@@ -319,16 +550,25 @@ async fn pause_scheduler(
     )?))
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResumeSchedulerBody {
+    #[serde(default)]
+    additional_token_budget: u64,
+}
+
 async fn resume_scheduler(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(run_id): Path<String>,
+    body: Option<Json<ResumeSchedulerBody>>,
 ) -> Result<Json<harness_domain::RunSummary>, ApiError> {
     authenticate(&state, &headers, true)?;
     let run_id = RunId::from(run_id);
+    let additional_token_budget = body.unwrap_or_default().0.additional_token_budget;
     state
         .orchestrator
-        .set_scheduler_paused(&run_id, false, "local-user")?;
+        .resume_scheduler(&run_id, additional_token_budget, "local-user")?;
     let _ = state.orchestrator.tick(&run_id).await?;
     Ok(Json(state.orchestrator.store().run(&run_id)?))
 }
@@ -371,6 +611,19 @@ async fn stop_run(
     ))
 }
 
+async fn archive_run(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<Json<harness_domain::RunSummary>, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .archive_run(&RunId::from(run_id), "local-user")?,
+    ))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApproveIntegrationBody {
@@ -397,6 +650,62 @@ async fn approve_integration(
     ))
 }
 
+async fn approve_signoff(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Json(body): Json<ApproveSignoffRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    reject_long_note(body.note.as_deref())?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            state
+                .orchestrator
+                .approve_signoff(&RunId::from(run_id), body, "local-user")
+                .await?,
+        ),
+    ))
+}
+
+async fn request_signoff_changes(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Json(body): Json<RequestSignoffChanges>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    reject_long_note(Some(&body.summary))?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            state
+                .orchestrator
+                .request_signoff_changes(&RunId::from(run_id), body, "local-user")
+                .await?,
+        ),
+    ))
+}
+
+async fn attest_acceptance(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path((run_id, acceptance_id)): Path<(String, String)>,
+    Json(body): Json<AttestAcceptanceRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            state
+                .orchestrator
+                .attest_acceptance(&RunId::from(run_id), &acceptance_id, body, "local-user")
+                .await?,
+        ),
+    ))
+}
+
 async fn publish_draft_pr(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -410,6 +719,23 @@ async fn publish_draft_pr(
             state
                 .orchestrator
                 .publish_draft_pr(&RunId::from(run_id), body, "local-user")
+                .await?,
+        ),
+    ))
+}
+
+async fn refresh_draft_pr_ci(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            state
+                .orchestrator
+                .refresh_draft_pr_ci(&RunId::from(run_id), "local-user")
                 .await?,
         ),
     ))
@@ -448,15 +774,19 @@ async fn retry_task(
     Json(body): Json<RetryTaskRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     authenticate(&state, &headers, true)?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(
-            state
-                .orchestrator
-                .retry_task(&TaskId::from(task_id), body, "local-user")
-                .await?,
-        ),
-    ))
+    let task_id = TaskId::from(task_id);
+    let run_id = state.orchestrator.store().task(&task_id)?.run_id;
+    let accepted = state
+        .orchestrator
+        .retry_task(&task_id, body, "local-user")
+        .await?;
+    let orchestrator = Arc::clone(&state.orchestrator);
+    tokio::spawn(async move {
+        if let Err(error) = orchestrator.tick(&run_id).await {
+            warn!(%run_id, %error, "background task scheduling failed");
+        }
+    });
+    Ok((StatusCode::ACCEPTED, Json(accepted)))
 }
 
 async fn request_task_review(
@@ -565,13 +895,43 @@ async fn agent_activity(
     Query(query): Query<ActivityQuery>,
 ) -> Result<Json<Value>, ApiError> {
     authenticate(&state, &headers, false)?;
-    let items = state.orchestrator.store().list_activity(
-        &AgentSessionId::from(agent_id),
-        query.after.unwrap_or_default().max(0),
-        query.limit.unwrap_or(200).clamp(1, 1_000),
-    )?;
+    let agent_id = AgentSessionId::from(agent_id);
+    let limit = query.limit.unwrap_or(200).clamp(1, 1_000);
+    let items = if let Some(after) = query.after {
+        state
+            .orchestrator
+            .store()
+            .list_activity(&agent_id, after.max(0), limit)?
+    } else {
+        state
+            .orchestrator
+            .store()
+            .list_recent_activity(&agent_id, limit)?
+    };
+    let agent = state.orchestrator.store().agent(&agent_id)?;
+    let messages = if agent.role == AgentRole::Governor {
+        if let Some(task_id) = agent.task_id {
+            state
+                .orchestrator
+                .store()
+                .list_task_governor_messages(&task_id, 100)?
+        } else {
+            state
+                .orchestrator
+                .store()
+                .list_agent_messages(&agent_id, 100)?
+        }
+    } else {
+        state
+            .orchestrator
+            .store()
+            .list_agent_messages(&agent_id, 100)?
+    };
+    let latest_message = messages.last();
     let next = items.last().map(|item| item.sequence);
-    Ok(Json(json!({"items": items, "next_cursor": next})))
+    Ok(Json(
+        json!({"items": items, "next_cursor": next, "latest_message": latest_message, "messages": messages}),
+    ))
 }
 
 #[derive(Default, Deserialize)]
@@ -650,6 +1010,20 @@ async fn list_worktrees(
     Ok(Json(worktrees))
 }
 
+async fn worktree_diff(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(worktree_id): Path<String>,
+) -> Result<Json<harness_orchestrator::WorktreeDiffSummary>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .worktree_diff_summary(&WorktreeId::from(worktree_id))
+            .await?,
+    ))
+}
+
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PreserveBody {
@@ -702,6 +1076,14 @@ async fn run_usage(
     Ok(Json(
         state.orchestrator.usage_summary(&RunId::from(run_id))?,
     ))
+}
+
+async fn usage_breakdown(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<harness_domain::UsageBreakdown>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(state.orchestrator.usage_breakdown()?))
 }
 
 #[derive(Default, Deserialize)]

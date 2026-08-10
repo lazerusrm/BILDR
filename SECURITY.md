@@ -1,6 +1,6 @@
 # Security policy
 
-Harness Console is a single-user, local-only control plane. It deliberately
+BILDR is a single-user, local-only control plane. It deliberately
 does not provide network-facing authentication, multi-user authorization, or
 TLS termination. Do not bind it to a LAN/WAN address or place it behind a
 shared reverse proxy. Use an SSH tunnel to the loopback listener for remote

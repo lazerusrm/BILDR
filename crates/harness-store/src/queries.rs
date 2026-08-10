@@ -1,10 +1,14 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use harness_domain::{
     ActivityItem, AgentSessionId, AgentSummary, ApprovalId, ApprovalSummary, ArtifactId, AttemptId,
-    CostConfidence, CostEstimate, DomainEvent, ModelUsageSummary, PlanRevisionId, RepositoryId,
-    RepositorySummary, RunId, RunPlan, RunState, RunSummary, TaskId, TaskState, TaskSummary,
-    TokenUsage, UsageSummary, WorktreeId, WorktreeSummary, format_timestamp, now_ms,
+    CostConfidence, CostEstimate, DomainEvent, LatestAgentMessage, ModelUsageSummary,
+    PlanRevisionId, RepositoryId, RepositorySummary, RunId, RunPlan, RunState, RunSummary, TaskId,
+    TaskState, TaskSummary, TokenUsage, UsageBreakdown, UsageGroup, UsageSummary, WorktreeId,
+    WorktreeSummary, format_timestamp, now_ms,
 };
 use rusqlite::{OptionalExtension, Row, params};
 use serde::Serialize;
@@ -12,9 +16,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ArtifactRecord, NewAgentSession, NewApproval, NewArtifact, NewCommandRecord, NewContextPacket,
-    NewEvidenceRecord, NewRepository, NewRun, NewTaskAttempt, NewValidationRecord, NewWorktree,
-    RawEventInput, RepositoryHealthInput, Store, StoreError, StoredSession,
+    ArtifactRecord, NativeSubagentActivityRecord, NewAgentSession, NewApproval, NewArtifact,
+    NewCommandRecord, NewContextPacket, NewEvidenceRecord, NewRepository, NewRun, NewTaskAttempt,
+    NewValidationRecord, NewWorktree, PriorAttemptContext, RawEventInput, RepositoryHealthInput,
+    Store, StoreError, StoredSession,
 };
 
 impl Store {
@@ -44,6 +49,125 @@ impl Store {
         Ok(())
     }
 
+    pub fn governor_token_samples(
+        &self,
+        limit: u32,
+        model: &str,
+        reasoning_effort: &str,
+        owner_profile: Option<&str>,
+    ) -> Result<Vec<u64>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT a.goal_tokens_used FROM agent_sessions a JOIN task_attempts ta ON ta.id=a.task_attempt_id JOIN tasks t ON t.id=ta.task_id WHERE a.role='governor' AND a.parent_agent_session_id IS NULL AND a.completed_at IS NOT NULL AND a.goal_tokens_used > 0 AND coalesce(a.failure_class,'') NOT IN ('infrastructure_unavailable','authentication_rejected') AND coalesce(a.effective_model,a.requested_model)=?1 AND coalesce(a.effective_reasoning_effort,a.requested_reasoning_effort)=?2 AND (?3 IS NULL OR t.owner_profile=?3) ORDER BY a.completed_at DESC LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![
+                model,
+                reasoning_effort,
+                owner_profile,
+                i64::from(limit.clamp(1, 100)),
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+        rows.map(|row| {
+            row.map(|value| u64::try_from(value).unwrap_or_default())
+                .map_err(StoreError::from)
+        })
+        .collect()
+    }
+
+    /// Counts the task's root governors and their delegated descendants across
+    /// attempts, excluding independent verifier trees.
+    pub fn task_governor_usage(&self, task_id: &TaskId) -> Result<u64, StoreError> {
+        let connection = self.connection()?;
+        let total = connection.query_row(
+            "WITH RECURSIVE governor_tree(id) AS (
+                SELECT a.id
+                FROM agent_sessions a
+                JOIN task_attempts ta ON ta.id=a.task_attempt_id
+                WHERE ta.task_id=?1
+                  AND a.role='governor'
+                  AND a.parent_agent_session_id IS NULL
+                UNION ALL
+                SELECT child.id
+                FROM agent_sessions child
+                JOIN governor_tree parent ON child.parent_agent_session_id=parent.id
+             )
+             SELECT coalesce(sum(a.goal_tokens_used),0)
+             FROM agent_sessions a
+             JOIN governor_tree tree ON tree.id=a.id",
+            [task_id.as_str()],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(u64::try_from(total).unwrap_or_default())
+    }
+
+    pub fn agent_goal_status(
+        &self,
+        agent_id: &AgentSessionId,
+    ) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .connection()?
+            .query_row(
+                "SELECT goal_status FROM agent_sessions WHERE id=?1",
+                [agent_id.as_str()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    pub fn record_handoff(
+        &self,
+        attempt_id: &AttemptId,
+        agent_id: &AgentSessionId,
+        handoff: &Value,
+        schema_valid: bool,
+    ) -> Result<(), StoreError> {
+        let raw = serde_json::to_string(handoff)?;
+        let digest = sha256(raw.as_bytes());
+        self.connection()?.execute(
+            "INSERT INTO handoffs(id,task_attempt_id,agent_session_id,handoff_json,handoff_sha256,schema_valid,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(task_attempt_id) DO UPDATE SET agent_session_id=excluded.agent_session_id,handoff_json=excluded.handoff_json,handoff_sha256=excluded.handoff_sha256,schema_valid=excluded.schema_valid,created_at=excluded.created_at",
+            params![
+                format!("handoff-{}", attempt_id.as_str()),
+                attempt_id.as_str(),
+                agent_id.as_str(),
+                raw,
+                digest,
+                schema_valid,
+                now_ms(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn attempt_handoff(&self, attempt_id: &AttemptId) -> Result<Option<String>, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT handoff_json FROM handoffs WHERE task_attempt_id=?1",
+                [attempt_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn recent_task_handoffs(
+        &self,
+        task_id: &TaskId,
+        limit: u32,
+    ) -> Result<Vec<String>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT h.handoff_json FROM handoffs h JOIN task_attempts a ON a.id=h.task_attempt_id WHERE a.task_id=?1 AND h.schema_valid=1 ORDER BY a.attempt_number DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![task_id.as_str(), i64::from(limit.clamp(1, 20))],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn create_repository(
         &self,
         input: &NewRepository,
@@ -65,6 +189,31 @@ impl Store {
             ],
         )?;
         self.repository(&input.id)
+    }
+
+    pub fn replace_repository_checkout(
+        &self,
+        repository_id: &RepositoryId,
+        expected_root: &Path,
+        replacement_root: &Path,
+        origin_url: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection()?.execute(
+            "UPDATE repositories SET root_path=?3,origin_url=?4,updated_at=?5,version=version+1 WHERE id=?1 AND root_path=?2",
+            params![
+                repository_id.as_str(),
+                expected_root.to_string_lossy(),
+                replacement_root.to_string_lossy(),
+                origin_url,
+                now_ms(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "repository {repository_id} checkout changed while preparing its replacement"
+            )));
+        }
+        Ok(())
     }
 
     pub fn record_repository_health(
@@ -252,6 +401,21 @@ impl Store {
         self.run(id)
     }
 
+    pub fn set_run_token_budget_and_resume(
+        &self,
+        id: &RunId,
+        token_budget: u64,
+    ) -> Result<RunSummary, StoreError> {
+        let changed = self.connection()?.execute(
+            "UPDATE runs SET run_token_budget=?2,scheduler_paused=0,updated_at=?3,version=version+1 WHERE id=?1",
+            params![id.as_str(), token_budget as i64, now_ms()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::NotFound(format!("run {id}")));
+        }
+        self.run(id)
+    }
+
     pub fn set_run_integration(
         &self,
         id: &RunId,
@@ -262,6 +426,17 @@ impl Store {
             "UPDATE runs SET integration_branch=?2,integration_sha=?3,updated_at=?4,version=version+1 WHERE id=?1",
             params![id.as_str(), branch, sha, now_ms()],
         )?;
+        Ok(())
+    }
+
+    pub fn clear_run_integration(&self, id: &RunId) -> Result<(), StoreError> {
+        let changed = self.connection()?.execute(
+            "UPDATE runs SET integration_branch=NULL,integration_sha=NULL,updated_at=?2,version=version+1 WHERE id=?1",
+            params![id.as_str(), now_ms()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::NotFound(format!("run {id}")));
+        }
         Ok(())
     }
 
@@ -338,13 +513,14 @@ impl Store {
 
     pub fn create_agent_session(&self, input: &NewAgentSession) -> Result<(), StoreError> {
         self.connection()?.execute(
-            "INSERT INTO agent_sessions(id,run_id,task_attempt_id,parent_agent_session_id,runtime_kind,role,nickname,requested_model,requested_reasoning_effort,sandbox_mode,approval_policy,cwd,state,current_goal,goal_status,token_budget,started_at,last_heartbeat_at,version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'active',?15,?16,?16,1)",
+            "INSERT INTO agent_sessions(id,run_id,task_attempt_id,parent_agent_session_id,runtime_kind,codex_account_id,role,nickname,requested_model,requested_reasoning_effort,sandbox_mode,approval_policy,cwd,state,current_goal,goal_status,token_budget,started_at,last_heartbeat_at,version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,'active',?16,?17,?17,1)",
             params![
                 input.id.as_str(),
                 input.run_id.as_str(),
                 input.task_attempt_id.as_ref().map(AttemptId::as_str),
                 input.parent_agent_session_id.as_ref().map(AgentSessionId::as_str),
                 input.runtime_kind,
+                input.codex_account_id,
                 enum_text(&input.role)?,
                 input.nickname,
                 input.requested_model,
@@ -362,6 +538,53 @@ impl Store {
             "INSERT INTO agent_runtime_details(agent_session_id,updated_at) VALUES(?1,?2)",
             params![input.id.as_str(), now_ms()],
         )?;
+        Ok(())
+    }
+
+    pub fn set_agent_context_strategy(
+        &self,
+        agent_id: &AgentSessionId,
+        strategy: &str,
+        source_attempt_id: Option<&AttemptId>,
+        reason: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection()?.execute(
+            "UPDATE agent_runtime_details SET context_strategy=?2,context_source_attempt_id=?3,context_reuse_reason=?4,updated_at=?5 WHERE agent_session_id=?1",
+            params![
+                agent_id.as_str(),
+                strategy,
+                source_attempt_id.map(AttemptId::as_str),
+                reason,
+                now_ms(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::NotFound(format!("agent {agent_id}")));
+        }
+        Ok(())
+    }
+
+    pub fn prepare_agent_continuation(
+        &self,
+        agent_id: &AgentSessionId,
+        token_budget: u64,
+        current_action: &str,
+    ) -> Result<(), StoreError> {
+        let now = now_ms();
+        let connection = self.connection()?;
+        let transaction = connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE agent_sessions SET token_budget=?2,state='STARTING',completed_at=NULL,failure_class=NULL,failure_reason=NULL,last_heartbeat_at=?3,version=version+1 WHERE id=?1",
+            params![agent_id.as_str(), token_budget as i64, now],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::NotFound(format!("agent {agent_id}")));
+        }
+        transaction.execute(
+            "UPDATE agent_runtime_details SET active_turn_id=NULL,current_action=?2,last_activity_kind='turn',last_activity_at=?3,updated_at=?3 WHERE agent_session_id=?1",
+            params![agent_id.as_str(), current_action, now],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -389,6 +612,7 @@ impl Store {
         turn_id: &str,
         requested_model: Option<&str>,
         requested_effort: Option<&str>,
+        authoritative_notification: bool,
     ) -> Result<(), StoreError> {
         let now = now_ms();
         let connection = self.connection()?;
@@ -398,8 +622,8 @@ impl Store {
             params![turn_id, thread_id, requested_model, requested_effort, now],
         )?;
         transaction.execute(
-            "UPDATE agent_runtime_details SET active_turn_id=?2,last_activity_kind='turn',last_activity_at=?3,updated_at=?3 WHERE agent_session_id=?1",
-            params![agent_id.as_str(), turn_id, now],
+            "UPDATE agent_runtime_details SET active_turn_id=CASE WHEN ?3 THEN ?2 ELSE coalesce(active_turn_id,?2) END,last_activity_kind='turn',last_activity_at=?4,updated_at=?4 WHERE agent_session_id=?1",
+            params![agent_id.as_str(), turn_id, authoritative_notification, now],
         )?;
         transaction.execute(
             "UPDATE agent_sessions SET state='RUNNING',last_heartbeat_at=?2,version=version+1 WHERE id=?1",
@@ -457,6 +681,58 @@ impl Store {
             .optional()?)
     }
 
+    pub fn native_subagent_activities(
+        &self,
+    ) -> Result<Vec<NativeSubagentActivityRecord>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT re.agent_session_id,re.thread_id,pi.payload_json FROM projected_items pi JOIN raw_events re ON re.id=pi.source_raw_event_id WHERE pi.item_type='subAgentActivity' AND pi.summary='Subagent started' AND re.agent_session_id IS NOT NULL AND re.thread_id IS NOT NULL ORDER BY re.id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (parent_agent_session_id, parent_thread_id, payload) = row?;
+            Ok(NativeSubagentActivityRecord {
+                parent_agent_session_id: AgentSessionId::from(parent_agent_session_id),
+                parent_thread_id,
+                payload: serde_json::from_str(&payload)?,
+            })
+        })
+        .collect()
+    }
+
+    pub fn latest_thread_turn_status(&self, thread_id: &str) -> Result<Option<String>, StoreError> {
+        let event = self
+            .connection()?
+            .query_row(
+                "SELECT method,payload_json FROM raw_events WHERE thread_id=?1 AND method IN ('turn/started','turn/completed') ORDER BY id DESC LIMIT 1",
+                [thread_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        event
+            .map(|(method, payload)| {
+                if method == "turn/started" {
+                    return Ok(None);
+                }
+                let payload: Value = serde_json::from_str(&payload)?;
+                Ok(Some(
+                    payload
+                        .pointer("/turn/status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("failed")
+                        .to_owned(),
+                ))
+            })
+            .transpose()
+            .map(Option::flatten)
+    }
+
     pub fn agent(&self, id: &AgentSessionId) -> Result<AgentSummary, StoreError> {
         let connection = self.connection()?;
         connection
@@ -495,6 +771,14 @@ impl Store {
             "SELECT coalesce(max(revision),0)+1 FROM run_plan_revisions WHERE run_id=?1",
             [run_id.as_str()],
             |row| row.get(0),
+        )?;
+        transaction.execute(
+            "DELETE FROM tasks WHERE run_id=?1 AND plan_revision_id IN (SELECT id FROM run_plan_revisions WHERE run_id=?1 AND state IN ('PROPOSED','CERTIFIED','REVISION_REQUIRED'))",
+            [run_id.as_str()],
+        )?;
+        transaction.execute(
+            "UPDATE run_plan_revisions SET state='SUPERSEDED' WHERE run_id=?1 AND state IN ('PROPOSED','CERTIFIED','REVISION_REQUIRED')",
+            [run_id.as_str()],
         )?;
         transaction.execute(
             "INSERT INTO run_plan_revisions(id,run_id,revision,architect_agent_session_id,plan_json,plan_sha256,state,created_at) VALUES(?1,?2,?3,?4,?5,?6,'PROPOSED',?7)",
@@ -568,9 +852,9 @@ impl Store {
         let Some((revision_id, _, state, _)) = self.latest_plan(run_id)? else {
             return Err(StoreError::NotFound(format!("plan for run {run_id}")));
         };
-        if state != "PROPOSED" {
+        if state != "CERTIFIED" {
             return Err(StoreError::Conflict(format!(
-                "plan is {state}, not PROPOSED"
+                "plan is {state}, not CERTIFIED"
             )));
         }
         let now = now_ms();
@@ -585,6 +869,59 @@ impl Store {
             params![revision_id.as_str(), now],
         )?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn certify_latest_plan(&self, run_id: &RunId) -> Result<(), StoreError> {
+        self.transition_latest_plan_state(run_id, "PROPOSED", "CERTIFIED")
+    }
+
+    pub fn mark_latest_plan_revision_required(&self, run_id: &RunId) -> Result<(), StoreError> {
+        self.transition_latest_plan_state(run_id, "PROPOSED", "REVISION_REQUIRED")
+    }
+
+    pub fn request_latest_plan_revision(&self, run_id: &RunId) -> Result<(), StoreError> {
+        let Some((_, _, state, _)) = self.latest_plan(run_id)? else {
+            return Err(StoreError::NotFound(format!("plan for run {run_id}")));
+        };
+        match state.as_str() {
+            "CERTIFIED" => {
+                self.transition_latest_plan_state(run_id, "CERTIFIED", "REVISION_REQUIRED")
+            }
+            "REVISION_REQUIRED" => Ok(()),
+            _ => Err(StoreError::Conflict(format!(
+                "plan is {state}, not CERTIFIED or REVISION_REQUIRED"
+            ))),
+        }
+    }
+
+    pub fn reopen_latest_plan_for_review(&self, run_id: &RunId) -> Result<(), StoreError> {
+        self.transition_latest_plan_state(run_id, "CERTIFIED", "PROPOSED")
+    }
+
+    fn transition_latest_plan_state(
+        &self,
+        run_id: &RunId,
+        expected: &str,
+        next: &str,
+    ) -> Result<(), StoreError> {
+        let Some((revision_id, _, state, _)) = self.latest_plan(run_id)? else {
+            return Err(StoreError::NotFound(format!("plan for run {run_id}")));
+        };
+        if state != expected {
+            return Err(StoreError::Conflict(format!(
+                "plan is {state}, not {expected}"
+            )));
+        }
+        let changed = self.connection()?.execute(
+            "UPDATE run_plan_revisions SET state=?2 WHERE id=?1 AND state=?3",
+            params![revision_id.as_str(), next, expected],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(
+                "plan changed during state transition".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -624,6 +961,107 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn latest_attempt_context(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<PriorAttemptContext>, StoreError> {
+        let connection = self.connection()?;
+        let attempt = connection
+            .query_row(
+                "SELECT id,attempt_number,state,terminal_class,failure_reason FROM task_attempts WHERE task_id=?1 ORDER BY attempt_number DESC LIMIT 1",
+                [task_id.as_str()],
+                |row| {
+                    Ok((
+                        AttemptId::from(row.get::<_, String>(0)?),
+                        row.get::<_, i64>(1)? as u32,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((attempt_id, attempt_number, state, terminal_class, failure_reason)) = attempt
+        else {
+            return Ok(None);
+        };
+        let worktree_path = connection
+            .query_row(
+                "SELECT path FROM worktrees WHERE task_attempt_id=?1 ORDER BY created_at DESC LIMIT 1",
+                [attempt_id.as_str()],
+                |row| row.get::<_, String>(0).map(PathBuf::from),
+            )
+            .optional()?;
+        let agent = connection
+            .query_row(
+                "SELECT id,role,requested_model,effective_model,requested_reasoning_effort,effective_reasoning_effort,coalesce(goal_tokens_used,0) FROM agent_sessions WHERE task_attempt_id=?1 AND parent_agent_session_id IS NULL AND role IN ('governor','worker','high_risk_worker') ORDER BY started_at DESC,id DESC LIMIT 1",
+                [attempt_id.as_str()],
+                |row| {
+                    Ok((
+                        AgentSessionId::from(row.get::<_, String>(0)?),
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, i64>(6)? as u64,
+                    ))
+                },
+            )
+            .optional()?;
+        let verifier_verdict = connection
+            .query_row(
+                "SELECT verifier_verdict FROM task_results WHERE task_attempt_id=?1",
+                [attempt_id.as_str()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        drop(connection);
+        let last_agent_message = if let Some((agent_id, ..)) = agent.as_ref() {
+            self.latest_agent_message(agent_id)?
+                .map(|message| message.text)
+        } else {
+            None
+        };
+        let (
+            agent_id,
+            role,
+            requested_model,
+            effective_model,
+            requested_reasoning_effort,
+            effective_reasoning_effort,
+            tokens_used,
+        ) = agent.map_or((None, None, None, None, None, None, 0), |agent| {
+            (
+                Some(agent.0),
+                Some(agent.1),
+                Some(agent.2),
+                agent.3,
+                Some(agent.4),
+                agent.5,
+                agent.6,
+            )
+        });
+        Ok(Some(PriorAttemptContext {
+            attempt_id,
+            attempt_number,
+            state,
+            terminal_class,
+            failure_reason,
+            worktree_path,
+            agent_id,
+            role,
+            requested_model,
+            effective_model,
+            requested_reasoning_effort,
+            effective_reasoning_effort,
+            tokens_used,
+            verifier_verdict,
+            last_agent_message,
+        }))
     }
 
     pub fn create_task_attempt(&self, input: &NewTaskAttempt) -> Result<(), StoreError> {
@@ -1085,6 +1523,116 @@ impl Store {
                 summary: row.get(3)?,
                 payload: serde_json::from_str(&raw).unwrap_or(Value::Null),
                 occurred_at: format_timestamp(row.get(5)?),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_recent_activity(
+        &self,
+        agent_id: &AgentSessionId,
+        limit: u32,
+    ) -> Result<Vec<ActivityItem>, StoreError> {
+        let connection = self.connection()?;
+        let thread: Option<String> = connection
+            .query_row(
+                "SELECT thread_id FROM codex_threads WHERE agent_session_id=?1",
+                [agent_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(thread) = thread else {
+            return Ok(Vec::new());
+        };
+        let mut statement = connection.prepare(
+            "SELECT id,method,state,summary,payload_json,received_at FROM (SELECT re.id,re.method,coalesce(pi.state,'completed') AS state,coalesce(pi.summary,re.method) AS summary,re.payload_json,re.received_at FROM raw_events re LEFT JOIN projected_items pi ON pi.source_raw_event_id=re.id WHERE re.thread_id=?1 ORDER BY re.id DESC LIMIT ?2) ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![thread, limit], |row| {
+            let raw: String = row.get(4)?;
+            Ok(ActivityItem {
+                id: row.get::<_, i64>(0)?.to_string(),
+                sequence: row.get(0)?,
+                kind: row.get(1)?,
+                state: row.get(2)?,
+                summary: row.get(3)?,
+                payload: serde_json::from_str(&raw).unwrap_or(Value::Null),
+                occurred_at: format_timestamp(row.get(5)?),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn latest_agent_message(
+        &self,
+        agent_id: &AgentSessionId,
+    ) -> Result<Option<LatestAgentMessage>, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT pi.item_id,json_extract(pi.payload_json,'$.text'),json_extract(pi.payload_json,'$.phase'),coalesce(pi.completed_at,pi.started_at) FROM projected_items pi JOIN codex_threads ct ON ct.thread_id=pi.thread_id WHERE ct.agent_session_id=?1 AND pi.item_type='agentMessage' AND pi.state='completed' AND json_extract(pi.payload_json,'$.text') IS NOT NULL ORDER BY (json_extract(pi.payload_json,'$.phase')='final_answer') DESC,coalesce(pi.completed_at,pi.started_at) DESC LIMIT 1",
+                [agent_id.as_str()],
+                |row| {
+                    Ok(LatestAgentMessage {
+                        id: row.get(0)?,
+                        text: row.get(1)?,
+                        phase: row.get(2)?,
+                        occurred_at: format_timestamp(row.get(3)?),
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_agent_messages(
+        &self,
+        agent_id: &AgentSessionId,
+        limit: u32,
+    ) -> Result<Vec<LatestAgentMessage>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT item_id,text,phase,occurred_at FROM (SELECT pi.item_id AS item_id,json_extract(pi.payload_json,'$.text') AS text,json_extract(pi.payload_json,'$.phase') AS phase,coalesce(pi.completed_at,pi.started_at) AS occurred_at,pi.rowid AS sort_id FROM projected_items pi JOIN codex_threads ct ON ct.thread_id=pi.thread_id WHERE ct.agent_session_id=?1 AND pi.item_type='agentMessage' AND pi.state='completed' AND json_extract(pi.payload_json,'$.text') IS NOT NULL ORDER BY occurred_at DESC,sort_id DESC LIMIT ?2) ORDER BY occurred_at,sort_id",
+        )?;
+        let rows = statement.query_map(params![agent_id.as_str(), limit], |row| {
+            Ok(LatestAgentMessage {
+                id: row.get(0)?,
+                text: row.get(1)?,
+                phase: row.get(2)?,
+                occurred_at: format_timestamp(row.get(3)?),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn latest_agent_plan(
+        &self,
+        agent_id: &AgentSessionId,
+    ) -> Result<Option<Value>, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT pi.payload_json FROM projected_items pi JOIN codex_threads ct ON ct.thread_id=pi.thread_id WHERE ct.agent_session_id=?1 AND pi.item_type='plan' ORDER BY pi.rowid DESC LIMIT 1",
+                [agent_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|raw| serde_json::from_str(&raw).map_err(StoreError::from))
+            .transpose()
+    }
+
+    pub fn list_task_governor_messages(
+        &self,
+        task_id: &TaskId,
+        limit: u32,
+    ) -> Result<Vec<LatestAgentMessage>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT item_id,text,phase,occurred_at FROM (SELECT pi.item_id AS item_id,json_extract(pi.payload_json,'$.text') AS text,json_extract(pi.payload_json,'$.phase') AS phase,coalesce(pi.completed_at,pi.started_at) AS occurred_at,pi.rowid AS sort_id FROM projected_items pi JOIN codex_threads ct ON ct.thread_id=pi.thread_id JOIN agent_sessions a ON a.id=ct.agent_session_id JOIN task_attempts ta ON ta.id=a.task_attempt_id WHERE ta.task_id=?1 AND a.role='governor' AND pi.item_type='agentMessage' AND pi.state='completed' AND json_extract(pi.payload_json,'$.text') IS NOT NULL ORDER BY occurred_at DESC,sort_id DESC LIMIT ?2) ORDER BY occurred_at,sort_id",
+        )?;
+        let rows = statement.query_map(params![task_id.as_str(), limit], |row| {
+            Ok(LatestAgentMessage {
+                id: row.get(0)?,
+                text: row.get(1)?,
+                phase: row.get(2)?,
+                occurred_at: format_timestamp(row.get(3)?),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1595,6 +2143,113 @@ impl Store {
         Ok(summary)
     }
 
+    pub fn usage_breakdown(&self) -> Result<UsageBreakdown, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT coalesce(a.codex_account_id,'legacy'),r.id,r.display_name,a.id,coalesce(a.nickname,a.role),a.role,ts.effective_model,ts.input_tokens,ts.cached_input_tokens,ts.cache_write_input_tokens,ts.output_tokens,ts.reasoning_output_tokens,ts.total_tokens,ts.model_context_window,c.lower_microusd,c.upper_microusd,c.confidence,c.explanation,c.pricing_snapshot_id FROM token_samples ts JOIN codex_threads ct ON ct.thread_id=ts.thread_id JOIN agent_sessions a ON a.id=ct.agent_session_id JOIN runs ru ON ru.id=a.run_id JOIN repositories r ON r.id=ru.repository_id LEFT JOIN cost_entries c ON c.token_sample_id=ts.id ORDER BY ts.observed_at,ts.id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                TokenUsage {
+                    input_tokens: row.get::<_, i64>(7)? as u64,
+                    cached_input_tokens: row.get::<_, i64>(8)? as u64,
+                    cache_write_input_tokens: row
+                        .get::<_, Option<i64>>(9)?
+                        .map(|value| value as u64),
+                    output_tokens: row.get::<_, i64>(10)? as u64,
+                    reasoning_output_tokens: row.get::<_, i64>(11)? as u64,
+                    total_tokens: row.get::<_, i64>(12)? as u64,
+                    model_context_window: row.get::<_, Option<i64>>(13)?.map(|value| value as u64),
+                },
+                row.get::<_, Option<i64>>(14)?,
+                row.get::<_, Option<i64>>(15)?,
+                row.get::<_, Option<String>>(16)?,
+                row.get::<_, Option<String>>(17)?,
+                row.get::<_, Option<String>>(18)?,
+            ))
+        })?;
+        let mut result = UsageBreakdown::default();
+        let mut accounts = BTreeMap::<String, UsageGroup>::new();
+        let mut repositories = BTreeMap::<String, UsageGroup>::new();
+        let mut agents = BTreeMap::<String, UsageGroup>::new();
+        for row in rows {
+            let (
+                account_id,
+                repository_id,
+                repository_label,
+                agent_id,
+                agent_label,
+                role,
+                model,
+                usage,
+                lower,
+                upper,
+                confidence,
+                explanation,
+                pricing_id,
+            ) = row?;
+            let cost = CostEstimate {
+                lower_microusd: lower.unwrap_or_default().max(0) as u64,
+                upper_microusd: upper.unwrap_or_default().max(0) as u64,
+                confidence: match confidence.as_deref() {
+                    Some("exact") => CostConfidence::Exact,
+                    Some("bounded") => CostConfidence::Bounded,
+                    _ => CostConfidence::Unknown,
+                },
+                pricing_snapshot_ids: pricing_id.into_iter().collect(),
+                explanation: explanation.unwrap_or_else(|| "No matching price snapshot".to_owned()),
+            };
+            harness_usage::add_sample(&mut result.total, &usage, &cost)
+                .map_err(|error| StoreError::Validation(error.to_string()))?;
+            add_usage_group(
+                &mut accounts,
+                account_id.clone(),
+                if account_id == "legacy" {
+                    "Unattributed history".to_owned()
+                } else {
+                    account_id
+                },
+                "Codex account".to_owned(),
+                &usage,
+                &cost,
+            )?;
+            add_usage_group(
+                &mut repositories,
+                repository_id,
+                repository_label,
+                "Repository".to_owned(),
+                &usage,
+                &cost,
+            )?;
+            add_usage_group(
+                &mut agents,
+                agent_id,
+                agent_label,
+                format!("{role} · {model}"),
+                &usage,
+                &cost,
+            )?;
+        }
+        result.by_account = accounts.into_values().collect();
+        result.by_repository = repositories.into_values().collect();
+        result.by_agent = agents.into_values().collect();
+        for groups in [
+            &mut result.by_account,
+            &mut result.by_repository,
+            &mut result.by_agent,
+        ] {
+            groups.sort_by_key(|group| std::cmp::Reverse(group.usage.total_tokens));
+        }
+        Ok(result)
+    }
+
     pub fn record_run_export(
         &self,
         run_id: &RunId,
@@ -1609,6 +2264,46 @@ impl Store {
         )?;
         Ok(id)
     }
+}
+
+fn add_usage_group(
+    groups: &mut BTreeMap<String, UsageGroup>,
+    id: String,
+    label: String,
+    detail: String,
+    usage: &TokenUsage,
+    cost: &CostEstimate,
+) -> Result<(), StoreError> {
+    let group = groups.entry(id.clone()).or_insert_with(|| UsageGroup {
+        id,
+        label,
+        detail,
+        ..UsageGroup::default()
+    });
+    group.turns = group.turns.saturating_add(1);
+    let mut summary = UsageSummary {
+        input_tokens: group.usage.input_tokens,
+        cached_input_tokens: group.usage.cached_input_tokens,
+        cache_write_input_tokens: group.usage.cache_write_input_tokens,
+        output_tokens: group.usage.output_tokens,
+        reasoning_output_tokens: group.usage.reasoning_output_tokens,
+        total_tokens: group.usage.total_tokens,
+        cost: group.cost.clone(),
+        by_model: Vec::new(),
+    };
+    harness_usage::add_sample(&mut summary, usage, cost)
+        .map_err(|error| StoreError::Validation(error.to_string()))?;
+    group.usage = TokenUsage {
+        input_tokens: summary.input_tokens,
+        cached_input_tokens: summary.cached_input_tokens,
+        cache_write_input_tokens: summary.cache_write_input_tokens,
+        output_tokens: summary.output_tokens,
+        reasoning_output_tokens: summary.reasoning_output_tokens,
+        total_tokens: summary.total_tokens,
+        model_context_window: usage.model_context_window,
+    };
+    group.cost = summary.cost;
+    Ok(())
 }
 
 fn repository_select(by_id: bool) -> &'static str {
@@ -1678,35 +2373,40 @@ fn map_run(row: &Row<'_>) -> rusqlite::Result<RunSummary> {
 }
 
 fn agent_select() -> &'static str {
-    "SELECT a.id,a.parent_agent_session_id,t.id,a.role,a.nickname,a.state,a.requested_model,a.effective_model,a.requested_reasoning_effort,a.effective_reasoning_effort,a.sandbox_mode,a.cwd,a.current_goal,d.current_action,a.token_budget,coalesce(a.goal_tokens_used,0),coalesce((SELECT sum(c.lower_microusd) FROM codex_threads ct JOIN token_samples ts ON ts.thread_id=ct.thread_id JOIN cost_entries c ON c.token_sample_id=ts.id WHERE ct.agent_session_id=a.id),0),coalesce((SELECT sum(c.upper_microusd) FROM codex_threads ct JOIN token_samples ts ON ts.thread_id=ct.thread_id JOIN cost_entries c ON c.token_sample_id=ts.id WHERE ct.agent_session_id=a.id),0),a.last_heartbeat_at,ct.thread_id,d.active_turn_id,a.version FROM agent_sessions a LEFT JOIN task_attempts at ON at.id=a.task_attempt_id LEFT JOIN tasks t ON t.id=at.task_id LEFT JOIN agent_runtime_details d ON d.agent_session_id=a.id LEFT JOIN codex_threads ct ON ct.agent_session_id=a.id"
+    "SELECT a.id,a.parent_agent_session_id,t.id,a.role,a.codex_account_id,a.nickname,a.state,a.requested_model,a.effective_model,a.requested_reasoning_effort,a.effective_reasoning_effort,a.sandbox_mode,a.cwd,a.current_goal,d.current_action,a.token_budget,coalesce(a.goal_tokens_used,0),coalesce((SELECT sum(c.lower_microusd) FROM codex_threads ct JOIN token_samples ts ON ts.thread_id=ct.thread_id JOIN cost_entries c ON c.token_sample_id=ts.id WHERE ct.agent_session_id=a.id),0),coalesce((SELECT sum(c.upper_microusd) FROM codex_threads ct JOIN token_samples ts ON ts.thread_id=ct.thread_id JOIN cost_entries c ON c.token_sample_id=ts.id WHERE ct.agent_session_id=a.id),0),a.last_heartbeat_at,ct.thread_id,d.active_turn_id,coalesce(d.context_strategy,'fresh_independent'),d.context_source_attempt_id,d.context_reuse_reason,a.version FROM agent_sessions a LEFT JOIN task_attempts at ON at.id=a.task_attempt_id LEFT JOIN tasks t ON t.id=at.task_id LEFT JOIN agent_runtime_details d ON d.agent_session_id=a.id LEFT JOIN codex_threads ct ON ct.agent_session_id=a.id"
 }
 
 fn map_agent(row: &Row<'_>) -> rusqlite::Result<AgentSummary> {
     let role: String = row.get(3)?;
-    let sandbox: String = row.get(10)?;
+    let sandbox: String = row.get(11)?;
     Ok(AgentSummary {
         id: AgentSessionId::from(row.get::<_, String>(0)?),
         parent_agent_id: row.get::<_, Option<String>>(1)?.map(AgentSessionId::from),
         task_id: row.get::<_, Option<String>>(2)?.map(TaskId::from),
         role: parse_enum(&role)?,
-        nickname: row.get(4)?,
-        state: row.get(5)?,
-        requested_model: row.get(6)?,
-        effective_model: row.get(7)?,
-        requested_reasoning_effort: row.get(8)?,
-        effective_reasoning_effort: row.get(9)?,
+        codex_account_id: row.get(4)?,
+        nickname: row.get(5)?,
+        state: row.get(6)?,
+        requested_model: row.get(7)?,
+        effective_model: row.get(8)?,
+        requested_reasoning_effort: row.get(9)?,
+        effective_reasoning_effort: row.get(10)?,
         sandbox_mode: parse_enum(&sandbox)?,
-        cwd: row.get(11)?,
-        current_goal: row.get(12)?,
-        current_action: row.get(13)?,
-        token_budget: row.get::<_, Option<i64>>(14)?.map(|value| value as u64),
-        tokens_used: row.get::<_, i64>(15)? as u64,
-        estimated_cost_lower: format_microusd(row.get(16)?),
-        estimated_cost_upper: format_microusd(row.get(17)?),
-        heartbeat_at: row.get::<_, Option<i64>>(18)?.map(format_timestamp),
-        thread_id: row.get(19)?,
-        active_turn_id: row.get(20)?,
-        version: row.get::<_, i64>(21)? as u64,
+        cwd: row.get(12)?,
+        current_goal: row.get(13)?,
+        current_action: row.get(14)?,
+        token_budget: row.get::<_, Option<i64>>(15)?.map(|value| value as u64),
+        tokens_used: row.get::<_, i64>(16)? as u64,
+        budget_tokens_used: row.get::<_, i64>(16)? as u64,
+        estimated_cost_lower: format_microusd(row.get(17)?),
+        estimated_cost_upper: format_microusd(row.get(18)?),
+        heartbeat_at: row.get::<_, Option<i64>>(19)?.map(format_timestamp),
+        thread_id: row.get(20)?,
+        active_turn_id: row.get(21)?,
+        context_strategy: row.get(22)?,
+        context_source_attempt_id: row.get::<_, Option<String>>(23)?.map(AttemptId::from),
+        context_reuse_reason: row.get(24)?,
+        version: row.get::<_, i64>(25)? as u64,
     })
 }
 

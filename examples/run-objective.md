@@ -1,10 +1,8 @@
-# Example NeuralMatrix run objective
+# Example run objective
 
-Audit and hard-cut event-media camera identity across the canonical producer,
-C2 projection, and consumers. An explicitly present camera identity must parse
-and resolve exactly; malformed explicit identity must fail closed. Resolution
-from canonical event binding is allowed only when the explicit field is absent.
-Remove reachable normalization, alias, latest-frame, neighboring-camera, and
-best-effort repair behavior. Add focused positive and negative contract tests,
-metrics for typed rejection, and exact-SHA evidence. Do not claim hardware/live
-proof unless the named environment is actually exercised.
+Audit the execution signoff path. Require the controller to run configured
+behavioral checks against the clean integrated head before final review. Bind
+human approval to that head and the deterministic signoff packet. Route a
+file-scoped rejection into a new integration candidate. Add focused positive
+and negative state tests, and do not claim hosted CI or device proof unless the
+named environment runs the candidate.

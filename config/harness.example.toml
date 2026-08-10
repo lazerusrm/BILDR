@@ -20,9 +20,10 @@ service_name = "harness_console"
 experimental_api = false
 # Release validated by generated/CODEX_COMPATIBILITY.json. Update both pins with
 # `cargo xtask codex-schema` when intentionally upgrading Codex.
-required_version = "0.146.0"
-# Generated with: codex app-server generate-json-schema --out <dir>
-required_protocol_schema_sha256 = "4e5515cf5ec697e85c16a627a49cf5759f5f102a5a770456d546670effee26fa"
+required_version = "0.147.0"
+# SHA-256 over the parsed, canonical JSON generated with:
+# codex app-server generate-json-schema --out <dir>
+required_protocol_schema_sha256 = "9c8a7d0c96b8e33a989c7d0b178f271ec80d19aba90b9631c978fc985d289ff6"
 execution_on_schema_mismatch = "disabled"
 reasoning_summary = "concise"
 
@@ -31,7 +32,10 @@ max_total_agent_threads = 6
 max_mutable_tasks = 3
 max_independent_verifiers = 1
 max_read_only_discovery = 2
+# Consecutive identical verifier repairs before the controller changes strategy.
 max_automatic_remediation_rounds = 2
+# Certified plans above this controller-computed execution allowance wait for a human.
+automatic_plan_approval_max_execution_tokens = 2000000
 default_task_token_budget = 80000
 default_turn_timeout_seconds = 3600
 lease_ttl_seconds = 900

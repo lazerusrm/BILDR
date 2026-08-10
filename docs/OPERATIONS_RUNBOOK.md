@@ -1,6 +1,6 @@
-# Harness Console operations runbook
+# BILDR operations runbook
 
-Harness Console is a single-user, Linux-local service. The daemon owns Codex
+BILDR is a single-user, Linux-local service. The daemon owns Codex
 App Server, orchestration, SQLite, worktrees, command processes, evidence, and
 the browser/API boundary. It never needs a public listener.
 
@@ -8,9 +8,9 @@ the browser/API boundary. It never needs a public listener.
 
 Required:
 
-- Codex CLI 0.146.0, authenticated through the normal Codex login flow;
+- Codex CLI 0.147.0, authenticated through the normal Codex login flow;
 - Git, `rg`, Bash, and the build tools required by the target repository;
-- a clean NeuralMatrix coordination clone with `origin` and Git identity;
+- a clean Git coordination clone with `origin` and Git identity;
 - `gh` only for the optional, explicit draft-PR operation.
 
 Rust and Node are build-time requirements. Docker/Podman and hardware runners
@@ -23,7 +23,7 @@ Defaults follow the XDG base-directory convention:
 
 ```text
 $XDG_CONFIG_HOME/harness-console/config.toml
-$XDG_CONFIG_HOME/harness-console/profiles/neuralmatrix.toml
+$XDG_CONFIG_HOME/harness-console/profiles/bildr.toml
 $XDG_DATA_HOME/harness-console/harness.sqlite3
 $XDG_DATA_HOME/harness-console/artifacts/sha256/
 $XDG_DATA_HOME/harness-console/worktrees/
@@ -84,16 +84,17 @@ harnessctl runtime
 harnessctl runtime codex
 ```
 
-## Register a NeuralMatrix checkout
+## Register a checkout
 
 ```bash
-harnessctl repo add --path /path/to/NeuralMatrix
+harnessctl repo add --path /path/to/project
 harnessctl repo list
 harnessctl repo inspect <repository-id>
 ```
 
-Registration checks Git state, branch, identity, remote policy, filesystem
-access, and all mandatory authority files. If a legitimate mirror uses a
+The default `general` profile checks Git state, the active branch, identity,
+remote policy, and filesystem access. The optional BILDR profile also requires
+this repository's mandatory authority files. If a legitimate mirror uses a
 different origin, pass an exact, intentional `--expected-origin`; this affects
 only that registration and does not weaken the profile globally.
 
@@ -117,8 +118,30 @@ harnessctl run approve-plan <run-id> --digest <plan-digest>
 
 Run creation fetches `origin`, resolves an exact lowercase 40-character SHA,
 creates a read-only inspection worktree, hashes authority, and freezes that
-tuple. The architecture turn must return a schema-valid DAG. Execution cannot
-begin until the operator approves the exact plan digest.
+tuple. The architecture turn must return a schema-valid DAG, then a fresh
+read-only Sol reviewer adversarially checks the plan against the repository for
+goal alignment, feasibility, critical-path liveness, behavior-first evidence,
+appropriate test timing, and recovery authority. Blocking findings are returned
+to a new architect revision automatically and reviewed again. Temporary
+review/revision startup failures remain queued; the total run token ceiling is
+the stopping authority.
+
+The approve command accepts only the exact digest in `CERTIFIED` state. Manual
+approval is the default. Automatic plan approval runs the identical
+review/revision loop and performs only the final certified-to-approved
+transition; it never approves a merely schema-valid proposal. Execution cannot
+begin before certification and the configured approval posture.
+
+Certification is not a blank thumbs-up. Run detail exposes the structured
+certificate, advisory findings, revision history, and planning spend. Automatic
+approval is deferred for high-risk or serial-path plans, same-family
+architect/reviewer pairs, execution reserves above the configured threshold, or
+insufficient remaining run budget. Use **Request changes** to feed a blocking
+operator finding into the full-replacement revision loop. If review fingerprints
+repeat or fail to shrink, the controller pauses with phase
+`plan_review_deadlocked`; use the same action to give the next architect a
+concrete correction. Budget-infeasible approval requires the explicit local-user
+override control.
 
 For a planning-only run, approval closes the run without creating mutable task
 attempts. For implementation runs, the scheduler starts dependency-ready tasks
@@ -172,6 +195,35 @@ harnessctl run request-review <task-id>
 Use `--model-route escalate_terra` only for an intentional escalation. Prior
 packet, diff, logs, findings, and worktree remain durable.
 
+Daemon or App Server restart recovery follows the same contract automatically
+when a root governor was actively pursuing an implementation task, when a valid
+progressing checkpoint exists, or when the latest governor attempt was stalled
+only by infrastructure loss. The interrupted attempt is preserved, its leases
+are released, and the next bounded attempt is queued without an operator prompt.
+A pending approval or genuinely blocked checkpoint remains stopped for a human
+decision.
+Delegated governor threads are also hard-stopped by the controller at their
+250k token ceiling; the governor remains responsible for reconciling the bounded
+result and selecting the next action.
+If governor output fails Git custody, Harness preserves that attempt, reports the
+exact policy findings to a clean bounded continuation, and keeps the rejected
+diff uncommitted. Only a genuine authority/approval decision or exhausted
+no-progress envelope is routed to the operator. That envelope counts the task's
+governor and delegated descendants only; independent verifier work remains part
+of the total run ceiling but cannot consume the remediation allowance.
+An independent verifier rejection opens a fresh bounded repair window. Repeated
+identical finding sets cross the configured remediation threshold into a
+controller-authored strategy correction; they do not become a routine human
+resume prompt. Every repair cycle remains charged to the selected total run
+ceiling.
+
+For a governor-owned task, a reason may be a short human priority rather than an
+internal execution recipe. The controller compiles the next action from the
+latest `harness.governor-checkpoint.v1` milestone ledger and up to five recent
+valid handoffs. Candidate trees named by a structured checkpoint are
+materialized only into a clean leased worktree and still pass the normal exact
+base, owned-path, forbidden-path, and diff-budget gates before controller commit.
+
 After every task is verified, dependency-ordered commits are composed into a
 dedicated integration worktree. Review the displayed exact SHA, then:
 
@@ -179,11 +231,22 @@ dedicated integration worktree. Review the displayed exact SHA, then:
 harnessctl run approve-integration <run-id> --expected-head <40-char-sha>
 ```
 
-Approval rechecks the worktree HEAD, runs controller validation/final audit,
-records exact-SHA evidence, and starts a fresh read-only final-auditor thread.
-The run remains in `FINAL_AUDIT` until that schema-valid independent verdict is
-accepted. A rejected or lost audit blocks the run instead of producing a false
-green. An accepted audit completes a `local_only` run. It never merges.
+Approval rechecks the worktree HEAD and runs every path-selected integration
+validator plus automated platform acceptance against that exact, clean SHA.
+The controller records command artifacts and the full before/after worktree
+fingerprint; a validator that changes source is a failure. Missing behavioral
+coverage for a configured code path is also a failure. Only then does Harness
+assemble the signoff packet and start a fresh read-only final-auditor thread.
+
+An accepted audit stops in `HUMAN_REVIEW`; it never auto-completes, including in
+`local_only` mode. The Console shows the exact-head checks, proof classes,
+unproved claims, platform acceptance, audit evidence, spend, packet digest, and
+integration SHA. Complete any path-selected device attestations with the real
+target identity and observed behavior, then approve the packet or reject it
+with a blocking file finding. Approval is digest/SHA-bound. Rejection reopens
+only mapped task owners, preserves the rejected integration worktree, and
+creates a fresh integration candidate. Fileless or unmapped findings stop for a
+decision rather than triggering a guessed broad repair.
 
 For a run created with `--publication draft_pr_after_approval`, publication is
 a second explicit operation:
@@ -191,11 +254,17 @@ a second explicit operation:
 ```bash
 harnessctl run publish-draft-pr <run-id> \
   --expected-head <reviewed-sha> \
-  --title "Bounded NeuralMatrix change"
+  --title "Bounded repository change"
 ```
 
 The controller pushes only that exact reviewed head and invokes `gh pr create
---draft`. It does not mark the PR ready or merge it.
+--draft`. When the repository profile sets `require_draft_pr_ci = true`, it then
+polls the PR head plus `gh pr checks --required` read-only. Only an unchanged PR
+head equal to the integration SHA and all-pass required checks promote tasks
+through `CI_PROVEN` and complete the run. Pending, failed, skipped, unavailable,
+empty required-check sets, or a force-pushed PR head never become proof. When
+the profile does not declare this gate, draft creation completes the run without
+claiming `CI_PROVEN`. Harness does not mark the PR ready or merge it.
 
 ## Usage and evidence
 
@@ -226,15 +295,21 @@ systemctl --user stop harnessd.service
 
 SIGINT/SIGTERM stops HTTP intake, terminates the App Server process group, and
 leaves SQLite/WAL, command spools, artifacts, and managed worktrees intact.
-After an unplanned daemon loss, inspect active runs and preserve questionable
-worktrees before retrying; a retry always creates a new attempt.
+After an unplanned daemon loss, governor work is preserved and resumed as a new
+bounded attempt automatically when the run is executing, scheduling is enabled,
+and no approval is pending. Inspect questionable worktrees before manually
+retrying non-governor work.
 
 An App Server exit pauses unsafe progress, reconciles active sessions, and
 preserves uncertain work. The daemon then makes at most three compatible
 restart attempts with bounded backoff. Version or schema mismatch remains
-fail-closed. A replacement process never causes stalled mutable work to be
-silently marked successful; use the retained evidence to create an explicit
-new attempt.
+fail-closed. A replacement process never marks stalled mutable work successful;
+for a governor it creates a new bounded attempt from retained continuity state.
+
+Systemd process supervision uses `Restart=on-failure`. Local HTTP health probes
+are observational and must not restart the daemon after a single timeout: a
+busy but productive App Server can temporarily miss a probe deadline, and
+killing it would manufacture an infrastructure stall.
 
 Never delete a managed worktree by hand while a run is active. Preservation is
 the safe default for conflicts and failed attempts.

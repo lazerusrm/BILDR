@@ -1,7 +1,7 @@
 //! Typed configuration, Linux XDG paths, and repository policy profiles.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -13,7 +13,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const DEFAULT_CONFIG: &str = include_str!("../../../config/harness.example.toml");
-const NEURALMATRIX_PROFILE: &str = include_str!("../../../profiles/neuralmatrix/profile.toml");
+const GENERAL_PROFILE: &str = include_str!("../../../profiles/general/profile.toml");
+const BILDR_PROFILE: &str = include_str!("../../../profiles/bildr/profile.toml");
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -69,10 +70,16 @@ pub struct OrchestrationConfig {
     pub max_independent_verifiers: u32,
     pub max_read_only_discovery: u32,
     pub max_automatic_remediation_rounds: u32,
+    #[serde(default = "default_automatic_plan_approval_max_execution_tokens")]
+    pub automatic_plan_approval_max_execution_tokens: u64,
     pub default_task_token_budget: u64,
     pub default_turn_timeout_seconds: u64,
     pub lease_ttl_seconds: u64,
     pub heartbeat_interval_seconds: u64,
+}
+
+const fn default_automatic_plan_approval_max_execution_tokens() -> u64 {
+    2_000_000
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -339,6 +346,15 @@ impl HarnessConfig {
                 "verifier capacity exceeds total thread capacity".to_owned(),
             ));
         }
+        if self
+            .orchestration
+            .automatic_plan_approval_max_execution_tokens
+            == 0
+        {
+            return Err(ProfileError::Validation(
+                "automatic plan approval execution threshold must be non-zero".to_owned(),
+            ));
+        }
         if self.orchestration.heartbeat_interval_seconds == 0
             || self.orchestration.lease_ttl_seconds <= self.orchestration.heartbeat_interval_seconds
         {
@@ -431,7 +447,11 @@ pub struct RepositoryProfile {
     pub concurrency: ProfileConcurrency,
     pub models: ProfileModels,
     pub domains: Vec<DomainRule>,
+    #[serde(default)]
+    pub validation_policy: ValidationPolicy,
     pub validators: Vec<ValidatorRule>,
+    #[serde(default)]
+    pub acceptance: Vec<AcceptanceRule>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -448,6 +468,7 @@ pub struct ProfileConcurrency {
 #[serde(deny_unknown_fields)]
 pub struct ProfileModels {
     pub architect: ModelRoute,
+    pub governor: ModelRoute,
     pub explorer: ModelRoute,
     pub worker: ModelRoute,
     pub worker_escalation: ModelRoute,
@@ -474,6 +495,94 @@ pub struct DomainRule {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ValidationPolicy {
+    #[serde(default)]
+    pub review_ready: bool,
+    #[serde(default = "default_true")]
+    pub integration: bool,
+    #[serde(default = "default_true")]
+    pub require_behavioral_integration: bool,
+    #[serde(default = "default_all_paths")]
+    pub behavioral_required_globs: Vec<String>,
+    #[serde(default = "default_true")]
+    pub require_human_signoff: bool,
+    #[serde(default)]
+    pub require_draft_pr_ci: bool,
+}
+
+impl Default for ValidationPolicy {
+    fn default() -> Self {
+        Self {
+            review_ready: false,
+            integration: true,
+            require_behavioral_integration: true,
+            behavioral_required_globs: default_all_paths(),
+            require_human_signoff: true,
+            require_draft_pr_ci: false,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_all_paths() -> Vec<String> {
+    vec!["**".to_owned()]
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationGate {
+    ReviewReady,
+    Integration,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidatorEvidenceClass {
+    #[default]
+    Custody,
+    Contract,
+    Behavioral,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceptanceKind {
+    Automated,
+    Attested,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptanceRule {
+    pub id: String,
+    pub kind: AcceptanceKind,
+    #[serde(default)]
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub instructions: String,
+    pub proof_tier: String,
+    pub resource_class: String,
+    #[serde(default)]
+    pub path_globs: Vec<String>,
+}
+
+impl AcceptanceRule {
+    #[must_use]
+    pub fn class(&self) -> ResourceClass {
+        match self.resource_class.as_str() {
+            "control" => ResourceClass::Control,
+            "medium" => ResourceClass::Medium,
+            "heavy" => ResourceClass::Heavy,
+            other => ResourceClass::Hardware(other.to_owned()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValidatorRule {
     pub id: String,
     pub command: Vec<String>,
@@ -483,6 +592,10 @@ pub struct ValidatorRule {
     pub manual_prerequisites: bool,
     #[serde(default)]
     pub path_globs: Vec<String>,
+    #[serde(default)]
+    pub gates: Vec<ValidationGate>,
+    #[serde(default)]
+    pub evidence_class: ValidatorEvidenceClass,
 }
 
 impl ValidatorRule {
@@ -505,15 +618,19 @@ pub struct LoadedProfile {
 }
 
 pub fn load_profile(id_or_path: &str, config_dir: &Path) -> Result<LoadedProfile, ProfileError> {
-    let (source, text) = if id_or_path == "neuralmatrix" {
-        let installed = config_dir.join("profiles/neuralmatrix.toml");
+    let (source, text) = if id_or_path == "general" {
+        let installed = config_dir.join("profiles/general.toml");
         if installed.exists() {
             (installed.clone(), fs::read_to_string(installed)?)
         } else {
-            (
-                PathBuf::from("builtin:neuralmatrix"),
-                NEURALMATRIX_PROFILE.to_owned(),
-            )
+            (PathBuf::from("builtin:general"), GENERAL_PROFILE.to_owned())
+        }
+    } else if id_or_path == "bildr" {
+        let installed = config_dir.join("profiles/bildr.toml");
+        if installed.exists() {
+            (installed.clone(), fs::read_to_string(installed)?)
+        } else {
+            (PathBuf::from("builtin:bildr"), BILDR_PROFILE.to_owned())
         }
     } else {
         let source = PathBuf::from(id_or_path);
@@ -537,9 +654,9 @@ fn validate_profile(profile: &RepositoryProfile) -> Result<(), ProfileError> {
             profile.schema_version
         )));
     }
-    if profile.profile_id.trim().is_empty() || profile.required_global_authorities.is_empty() {
+    if profile.profile_id.trim().is_empty() {
         return Err(ProfileError::Validation(
-            "profile id and global authorities are required".to_owned(),
+            "profile id is required".to_owned(),
         ));
     }
     if !profile
@@ -550,6 +667,119 @@ fn validate_profile(profile: &RepositoryProfile) -> Result<(), ProfileError> {
         return Err(ProfileError::Validation(
             "profile must forbid repository-local Harness runtime state".to_owned(),
         ));
+    }
+    if !profile.validation_policy.integration {
+        return Err(ProfileError::Validation(
+            "integrated-head validation cannot be disabled".to_owned(),
+        ));
+    }
+    if !profile.validation_policy.require_behavioral_integration {
+        return Err(ProfileError::Validation(
+            "behavioral integration proof cannot be disabled".to_owned(),
+        ));
+    }
+    if !profile.validation_policy.require_human_signoff {
+        return Err(ProfileError::Validation(
+            "final human signoff cannot be disabled".to_owned(),
+        ));
+    }
+    if profile
+        .validation_policy
+        .behavioral_required_globs
+        .is_empty()
+    {
+        return Err(ProfileError::Validation(
+            "behavioral_required_globs cannot be empty when behavioral integration proof is required"
+                .to_owned(),
+        ));
+    }
+    let mut validator_ids = BTreeMap::new();
+    let mut integration_validator_declared = false;
+    let mut review_ready_validator_declared = false;
+    for validator in &profile.validators {
+        if validator.id.trim().is_empty() {
+            return Err(ProfileError::Validation(
+                "validator id is required".to_owned(),
+            ));
+        }
+        if validator.command.is_empty() || validator.command.iter().any(|part| part.is_empty()) {
+            return Err(ProfileError::Validation(format!(
+                "validator {} must have a non-empty command",
+                validator.id
+            )));
+        }
+        if !matches!(
+            validator.proof_tier.as_str(),
+            "T0" | "T1" | "T2" | "T3" | "T4" | "T5" | "T6"
+        ) {
+            return Err(ProfileError::Validation(format!(
+                "validator {} has unknown proof tier {}",
+                validator.id, validator.proof_tier
+            )));
+        }
+        if validator_ids.insert(&validator.id, ()).is_some() {
+            return Err(ProfileError::Validation(format!(
+                "duplicate validator id {}",
+                validator.id
+            )));
+        }
+        let unique_gates = validator.gates.iter().copied().collect::<BTreeSet<_>>();
+        if unique_gates.len() != validator.gates.len() {
+            return Err(ProfileError::Validation(format!(
+                "validator {} declares a lifecycle gate more than once",
+                validator.id
+            )));
+        }
+        if validator.manual_prerequisites && !validator.gates.is_empty() {
+            return Err(ProfileError::Validation(format!(
+                "validator {} cannot bind a manual-prerequisite command to an automatic lifecycle gate",
+                validator.id
+            )));
+        }
+        integration_validator_declared |= validator.gates.contains(&ValidationGate::Integration);
+        review_ready_validator_declared |= validator.gates.contains(&ValidationGate::ReviewReady);
+    }
+    if !integration_validator_declared {
+        return Err(ProfileError::Validation(
+            "at least one integrated-head validator is required".to_owned(),
+        ));
+    }
+    if profile.validation_policy.review_ready && !review_ready_validator_declared {
+        return Err(ProfileError::Validation(
+            "review_ready is enabled but no validator is bound to that gate".to_owned(),
+        ));
+    }
+    for acceptance in &profile.acceptance {
+        if acceptance.id.trim().is_empty()
+            || validator_ids.insert(&acceptance.id, ()).is_some()
+            || !matches!(
+                acceptance.proof_tier.as_str(),
+                "T0" | "T1" | "T2" | "T3" | "T4" | "T5" | "T6"
+            )
+        {
+            return Err(ProfileError::Validation(format!(
+                "acceptance id {} must be unique and use a known proof tier",
+                acceptance.id
+            )));
+        }
+        if acceptance.instructions.trim().is_empty() {
+            return Err(ProfileError::Validation(format!(
+                "acceptance {} needs operator-facing proof instructions",
+                acceptance.id
+            )));
+        }
+        match acceptance.kind {
+            AcceptanceKind::Automated
+                if acceptance.command.is_empty()
+                    || acceptance.command.iter().any(|part| part.trim().is_empty()) =>
+            {
+                return Err(ProfileError::Validation(format!(
+                    "automated acceptance {} needs a command",
+                    acceptance.id
+                )));
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -591,6 +821,7 @@ pub fn redact_diagnostic(input: &str) -> String {
 pub fn profile_model_map(profile: &RepositoryProfile) -> BTreeMap<&'static str, &ModelRoute> {
     BTreeMap::from([
         ("architect", &profile.models.architect),
+        ("governor", &profile.models.governor),
         ("explorer", &profile.models.explorer),
         ("worker", &profile.models.worker),
         ("worker_escalation", &profile.models.worker_escalation),
@@ -622,9 +853,31 @@ mod tests {
     fn supplied_config_and_profile_parse() {
         let config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
         config.validate().expect("config validates");
-        let profile: RepositoryProfile =
-            toml::from_str(NEURALMATRIX_PROFILE).expect("profile parses");
+        let profile: RepositoryProfile = toml::from_str(BILDR_PROFILE).expect("profile parses");
         validate_profile(&profile).expect("profile validates");
+        assert_eq!(profile.models.governor.model, "gpt-5.6-sol");
+        assert_eq!(profile.models.governor.reasoning_effort, "xhigh");
+        assert_eq!(profile.models.governor.sandbox, "workspace-write");
+        assert!(profile.validation_policy.integration);
+        assert!(profile.validation_policy.require_behavioral_integration);
+        assert!(profile.validation_policy.require_human_signoff);
+        assert!(profile.validation_policy.require_draft_pr_ci);
+        assert!(profile.validators.iter().any(|validator| {
+            validator.gates.contains(&ValidationGate::Integration)
+                && validator.evidence_class == ValidatorEvidenceClass::Behavioral
+        }));
+        assert!(
+            profile
+                .acceptance
+                .iter()
+                .any(|acceptance| acceptance.kind == AcceptanceKind::Automated)
+        );
+
+        let general: RepositoryProfile =
+            toml::from_str(GENERAL_PROFILE).expect("general profile parses");
+        validate_profile(&general).expect("general profile validates");
+        assert_eq!(general.repository, "*");
+        assert!(!general.validation_policy.require_draft_pr_ci);
     }
 
     #[test]
@@ -669,5 +922,16 @@ mod tests {
         let mut config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
         config.storage.hash_algorithm = "sha1".to_owned();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn automatic_validator_gates_reject_manual_or_missing_commands() {
+        let mut profile: RepositoryProfile = toml::from_str(BILDR_PROFILE).expect("profile parses");
+        profile.validators[0].manual_prerequisites = true;
+        assert!(validate_profile(&profile).is_err());
+
+        let mut profile: RepositoryProfile = toml::from_str(BILDR_PROFILE).expect("profile parses");
+        profile.validation_policy.review_ready = true;
+        assert!(validate_profile(&profile).is_err());
     }
 }

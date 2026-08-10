@@ -1,7 +1,7 @@
-# Harness Console Dependency-Ordered Implementation Backlog
+# BILDR dependency-ordered implementation backlog
 
 **Status:** implemented in v0.1.0; retained as the dependency-ordered delivery record
-**Initial target:** Linux + `lazerusrm/NeuralMatrix`
+**Initial target:** Linux + a local Git repository
 **Rule:** every PR is independently reviewable and leaves the repository in a usable state; later PRs must not retroactively excuse missing tests in earlier foundations
 
 ## Delivery strategy
@@ -23,7 +23,7 @@ Recommended branch/PR prefix: `harness/HC-###-<slug>`.
 | M1 Observe | HC-004–007 | one read-only Codex thread visible and durable |
 | M2 Mutate safely | HC-008–011 | one task, one worktree, approvals, diff, validation |
 | M3 Orchestrate | HC-012–015 | task DAG, bounded workers, verifier, integration |
-| M4 NeuralMatrix | HC-016–018 | authority context, proof/evidence, repository profile |
+| M4 Repository policy | HC-016–018 | authority context, proof/evidence, repository profile |
 | M5 Publish and harden | HC-019–023 | PR/CI, restart recovery, packaging, pilots, release |
 
 ---
@@ -249,7 +249,7 @@ Pilot 0 can be observed end to end from the browser, including restart/reconnect
 - controller-owned `fetch --prune`;
 - exact base-ref resolution;
 - inspection worktree create/preserve/remove;
-- primary-checkout clean/on-main invariant for NeuralMatrix;
+- primary-checkout clean/on-default-branch invariant;
 - Git command audit artifacts.
 
 ### Tests
@@ -376,7 +376,8 @@ Focused validation commands run with reliable cancellation/logs/result semantics
 
 ### Exit gate
 
-A user objective becomes a schema-valid, human-reviewable, dependency-ordered NeuralMatrix task graph with no mutation yet dispatched.
+A user objective becomes a schema-valid, human-reviewable, dependency-ordered
+repository task graph with no mutation yet dispatched.
 
 ---
 
@@ -475,7 +476,7 @@ Verified task commits integrate on exact base, affected proof is rerun, and a fr
 
 ### Scope
 
-- authority-first NeuralMatrix context compiler;
+- authority-first repository context compiler;
 - bounded text inventory, FTS5 metadata, ripgrep search, Git file map;
 - Rust workspace/package metadata per actual workspace;
 - CI claim/workflow registry ingestion;
@@ -500,7 +501,7 @@ The architect/worker receives a compact reproducible context packet rather than 
 
 ---
 
-## HC-017 — NeuralMatrix profile, model/risk router, and validator catalog
+## HC-017 — Strict repository profile, risk router, and validator catalog
 
 **Depends on:** HC-014, HC-016
 
@@ -513,13 +514,13 @@ The architect/worker receives a compact reproducible context packet rather than 
 - direct Terra route for high-risk work;
 - Sol architect/verifier/final-auditor roles;
 - Luna explorer/worker/CI triage roles;
-- docs, CI self-test, local C2, Jetson cross-build validators;
+- docs, CI self-test, local build, and environment-specific validators;
 - proof tier/result semantics;
 - no `.omx` runtime state as authority.
 
 ### Tests
 
-- real-profile parsing against a pinned NeuralMatrix fixture/checkout;
+- real-profile parsing against a pinned repository fixture;
 - domain/risk/serial-path classification tables;
 - no-fallback protected semantics appear in every mutable packet;
 - heavy prerequisite unavailable result;
@@ -527,7 +528,8 @@ The architect/worker receives a compact reproducible context packet rather than 
 
 ### Exit gate
 
-Pilots 0–3 run under NeuralMatrix's actual repository governance with correct model routing, path custody, and proof semantics.
+Pilots 0–3 run under the repository's declared governance with correct routing,
+path custody, and proof semantics.
 
 ---
 
@@ -571,7 +573,7 @@ A completed pilot exports a self-verifying bundle that accurately states the hig
 - draft PR creation through `gh` or GitHub integration;
 - attach run summary/evidence links/artifacts as policy allows;
 - poll/ingest PR checks and classify results;
-- invoke NeuralMatrix required-check verifier when requested;
+- invoke the repository's required-check verifier when requested;
 - no automatic ready/merge;
 - remote head drift detection.
 
@@ -647,7 +649,7 @@ A release artifact installs on both Linux families, starts via `systemd --user`,
 
 ---
 
-## HC-022 — NeuralMatrix pilot campaign and quality remediation
+## HC-022 — Repository pilot campaign and quality remediation
 
 **Depends on:** HC-021
 
@@ -705,6 +707,8 @@ These are deliberate later additions, not hidden v1 requirements:
 7. GitHub review-thread remediation workflows;
 8. configurable additional model/provider adapters behind the same task/evidence contracts;
 9. evaluation corpus and automatic harness-improvement suggestions;
-10. signed release/update channel for Harness Console itself.
+10. signed release/update channel for BILDR itself.
 
-Do not begin distributed/multi-user/provider abstraction until the local single-user NeuralMatrix control plane is stable. Those features multiply security, state, and failure domains and are not necessary to realize the primary value.
+Do not begin distributed or multi-user abstraction until the local single-user
+control plane is stable. Those features multiply security, state, and failure
+domains and are not necessary to realize the primary value.

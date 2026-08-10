@@ -1,15 +1,21 @@
 import type {
-  ActivityItem,
+  ActivityPage,
   Agent,
   Approval,
+  CodexAccountLoginStatus,
+  CodexAccountsSnapshot,
   EvidenceSnapshot,
+  OperatorSettings,
   Repository,
+  RepositoryDiscovery,
   Run,
   RunDetail,
   RuntimeStatus,
   Task,
   Usage,
+  UsageBreakdown,
   Worktree,
+  WorktreeDiffSummary,
 } from "./types";
 
 type JsonBody = Record<string, unknown>;
@@ -48,7 +54,11 @@ class HarnessApi {
     }
   }
 
-  async request<T>(path: string, init: RequestInit = {}, mutation = false): Promise<T> {
+  async request<T>(
+    path: string,
+    init: RequestInit = {},
+    mutation = false,
+  ): Promise<T> {
     await this.ensureSession();
     const headers = new Headers(init.headers);
     headers.set("Accept", "application/json");
@@ -68,39 +78,137 @@ class HarnessApi {
   }
 
   post<T>(path: string, body: JsonBody = {}): Promise<T> {
-    return this.request<T>(path, { method: "POST", body: JSON.stringify(body) }, true);
+    return this.request<T>(
+      path,
+      { method: "POST", body: JSON.stringify(body) },
+      true,
+    );
   }
 
   runtime = () => this.get<RuntimeStatus>("/runtime");
+  codexAccounts = () => this.get<CodexAccountsSnapshot>("/codex/accounts");
   repositories = () => this.get<Repository[]>("/repositories");
-  runs = () => this.get<{ items: Run[] }>("/runs?limit=200").then((value) => value.items);
+  discoverRepositories = () =>
+    this.get<RepositoryDiscovery[]>("/repositories/discover");
+  settings = () => this.get<OperatorSettings>("/settings");
+  runs = () =>
+    this.get<{ items: Run[] }>("/runs?limit=200").then((value) => value.items);
   approvals = () => this.get<Approval[]>("/approvals?state=pending");
   worktrees = () => this.get<Worktree[]>("/worktrees");
   run = (id: string) => this.get<RunDetail>(`/runs/${id}`);
   tasks = (runId: string) => this.get<Task[]>(`/runs/${runId}/tasks`);
   agent = (id: string) => this.get<Agent>(`/agents/${id}`);
   activity = (id: string) =>
-    this.get<{ items: ActivityItem[] }>(`/agents/${id}/activity?limit=500`).then(
-      (value) => value.items,
-    );
+    this.get<ActivityPage>(`/agents/${id}/activity?limit=500`);
   usage = (runId: string) => this.get<Usage>(`/runs/${runId}/usage`);
-  evidence = (runId: string) => this.get<EvidenceSnapshot>(`/runs/${runId}/evidence`);
+  usageBreakdown = () => this.get<UsageBreakdown>("/usage");
+  evidence = (runId: string) =>
+    this.get<EvidenceSnapshot>(`/runs/${runId}/evidence`);
+  worktreeDiff = (worktreeId: string) =>
+    this.get<WorktreeDiffSummary>(`/worktrees/${worktreeId}/diff`);
 
   registerRepository(rootPath: string) {
     return this.post<Repository>("/repositories", {
-      profile_id: "neuralmatrix",
+      profile_id: "general",
       root_path: rootPath,
     });
   }
 
-  createRun(repositoryId: string, objective: string, mode: string, publication: string) {
+  prepareCoordinationCheckout(repositoryId: string, destinationPath: string) {
+    return this.post<Repository>(
+      `/repositories/${repositoryId}/prepare-clean-checkout`,
+      {
+        destination_path: destinationPath,
+      },
+    );
+  }
+
+  updateSettings(
+    settings: Partial<
+      Pick<
+        OperatorSettings,
+        | "store_reasoning_summaries"
+        | "store_raw_reasoning"
+        | "yolo_mode"
+        | "automatic_account_handoff"
+        | "adaptive_governor_budgets"
+        | "automatic_governor_continuation"
+        | "automatic_plan_approval"
+        | "governor_goal_token_budget"
+        | "governor_attempt_token_ceiling"
+      >
+    >,
+  ) {
+    return this.post<OperatorSettings>("/settings", { ...settings });
+  }
+
+  selectCodexAccount(accountId: string) {
+    return this.post<CodexAccountsSnapshot>(
+      `/codex/accounts/${encodeURIComponent(accountId)}/select`,
+    );
+  }
+
+  startCodexAccountLogin(label: string, accountId?: string) {
+    return this.post<CodexAccountLoginStatus>("/codex/accounts/login", {
+      label,
+      account_id: accountId || null,
+    });
+  }
+
+  codexAccountLoginStatus(loginId: string) {
+    return this.get<CodexAccountLoginStatus>(
+      `/codex/accounts/login/${encodeURIComponent(loginId)}`,
+    );
+  }
+
+  cancelCodexAccountLogin(loginId: string) {
+    return this.post<CodexAccountLoginStatus>(
+      `/codex/accounts/login/${encodeURIComponent(loginId)}/cancel`,
+    );
+  }
+
+  renameCodexAccount(accountId: string, label: string) {
+    return this.post<CodexAccountsSnapshot>(
+      `/codex/accounts/${encodeURIComponent(accountId)}/rename`,
+      { label },
+    );
+  }
+
+  removeCodexAccount(accountId: string) {
+    return this.post<CodexAccountsSnapshot>(
+      `/codex/accounts/${encodeURIComponent(accountId)}/remove`,
+    );
+  }
+
+  createRun(
+    repositoryId: string,
+    objective: string,
+    publication: string,
+    governorModel: string,
+    governorReasoningEffort: string,
+    automaticPlanApproval: boolean,
+    runTokenBudget: number,
+    codexAccountId?: string,
+  ) {
     return this.post<Run>("/runs", {
       repository_id: repositoryId,
       objective,
-      base_ref: "origin/main",
-      mode,
+      mode: "plan_and_implement",
       publication,
+      governor_model: governorModel,
+      governor_reasoning_effort: governorReasoningEffort,
+      automatic_plan_approval: automaticPlanApproval,
+      run_token_budget: runTokenBudget,
+      codex_account_id: codexAccountId || null,
     });
+  }
+
+  startArchitecture(runId: string) {
+    return this.post(`/runs/${runId}/start-architecture`);
+  }
+
+  archiveRun(runId: string) {
+    return this.post<Run>(`/runs/${runId}/archive`);
   }
 }
 

@@ -7,11 +7,7 @@ use serde_json::{Value, json};
 use url::Url;
 
 #[derive(Parser)]
-#[command(
-    name = "harnessctl",
-    version,
-    about = "Operator CLI for Harness Console"
-)]
+#[command(name = "harnessctl", version, about = "Operator CLI for BILDR")]
 struct Cli {
     #[arg(long, env = "HARNESS_URL", default_value = "http://127.0.0.1:7310")]
     url: String,
@@ -58,7 +54,7 @@ enum Command {
 enum RepoCommand {
     List,
     Add {
-        #[arg(long, default_value = "neuralmatrix")]
+        #[arg(long, default_value = "general")]
         profile: String,
         #[arg(long)]
         path: PathBuf,
@@ -116,6 +112,9 @@ enum RunCommand {
         #[arg(long)]
         interrupt: bool,
     },
+    Archive {
+        run_id: String,
+    },
     Export {
         run_id: String,
     },
@@ -127,7 +126,7 @@ enum RunCommand {
     },
     RetryTask {
         task_id: String,
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         reason: String,
         #[arg(long)]
         revised_objective: Option<String>,
@@ -447,6 +446,13 @@ async fn execute(api: &ApiClient, command: Command) -> Result<Value> {
                 api.post(
                     &format!("/api/v1/runs/{run_id}/stop"),
                     json!({"mode": if interrupt { "interrupt_turns" } else { "after_current_commands" }, "preserve_all_worktrees": true}),
+                )
+                .await
+            }
+            RunCommand::Archive { run_id } => {
+                api.post(
+                    &format!("/api/v1/runs/{run_id}/archive"),
+                    json!({}),
                 )
                 .await
             }

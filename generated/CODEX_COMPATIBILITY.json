@@ -1,9 +1,10 @@
 {
-  "schema": "harness-codex-compatibility/v1",
-  "codex_cli_version": "0.146.0",
-  "transport": "stdio-jsonl",
+  "codex_cli_version": "0.147.0",
+  "generated_at": "2026-08-07",
   "generated_schema_root": "generated/codex-app-server-schema",
   "root_schema": "codex_app_server_protocol.v2.schemas.json",
-  "root_schema_sha256": "4e5515cf5ec697e85c16a627a49cf5759f5f102a5a770456d546670effee26fa",
-  "generated_at": "2026-08-05"
+  "root_schema_sha256": "9c8a7d0c96b8e33a989c7d0b178f271ec80d19aba90b9631c978fc985d289ff6",
+  "root_schema_sha256_encoding": "normalized-compact-json",
+  "schema": "harness-codex-compatibility/v1",
+  "transport": "stdio-jsonl"
 }

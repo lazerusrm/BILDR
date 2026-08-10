@@ -1,8 +1,10 @@
-# Harness Console
-## Linux-First Codex Multi-Agent Control Plane for NeuralMatrix
+# BILDR
+
+## Linux-First Codex Multi-Agent Control Plane for Local Git Repositories
 
 **Status:** proposed architecture and implementation plan
-**Initial repository:** `lazerusrm/NeuralMatrix`
+**Strict repository profile:** `lazerusrm/BILDR`
+**Default runtime profile:** repository-neutral `general`
 **Target host:** Linux workstation/server
 **Prepared:** 2026-08-05
 **Primary binaries:** `harnessd`, `harnessctl`
@@ -11,13 +13,18 @@
 
 ## Executive decision
 
-Build **Harness Console** as a local supervisory control plane around a version-pinned Codex App Server. It should feel like a focused Codex desktop command center, but its differentiator is not another chat UI. Its job is to make multi-agent engineering **observable, bounded, reproducible, and safe**:
+Build **BILDR** as a local supervisory control plane around a version-pinned Codex App Server. It should feel like a focused Codex desktop command center, but its differentiator is not another chat UI. Its job is to make multi-agent engineering **observable, bounded, reproducible, and safe**:
 
 - every agent and native subagent is visible with requested/effective model, reasoning effort, current goal, plan, current action, parent, worktree, branch, SHA, token use, and API-equivalent cost;
 - every mutable task runs in a controller-created Git worktree with explicit path leases;
 - the controller, not a model, owns state transitions, scheduling, Git, validation, evidence, budgets, retries, and publication;
-- Sol plans and independently audits; Luna performs bounded high-volume exploration/implementation; Terra handles complex/high-risk implementation and serial integration;
-- NeuralMatrix's active authority documents, completion checklist, proof tiers, no-fallback doctrine, exact-head rule, CI semantics, and worktree discipline are imported as profile policy rather than duplicated or weakened;
+- a task whose owner profile is a controller/governor runs as a visible governing agent: it maintains the bounded plan, delegates read-only investigations to native child threads, reconciles or redirects those children, and receives automatic controller checkpoints before its token budget is exhausted;
+- Sol plans, governs repository-wide goals, and independently audits; Luna performs bounded high-volume exploration/implementation; Terra handles complex/high-risk implementation and serial integration;
+- repository-specific authority is imported through profiles rather than
+  hard-coded; BILDR ships a strict self-profile while other Git repositories use
+  the `general` profile or provide their own policy adapter;
+- the human primarily steers one visible governor conversation; child threads remain inspectable, while approvals appear inline and internal evidence/worktree ledgers do not become separate mental workspaces;
+- signed-in Codex homes are discovered without copying credentials; Harness can also create private app-managed Codex homes through Codex device authorization, usage is attributable by account/repository/agent, and optional capacity handoff happens only between attempts;
 - state survives daemon or App Server restart;
 - external writes stop at explicit human approval; v1 creates at most a draft PR and never auto-merges.
 
@@ -41,9 +48,9 @@ Do **not** begin with a cloud service, Kubernetes, a general provider abstractio
 
 ## 1. Product definition
 
-### 1.1 What Harness Console is
+### 1.1 What BILDR is
 
-Harness Console is a durable local application that accepts an engineering objective scoped to a registered repository and exact base, turns it into a reviewed task graph, dispatches bounded Codex agents, records their runtime activity, verifies their changes, serially integrates accepted commits, and produces a reviewable exact-head result plus evidence.
+BILDR is a durable local application that accepts an engineering objective scoped to a registered repository and exact base, turns it into a reviewed task graph, dispatches bounded Codex agents, records their runtime activity, verifies their changes, serially integrates accepted commits, and produces a reviewable exact-head result plus evidence.
 
 It combines four product categories:
 
@@ -54,10 +61,10 @@ It combines four product categories:
 
 ### 1.2 What it is not
 
-Harness Console is not:
+BILDR is not:
 
 - a replacement for Codex's own sandbox, approvals, or agent loop;
-- a second NeuralMatrix architecture or completion authority;
+- a second architecture or completion authority for a registered repository;
 - a hidden chain-of-thought viewer;
 - a general IDE or terminal multiplexer;
 - a continuous background coding service that pushes changes without review;
@@ -69,23 +76,26 @@ Harness Console is not:
 ### 1.3 Primary user workflow
 
 ```text
-1. Select NeuralMatrix and state the objective.
+1. Select a registered repository, governor model/effort, and state the objective.
 2. Controller fetches and pins origin/main to an exact SHA.
 3. Sol xhigh inspects active authority and emits a schema-valid task graph.
 4. User reviews task boundaries, paths, models, budgets, tests, and proof limits.
 5. Controller leases non-overlapping paths and creates task worktrees.
 6. Luna/Terra workers implement bounded tasks; read-only native subagents assist.
+   Repository-wide serial tasks use a Sol xhigh governor as the parent and show its
+   delegated children explicitly; they do not masquerade as one ordinary worker.
 7. Controller runs focused validations and captures evidence.
 8. Fresh Sol verifier attempts to reject each task.
 9. Terra integrates verified commits in dependency order.
 10. Integration proof reruns; invalidated evidence is explicit.
 11. Fresh Sol max final audit attempts to reject the complete result.
-12. User reviews diff/evidence/cost and explicitly approves push/draft PR.
+12. User receives required Sol final signoff and explicitly approves any push/draft PR action.
 ```
 
 ### 1.4 v1 success criteria
 
-V1 is successful when it can run the NeuralMatrix pilot ladder and reliably answer, at any time:
+V1 is successful when it can run the repository pilot ladder and reliably
+answer, at any time:
 
 - What is the exact objective and current phase?
 - Which agent and model/effort is working on what?
@@ -109,24 +119,30 @@ The product is built on Codex App Server because the required GUI state is alrea
 
 Use App Server's default JSONL stdio transport. Do not expose its experimental WebSocket listener. `harnessd` is the only client and owns the process lifetime.
 
-### 2.2 NeuralMatrix basis
+### 2.2 Repository policy basis
 
-The NeuralMatrix profile must enforce the repository's current rules:
+Each repository profile enforces the checkout's current rules:
 
-- start from active authority, not archived plans;
-- keep the primary checkout clean and create worktrees from a freshly fetched exact base;
-- one canonical producer/semantic owner and fail-closed behavior;
-- no compatibility alias, accept-both decoder, broad normalization, stale/latest/raw-id/URL/binding/client repair, dual authority, or semantic fallback;
-- exact-head evidence and result classes that distinguish source failure, unavailable infrastructure, and inconclusive proof;
-- bounded mutable workers plus an independent verifier;
-- no worker self-approval or automatic completion-checklist claim;
-- source, integration, hardware/live, rollout, and default-on proof remain distinct.
+- start from active authority instead of archived plans;
+- keep the coordination checkout clean and create worktrees from a freshly
+  resolved exact base;
+- preserve canonical ownership and fail-closed behavior;
+- bind evidence to an exact SHA and distinguish source failure, unavailable
+  infrastructure, and inconclusive proof;
+- use bounded mutable workers plus independent verification;
+- prevent worker self-approval and automatic completion-authority updates;
+- keep source, integration, environment, live, and rollout proof distinct.
 
-Harness runtime state is disposable execution state relative to repository authority. It may export evidence and proposed checklist updates, but it must never silently become the completion ledger.
+Controller runtime state is disposable relative to repository authority. It may
+export evidence and propose changes, but it never silently becomes the
+repository's completion ledger.
 
 ### 2.3 Repository scale
 
-NeuralMatrix is a large multi-surface repository with multiple Rust workspaces, platform-specific build paths, clients, C2, edge, infrastructure, CI, and extensive documentation. The context engine must route and cache; it cannot pass the entire repository to every agent or assume one root `cargo test` establishes product truth.
+Registered repositories can span multiple workspaces, languages, platforms, and
+delivery paths. The context engine must route and cache; it cannot pass an
+entire large repository to every role or assume one root test command
+establishes product truth.
 
 ### 2.4 Reasoning visibility
 
@@ -172,36 +188,36 @@ It should not promise or retain private hidden chain-of-thought. Raw reasoning s
 │  │           OpenAI/Codex auth                                               │  │
 │  └───────────────┬─────────────────────────────┬───────────────────────────┘  │
 │                  │                             │                              │
-│          SQLite/WAL + artifacts       NeuralMatrix primary repo/object DB    │
+│          SQLite/WAL + artifacts       registered repository/object DB         │
 │                                                                             │
 │  Optional controlled external edges: origin/GitHub, container engine,       │
-│  self-hosted CI, Jetson/C2/hardware validation targets                      │
+│  hosted CI and optional environment-specific validation targets             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 3.2 Component map
 
-| Component | Responsibility | Must not own |
-|---|---|---|
-| `harness-api` | local REST/SSE, session/CSRF, DTOs | orchestration decisions |
-| `harness-domain` | state machines, IDs, result classes, domain events | I/O |
-| `harness-codex` | App Server process/protocol, raw events, requests | task truth or Git |
-| `harness-store` | SQLite migrations/repositories, event journal, artifacts | business policy |
-| `harness-profile` | repository policy, domain/risk/validator routing | runtime mutable state |
-| `harness-git` | locks, fetch, worktrees, leases, diff, commit, integration | semantic conflict decisions |
-| `harness-runner` | controller-owned commands, resources, logs, cancellation | model turns |
-| `harness-context` | authority routing, repo map, context packet, probe helper | architecture authority |
-| `harness-orchestrator` | run/task state, scheduler, retries, escalation | direct protocol/Git shell details |
-| `harness-evidence` | validation, claims, artifact manifests, export | release promotion decision |
-| `harness-usage` | token deltas, price snapshots, cost/budgets | billing claims beyond evidence |
-| `harnessd` | composition root and lifecycle | domain logic embedded ad hoc |
-| `harnessctl` | operator commands over the same API/domain services | an independent hidden control path |
-| `ui` | observability and explicit human controls | source-of-truth state |
+| Component              | Responsibility                                             | Must not own                       |
+| ---------------------- | ---------------------------------------------------------- | ---------------------------------- |
+| `harness-api`          | local REST/SSE, session/CSRF, DTOs                         | orchestration decisions            |
+| `harness-domain`       | state machines, IDs, result classes, domain events         | I/O                                |
+| `harness-codex`        | App Server process/protocol, raw events, requests          | task truth or Git                  |
+| `harness-store`        | SQLite migrations/repositories, event journal, artifacts   | business policy                    |
+| `harness-profile`      | repository policy, domain/risk/validator routing           | runtime mutable state              |
+| `harness-git`          | locks, fetch, worktrees, leases, diff, commit, integration | semantic conflict decisions        |
+| `harness-runner`       | controller-owned commands, resources, logs, cancellation   | model turns                        |
+| `harness-context`      | authority routing, repo map, context packet, probe helper  | architecture authority             |
+| `harness-orchestrator` | run/task state, scheduler, retries, escalation             | direct protocol/Git shell details  |
+| `harness-evidence`     | validation, claims, artifact manifests, export             | release promotion decision         |
+| `harness-usage`        | token deltas, price snapshots, cost/budgets                | billing claims beyond evidence     |
+| `harnessd`             | composition root and lifecycle                             | domain logic embedded ad hoc       |
+| `harnessctl`           | operator commands over the same API/domain services        | an independent hidden control path |
+| `ui`                   | observability and explicit human controls                  | source-of-truth state              |
 
 ### 3.3 Proposed source repository layout
 
 ```text
-harness-console/
+bildr/
 ├── Cargo.toml
 ├── rust-toolchain.toml
 ├── crates/
@@ -229,9 +245,9 @@ harness-console/
 ├── schemas/
 ├── openapi/
 ├── profiles/
-│   └── neuralmatrix/
-├── codex/
-│   ├── agents/
+│   └── bildr/
+├── runtime/
+│   ├── roles/
 │   └── skills/
 ├── packaging/
 │   └── systemd/
@@ -396,7 +412,11 @@ CREATED
   -> PREPARING
   -> READY_FOR_ARCHITECTURE
   -> ARCHITECTING
-  -> PLAN_REVIEW_REQUIRED
+  -> PLAN_ADVERSARIAL_REVIEW
+       -> PLAN_REVISION_REQUIRED -> ARCHITECTING (review/revision loop)
+       -> PLAN_REVIEW_REQUIRED (independently certified)
+            -> PLAN_REVISION_REQUIRED (operator findings)
+            -> PLAN_ADVERSARIAL_REVIEW (stale certificate bindings)
   -> READY_TO_EXECUTE
   -> EXECUTING
   -> TASK_VERIFICATION
@@ -405,9 +425,10 @@ CREATED
   -> INTEGRATION_VERIFICATION
   -> FINAL_AUDIT
   -> HUMAN_REVIEW
+       -> EXECUTING (blocking findings reopen owned tasks and rebuild integration)
   -> PUBLICATION_READY
   -> DRAFT_PR_CREATED
-  -> COMPLETED
+       -> COMPLETED (directly when the profile has no CI gate; otherwise tasks pass through CI_PROVEN after required checks pass at the integration SHA)
 ```
 
 Cross-cutting terminal/suspension states:
@@ -423,9 +444,22 @@ ARCHIVED
 
 No state is inferred from UI counts. The controller executes an explicit transition command in a transaction, validates preconditions, and emits a domain event.
 
+`PLAN_REVIEW_REQUIRED` means the current plan digest and its base/profile/authority
+bindings have already passed a fresh, read-only adversarial review with zero
+blocking findings; it does not mean merely schema-valid. Automatic plan approval may perform the certified
+`PLAN_REVIEW_REQUIRED -> READY_TO_EXECUTE` transition, but cannot bypass
+`PLAN_ADVERSARIAL_REVIEW`. Blocking findings create a complete replacement plan
+revision and repeat review automatically. Advisory findings remain on the
+certificate and enter execution context without buying another planning round.
+Repeated/oscillating finding fingerprints or three non-shrinking review rounds
+pause as `plan_review_deadlocked` with the findings history for an operator
+decision; this is evidence-based convergence detection, not a raw review-count
+cap. Temporary capacity/runtime failures remain queued, and the run token
+ceiling remains authoritative.
+
 ### 5.3 Task state machine
 
-Align with NeuralMatrix's existing orchestration vocabulary:
+Use a repository-neutral orchestration vocabulary:
 
 ```text
 PROPOSED
@@ -468,9 +502,16 @@ A task attempt never overwrites prior attempt evidence. Retry creates a new atte
 - worker output can reach `REVIEW_READY`, never `VERIFIED`;
 - `VERIFIED` requires an independent verifier and controller validation;
 - `INTEGRATED` requires the verified commit to exist in the integration history in dependency order;
+- `FINAL_AUDIT` requires every profile-selected validator and automated acceptance command to have succeeded on the exact, clean integrated head; patch formatting is custody proof, not behavioral proof;
+- a validator result is inadmissible when the checkout fingerprint or `HEAD` changes while it runs;
 - evidence binds to exact source SHA and is invalidated after relevant source/artifact changes;
-- `PUBLICATION_READY` requires accepted final audit, no unresolved required findings/approvals, and current integration proof;
-- `COMPLETED` is a Harness run state, not a NeuralMatrix checklist completion claim.
+- `HUMAN_REVIEW` is a resting state. Approval and rejection both bind to the current signoff-packet digest and integration SHA; rejection names owned files and creates a fresh integration candidate rather than reviving the rejected SHA;
+- `PUBLICATION_READY` requires accepted final audit, explicit human signoff, all path-selected platform acceptance entries, no unproved claims, and current integration proof;
+- `CI_PROVEN` is profile-gated. When required, the controller must observe the
+  draft PR still points at the integration SHA and every required check passes
+  on that SHA. Profiles without this gate complete after draft creation without
+  falsely claiming `CI_PROVEN`; neither path authorizes merge;
+- `COMPLETED` is a BILDR run state, not a repository completion-authority claim.
 
 ### 5.5 Concurrency and transactions
 
@@ -490,24 +531,28 @@ Every API mutation uses an `If-Match`/version precondition so two UI tabs cannot
 
 ### 6.1 Division of responsibility
 
-| Concern | Controller code | Model |
-|---|---|---|
-| exact base/ref/worktree/branch | owns | receives |
-| active authority selection | validates/imports | interprets and cites |
-| task graph | schema/risk/path/DAG validation | Sol proposes |
-| task objective/acceptance | freezes per attempt | follows; may report conflict |
-| scheduling and concurrency | owns | none |
-| path leases/serial paths | owns/enforces | obeys |
-| implementation | observes/bounds | Luna/Terra performs |
-| commands | records/limits; some controller-owned | requests/runs through Codex sandbox |
-| validation classification | owns | may recommend |
-| independent review | starts/freshens | Sol performs |
-| integration order | owns | Terra resolves approved semantic work |
-| completion/evidence | owns typed state | supplies structured handoff/findings |
-| push/PR | owns after human approval | never improvises |
-| merge | absent in v1 | none |
+| Concern                        | Controller code                       | Model                                 |
+| ------------------------------ | ------------------------------------- | ------------------------------------- |
+| exact base/ref/worktree/branch | owns                                  | receives                              |
+| active authority selection     | validates/imports                     | interprets and cites                  |
+| task graph                     | schema/risk/path/DAG validation       | Sol proposes                          |
+| task objective/acceptance      | freezes per attempt                   | follows; may report conflict          |
+| scheduling and concurrency     | owns                                  | none                                  |
+| path leases/serial paths       | owns/enforces                         | obeys                                 |
+| implementation                 | observes/bounds                       | Luna/Terra performs                   |
+| commands                       | records/limits; some controller-owned | requests/runs through Codex sandbox   |
+| validation selection/execution | owns gate/path matching, exact-SHA execution, mutation checks, and classification | may recommend; cannot waive           |
+| independent review             | starts/freshens                       | Sol performs                          |
+| integration order              | owns                                  | Terra resolves approved semantic work |
+| completion/evidence            | owns typed state                      | supplies structured handoff/findings  |
+| push/PR                        | owns after human approval             | never improvises                      |
+| merge                          | absent in v1                          | none                                  |
 
 A model sentence such as “all tests pass” is not a state transition. The command and result must exist in the controller evidence ledger.
+Likewise, a review-model `accept` cannot substitute for a missing validator,
+platform acceptance item, or human signoff. Review verdicts distinguish
+blocking findings from advisories and include inspected-file/check/failure-mode
+evidence; only blocking findings cause another repair cycle.
 
 ### 6.2 Architecture phase
 
@@ -520,20 +565,74 @@ Sol xhigh runs read-only in the inspection worktree with:
 - task schema and risk vocabulary;
 - explicit instruction not to edit or claim completion.
 
-It emits `nm.orchestration.task.v1[]` plus a run-level plan summary. The controller rejects:
+It emits `harness.orchestration.task.v1[]` plus a run-level plan summary.
+Deterministic controller validation rejects:
 
 - cycles;
 - missing authority or checklist mapping where required;
 - ambiguous base SHA;
 - overlapping mutable paths without serial ownership;
 - serial/forbidden paths assigned to ordinary workers;
-- missing positive/negative proof;
 - tasks too broad for configured diff/token budgets;
 - implicit compatibility/fallback/normalization/repair;
 - a proof claim beyond the requested validators/environments;
 - unsupported model/effort/sandbox.
 
-The user sees and may edit objective text, non-goals, budgets, and dispatch choices. Changes produce a new plan revision/digest; the original is retained.
+After deterministic validation, a fresh read-only reviewer from the configured
+integrator model family (Terra xhigh in the bundled profiles, deliberately
+different from the Sol architect) inspects the repository and attempts to prove that the plan will stall, waste the budget,
+ossify a provisional design, or finish metadata without delivering behavior.
+It checks objective alignment, feasibility, critical-path liveness, milestone
+and dependency sizing, available resources, behavior-first evidence, test
+timing, recovery/replan authority, and immutable safety boundaries. It rejects
+global gates built from mutable PR/branch/deployment inventories, read-only
+inventory that blocks all code progress, SHA bookkeeping treated as the work,
+and broad test construction around code that has not worked in its real
+pipeline.
+
+The required implementation/proof sequence is:
+
+`vertical code slice -> real pipeline proof -> iterate -> certify behavior/code
+shape -> targeted regressions -> broader hardening`.
+
+Before pipeline proof, a plan asks only for the minimum smoke/probe/acceptance
+path needed to learn. Durable regressions validate the authoritative path and
+generic invalid-shape categories, not every historical alias, fallback,
+rejection, or provisional internal. Existing failing tests are blockers only
+when they protect a current certified contract through credible production
+behavior; stale tests may be revised or removed.
+
+Exact SHAs, worktree custody, manifests, and evidence digests remain mandatory
+boundary receipts. They never substitute for direct behavioral proof from
+running code. If a plan-created assumption or constraint prevents progress,
+the governor may replan within the objective, immutable safety boundaries,
+external-write approval policy, and remaining run budget.
+
+Only a coherent `accept` verdict with zero **blocking** findings marks the digest
+`CERTIFIED`; concrete advisory findings are retained for the governor. Every
+review verdict also carries non-empty inspected-file evidence, a task-id
+critical-path trace to behavioral proof, and one to three material failure modes
+with mitigations. The controller—not reviewer prose—attaches budget arithmetic,
+risk routing, planning spend, reviewer identity, and the plan/base/profile/
+authority binding tuple to the certificate.
+
+A `changes_requested` verdict must contain concrete blocking findings; the
+architect receives the prior plan and only those blockers and returns a full
+replacement revision. `POST /runs/{runId}/plan/request_changes` gives the
+operator the same path from a certified or convergence-blocked plan. Requested
+objective, non-goal, budget, or dispatch corrections are expressed as findings
+and materialized by the architect into a replacement digest, so the result is
+always re-certified instead of mutating a certified object in place. Prior plan
+JSON, certificates, and the complete review history are retained.
+
+Approval rechecks the certificate's complete binding tuple and re-enters
+adversarial review if any binding changed. It also recomputes whether remaining
+run tokens cover planned task budgets, per-task verifier reserve, final audit,
+and contingency. An infeasible plan cannot start without an explicit local-user
+budget override. Automatic approval additionally requires no high-risk or
+serial-path task, a controller execution reserve below
+`automatic_plan_approval_max_execution_tokens`, and a reviewer from a different
+model family; otherwise the certified plan waits for a human decision.
 
 ### 6.3 Risk router
 
@@ -575,7 +674,7 @@ The scheduler computes waves only among tasks that are:
 - not blocked on approval/user decision;
 - based on a still-valid plan revision and base lineage.
 
-Default NeuralMatrix capacity:
+Default strict-profile capacity:
 
 ```text
 max live Codex threads          6
@@ -656,7 +755,32 @@ A retry is not “same prompt again.” It includes:
 - a new token/tool budget and attempt ID;
 - chosen model route.
 
-Automatic remediation is capped, recommended at two rounds. After that, require human review or architecture rejection.
+The controller compiles those inputs into a bounded
+`harness.attempt-continuity.v1` packet. It prefers the task's declared durable
+checkpoint, includes a bounded chain of recent valid attempt handoffs, and only
+then falls back to a prior final agent message. Operator guidance is optional:
+a blank Continue action means the controller selects the next action from the
+durable milestone ledger without rewriting the goal. Raw reasoning and the full
+conversational transcript are not copied. The prior worktree remains a read-only
+recovery source; uncommitted edits are never implied to exist in the new isolated
+attempt. An attested candidate tree may be materialized into a clean leased
+worktree by the controller, after which normal path, diff-budget, and base-SHA
+custody still applies. The run UI labels cold recovery as `bounded_handoff` and
+links the source attempt.
+
+Every governor-owned task contains 3-20 human-reviewable milestones. Every
+governor turn finishes with `harness.governor-checkpoint.v1`: a monotonic
+revision, the full milestone ledger, one active milestone while progressing, a
+plain-language operator update, the controller-selected next action, workspace
+state, and durable artifact locators. Completed milestones may not regress.
+`blocked` is reserved for a genuine external, policy, credential, or approval
+boundary; ordinary implementation choices and turn-budget rollover remain the
+governor's responsibility.
+
+Direct repetition of one verifier finding set is capped, recommended at two
+rounds. Crossing that threshold produces a controller-authored strategy
+correction and another bounded repair window; it does not require the human to
+translate internal verifier feedback.
 
 ### 6.8 Stop conditions
 
@@ -680,22 +804,24 @@ The controller renders the stop condition and routes it to user, architect, or i
 
 ### 7.1 Default roles
 
-| Role | Model | Effort | Sandbox | Purpose |
-|---|---|---|---|---|
-| architect | `gpt-5.6-sol` | `xhigh` | read-only | authority map, invariants, task graph |
-| explorer | `gpt-5.6-luna` | `medium` | read-only | bounded source/test/contract discovery |
-| normal worker | `gpt-5.6-luna` | `max` | workspace-write | narrow implementation and focused proof |
-| CI triage | `gpt-5.6-luna` | `high` | read-only | classify logs/result semantics |
-| high-risk worker | `gpt-5.6-terra` | `xhigh` | workspace-write | contracts, persistence, security, native, cross-domain |
-| integrator | `gpt-5.6-terra` | `xhigh` | workspace-write | serial integration/conflict/evidence invalidation |
-| verifier | `gpt-5.6-sol` | `xhigh` | read-only | adversarial task review |
-| final auditor | `gpt-5.6-sol` | `max` | read-only | integrated system rejection attempt |
+| Role             | Model           | Effort   | Sandbox         | Purpose                                                                    |
+| ---------------- | --------------- | -------- | --------------- | -------------------------------------------------------------------------- |
+| architect        | `gpt-5.6-sol`   | `xhigh`  | read-only       | authority map, invariants, task graph                                      |
+| plan reviewer    | `gpt-5.6-sol`   | `xhigh`  | read-only       | adversarial plan liveness, feasibility, evidence, and test-timing review   |
+| governor         | `gpt-5.6-sol`   | `xhigh`  | workspace-write | preserve goal intent, bound/delegate work, reconcile evidence and failures |
+| explorer         | `gpt-5.6-luna`  | `medium` | read-only       | bounded source/test/contract discovery                                     |
+| normal worker    | `gpt-5.6-luna`  | `max`    | workspace-write | narrow implementation and focused proof                                    |
+| CI triage        | `gpt-5.6-luna`  | `high`   | read-only       | classify logs/result semantics                                             |
+| high-risk worker | `gpt-5.6-terra` | `xhigh`  | workspace-write | contracts, persistence, security, native, cross-domain                     |
+| integrator       | `gpt-5.6-terra` | `xhigh`  | workspace-write | serial integration/conflict/evidence invalidation                          |
+| verifier         | `gpt-5.6-sol`   | `xhigh`  | read-only       | adversarial task review                                                    |
+| final auditor    | `gpt-5.6-sol`   | `max`    | read-only       | integrated system rejection attempt                                        |
 
 These are policy defaults, not hard-coded universal truth. Store them in the repository profile and show every override.
 
 ### 7.2 Why this split
 
-- Sol is spent where global correctness and adversarial review have the highest leverage.
+- Sol is spent where global correctness, goal governance, and adversarial review have the highest leverage.
 - Terra receives tasks whose semantics span components or whose failure could create subtle compatibility/security/persistence debt.
 - Luna handles many bounded tasks economically, but uses a high effort for implementation because the scope has already been constrained.
 - Read-only exploration uses lower effort and compact outputs to reduce repeated expensive repo rediscovery.
@@ -710,6 +836,8 @@ Start with task budgets, then tune from pilots:
 
 ```text
 architect               120k tokens
+plan reviewer            120k tokens
+Sol goal governor       task-specific budget
 read-only explorer       30k tokens
 Luna bounded worker      80k tokens
 Terra high-risk worker  140k tokens
@@ -720,13 +848,72 @@ final auditor           120k tokens
 
 The goal API carries the active budget where supported. The controller ledger remains authoritative across turns and subagents.
 
+Governor budgets use two independent bounds. A goal envelope limits consecutive
+work without durable milestone or artifact progress, while each attempt receives
+a smaller adaptive slice. Durable progress automatically opens the next bounded
+envelope, so productive goals do not require manual token replenishment. The
+slice is the rounded 75th percentile of recent productive governor usage plus
+50% headroom, bounded by the operator's attempt ceiling. Infrastructure,
+authentication, and controller-policy failures are excluded from the learning
+sample. With fewer than two usable samples, use the bounded cold-start default.
+The no-progress envelope counts only the governor and its delegated descendant
+threads for that task. Architecture, independent verifier, and unrelated task
+usage still count against the total run ceiling, but cannot consume the
+governor's autonomy window or prevent automatic verifier remediation.
+
 ### 7.5 Budget behavior
 
-- 70%: UI warning and agent receives remaining-budget reminder.
+- 50%: confirm bounded child assignments and the next concrete completion criterion.
+- 75%: reconcile repeated children and persist durable evidence.
 - 90%: ask agent to converge on required proof/handoff.
-- 100%: no new turn without approved increase or a new attempt.
+- 100%: hard-stop the attempt; never silently widen its bound.
+- run creation exposes the total goal envelope, defaulted from operator settings;
+  a human continuation may explicitly add a bounded allowance to the next
+  governor attempt, and the controller raises the run cap only enough to admit
+  that attempt plus the configured read-only child ceilings before resuming
+  scheduling, so ordinary bounded delegation cannot consume the governor's
+  entire continuation window. Manual additions may be as large as 50m from the
+  run surface; the internal hard attempt ceiling is 100m and the lifetime run
+  ceiling is 1b so long-lived goals already above 100m remain resumable;
+- native governor children have a controller-enforced 250k cumulative ceiling;
+  crossing it interrupts the child and returns control to the governor instead
+  of relying on prompt compliance or human babysitting.
 - running command may finish under command timeout.
 - budget pressure never authorizes hidden scope reduction or weak tests.
+- a productive incomplete governor checkpoint first starts another bounded turn
+  on the same native Codex thread and leased worktree so opaque reasoning state,
+  prompt-cache locality, and useful child context remain available;
+- a governor waiting only on delegated children uses one long native
+  `wait_agent` call; child completion wakes it early, avoiding token-bearing
+  short polling loops;
+- if native thread reuse is unavailable or unsafe, the controller falls back to
+  a fresh immutable attempt from the stored bounded handoff. Account, model,
+  base, worktree-custody, or sandbox changes always take this cold path;
+- daemon or App Server loss while a root governor is active preserves the
+  interrupted attempt and automatically queues a fresh bounded attempt. A
+  finalized checkpoint is useful continuity evidence but is not required for
+  recovery; active root-governor custody or an infrastructure-stalled governor
+  attempt is sufficient. Pending approvals remain fail-closed;
+- process supervision may restart a crashed daemon, but a single missed HTTP
+  health deadline is observational only and must never kill active agent work;
+- an ordinary governor diff-custody rejection preserves the rejected worktree
+  read-only and schedules a clean bounded attempt with the exact forbidden,
+  serial, or `diff --check` findings; it never commits the rejected diff and it
+  does not ask the human to translate an internal repair;
+- three consecutive checkpoints with no milestone/artifact/workspace progress
+  trigger a controller-authored strategy correction that forbids repeating the
+  same probe or delegation; only a real approval/authority decision or an
+  exhausted no-progress envelope stops automatic continuation and asks the user;
+- verifier findings return to the governor in a fresh bounded repair window.
+  The configured remediation count bounds repetition of one finding set: when
+  crossed, the controller issues a strategy correction and resets that bounded
+  cycle instead of asking the human to translate internal verifier feedback.
+  A real approval/authority decision, an attempt that cannot materialize a new
+  candidate within its no-progress window, or the selected total run ceiling
+  may still stop the run;
+- governor handoffs are controller records outside the repository. A generated
+  `.omx`, `.harness-runtime`, or equivalent runtime file is captured and removed
+  before source-diff custody without weakening the forbidden-path rule.
 
 ---
 
@@ -734,12 +921,18 @@ The goal API carries the active budget where supported. The controller ledger re
 
 ### 8.1 Two kinds of “agent”
 
-Harness Console must distinguish:
+BILDR must distinguish:
 
 1. **Controller-created primary agents** — top-level Codex threads, each assigned a task attempt and explicit worktree/sandbox/lease.
 2. **Codex-native child subagents** — spawned by a parent thread, inheriting its runtime/workspace boundary and represented by collaborative-agent events.
 
 This distinction is central to correctness.
+
+Harness does not implement a second mailbox. Codex owns native spawn, message,
+follow-up, wait, interrupt, and list operations. Harness feature-detects that
+capability before governor launch, journals each collaboration item, projects
+human-readable sender/receiver lifecycle state, and routes operator steering to
+the governor rather than making the operator schedule children directly.
 
 ### 8.2 Mutable parallelism
 
@@ -776,6 +969,11 @@ max live children per parent  2
 max children created per task 6
 ```
 
+The global live-thread and per-run discovery limits are controller-enforced in
+v1. The depth, per-parent, and lifetime-created recommendations remain defense
+in depth for a follow-up controller admission guard; exceeding a live limit is
+detected from the native spawn event and pauses the run.
+
 ### 8.5 Fresh-review contexts
 
 Independent verification and final audit should be new controller-created read-only sessions, not child agents of the implementer. This avoids inherited anchoring and makes independence visible in state/evidence.
@@ -786,7 +984,10 @@ Independent verification and final audit should be new controller-created read-o
 
 ### 9.1 Registered repository model
 
-V1 registers an existing local NeuralMatrix clone as the **coordination repository**. It remains on `main`, clean, and synchronized with `origin/main` per repository policy. Harness uses its shared Git object database to create managed worktrees under the XDG data root.
+V1 registers an existing local clone as the **coordination repository**. It
+remains on its declared primary branch, clean, and synchronized with its base
+reference per repository policy. BILDR uses its shared Git object database to
+create managed worktrees under the XDG data root.
 
 This avoids duplicating a very large repository while preserving the existing rule that the primary checkout is for coordination/inspection only.
 
@@ -808,12 +1009,12 @@ Persist the requested ref, exact SHA, fetch time, remote URL, primary HEAD/statu
 
 ### 9.3 Worktree kinds
 
-| Kind | Branch | Mutable | Purpose |
-|---|---|---:|---|
-| inspection | detached base | no | architecture/context/search |
-| task attempt | `agent/hc/<run>/<task>-a<n>` | yes | one worker task |
-| verifier | detached task head or integration head | no | independent audit |
-| integration | `agent/hc/<run>/integration` | yes, serial | accepted commits/generation/conflict resolution |
+| Kind         | Branch                                 |     Mutable | Purpose                                         |
+| ------------ | -------------------------------------- | ----------: | ----------------------------------------------- |
+| inspection   | detached base                          |          no | architecture/context/search                     |
+| task attempt | `agent/hc/<run>/<task>-a<n>`           |         yes | one worker task                                 |
+| verifier     | detached task head or integration head |          no | independent audit                               |
+| integration  | `agent/hc/<run>/integration`           | yes, serial | accepted commits/generation/conflict resolution |
 
 ### 9.4 Branch management
 
@@ -844,7 +1045,7 @@ Before dispatch, normalize globs to an overlap representation. On completion, co
 
 ### 9.6 Serial paths
 
-Initial NeuralMatrix serial set includes:
+An initial strict-profile serial set can include:
 
 - architecture spine and master completion checklist;
 - generated shared contracts;
@@ -909,7 +1110,8 @@ The context engine should prevent every agent from repeatedly rediscovering a 2.
 ### 10.2 Context layers
 
 1. **Permanent repository policy**
-   - `AGENTS.md`, `CODEX.md`, documentation authority rules, protected semantics.
+   - contributor guidance, product contracts, documentation authority rules,
+     and protected semantics.
 2. **Repository map**
    - path domains, workspaces/packages, deployables, generated/serial paths, code-navigation seeds, CI claims/validators.
 3. **Task packet**
@@ -920,6 +1122,9 @@ The context engine should prevent every agent from repeatedly rediscovering a 2.
    - commands, logs, findings, partial diff, prior attempt limits.
 
 Do not continuously append all layers and all prior turns into one unbounded conversation. Use fresh verifier/integrator threads and compact task-specific handoffs.
+Codex memory may inform future heuristics after a run, but immediate retry and
+supervision state is Harness-owned durable data and must not depend on
+asynchronous memory generation.
 
 ### 10.3 Repository map v1
 
@@ -930,7 +1135,7 @@ Build deterministic indexes from an exact SHA:
 - excluded archive/vendor/binary/generated classes;
 - `cargo metadata` for each detected workspace, packages, targets, features, dependencies;
 - known component/profile/validator catalog;
-- NeuralMatrix CI claim/workflow/fixture/quarantine registries;
+- repository CI claim, workflow, fixture, and quarantine registries;
 - test file and named command catalog;
 - symbol/search seeds extracted from profile and authority docs;
 - FTS5 index for bounded text files and metadata, with `rg` as authoritative on-demand search.
@@ -958,26 +1163,30 @@ Example:
 ```json
 {
   "schema": "harness.context.packet.v1",
-  "run_id": "NM-20260805-014",
-  "task_id": "MEDIA-002",
+  "run_id": "RUN-20260805-014",
+  "task_id": "CORE-002",
   "base_sha": "...",
   "profile_digest": "sha256:...",
   "instruction_sources": [
-    {"path":"AGENTS.md","sha256":"...","class":"repository_policy"}
+    { "path": "CONTRIBUTING.md", "sha256": "...", "class": "repository_policy" }
   ],
   "authorities": [
-    {"path":"docs/architecture/PRODUCT_EVIDENCE_CONTRACT.md","sha256":"..."}
+    {
+      "path": "ARCHITECTURE_AND_IMPLEMENTATION_PLAN.md",
+      "sha256": "..."
+    }
   ],
-  "checklist_rows": ["MEDIA-..."],
-  "owned_paths": ["central/rust-c2/..."],
-  "code_seeds": [
-    {"path":"...","symbols":["..."]}
-  ],
+  "checklist_rows": ["CORE-..."],
+  "owned_paths": ["crates/harness-orchestrator/..."],
+  "code_seeds": [{ "path": "...", "symbols": ["..."] }],
   "test_seeds": ["cargo test -p ..."],
   "dependency_contracts": [],
   "prior_evidence": [],
   "excluded": [
-    {"pattern":"docs/archive/**","reason":"historical, non-authoritative by default"}
+    {
+      "pattern": "docs/archive/**",
+      "reason": "historical, non-authoritative by default"
+    }
   ],
   "estimated_tokens": 42000
 }
@@ -1042,17 +1251,17 @@ A task can be `REVIEW_READY` with passing focused tests but still fail verificat
 
 ### 11.2 Proof tiers
 
-Use NeuralMatrix's T0–T6 definitions in the profile:
+Use the profile's T0–T6 definitions:
 
-| Tier | Harness interpretation |
-|---|---|
-| T0 | deterministic algorithm/state/repository topology proof |
-| T1 | exact canonical shape and negative rejection |
-| T2 | component API with real local dependencies |
-| T3 | property/fuzz/parser/state breadth |
-| T4 | ordering/cancellation/backpressure/fault behavior |
-| T5 | named OS/SDK/codec/accelerator/database/hardware target |
-| T6 | exact-candidate live/capacity/recovery/rollout/fleet proof |
+| Tier | Harness interpretation                                     |
+| ---- | ---------------------------------------------------------- |
+| T0   | deterministic algorithm/state/repository topology proof    |
+| T1   | exact canonical shape and negative rejection               |
+| T2   | component API with real local dependencies                 |
+| T3   | property/fuzz/parser/state breadth                         |
+| T4   | ordering/cancellation/backpressure/fault behavior          |
+| T5   | named OS/SDK/codec/accelerator/database/hardware target    |
+| T6   | exact-candidate live/capacity/recovery/rollout/fleet proof |
 
 The UI never collapses these into one “tests passed” badge.
 
@@ -1086,9 +1295,23 @@ result parser
 artifact rules
 timeout
 owner
+gate (`review_ready` or `integration`)
+evidence class (`custody`, `contract`, or `behavioral`)
 ```
 
-The selector broadens on unknown paths. The controller records why a validator was selected or not selected.
+The selector broadens on unknown paths. The controller records why a validator was selected or not selected. Proof tiers remain claim-specific: a T5 hardware observation does not substitute for a configured T2 component check. A gate consumes explicit selected validator IDs at the exact SHA, not “anything at or above a tier.” The default sequence keeps expensive validation on the integrated head; `review_ready` validation is opt-in for cheap, stable checks so provisional code is not surrounded by a large brittle suite.
+
+Profiles may also define path-selected acceptance entries. `automated` entries
+run through the same controller-owned evidence path. `attested` entries remain
+pending in the signoff packet until the local user records target identity and
+observed behavior against the exact integration SHA. Missing tools, runners,
+devices, or attestations are never converted to success.
+
+`validation_policy.require_draft_pr_ci` is explicit and defaults false. A
+profile that enables it treats an empty required-check set, an unreadable PR
+head, or a PR head different from the integration SHA as non-proof. A profile
+that leaves it disabled does not strand the run waiting for CI it never
+declared and does not promote tasks through `CI_PROVEN`.
 
 ### 11.5 Command evidence
 
@@ -1188,7 +1411,7 @@ Raw hidden reasoning and secrets are excluded by default. Bundle verification fa
 
 ### 12.1 Token fields
 
-The App Server protocol exposes input, cached input, cache-write input, output, reasoning-output, total, last-turn/total usage, and context window in the pinned source version. Store last-turn values or safe cumulative deltas.
+The App Server protocol exposes input, cached input, cache-write input, output, reasoning-output, total, last-call/total usage, and context window in the pinned source version. A Codex turn may contain many model calls between tools. Deduplicate notifications with the monotonic thread total, sum every distinct last-call sample into the durable turn total, and retain per-agent attribution.
 
 Reasoning-output tokens are an output breakdown and must not be charged twice.
 
@@ -1197,10 +1420,10 @@ Reasoning-output tokens are an output breakdown and must not be charged twice.
 Configuration includes immutable effective-dated snapshots. The initial 2026-08-05 example is:
 
 | Model | Input / 1M | Cached / 1M | Output / 1M |
-|---|---:|---:|---:|
-| Sol | $5.00 | $0.50 | $30.00 |
-| Terra | $2.00 | $0.20 | $12.00 |
-| Luna | $0.20 | $0.02 | $1.20 |
+| ----- | ---------: | ----------: | ----------: |
+| Sol   |      $5.00 |       $0.50 |      $30.00 |
+| Terra |      $2.00 |       $0.20 |      $12.00 |
+| Luna  |      $0.20 |       $0.02 |       $1.20 |
 
 Cache writes are configured at 1.25× uncached input. Requests above the configured 272K input threshold receive the configured 2× input and 1.5× output multipliers. Price rules remain data, not code constants.
 
@@ -1288,11 +1511,11 @@ Controller-owned `git fetch`, push, GitHub, package acquisition, or hardware ope
 
 ### 13.5 Approval classes
 
-| Risk | Examples | Default |
-|---|---|---|
-| low | read worktree, bounded search, controller-selected local test | trusted/automatic under policy |
-| medium | network-enabled package fetch, new tool invocation, broader local command | explicit once |
-| high | write outside task scope, push branch, create PR, destructive cleanup | individual explicit approval |
+| Risk     | Examples                                                                     | Default                                         |
+| -------- | ---------------------------------------------------------------------------- | ----------------------------------------------- |
+| low      | read worktree, bounded search, controller-selected local test                | trusted/automatic under policy                  |
+| medium   | network-enabled package fetch, new tool invocation, broader local command    | explicit once                                   |
+| high     | write outside task scope, push branch, create PR, destructive cleanup        | individual explicit approval                    |
 | critical | production deployment, live actuator/customer environment, credential change | unsupported or separate operator ceremony in v1 |
 
 There is no global “approve all.” Decision binds exact request, thread/turn/item, worktree, and expected head where applicable.
@@ -1404,127 +1627,109 @@ Never label an inferred animation or timer as “thoughts.”
 
 ---
 
-## 15. NeuralMatrix repository profile
+## 15. Strict repository profile
 
 ### 15.1 Profile purpose
 
-The profile is a versioned policy adapter. It teaches the generic controller how NeuralMatrix routes authority, paths, proof, models, and resources. It does not copy the entire repository documentation into Harness or become an alternative contract.
+A profile is a versioned policy adapter. It tells the controller how a
+repository routes authority, paths, proof, roles, and resources. It does not
+copy repository documentation or become an alternative product contract.
 
-The supplied `profiles/neuralmatrix/profile.toml` is the initial shape.
+The supplied `profiles/bildr/profile.toml` is a strict example for this
+repository. The `general` profile remains the neutral default.
 
-### 15.2 Required instruction/authority chain
+### 15.2 Authority chain
 
-Always load/hash:
+The BILDR profile loads and hashes:
 
 ```text
-AGENTS.md
-CODEX.md
-docs/README.md
-docs/INDEX_FOR_AGENTS.md
-docs/architecture/CANONICAL_INDEX.md
-docs/product/NEURALMATRIX_PRODUCT_CONTRACT.md
-docs/architecture/PRODUCT_ARCHITECTURE_CONTRACT.md
-docs/architecture/CANONICAL_AUTHORITY_DOCTRINE.md
-docs/architecture/ENGINEERING_GOVERNANCE_CONTRACT.md
-docs/architecture/CI_TEST_ARCHITECTURE.md
-docs/architecture/MASTER_COMPLETION_CHECKLIST.md
+CONTRIBUTING.md
+ARCHITECTURE_AND_IMPLEMENTATION_PLAN.md
+docs/STYLE_GUIDE.md
+SECURITY.md
 ```
 
-Then add the surface-specific active contract(s). Archived plans/audits are supporting evidence only unless active authority explicitly promotes them.
+A different repository declares its own authorities. Archived plans and audits
+remain supporting evidence unless an active authority explicitly promotes them.
 
 ### 15.3 Domain routing
 
-Initial domains:
+The strict example defines four domains:
 
-| Domain | Paths | Typical additional authority |
-|---|---|---|
-| edge | `edge/**` | edge streamer, resource/media/analytics/live contracts |
-| C2 | `central/**` | C2, tenancy/RBAC, entitlement/security |
-| contracts | `shared/**`, proto/schema | canonical authority, product evidence |
-| dashboard | `dashboard/**`, `NewDesign/**` | product/tenancy/surface contracts |
-| iOS | `ios-native/**` | iOS reference audit, evidence/sensor/playback |
-| Apex | `apex-vms/**` | product/playback/evidence |
-| Hyperwall | `hyperwall/**` | Hyperwall/media/runtime |
-| CI/release | workflows/tools/infra/deploy | engineering governance, CI architecture, OTA/release |
+| Domain | Paths | Primary authority |
+| --- | --- | --- |
+| Controller | `crates/**`, `bins/**`, migrations | architecture and security contracts |
+| Browser | `ui/**` | UI wireframes and acceptance plan |
+| Contracts | schemas, OpenAPI, generated bindings, profiles | architecture and protocol mapping |
+| Delivery | workflows, packaging, build tasks | contributor and operations guidance |
 
-Cross-domain task classification unions the authorities and raises risk.
+Cross-domain task classification unions the relevant authorities and raises
+risk. Repository profiles can add or replace domains without changing the
+controller.
 
-### 15.4 Protected semantics injected into every mutable packet
+### 15.4 Protected semantics
 
-```text
-- one canonical producer/consumer semantic contract
-- fail closed when canonical truth or required proof is missing
-- no aliases, accept-both decoding, broad normalization, translation shims
-- no stale/latest/raw-id/URL/binding/client repair
-- no semantic/protocol fallback or dual authority
-- operational resource adaptation only when active policy explicitly authorizes it
-- exact-head evidence
-- no AI commit attribution/co-author trailers
-- no completion claim beyond executed proof
-```
+Every mutable packet preserves these rules:
 
-These statements are guardrails, not an instruction to refuse all operational adaptation. The task must read the active resource policy for authorized bounded degradation.
+- Keep the service bound to localhost.
+- Bind evidence, review, and publication to the exact candidate SHA.
+- Keep mutable work isolated by task and worktree lease.
+- Require explicit approval for external writes.
+- Never merge automatically.
+- Treat missing, stale, or inconclusive proof as unsatisfied.
+- Do not claim completion beyond executed proof.
 
-### 15.5 Model/risk examples
+These guardrails do not prohibit reasonable implementation changes. When a plan
+or task constraint prevents the stated objective, review must identify the
+constraint and revise the plan instead of preserving a deadlock.
 
-```text
-Change isolated dashboard copy/layout
-  -> Luna max worker + Sol verifier
+### 15.5 Validation and test economics
 
-Change C2 tenant-scoped data hydration
-  -> Terra xhigh directly + Sol verifier
+The strict profile selects validators by changed path:
 
-Change shared generated identity contract
-  -> Terra xhigh producer task, serial integrator generation,
-     consumer tasks after producer freeze, Sol verification
+- Rust changes run the workspace test suite on the integrated head.
+- Browser changes run type checks, unit tests, and a production build.
+- Contract changes run schema, API, and generated-binding checks.
+- Browser changes also run an end-to-end acceptance flow.
+- Every change receives exact-head diff custody and required draft-PR CI.
 
-Fix focused Rust test in one crate
-  -> Luna max; Terra escalation only with evidence
+Do not surround provisional code with a broad regression suite. First exercise
+the implementation through the authoritative pipeline and confirm that it meets
+the objective. Add focused durable tests after the code shape is accepted. Test
+authoritative behavior and reject invalid classes generically; do not encode a
+catalog of every discarded intermediate shape.
 
-Change GitHub required context/classifier
-  -> Terra xhigh + CI triage child + Sol verifier
+The `general` profile fails closed for code integration until the repository
+provides a behavioral validator. Patch-format success alone is never completion
+proof.
 
-Jetson NVDEC/ROI/native lifecycle
-  -> Terra xhigh, explicit T5/T6 proof limits, hardware gate separate
-```
+### 15.6 Completion authority
 
-### 15.6 Validator routing
+- The architect maps tasks to repository completion criteria when relevant.
+- A worker handoff recommends only the state justified by its evidence.
+- The controller and independent reviewers validate evidence.
+- BILDR changes a repository checklist only when the objective explicitly owns
+  that edit.
+- A completed run does not automatically complete a repository milestone.
+- Environment, live, and rollout requirements remain explicit proof limits.
 
-Initial supplied validators:
+### 15.7 Runtime state and resources
 
-- `git diff --check`;
-- docs active-authority checks for docs changes;
-- CI program self-tests for workflow/CI architecture changes;
-- local AArch64 Jetson cross-build as heavy T5 with explicit prerequisites;
-- local Debian 12 C2 build as heavy T5 with explicit prerequisites.
+Runtime prompts, inboxes, and worktrees are disposable execution state, not
+authority. Keep them outside registered repositories under XDG directories.
+Never commit `.harness-runtime`.
 
-Extend from active component/CI claim registries. Do not create a feature-named workflow per Harness task; select existing credible commands/gates.
-
-### 15.7 Completion checklist handling
-
-- architect maps tasks to checklist rows when relevant;
-- worker handoff may recommend a maximum justified state;
-- verifier/controller validate evidence;
-- Harness may propose a checklist patch as a serial task only when the user objective includes it;
-- Harness never writes or changes a checklist state merely because its run reaches `COMPLETED`;
-- T5/T6/live/rollout requirements remain explicit proof limits.
-
-### 15.8 `.omx` and runtime state
-
-Existing `.omx` generated prompts/inboxes are disposable runtime state and not authority. Harness runtime belongs outside the repo by default under XDG directories. Do not commit `.harness-runtime` or duplicate orchestrator state into NeuralMatrix.
-
-### 15.9 Resource classes on the target workstation
-
-Recommended defaults for the known high-core Linux host:
+Resource classes are independent of role slots:
 
 ```text
-control:  short Git/index/schema/static commands; concurrency 4–8
-medium:   focused Rust/TypeScript tests/checks; concurrency 2–3
-heavy:    link/container/workspace builds; concurrency 1
-hardware: Jetson/fleet/device/live operation; exclusive/manual readiness
+control:  short Git, schema, and static commands
+medium:   focused language and contract checks
+heavy:    workspace builds and integrated test suites
+hardware: exclusive environment or device proof with explicit readiness
 ```
 
-Agent slots and resource slots are separate. Three Luna workers may think concurrently while only one heavy build runs.
+Multiple roles can reason concurrently while one heavy validator uses the build
+slot.
 
 ---
 
@@ -1599,7 +1804,8 @@ Use a `justfile` or `cargo xtask dev` to launch:
 - optional live pinned App Server smoke;
 - temporary SQLite/repo fixture.
 
-Do not use a real NeuralMatrix worktree for most harness unit/UI development.
+Do not use a registered production checkout for routine controller unit or UI
+development.
 
 ### 16.6 Browser/PWA vs Tauri
 
@@ -1677,6 +1883,11 @@ failed/preserved worktrees        no automatic removal
 pricing/profile/schema snapshots  permanent while referenced
 ```
 
+Run archival is a non-destructive terminal-state transition. Only completed,
+canceled, or failed runs may be archived; their manifests, usage, events, and
+preserved worktrees remain addressable. The ordinary run selector excludes
+archived runs unless the operator explicitly enables archived history.
+
 Retention cleanup is reference-aware and dry-run visible. Storage pressure may stop execution but must not silently delete active evidence.
 
 ### 17.5 Search
@@ -1719,6 +1930,10 @@ On startup:
 10. replay projections/SSE and resume scheduler only when safe.
 
 Never assume an in-flight task failed or succeeded solely because the daemon restarted.
+If an interrupted governor has a valid progressing checkpoint, preserve the old
+attempt and worktree, release its leases, and enqueue a bounded continuation
+automatically. The human must not have to repair an internal task state or
+restate the governor's next action after a daemon restart.
 
 ### 18.3 App Server crash
 
@@ -1820,7 +2035,7 @@ The correct build order is:
 7. usage/cost/budgets;
 8. bounded parallel scheduler;
 9. verifier/integrator/final audit;
-10. NeuralMatrix context/profile;
+10. strict repository context/profile;
 11. GitHub publication/recovery/packaging/pilots.
 
 Do not implement a swarm scheduler before a single task can be safely interrupted, recovered, diffed, verified, and costed.
@@ -1865,7 +2080,18 @@ pub enum ResultClass {
 
 pub enum SandboxMode { ReadOnly, WorkspaceWrite }
 pub enum ResourceClass { Control, Medium, Heavy, Hardware(String) }
-pub enum AgentRole { Architect, Explorer, Worker, Integrator, Verifier, FinalAuditor, CiTriage }
+pub enum AgentRole {
+    Architect,
+    PlanReviewer,
+    Explorer,
+    Governor,
+    Worker,
+    HighRiskWorker,
+    Integrator,
+    Verifier,
+    FinalAuditor,
+    CiTriage,
+}
 ```
 
 Use newtypes and closed enums for identifiers/results/states. Unknown protocol values belong in adapter types, not silently in domain enums.
@@ -1944,13 +2170,13 @@ The full matrix is in `docs/TEST_AND_ACCEPTANCE_PLAN.md`. Non-negotiable suites:
 9. fault injection at every state boundary;
 10. Fedora/Nobara and Ubuntu/Debian package smoke;
 11. live pinned App Server compatibility smoke;
-12. NeuralMatrix pilot ladder.
+12. repository pilot ladder.
 
 Release must fail if any fault path can produce false `VERIFIED`, `PUBLICATION_READY`, or `COMPLETED` state.
 
 ---
 
-## 22. NeuralMatrix pilot and rollout plan
+## 22. Repository pilot and rollout plan
 
 ### Pilot 0 — read-only architecture
 
@@ -1976,7 +2202,9 @@ Goal: direct Terra route, serial generated paths, consumer dependency order, no 
 
 ### Pilot 5 — heavy/hardware proof representation
 
-Goal: C2 container/Jetson lane selection and result semantics. Unavailable target remains non-green; live production action remains operator-controlled.
+Goal: environment-specific lane selection and honest result semantics.
+Unavailable targets remain non-green; live production actions remain
+operator-controlled.
 
 ### Pilot metrics
 
@@ -2021,21 +2249,21 @@ These omissions keep the system durable and usable rather than over-engineered.
 
 ## 24. Principal risks and mitigations
 
-| Risk | Mitigation |
-|---|---|
-| App Server protocol changes rapidly | pin version/schema, generated bindings, raw events, golden traces, fail closed |
-| child agents appear isolated but share workspace | top-level worktree per mutable task; children read-only by policy |
-| repository context is too large | authority router, exact repo map, bounded probe, fresh role-specific threads |
-| agent claims outrun proof | controller validation, exact SHA, independent verifier, proof-tier UI |
-| expensive Sol/Terra use | role routing, Luna bounded workers, cached stable context, per-task budgets |
-| subscription usage differs from API price | label API-equivalent estimate, store source snapshot/rate limits separately |
-| hidden process mutates after cancellation | process groups, reconciliation, lease held until safe |
-| primary repo damaged | coordination lock, no edits, managed worktrees, exact preflight |
-| parallel tasks conflict semantically | DAG + path/symbol/serial risk; bounded 3 workers; serial integration |
-| logs leak secrets | allowlist/redaction, local permissions, retention, sanitized export |
-| DB/event volume grows | compact projections, virtualized UI, artifact spill, reference-aware retention |
-| UI becomes overwhelming | list+inspector default, progressive disclosure, action-oriented status |
-| Harness becomes second NeuralMatrix authority | profile import only, explicit completion authority, no automatic checklist state |
+| Risk                                             | Mitigation                                                                       |
+| ------------------------------------------------ | -------------------------------------------------------------------------------- |
+| App Server protocol changes rapidly              | pin version/schema, generated bindings, raw events, golden traces, fail closed   |
+| child agents appear isolated but share workspace | top-level worktree per mutable task; children read-only by policy                |
+| repository context is too large                  | authority router, exact repo map, bounded probe, fresh role-specific threads     |
+| agent claims outrun proof                        | controller validation, exact SHA, independent verifier, proof-tier UI            |
+| expensive Sol/Terra use                          | role routing, Luna bounded workers, cached stable context, per-task budgets      |
+| subscription usage differs from API price        | label API-equivalent estimate, store source snapshot/rate limits separately      |
+| hidden process mutates after cancellation        | process groups, reconciliation, lease held until safe                            |
+| primary repo damaged                             | coordination lock, no edits, managed worktrees, exact preflight                  |
+| parallel tasks conflict semantically             | DAG + path/symbol/serial risk; bounded 3 workers; serial integration             |
+| logs leak secrets                                | allowlist/redaction, local permissions, retention, sanitized export              |
+| DB/event volume grows                            | compact projections, virtualized UI, artifact spill, reference-aware retention   |
+| UI becomes overwhelming                          | list+inspector default, progressive disclosure, action-oriented status           |
+| Harness becomes a second repository authority    | profile import only, explicit completion authority, no automatic checklist state |
 
 ---
 
@@ -2051,7 +2279,7 @@ The following decisions should be treated as fixed for v1 unless a concrete impl
 6. Deterministic controller owns state/Git/scheduling/evidence/publication.
 7. One controller-created top-level thread/worktree per mutable task attempt.
 8. Native subagents primarily read-only and counted against total capacity.
-9. Default NeuralMatrix capacity: three mutable, one verifier, six total threads.
+9. Default strict-profile capacity: three mutable, one verifier, six total threads.
 10. Sol architect/verifier/final audit; Luna bounded work; Terra risk/escalation/integration.
 11. Authority-first context and no vector DB in v1.
 12. REST + durable SSE; WebSocket only for explicit human terminal later.
@@ -2060,7 +2288,7 @@ The following decisions should be treated as fixed for v1 unless a concrete impl
 15. No raw hidden reasoning retention by default.
 16. No automatic push/PR; explicit user gate. Draft PR is maximum publication action in v1.
 17. No automatic merge.
-18. NeuralMatrix master checklist remains the only repository completion authority.
+18. The registered repository retains its declared completion authority.
 19. Missing infrastructure is never success.
 20. Release only after restart/fault/Git/security/cost/UI tests and the pilot ladder.
 
@@ -2081,7 +2309,7 @@ The architecture provides a closed procedure for selecting each.
 
 ## 26. Definition of done
 
-Harness Console v1 is done when all of the following are true:
+BILDR v1 is done when all of the following are true:
 
 ### Runtime
 
@@ -2091,7 +2319,7 @@ Harness Console v1 is done when all of the following are true:
 
 ### Repository custody
 
-- primary NeuralMatrix checkout remains clean/on-main;
+- primary coordination checkout remains clean on its declared branch;
 - every mutable attempt has an isolated worktree/branch/base/head/lease;
 - unexpected/serial/forbidden path changes block acceptance;
 - controller owns commits/integration/push/PR; no AI attribution;
@@ -2114,9 +2342,12 @@ Harness Console v1 is done when all of the following are true:
 
 ### UX
 
-- user sees current goal/action/model/effort/worktree/SHA/tokens/cost for every agent;
-- plan/diff/files/commands/evidence/usage/context tabs work;
-- approval center, steer, interrupt, retry, escalate, preserve, integration review work;
+- user sees the governor's latest update, active/idle posture, model/effort, token use, and meaningful activity without navigating tabs;
+- delegated child threads expose their status and latest message in the same pane, while steer/continue remain governor-routed;
+- governor completion reconciles active children, renders the task as `Waiting on you`, and prevents late item events from reopening terminal child state;
+- the run inspector exposes a live human-readable Git custody state, diff totals and changed paths, and only claims a single PR association when it is unambiguous;
+- approvals render inline in Runs; usage groups by account, repository, and agent;
+- repository discovery, governor selection, steer, interrupt, retry, and integration review work;
 - keyboard/accessibility/reconnect/large-log paths pass.
 
 ### Security/operations
@@ -2126,7 +2357,7 @@ Harness Console v1 is done when all of the following are true:
 - systemd install/upgrade/backup/doctor/runbook work on Fedora/Nobara and Ubuntu/Debian;
 - no automatic merge or production action path exists.
 
-### NeuralMatrix pilots
+### Repository pilots
 
 - Pilots 0–4 complete with evidence and no unresolved critical/high controller, Git, evidence, or security defect;
 - profile enforces active authority, no-fallback semantics, exact-head proof, and separate live/hardware state;
@@ -2149,13 +2380,13 @@ docs/IMPLEMENTATION_BACKLOG.md
 docs/OPERATIONS_RUNBOOK.md
 docs/TEST_AND_ACCEPTANCE_PLAN.md
 config/harness.example.toml
-profiles/neuralmatrix/profile.toml
-schemas/nm.orchestration.task.v1.schema.json
-schemas/nm.orchestration.handoff.v1.schema.json
+profiles/bildr/profile.toml
+schemas/harness.orchestration.task.v1.schema.json
+schemas/harness.orchestration.handoff.v1.schema.json
 schemas/harness.evidence.v1.schema.json
 migrations/0001_initial.sql
 openapi/harness-api.yaml
-codex/agents/*.toml
+runtime/roles/*.toml
 packaging/systemd/harnessd.service
 ```
 
@@ -2174,15 +2405,14 @@ The fastest responsible start is HC-001 through HC-007, producing one durable re
 - GPT-5.6 model catalog/guidance and current effective-dated model pricing.
 - OpenAI Codex source protocol definitions for token and collaborative-agent fields.
 
-### NeuralMatrix repository authority consulted
+### Repository authority consulted
 
-- `AGENTS.md`
-- `CODEX.md`
 - `README.md`
-- `docs/INDEX_FOR_AGENTS.md`
-- `docs/architecture/CANONICAL_INDEX.md`
-- `docs/architecture/ENGINEERING_GOVERNANCE_CONTRACT.md`
-- `docs/architecture/CI_TEST_ARCHITECTURE.md`
-- `docs/tasks/PRODUCTION_READINESS_ORCHESTRATION_PLAN_2026-07-19.md`
+- `CONTRIBUTING.md`
+- `ARCHITECTURE_AND_IMPLEMENTATION_PLAN.md`
+- `SECURITY.md`
+- `docs/TEST_AND_ACCEPTANCE_PLAN.md`
+- `docs/UI_WIREFRAMES.md`
 
-The repository profile must re-read these from the exact run base rather than assuming the August 5, 2026 snapshot remains current.
+The repository profile must read its declared authorities from the exact run
+base instead of assuming an earlier snapshot remains current.

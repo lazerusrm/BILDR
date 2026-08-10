@@ -1,0 +1,97 @@
+{
+  "schema": "harness.orchestration.task.v1",
+  "program_id": "bildr-signoff-20260810",
+  "task_id": "SIGNOFF-002",
+  "title": "Bind signoff approval to integrated evidence",
+  "state": "ready",
+  "priority": "P0",
+  "execution_mode": "agent",
+  "owner_profile": "worker",
+  "reviewer_profile": "verifier",
+  "checklist_rows": ["SIGNOFF-EVIDENCE-001"],
+  "authority_refs": [
+    "ARCHITECTURE_AND_IMPLEMENTATION_PLAN.md",
+    "docs/EXECUTION_SIGNOFF_ADVERSARIAL_REVIEW.md",
+    "openapi/harness-api.yaml"
+  ],
+  "base_sha": "4d6662ef0bb1f52ba40dc670830ff95e52ca1cbf",
+  "dependency_shas": {
+    "SIGNOFF-001": "5e21c91000000000000000000000000000000000"
+  },
+  "depends_on": ["SIGNOFF-001"],
+  "owned_paths": [
+    "crates/harness-orchestrator/src/lib.rs",
+    "crates/harness-api/src/lib.rs",
+    "openapi/harness-api.yaml"
+  ],
+  "forbidden_paths": [
+    ".harness-runtime/**",
+    "generated/**",
+    "ui/dist/**"
+  ],
+  "reserved_serial_paths": [],
+  "objective": "Require signoff decisions to match the current integrated SHA and deterministic signoff packet digest.",
+  "milestones": [
+    {
+      "id": "inspect",
+      "title": "Trace the authoritative signoff path",
+      "objective": "Identify every transition that can publish or complete a run.",
+      "success_criteria": ["The controller-owned transition path is explicit."]
+    },
+    {
+      "id": "implement",
+      "title": "Enforce evidence-bound decisions",
+      "objective": "Reject stale SHA, stale packet, and unproved acceptance claims.",
+      "success_criteria": ["Only the current proved integration candidate can advance."]
+    },
+    {
+      "id": "prove",
+      "title": "Exercise accepted and rejected shapes",
+      "objective": "Run focused state and request validation tests.",
+      "success_criteria": ["Valid approval passes and stale or incomplete requests fail."]
+    }
+  ],
+  "non_goals": [
+    "Do not add automatic merge behavior.",
+    "Do not replace behavioral validators with review prose."
+  ],
+  "success_criteria": [
+    "Approval checks both the integration SHA and packet digest.",
+    "Missing platform acceptance prevents publication.",
+    "Human rejection routes a file-scoped blocker into remediation."
+  ],
+  "required_positive_tests": [
+    "current SHA and packet with complete proof advances to publication readiness"
+  ],
+  "required_negative_tests": [
+    "stale integration SHA is rejected",
+    "stale packet digest is rejected",
+    "unproved acceptance is rejected"
+  ],
+  "required_metrics": [],
+  "required_evidence": [
+    "focused state-transition test output bound to the task commit SHA",
+    "controller validation records for the integrated head",
+    "independent verifier verdict"
+  ],
+  "proof_limits": [
+    "Local tests do not establish hosted CI or device behavior."
+  ],
+  "diff_budget": {
+    "files": 6,
+    "lines": 800
+  },
+  "token_budget": 80000,
+  "tool_budget": 80,
+  "lease_expires_at": "2026-08-11T00:30:00Z",
+  "stop_conditions": [
+    "The signoff state machine is not authoritative.",
+    "The repair requires an unowned path.",
+    "A required proof source cannot bind to the integrated SHA."
+  ],
+  "handoff_path": "coordination/handoffs/SIGNOFF-002.json",
+  "risk_flags": [
+    "canonical_contract",
+    "authorization"
+  ]
+}

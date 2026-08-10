@@ -1,0 +1,171 @@
+schema_version = 1
+profile_id = "bildr"
+display_name = "BILDR"
+repository = "lazerusrm/BILDR"
+default_branch = "main"
+base_ref = "origin/main"
+completion_authority = "Exact-head validation, signoff packet, and human approval"
+
+instruction_sources = [
+  "CONTRIBUTING.md",
+  "ARCHITECTURE_AND_IMPLEMENTATION_PLAN.md",
+  "docs/STYLE_GUIDE.md",
+]
+
+required_global_authorities = [
+  "ARCHITECTURE_AND_IMPLEMENTATION_PLAN.md",
+  "CONTRIBUTING.md",
+  "SECURITY.md",
+]
+
+protected_semantics = [
+  "Keep the service bound to localhost",
+  "Bind evidence, review, and publication to the exact candidate SHA",
+  "Keep mutable work isolated by task and worktree lease",
+  "Require explicit approval for external writes",
+  "Never merge automatically",
+  "Treat missing, stale, or inconclusive proof as unsatisfied",
+]
+
+serial_paths = [
+  "Cargo.lock",
+  "ui/package-lock.json",
+  "migrations/**",
+  "generated/**",
+  "schemas/**",
+  "openapi/**",
+  ".github/workflows/**",
+]
+
+forbidden_generated_runtime_paths = [
+  ".harness-runtime/**",
+  ".omx/**",
+]
+
+[concurrency]
+max_total_agent_threads = 6
+max_mutable_tasks = 3
+max_independent_verifiers = 1
+final_integration_mutable_tasks = 1
+live_certification_mutable_tasks = 1
+
+[models.architect]
+model = "gpt-5.6-sol"
+reasoning_effort = "xhigh"
+sandbox = "read-only"
+
+[models.governor]
+model = "gpt-5.6-sol"
+reasoning_effort = "xhigh"
+sandbox = "workspace-write"
+
+[models.explorer]
+model = "gpt-5.6-luna"
+reasoning_effort = "medium"
+sandbox = "read-only"
+
+[models.worker]
+model = "gpt-5.6-luna"
+reasoning_effort = "max"
+sandbox = "workspace-write"
+
+[models.worker_escalation]
+model = "gpt-5.6-terra"
+reasoning_effort = "xhigh"
+sandbox = "workspace-write"
+
+[models.integrator]
+model = "gpt-5.6-terra"
+reasoning_effort = "xhigh"
+sandbox = "workspace-write"
+
+[models.verifier]
+model = "gpt-5.6-sol"
+reasoning_effort = "xhigh"
+sandbox = "read-only"
+
+[models.final_auditor]
+model = "gpt-5.6-sol"
+reasoning_effort = "max"
+sandbox = "read-only"
+
+[[domains]]
+id = "controller"
+globs = ["crates/**", "bins/**", "migrations/**"]
+authority_hints = ["ARCHITECTURE_AND_IMPLEMENTATION_PLAN.md", "SECURITY.md"]
+
+[[domains]]
+id = "browser"
+globs = ["ui/**", "docs/UI_WIREFRAMES.md"]
+authority_hints = ["docs/UI_WIREFRAMES.md", "docs/TEST_AND_ACCEPTANCE_PLAN.md"]
+
+[[domains]]
+id = "contracts"
+globs = ["schemas/**", "openapi/**", "generated/**", "config/**", "profiles/**"]
+authority_hints = ["ARCHITECTURE_AND_IMPLEMENTATION_PLAN.md", "docs/APP_SERVER_EVENT_MAPPING.md"]
+
+[[domains]]
+id = "delivery"
+globs = [".github/**", "packaging/**", "xtask/**"]
+authority_hints = ["CONTRIBUTING.md", "docs/OPERATIONS_RUNBOOK.md"]
+
+# Run behavioral checks only on the integrated head. Review provisional task
+# shapes semantically before creating regression coverage around them.
+[validation_policy]
+review_ready = false
+integration = true
+require_behavioral_integration = true
+behavioral_required_globs = [
+  "bins/**/*.rs",
+  "crates/**/*.rs",
+  "migrations/**",
+  "ui/src/**",
+  "ui/tests/**",
+  "xtask/**/*.rs",
+]
+require_human_signoff = true
+require_draft_pr_ci = true
+
+[[validators]]
+id = "git-diff-check"
+command = ["bash", "-lc", "git diff --check \"$HARNESS_BASE_SHA..$HARNESS_SOURCE_SHA\" --"]
+proof_tier = "T0"
+resource_class = "control"
+gates = ["integration"]
+evidence_class = "custody"
+
+[[validators]]
+id = "rust-workspace"
+command = ["cargo", "test", "--workspace", "--all-targets"]
+proof_tier = "T2"
+resource_class = "heavy"
+path_globs = ["bins/**/*.rs", "crates/**/*.rs", "migrations/**", "xtask/**/*.rs", "Cargo.toml", "Cargo.lock"]
+gates = ["integration"]
+evidence_class = "behavioral"
+
+[[validators]]
+id = "browser-application"
+command = ["bash", "-lc", "npm --prefix ui run typecheck && npm --prefix ui test && npm --prefix ui run build"]
+proof_tier = "T2"
+resource_class = "heavy"
+path_globs = ["ui/**"]
+gates = ["integration"]
+evidence_class = "behavioral"
+
+[[validators]]
+id = "public-contracts"
+command = ["bash", "-lc", "cargo xtask schema-check && cargo xtask openapi-check && cargo xtask app-server-bindings-check"]
+proof_tier = "T1"
+resource_class = "medium"
+path_globs = ["schemas/**", "examples/**", "openapi/**", "generated/**", "config/**", "profiles/**", "crates/harness-api/**", "xtask/**"]
+gates = ["integration"]
+evidence_class = "contract"
+
+[[acceptance]]
+id = "browser-workspace"
+kind = "automated"
+command = ["npm", "--prefix", "ui", "run", "test:e2e"]
+instructions = "Exercise the operator workflow in a browser against the exact integrated head."
+proof_tier = "T3"
+resource_class = "heavy"
+path_globs = ["ui/**"]

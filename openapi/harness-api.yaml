@@ -1,9 +1,9 @@
 openapi: 3.1.0
 info:
-  title: Harness Console Local API
+  title: BILDR local API
   version: 1.0.0-draft
   description: >-
-    Localhost-only API for the Harness Console UI and harnessctl. This contract
+    Localhost-only API for the BILDR UI and harnessctl. This contract
     does not expose Codex App Server directly; harnessd projects it into durable
     repository/run/task/agent/evidence resources.
 servers:
@@ -54,6 +54,111 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/RuntimeStatus'}
+  /codex/accounts:
+    get:
+      tags: [Runtime]
+      operationId: listCodexAccounts
+      responses:
+        '200':
+          description: Detected local Codex homes and live telemetry for the selected account.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodexAccountsSnapshot'}
+  /codex/accounts/{accountId}/select:
+    post:
+      tags: [Runtime]
+      operationId: selectCodexAccount
+      parameters:
+        - {$ref: '#/components/parameters/AccountId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      responses:
+        '200':
+          description: Selected account and refreshed live telemetry.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodexAccountsSnapshot'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /codex/accounts/login:
+    post:
+      tags: [Runtime]
+      operationId: startCodexAccountLogin
+      parameters:
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/StartCodexAccountLoginRequest'}
+      responses:
+        '200':
+          description: Device authorization instructions from the installed Codex binary.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodexAccountLoginStatus'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /codex/accounts/login/{loginId}:
+    get:
+      tags: [Runtime]
+      operationId: getCodexAccountLoginStatus
+      parameters:
+        - name: loginId
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: Current device authorization state.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodexAccountLoginStatus'}
+  /codex/accounts/login/{loginId}/cancel:
+    post:
+      tags: [Runtime]
+      operationId: cancelCodexAccountLogin
+      parameters:
+        - name: loginId
+          in: path
+          required: true
+          schema: {type: string}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      responses:
+        '200':
+          description: Device authorization cancellation requested.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodexAccountLoginStatus'}
+  /codex/accounts/{accountId}/rename:
+    post:
+      tags: [Runtime]
+      operationId: renameCodexAccount
+      parameters:
+        - {$ref: '#/components/parameters/AccountId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RenameCodexAccountRequest'}
+      responses:
+        '200':
+          description: Account friendly name updated.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodexAccountsSnapshot'}
+  /codex/accounts/{accountId}/remove:
+    post:
+      tags: [Runtime]
+      operationId: removeCodexAccount
+      parameters:
+        - {$ref: '#/components/parameters/AccountId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      responses:
+        '200':
+          description: Harness-managed account credentials removed.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CodexAccountsSnapshot'}
+        '409': {$ref: '#/components/responses/Conflict'}
   /repositories:
     get:
       tags: [Repositories]
@@ -84,6 +189,18 @@ paths:
               schema: {$ref: '#/components/schemas/Repository'}
         '409': {$ref: '#/components/responses/Conflict'}
         '422': {$ref: '#/components/responses/ValidationError'}
+  /repositories/discover:
+    get:
+      tags: [Repositories]
+      operationId: discoverRepositories
+      responses:
+        '200':
+          description: Bounded local Git checkout discovery results.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/RepositoryDiscovery'}
   /repositories/{repositoryId}:
     get:
       tags: [Repositories]
@@ -97,6 +214,32 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Repository'}
         '404': {$ref: '#/components/responses/NotFound'}
+  /settings:
+    get:
+      tags: [Runtime]
+      operationId: getOperatorSettings
+      responses:
+        '200':
+          description: Effective local operator settings.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperatorSettings'}
+    post:
+      tags: [Runtime]
+      operationId: updateOperatorSettings
+      parameters:
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/UpdateOperatorSettingsRequest'}
+      responses:
+        '200':
+          description: Updated effective local operator settings.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperatorSettings'}
   /repositories/{repositoryId}/inspect:
     post:
       tags: [Repositories]
@@ -110,6 +253,27 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/OperationAccepted'}
+  /repositories/{repositoryId}/prepare-clean-checkout:
+    post:
+      tags: [Repositories]
+      operationId: prepareCoordinationCheckout
+      description: Create and verify a clean coordination checkout, then replace an unused blocked registration without changing the source checkout.
+      parameters:
+        - {$ref: '#/components/parameters/RepositoryId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PrepareCoordinationCheckoutRequest'}
+      responses:
+        '200':
+          description: Registration updated to the verified clean checkout.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Repository'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
   /runs:
     get:
       tags: [Runs]
@@ -196,9 +360,43 @@ paths:
               properties:
                 task_graph_digest: {type: string}
                 note: {type: string, maxLength: 4000}
+                allow_budget_override:
+                  type: boolean
+                  default: false
+                  description: Explicit local-user override when the remaining run ceiling is below the controller execution reserve.
       responses:
         '202':
           description: Scheduling enabled for approved graph.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /runs/{runId}/plan/request_changes:
+    post:
+      tags: [Runs]
+      operationId: requestPlanChanges
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [task_graph_digest, findings]
+              properties:
+                task_graph_digest: {type: string}
+                summary: {type: string, maxLength: 4000}
+                findings:
+                  type: array
+                  minItems: 1
+                  maxItems: 20
+                  items: {$ref: '#/components/schemas/PlanReviewFinding'}
+      responses:
+        '202':
+          description: Human findings entered the durable revision loop and a replacement plan was queued.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/OperationAccepted'}
@@ -223,9 +421,22 @@ paths:
       parameters:
         - {$ref: '#/components/parameters/RunId'}
         - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                additional_token_budget:
+                  type: integer
+                  minimum: 0
+                  maximum: 100000000
+                  description: Optional governor allowance for the resumed window; zero uses the adaptive recommendation. Bounded child-thread headroom is reserved separately.
       responses:
         '202':
-          description: Scheduler resumed and ready tasks dispatched.
+          description: Scheduler resumed and ready tasks dispatched. If the run budget was exhausted, the selected or adaptive governor allowance plus bounded child-thread headroom is added first.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Run'}
@@ -254,6 +465,20 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Run'}
+  /runs/{runId}/archive:
+    post:
+      tags: [Runs]
+      operationId: archiveRun
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      responses:
+        '200':
+          description: Terminal run archived; durable history and worktrees remain preserved.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Run'}
+        '409': {$ref: '#/components/responses/Conflict'}
   /runs/{runId}/approve-integration:
     post:
       tags: [Runs]
@@ -275,6 +500,94 @@ paths:
       responses:
         '202':
           description: Integration validation/final audit queued.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /runs/{runId}/signoff/approve:
+    post:
+      tags: [Runs]
+      operationId: approveExecutionSignoff
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expected_head_sha, expected_packet_digest]
+              properties:
+                expected_head_sha: {$ref: '#/components/schemas/GitSha'}
+                expected_packet_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+                note: {type: string, maxLength: 4000}
+      responses:
+        '202':
+          description: Human signoff bound to the exact integration SHA and packet accepted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /runs/{runId}/signoff/request_changes:
+    post:
+      tags: [Runs]
+      operationId: requestExecutionSignoffChanges
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expected_head_sha, expected_packet_digest, summary, findings]
+              properties:
+                expected_head_sha: {$ref: '#/components/schemas/GitSha'}
+                expected_packet_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+                summary: {type: string, minLength: 1, maxLength: 4000}
+                findings:
+                  type: array
+                  minItems: 1
+                  maxItems: 20
+                  items: {$ref: '#/components/schemas/PlanReviewFinding'}
+      responses:
+        '202':
+          description: Findings mapped to owned tasks and a fresh integration repair cycle queued.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /runs/{runId}/signoff/acceptance/{acceptanceId}/attest:
+    post:
+      tags: [Runs]
+      operationId: attestPlatformAcceptance
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+        - name: acceptanceId
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expected_head_sha, expected_packet_digest, target_identity, observations]
+              properties:
+                expected_head_sha: {$ref: '#/components/schemas/GitSha'}
+                expected_packet_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+                target_identity: {type: string, minLength: 2, maxLength: 500}
+                observations: {type: string, minLength: 8, maxLength: 4000}
+      responses:
+        '202':
+          description: Signed local-user acceptance evidence recorded against the exact integration SHA.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/OperationAccepted'}
@@ -301,6 +614,20 @@ paths:
       responses:
         '202':
           description: Explicit external publication operation accepted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /runs/{runId}/draft-pr/refresh-ci:
+    post:
+      tags: [Runs]
+      operationId: refreshDraftPrCi
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      responses:
+        '202':
+          description: Required draft-PR checks refreshed; passing exact-head checks promote tasks through CI_PROVEN.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/OperationAccepted'}
@@ -352,7 +679,7 @@ paths:
                 revised_objective: {type: string, maxLength: 4000}
                 model_route:
                   enum: [same, escalate_terra]
-                additional_token_budget: {type: integer, minimum: 0}
+                additional_token_budget: {type: integer, minimum: 0, maximum: 100000000}
       responses:
         '202':
           description: New immutable attempt created.
@@ -543,6 +870,18 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Worktree'}
+  /worktrees/{worktreeId}/diff:
+    get:
+      tags: [Worktrees]
+      operationId: getWorktreeDiffSummary
+      parameters:
+        - {$ref: '#/components/parameters/WorktreeId'}
+      responses:
+        '200':
+          description: Live Git state and bounded changed-file summary for a managed worktree.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WorktreeDiffSummary'}
   /runs/{runId}/evidence:
     get:
       tags: [Evidence]
@@ -589,6 +928,16 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/UsageSummary'}
+  /usage:
+    get:
+      tags: [Usage]
+      operationId: getUsageBreakdown
+      responses:
+        '200':
+          description: Usage grouped by Codex account, repository, and agent.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UsageBreakdown'}
   /events:
     get:
       tags: [Events]
@@ -651,6 +1000,11 @@ components:
       schema: {type: string}
     WorktreeId:
       name: worktreeId
+      in: path
+      required: true
+      schema: {type: string}
+    AccountId:
+      name: accountId
       in: path
       required: true
       schema: {type: string}
@@ -730,6 +1084,79 @@ components:
         active_verifiers: {type: integer}
         max_verifiers: {type: integer}
         queued_tasks: {type: integer}
+    CodexAccountsSnapshot:
+      type: object
+      additionalProperties: false
+      required: [selected_account_id, accounts]
+      properties:
+        selected_account_id: {type: [string, 'null']}
+        accounts:
+          type: array
+          items: {$ref: '#/components/schemas/CodexAccountProfile'}
+    CodexAccountProfile:
+      type: object
+      additionalProperties: false
+      required: [id, label, codex_home, selected, state, account_type, email, plan_type, rate_limits, observed_at, detail, managed]
+      properties:
+        id: {type: string}
+        label: {type: string}
+        codex_home: {type: string}
+        selected: {type: boolean}
+        state: {enum: [detected, ready, signed_out, unavailable]}
+        account_type: {type: [string, 'null']}
+        email: {type: [string, 'null']}
+        plan_type: {type: [string, 'null']}
+        rate_limits:
+          type: array
+          items: {$ref: '#/components/schemas/CodexRateLimit'}
+        observed_at: {type: [integer, 'null']}
+        detail: {type: [string, 'null']}
+        managed: {type: boolean}
+    StartCodexAccountLoginRequest:
+      type: object
+      additionalProperties: false
+      required: [label]
+      properties:
+        label: {type: string, minLength: 1, maxLength: 60}
+        account_id: {type: [string, 'null']}
+    RenameCodexAccountRequest:
+      type: object
+      additionalProperties: false
+      required: [label]
+      properties:
+        label: {type: string, minLength: 1, maxLength: 60}
+    CodexAccountLoginStatus:
+      type: object
+      additionalProperties: false
+      required: [id, label, state, verification_url, user_code, detail]
+      properties:
+        id: {type: string}
+        label: {type: string}
+        state: {enum: [waiting_for_user, completed, failed, canceling, canceled]}
+        verification_url: {type: [string, 'null'], format: uri}
+        user_code: {type: [string, 'null']}
+        detail: {type: [string, 'null']}
+    CodexRateLimit:
+      type: object
+      additionalProperties: false
+      required: [limit_id, limit_name, plan_type, windows]
+      properties:
+        limit_id: {type: string}
+        limit_name: {type: [string, 'null']}
+        plan_type: {type: [string, 'null']}
+        windows:
+          type: array
+          items: {$ref: '#/components/schemas/CodexRateLimitWindow'}
+    CodexRateLimitWindow:
+      type: object
+      additionalProperties: false
+      required: [kind, used_percent, remaining_percent, window_duration_mins, resets_at]
+      properties:
+        kind: {enum: [primary, secondary]}
+        used_percent: {type: integer, minimum: 0, maximum: 100}
+        remaining_percent: {type: integer, minimum: 0, maximum: 100}
+        window_duration_mins: {type: [integer, 'null'], minimum: 0}
+        resets_at: {type: [integer, 'null']}
     RegisterRepositoryRequest:
       type: object
       additionalProperties: false
@@ -738,6 +1165,57 @@ components:
         profile_id: {type: string}
         root_path: {type: string}
         expected_origin: {type: string}
+    PrepareCoordinationCheckoutRequest:
+      type: object
+      additionalProperties: false
+      required: [destination_path]
+      properties:
+        destination_path:
+          type: string
+          description: Absolute path for a new directory that does not already exist.
+    RepositoryDiscovery:
+      type: object
+      additionalProperties: false
+      required: [root_path, display_name, is_github, compatible, registered]
+      properties:
+        root_path: {type: string}
+        display_name: {type: string}
+        origin_url: {type: string}
+        is_github: {type: boolean}
+        compatible: {type: boolean}
+        registered: {type: boolean}
+    OperatorSettings:
+      type: object
+      additionalProperties: false
+      required: [store_reasoning_summaries, store_raw_reasoning, yolo_mode, allow_automatic_external_writes, automatic_external_writes_locked, automatic_account_handoff, adaptive_governor_budgets, automatic_governor_continuation, automatic_plan_approval, governor_goal_token_budget, governor_attempt_token_ceiling, recommended_governor_attempt_tokens, governor_budget_sample_count, governor_budget_reason]
+      properties:
+        store_reasoning_summaries: {type: boolean}
+        store_raw_reasoning: {type: boolean}
+        yolo_mode: {type: boolean}
+        allow_automatic_external_writes: {type: boolean}
+        automatic_external_writes_locked: {type: boolean}
+        automatic_account_handoff: {type: boolean}
+        adaptive_governor_budgets: {type: boolean}
+        automatic_governor_continuation: {type: boolean}
+        automatic_plan_approval: {type: boolean}
+        governor_goal_token_budget: {type: integer, minimum: 500000, maximum: 1000000000}
+        governor_attempt_token_ceiling: {type: integer, minimum: 400000, maximum: 100000000}
+        recommended_governor_attempt_tokens: {type: integer, minimum: 400000}
+        governor_budget_sample_count: {type: integer, minimum: 0}
+        governor_budget_reason: {type: string}
+    UpdateOperatorSettingsRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        store_reasoning_summaries: {type: boolean}
+        store_raw_reasoning: {type: boolean}
+        yolo_mode: {type: boolean}
+        automatic_account_handoff: {type: boolean}
+        adaptive_governor_budgets: {type: boolean}
+        automatic_governor_continuation: {type: boolean}
+        automatic_plan_approval: {type: boolean}
+        governor_goal_token_budget: {type: integer, minimum: 500000, maximum: 1000000000}
+        governor_attempt_token_ceiling: {type: integer, minimum: 400000, maximum: 100000000}
     Repository:
       type: object
       additionalProperties: false
@@ -761,7 +1239,7 @@ components:
     CreateRunRequest:
       type: object
       additionalProperties: false
-      required: [repository_id, objective, base_ref, mode]
+      required: [repository_id, objective, mode]
       properties:
         repository_id: {type: string}
         objective: {type: string, minLength: 1, maxLength: 50000}
@@ -769,7 +1247,11 @@ components:
         base_ref: {type: string, default: origin/main}
         mode: {enum: [plan_only, plan_and_implement]}
         publication: {enum: [local_only, draft_pr_after_approval], default: local_only}
-        run_token_budget: {type: integer, minimum: 1000}
+        run_token_budget: {type: integer, minimum: 500000, maximum: 1000000000}
+        governor_model: {enum: [gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna]}
+        governor_reasoning_effort: {enum: [low, medium, high, xhigh, max]}
+        automatic_plan_approval: {type: boolean, default: false}
+        codex_account_id: {type: [string, 'null']}
     Run:
       type: object
       additionalProperties: false
@@ -792,12 +1274,128 @@ components:
         started_at: {type: string, format: date-time}
         completed_at: {type: string, format: date-time}
         scheduler_paused: {type: boolean}
-        run_token_budget: {type: integer, minimum: 1000}
+        run_token_budget: {type: integer, minimum: 500000, maximum: 1000000000}
         version: {type: integer}
+    PlanReviewFinding:
+      type: object
+      additionalProperties: false
+      required: [severity, file, line, description, required_correction]
+      properties:
+        severity: {enum: [blocking, advisory]}
+        file: {type: [string, 'null']}
+        line: {type: [integer, 'null']}
+        description: {type: string, minLength: 1, maxLength: 8000}
+        required_correction: {type: string, minLength: 1, maxLength: 8000}
+    PlanReviewEvidence:
+      type: object
+      additionalProperties: false
+      required: [inspected_files, critical_path, failure_modes]
+      properties:
+        inspected_files: {type: array, minItems: 1, items: {type: string}}
+        critical_path:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            additionalProperties: false
+            required: [task_id, why_critical, behavioral_proof]
+            properties:
+              task_id: {type: string}
+              why_critical: {type: string}
+              behavioral_proof: {type: string}
+        failure_modes:
+          type: array
+          minItems: 1
+          maxItems: 3
+          items:
+            type: object
+            additionalProperties: false
+            required: [failure_mode, mitigation]
+            properties:
+              failure_mode: {type: string}
+              mitigation: {type: string}
+    PlanCertificate:
+      type: object
+      additionalProperties: false
+      required: [schema, run_id, revision, plan_digest, base_sha, profile_digest, authority_digest, reviewer_agent_id, reviewer, summary, evidence, advisory_findings, budget, risk, automatic_approval_eligible, automatic_approval_blockers, certified_at]
+      properties:
+        schema: {const: harness.plan-certificate.v2}
+        run_id: {type: string}
+        revision: {type: integer}
+        plan_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+        base_sha: {$ref: '#/components/schemas/GitSha'}
+        profile_digest: {type: string}
+        authority_digest: {type: string}
+        reviewer_agent_id: {type: string}
+        reviewer: {type: object}
+        summary: {type: string}
+        evidence: {$ref: '#/components/schemas/PlanReviewEvidence'}
+        advisory_findings: {type: array, items: {$ref: '#/components/schemas/PlanReviewFinding'}}
+        budget: {type: object}
+        risk: {type: object}
+        automatic_approval_eligible: {type: boolean}
+        automatic_approval_blockers: {type: array, items: {type: string}}
+        certified_at: {type: string, format: date-time}
+    PlanReviewRecord:
+      type: object
+      additionalProperties: false
+      required: [revision, plan_digest, source, verdict, summary, findings, blocking_count, recorded_at]
+      properties:
+        revision: {type: integer}
+        plan_digest: {type: string}
+        source: {enum: [agent, human]}
+        reviewer_agent_id: {type: [string, 'null']}
+        verdict: {enum: [accept, changes_requested]}
+        summary: {type: string}
+        findings: {type: array, items: {$ref: '#/components/schemas/PlanReviewFinding'}}
+        evidence:
+          anyOf:
+            - {$ref: '#/components/schemas/PlanReviewEvidence'}
+            - {type: 'null'}
+        blocking_fingerprint: {type: [string, 'null']}
+        blocking_count: {type: integer}
+        recorded_at: {type: string, format: date-time}
+    SignoffPacket:
+      type: object
+      additionalProperties: false
+      required: [schema, packet_digest, run_id, objective, plan_digest, plan_revision, plan_review_history, integration_sha, profile_digest, authority_digest, task_reviews, integration_validation, acceptance, exact_head_evidence, unproved_claims, total_tokens_used]
+      properties:
+        schema: {const: harness-signoff-packet/v1}
+        packet_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+        run_id: {type: string}
+        objective: {type: string}
+        plan_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+        plan_revision: {type: integer}
+        plan_review_history: {type: array, items: {$ref: '#/components/schemas/PlanReviewRecord'}}
+        integration_sha: {$ref: '#/components/schemas/GitSha'}
+        profile_digest: {type: string}
+        authority_digest: {type: string}
+        task_reviews: {type: array, items: {type: object}}
+        integration_validation: {type: object}
+        acceptance:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [id, kind, required, status, instructions, proof_tier]
+            properties:
+              id: {type: string}
+              kind: {enum: [automated, attested]}
+              required: {type: boolean}
+              status: {enum: [not_selected, passed, failed, pending_attestation, attested]}
+              instructions: {type: string}
+              proof_tier: {type: string}
+              result: {type: [object, 'null']}
+              attestation: {type: [object, 'null']}
+        exact_head_evidence: {type: array, items: {type: object}}
+        unproved_claims: {type: array, items: {type: string}}
+        total_tokens_used: {type: integer}
+        final_audit: {type: [object, 'null']}
+        human_decision: {type: [object, 'null']}
     RunDetail:
       type: object
       additionalProperties: false
-      required: [run, tasks, agents, worktrees, approvals]
+      required: [run, tasks, agents, worktrees, approvals, plan_review_history, planning_tokens_used, signoff_packet, draft_pr_ci, automatic_plan_approval]
       properties:
         run: {$ref: '#/components/schemas/Run'}
         tasks: {type: array, items: {$ref: '#/components/schemas/Task'}}
@@ -806,6 +1404,19 @@ components:
         approvals: {type: array, items: {$ref: '#/components/schemas/Approval'}}
         plan: {type: object}
         plan_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+        plan_certificate:
+          anyOf:
+            - {$ref: '#/components/schemas/PlanCertificate'}
+            - {type: 'null'}
+        plan_review_history: {type: array, items: {$ref: '#/components/schemas/PlanReviewRecord'}}
+        planning_tokens_used: {type: integer}
+        signoff_packet:
+          anyOf:
+            - {$ref: '#/components/schemas/SignoffPacket'}
+            - {type: 'null'}
+        draft_pr_ci: {type: [object, 'null']}
+        automatic_plan_approval: {type: boolean}
+        preferred_codex_account_id: {type: [string, 'null']}
     RunPage:
       type: object
       additionalProperties: false
@@ -851,6 +1462,7 @@ components:
       required: [id, role, state, requested_model, requested_reasoning_effort, cwd]
       properties:
         id: {type: string}
+        codex_account_id: {type: [string, 'null']}
         parent_agent_id: {type: string}
         task_id: {type: string}
         role: {type: string}
@@ -871,6 +1483,9 @@ components:
         heartbeat_at: {type: string, format: date-time}
         thread_id: {type: string}
         active_turn_id: {type: string}
+        context_strategy: {type: string, enum: [fresh_independent, bounded_handoff]}
+        context_source_attempt_id: {type: string}
+        context_reuse_reason: {type: string}
         version: {type: integer}
     AgentDetail:
       allOf:
@@ -895,6 +1510,14 @@ components:
           type: array
           items: {$ref: '#/components/schemas/ActivityItem'}
         next_cursor: {type: integer}
+        latest_message:
+          anyOf:
+            - {$ref: '#/components/schemas/LatestAgentMessage'}
+            - {type: 'null'}
+        messages:
+          type: array
+          description: Up to 100 recent completed agent messages in chronological order.
+          items: {$ref: '#/components/schemas/LatestAgentMessage'}
     ActivityItem:
       type: object
       additionalProperties: false
@@ -906,6 +1529,15 @@ components:
         state: {type: string}
         summary: {type: string}
         payload: {type: object}
+        occurred_at: {type: string, format: date-time}
+    LatestAgentMessage:
+      type: object
+      additionalProperties: false
+      required: [id, text, occurred_at]
+      properties:
+        id: {type: string}
+        text: {type: string}
+        phase: {type: string}
         occurred_at: {type: string, format: date-time}
     Approval:
       type: object
@@ -946,6 +1578,23 @@ components:
         additions: {type: integer}
         deletions: {type: integer}
         version: {type: integer}
+    WorktreeDiffSummary:
+      type: object
+      additionalProperties: false
+      required: [worktree_id, state, dirty, head_changed, files_changed, additions, deletions, changed_paths, changed_paths_truncated]
+      properties:
+        worktree_id: {type: string}
+        state: {enum: [clean, uncommitted, committed, committed_and_uncommitted]}
+        dirty: {type: boolean}
+        head_changed: {type: boolean}
+        files_changed: {type: integer}
+        additions: {type: integer}
+        deletions: {type: integer}
+        changed_paths:
+          type: array
+          maxItems: 200
+          items: {type: string}
+        changed_paths_truncated: {type: boolean}
     Finding:
       type: object
       additionalProperties: false
@@ -1027,6 +1676,26 @@ components:
         reasoning_output_tokens: {type: integer}
         total_tokens: {type: integer}
         model_context_window: {type: integer}
+    UsageBreakdown:
+      type: object
+      additionalProperties: false
+      required: [total, by_account, by_repository, by_agent]
+      properties:
+        total: {$ref: '#/components/schemas/UsageSummary'}
+        by_account: {type: array, items: {$ref: '#/components/schemas/UsageGroup'} }
+        by_repository: {type: array, items: {$ref: '#/components/schemas/UsageGroup'} }
+        by_agent: {type: array, items: {$ref: '#/components/schemas/UsageGroup'} }
+    UsageGroup:
+      type: object
+      additionalProperties: false
+      required: [id, label, detail, turns, usage, cost]
+      properties:
+        id: {type: string}
+        label: {type: string}
+        detail: {type: string}
+        turns: {type: integer, minimum: 0}
+        usage: {$ref: '#/components/schemas/TokenUsage'}
+        cost: {$ref: '#/components/schemas/CostEstimate'}
     CostEstimate:
       type: object
       additionalProperties: false

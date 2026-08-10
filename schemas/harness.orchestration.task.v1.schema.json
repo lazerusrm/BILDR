@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:bildr:harness.orchestration.task.v1",
+  "title": "Repository orchestration task",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "program_id", "task_id", "title", "state", "priority",
+    "execution_mode", "owner_profile", "reviewer_profile", "checklist_rows",
+    "authority_refs", "base_sha", "depends_on", "owned_paths",
+    "forbidden_paths", "reserved_serial_paths", "objective", "milestones", "non_goals",
+    "success_criteria", "required_positive_tests", "required_negative_tests",
+    "required_metrics", "required_evidence", "proof_limits", "diff_budget",
+    "token_budget", "lease_expires_at", "stop_conditions", "handoff_path"
+  ],
+  "properties": {
+    "schema": { "const": "harness.orchestration.task.v1" },
+    "program_id": { "$ref": "#/$defs/id" },
+    "task_id": { "$ref": "#/$defs/id" },
+    "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "state": {
+      "enum": [
+        "proposed", "ready", "leased", "implementing", "review_ready",
+        "changes_requested", "verified", "integrated", "ci_proven",
+        "live_proven", "closed", "blocked", "needs_help", "stalled",
+        "superseded", "canceled"
+      ]
+    },
+    "priority": { "enum": ["P0", "P1", "P2", "P3"] },
+    "execution_mode": { "enum": ["controller", "agent", "subagent_required", "manual_operator"] },
+    "owner_profile": { "$ref": "#/$defs/id" },
+    "reviewer_profile": { "$ref": "#/$defs/id" },
+    "checklist_rows": { "$ref": "#/$defs/nonEmptyStrings" },
+    "authority_refs": { "$ref": "#/$defs/nonEmptyStrings" },
+    "base_sha": { "$ref": "#/$defs/sha" },
+    "dependency_shas": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/sha" }
+    },
+    "depends_on": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+    "owned_paths": { "$ref": "#/$defs/nonEmptyStrings" },
+    "forbidden_paths": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+    "reserved_serial_paths": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+    "objective": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "milestones": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 20,
+      "items": { "$ref": "#/$defs/milestone" }
+    },
+    "non_goals": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "success_criteria": { "$ref": "#/$defs/nonEmptyStrings" },
+    "required_positive_tests": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "required_negative_tests": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "required_metrics": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "required_evidence": { "$ref": "#/$defs/nonEmptyStrings" },
+    "proof_limits": { "$ref": "#/$defs/nonEmptyStrings" },
+    "diff_budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["files", "lines"],
+      "properties": {
+        "files": { "type": "integer", "minimum": 1, "maximum": 500 },
+        "lines": { "type": "integer", "minimum": 1, "maximum": 100000 }
+      }
+    },
+    "token_budget": { "type": "integer", "minimum": 1000, "maximum": 100000000 },
+    "tool_budget": { "type": "integer", "minimum": 1, "maximum": 10000 },
+    "lease_expires_at": { "type": "string", "format": "date-time" },
+    "stop_conditions": { "$ref": "#/$defs/nonEmptyStrings" },
+    "handoff_path": { "type": "string", "minLength": 1 },
+    "risk_flags": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "canonical_contract", "generated_contract", "migration", "tenancy",
+          "authentication", "authorization", "privacy", "unsafe_native",
+          "hardware", "ota_release", "ci_required_context", "serial_path"
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 160, "pattern": "^[A-Za-z0-9._:-]+$" },
+    "sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "nonEmptyStrings": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "milestone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "objective", "success_criteria"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "objective": { "type": "string", "minLength": 1, "maxLength": 2000 },
+        "success_criteria": { "$ref": "#/$defs/nonEmptyStrings" }
+      }
+    }
+  }
+}

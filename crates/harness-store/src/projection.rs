@@ -1,9 +1,15 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use harness_domain::{
     AgentSessionId, CostEstimate, DomainEvent, PricingSnapshot, RunId, TokenUsage, now_ms,
 };
-use harness_usage::estimate;
+use harness_usage::{add_sample, estimate};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
@@ -13,7 +19,8 @@ use crate::{RawEventInput, Store, StoreError};
 pub struct ProtocolProjection {
     store: Store,
     pricing: Arc<BTreeMap<String, PricingSnapshot>>,
-    store_raw_reasoning: bool,
+    store_raw_reasoning: Arc<AtomicBool>,
+    store_reasoning_summaries: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
@@ -28,6 +35,7 @@ impl ProtocolProjection {
         store: Store,
         pricing: impl IntoIterator<Item = PricingSnapshot>,
         store_raw_reasoning: bool,
+        store_reasoning_summaries: bool,
     ) -> Self {
         Self {
             store,
@@ -37,8 +45,72 @@ impl ProtocolProjection {
                     .map(|snapshot| (snapshot.model.clone(), snapshot))
                     .collect(),
             ),
-            store_raw_reasoning,
+            store_raw_reasoning: Arc::new(AtomicBool::new(store_raw_reasoning)),
+            store_reasoning_summaries: Arc::new(AtomicBool::new(store_reasoning_summaries)),
         }
+    }
+
+    #[must_use]
+    pub fn store_raw_reasoning(&self) -> bool {
+        self.store_raw_reasoning.load(Ordering::Acquire)
+    }
+
+    pub fn set_store_raw_reasoning(&self, value: bool) {
+        self.store_raw_reasoning.store(value, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn store_reasoning_summaries(&self) -> bool {
+        self.store_reasoning_summaries.load(Ordering::Acquire)
+    }
+
+    pub fn set_store_reasoning_summaries(&self, value: bool) {
+        self.store_reasoning_summaries
+            .store(value, Ordering::Release);
+    }
+
+    /// Rebuild the usage ledger once when upgrading from the legacy projection
+    /// that retained only the final model call in each Codex turn. Raw App
+    /// Server events are the authority, so this is lossless and resumable.
+    pub fn rebuild_usage_projection_if_needed(&self) -> Result<(), StoreError> {
+        const PROJECTION_KEY: &str = "usage-projection-version";
+        const PROJECTION_VERSION: u64 = 3;
+        if self
+            .store
+            .runtime_metadata(PROJECTION_KEY)?
+            .and_then(|value| value.as_u64())
+            == Some(PROJECTION_VERSION)
+        {
+            return Ok(());
+        }
+
+        let turns = {
+            let connection = self.store.connection()?;
+            let mut statement = connection.prepare(
+                "SELECT thread_id,turn_id,max(id) FROM raw_events WHERE method='thread/tokenUsage/updated' AND thread_id IS NOT NULL AND turn_id IS NOT NULL GROUP BY thread_id,turn_id ORDER BY max(id)",
+            )?;
+            let turns = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            connection.execute("DELETE FROM cost_entries", [])?;
+            connection.execute("DELETE FROM token_samples", [])?;
+            connection.execute("UPDATE agent_sessions SET goal_tokens_used=0", [])?;
+            turns
+        };
+
+        for (thread_id, turn_id, source_raw_id) in turns {
+            self.rebuild_turn_usage(&thread_id, &turn_id, source_raw_id, None)?;
+        }
+        self.store
+            .put_runtime_metadata(PROJECTION_KEY, &json!(PROJECTION_VERSION))?;
+        Ok(())
     }
 
     pub fn ingest_notification(
@@ -47,8 +119,12 @@ impl ProtocolProjection {
         method: &str,
         payload: &Value,
     ) -> Result<(i64, DomainEvent), StoreError> {
-        let (stored_payload, redaction_class) =
-            redact_reasoning(method, payload, self.store_raw_reasoning);
+        let (stored_payload, redaction_class) = redact_reasoning(
+            method,
+            payload,
+            self.store_raw_reasoning(),
+            self.store_reasoning_summaries(),
+        );
         let thread_id = find_text(&stored_payload, &["threadId"])
             .or_else(|| find_text(&stored_payload, &["thread", "id"]))
             .map(ToOwned::to_owned);
@@ -192,6 +268,7 @@ impl ProtocolProjection {
             turn_id,
             find_text(payload, &["turn", "model"]),
             find_text(payload, &["turn", "effort"]),
+            true,
         )
     }
 
@@ -248,14 +325,27 @@ impl ProtocolProjection {
             params![item_id,thread_id,turn_id,item_type,state,summary,serde_json::to_string(item)?,raw_id,now,(method == "item/completed").then_some(now)],
         )?;
         if let Some(agent_id) = self.store.agent_by_thread(thread_id)? {
-            self.store.update_agent_state(
-                &agent_id,
-                "RUNNING",
-                summary.as_deref(),
-                None,
-                None,
-                None,
-            )?;
+            let agent = self.store.agent(&agent_id)?;
+            if agent.active_turn_id.is_some()
+                && !matches!(
+                    agent.state.as_str(),
+                    "COMPLETED"
+                        | "TURN_COMPLETE"
+                        | "FAILED"
+                        | "INTERRUPTED"
+                        | "CANCELED"
+                        | "STALLED"
+                )
+            {
+                self.store.update_agent_state(
+                    &agent_id,
+                    "RUNNING",
+                    summary.as_deref(),
+                    None,
+                    None,
+                    None,
+                )?;
+            }
         }
         Ok(())
     }
@@ -291,9 +381,14 @@ impl ProtocolProjection {
             return Ok(());
         };
         let goal = payload.get("goal").unwrap_or(payload);
+        // `goal.tokensUsed` is an App Server goal/context counter, not the
+        // cumulative billable usage for this Harness agent. The authoritative
+        // attempt ledger is rebuilt from token samples in `rebuild_turn_usage`.
+        // Never let a later goal notification replace that ledger with a
+        // smaller, semantically different value.
         self.store.connection()?.execute(
-            "UPDATE agent_sessions SET current_goal=?2,goal_status=?3,token_budget=coalesce(?4,token_budget),goal_tokens_used=coalesce(?5,goal_tokens_used),goal_time_used_seconds=coalesce(?6,goal_time_used_seconds),last_heartbeat_at=?7,version=version+1 WHERE id=?1",
-            params![agent_id.as_str(),find_text(goal,&["objective"]),find_text(goal,&["status"]),find_u64(goal,&["tokenBudget"]).map(|v| v as i64),find_u64(goal,&["tokensUsed"]).map(|v| v as i64),find_u64(goal,&["timeUsedSeconds"]).map(|v| v as i64),now_ms()],
+            "UPDATE agent_sessions SET current_goal=?2,goal_status=?3,token_budget=coalesce(?4,token_budget),goal_time_used_seconds=coalesce(?5,goal_time_used_seconds),last_heartbeat_at=?6,version=version+1 WHERE id=?1",
+            params![agent_id.as_str(),find_text(goal,&["objective"]),find_text(goal,&["status"]),find_u64(goal,&["tokenBudget"]).map(|v| v as i64),find_u64(goal,&["timeUsedSeconds"]).map(|v| v as i64),now_ms()],
         )?;
         Ok(())
     }
@@ -342,79 +437,155 @@ impl ProtocolProjection {
         raw_id: i64,
         payload: &Value,
     ) -> Result<(), StoreError> {
-        let (Some(thread_id), Some(turn_id), Some(last)) = (
+        let (Some(thread_id), Some(turn_id)) = (
             find_text(payload, &["threadId"]),
             find_text(payload, &["turnId"]),
-            payload.pointer("/tokenUsage/last"),
         ) else {
             return Ok(());
         };
-        let cache_write_present = last.get("cacheWriteInputTokens").is_some();
-        let usage = TokenUsage {
-            input_tokens: find_u64(last, &["inputTokens"]).unwrap_or_default(),
-            cached_input_tokens: find_u64(last, &["cachedInputTokens"]).unwrap_or_default(),
-            cache_write_input_tokens: cache_write_present
-                .then(|| find_u64(last, &["cacheWriteInputTokens"]).unwrap_or_default()),
-            output_tokens: find_u64(last, &["outputTokens"]).unwrap_or_default(),
-            reasoning_output_tokens: find_u64(last, &["reasoningOutputTokens"]).unwrap_or_default(),
-            total_tokens: find_u64(last, &["totalTokens"]).unwrap_or_default(),
-            model_context_window: find_u64(payload, &["tokenUsage", "modelContextWindow"]),
-        };
-        usage
-            .validate()
-            .map_err(|error| StoreError::Validation(error.to_string()))?;
-        let fallback_model = context
-            .agent_session_id
-            .as_ref()
-            .and_then(|agent| self.store.agent(agent).ok())
-            .map(|agent| agent.effective_model.unwrap_or(agent.requested_model));
+        self.rebuild_turn_usage(
+            thread_id,
+            turn_id,
+            raw_id,
+            context.agent_session_id.as_ref(),
+        )
+    }
+
+    fn rebuild_turn_usage(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        source_raw_id: i64,
+        fallback_agent_id: Option<&AgentSessionId>,
+    ) -> Result<(), StoreError> {
         let connection = self.store.connection()?;
-        let model: Option<String> = connection
+        let mapped_agent_id = connection
             .query_row(
-                "SELECT coalesce(effective_model,requested_model) FROM codex_turns WHERE turn_id=?1",
-                [turn_id],
-                |row| row.get(0),
+                "SELECT agent_session_id FROM codex_threads WHERE thread_id=?1",
+                [thread_id],
+                |row| row.get::<_, String>(0),
             )
             .optional()?;
-        let model = model
-            .or(fallback_model)
+        let agent_id = mapped_agent_id
+            .as_deref()
+            .or_else(|| fallback_agent_id.map(AgentSessionId::as_str));
+        let model = connection
+            .query_row(
+                "SELECT coalesce(ct.effective_model,a.effective_model,a.requested_model) FROM agent_sessions a LEFT JOIN codex_turns ct ON ct.turn_id=?2 WHERE a.id=?1",
+                params![agent_id, turn_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
             .unwrap_or_else(|| "unknown".to_owned());
-        let existing: Option<(String, i64)> = connection
+
+        let mut statement = connection.prepare(
+            "SELECT id,received_at,payload_json FROM raw_events WHERE thread_id=?1 AND turn_id=?2 AND method='thread/tokenUsage/updated' ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![thread_id, turn_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        let mut summary = harness_domain::UsageSummary::default();
+        let mut last_cumulative_total = None;
+        let mut observed_at = now_ms();
+        let mut last_source_raw_id = source_raw_id;
+        let mut context_window = None;
+        for (raw_id, received_at, payload_json) in rows {
+            let payload: Value = serde_json::from_str(&payload_json)?;
+            let Some(last) = payload.pointer("/tokenUsage/last") else {
+                continue;
+            };
+            let cumulative_total =
+                find_u64(&payload, &["tokenUsage", "total", "totalTokens"]).unwrap_or_default();
+            if last_cumulative_total == Some(cumulative_total) {
+                continue;
+            }
+            last_cumulative_total = Some(cumulative_total);
+            let usage = parse_token_usage(last, &payload)?;
+            let cost = if let Some(pricing) = self.pricing.get(&model) {
+                estimate(&usage, pricing)
+                    .map_err(|error| StoreError::Validation(error.to_string()))?
+            } else {
+                CostEstimate {
+                    explanation: "No matching price snapshot".to_owned(),
+                    ..CostEstimate::default()
+                }
+            };
+            add_sample(&mut summary, &usage, &cost)
+                .map_err(|error| StoreError::Validation(error.to_string()))?;
+            context_window = usage.model_context_window;
+            observed_at = received_at;
+            last_source_raw_id = raw_id;
+        }
+        if summary.total_tokens == 0 {
+            return Ok(());
+        }
+        summary.cost.explanation = if self.pricing.contains_key(&model) {
+            "Sum of distinct App Server model-call usage updates in this Codex turn; reasoning output is included in output and is not charged twice."
+                .to_owned()
+        } else {
+            "No matching price snapshot".to_owned()
+        };
+
+        let existing_sample_id = connection
             .query_row(
-                "SELECT id,total_tokens FROM token_samples WHERE turn_id=?1 AND sample_kind='last_turn'",
+                "SELECT id FROM token_samples WHERE turn_id=?1 AND sample_kind='turn_total'",
                 [turn_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get::<_, String>(0),
             )
             .optional()?;
-        let prior_total = existing.as_ref().map_or(0, |(_, total)| *total);
-        let sample_id = existing
-            .map(|(sample_id, _)| sample_id)
-            .unwrap_or_else(|| ulid::Ulid::generate().to_string());
+        let sample_id = existing_sample_id.unwrap_or_else(|| ulid::Ulid::generate().to_string());
         let transaction = connection.unchecked_transaction()?;
         transaction.execute(
-            "INSERT INTO token_samples(id,thread_id,turn_id,effective_model,observed_at,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,model_context_window,sample_kind,source_event_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'last_turn',?13) ON CONFLICT(turn_id,sample_kind) WHERE turn_id IS NOT NULL DO UPDATE SET effective_model=excluded.effective_model,observed_at=excluded.observed_at,input_tokens=excluded.input_tokens,cached_input_tokens=excluded.cached_input_tokens,cache_write_input_tokens=excluded.cache_write_input_tokens,output_tokens=excluded.output_tokens,reasoning_output_tokens=excluded.reasoning_output_tokens,total_tokens=excluded.total_tokens,model_context_window=excluded.model_context_window,source_event_id=excluded.source_event_id",
-            params![sample_id,thread_id,turn_id,model,now_ms(),usage.input_tokens as i64,usage.cached_input_tokens as i64,usage.cache_write_input_tokens.map(|v| v as i64),usage.output_tokens as i64,usage.reasoning_output_tokens as i64,usage.total_tokens as i64,usage.model_context_window.map(|v| v as i64),raw_id],
+            "DELETE FROM token_samples WHERE turn_id=?1 AND sample_kind<>'turn_total'",
+            [turn_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO token_samples(id,thread_id,turn_id,effective_model,observed_at,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,model_context_window,sample_kind,source_event_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'turn_total',?13) ON CONFLICT(turn_id,sample_kind) WHERE turn_id IS NOT NULL DO UPDATE SET effective_model=excluded.effective_model,observed_at=excluded.observed_at,input_tokens=excluded.input_tokens,cached_input_tokens=excluded.cached_input_tokens,cache_write_input_tokens=excluded.cache_write_input_tokens,output_tokens=excluded.output_tokens,reasoning_output_tokens=excluded.reasoning_output_tokens,total_tokens=excluded.total_tokens,model_context_window=excluded.model_context_window,source_event_id=excluded.source_event_id",
+            params![sample_id,thread_id,turn_id,model,observed_at,summary.input_tokens as i64,summary.cached_input_tokens as i64,summary.cache_write_input_tokens.map(|v| v as i64),summary.output_tokens as i64,summary.reasoning_output_tokens as i64,summary.total_tokens as i64,context_window.map(|v| v as i64),last_source_raw_id],
         )?;
         transaction.execute(
             "DELETE FROM cost_entries WHERE token_sample_id=?1",
             [&sample_id],
         )?;
         if let Some(pricing) = self.pricing.get(&model) {
-            let cost = estimate(&usage, pricing)
-                .map_err(|error| StoreError::Validation(error.to_string()))?;
-            insert_cost(&transaction, &sample_id, pricing, &cost)?;
+            insert_cost(&transaction, &sample_id, pricing, &summary.cost)?;
         }
-        if let Some(agent_id) = context.agent_session_id.as_ref() {
-            let delta = (usage.total_tokens as i128 - i128::from(prior_total))
-                .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+        if let Some(agent_id) = agent_id {
             transaction.execute(
-                "UPDATE agent_sessions SET goal_tokens_used=max(0,coalesce(goal_tokens_used,0)+?2),last_heartbeat_at=?3,version=version+1 WHERE id=?1",
-                params![agent_id.as_str(),delta,now_ms()],
+                "UPDATE agent_sessions SET goal_tokens_used=coalesce((SELECT sum(ts.total_tokens) FROM codex_threads ct JOIN token_samples ts ON ts.thread_id=ct.thread_id WHERE ct.agent_session_id=?1),0),last_heartbeat_at=?2,version=version+1 WHERE id=?1",
+                params![agent_id, now_ms()],
             )?;
         }
         transaction.commit()?;
         Ok(())
     }
+}
+
+fn parse_token_usage(last: &Value, payload: &Value) -> Result<TokenUsage, StoreError> {
+    let cache_write_present = last.get("cacheWriteInputTokens").is_some();
+    let usage = TokenUsage {
+        input_tokens: find_u64(last, &["inputTokens"]).unwrap_or_default(),
+        cached_input_tokens: find_u64(last, &["cachedInputTokens"]).unwrap_or_default(),
+        cache_write_input_tokens: cache_write_present
+            .then(|| find_u64(last, &["cacheWriteInputTokens"]).unwrap_or_default()),
+        output_tokens: find_u64(last, &["outputTokens"]).unwrap_or_default(),
+        reasoning_output_tokens: find_u64(last, &["reasoningOutputTokens"]).unwrap_or_default(),
+        total_tokens: find_u64(last, &["totalTokens"]).unwrap_or_default(),
+        model_context_window: find_u64(payload, &["tokenUsage", "modelContextWindow"]),
+    };
+    usage
+        .validate()
+        .map_err(|error| StoreError::Validation(error.to_string()))?;
+    Ok(usage)
 }
 
 fn insert_cost(
@@ -446,32 +617,58 @@ fn find_u64(value: &Value, path: &[&str]) -> Option<u64> {
         .as_u64()
 }
 
-fn redact_reasoning(method: &str, payload: &Value, retain: bool) -> (Value, String) {
-    if retain {
+fn redact_reasoning(
+    method: &str,
+    payload: &Value,
+    retain_raw: bool,
+    retain_summaries: bool,
+) -> (Value, String) {
+    if retain_raw && retain_summaries {
         return (payload.clone(), "none".to_owned());
     }
     let mut result = payload.clone();
-    if method == "item/reasoning/textDelta" {
+    let mut raw_dropped = false;
+    let mut summary_dropped = false;
+    if !retain_raw && method == "item/reasoning/textDelta" {
         if let Some(object) = result.as_object_mut() {
             object.insert(
                 "delta".to_owned(),
                 Value::String("[not retained]".to_owned()),
             );
         }
-        return (result, "raw_reasoning_dropped".to_owned());
+        raw_dropped = true;
     }
-    if result
+    if !retain_summaries && method == "item/reasoning/summaryTextDelta" {
+        if let Some(object) = result.as_object_mut() {
+            object.insert(
+                "delta".to_owned(),
+                Value::String("[not retained]".to_owned()),
+            );
+        }
+        summary_dropped = true;
+    }
+    let reasoning_item = result
         .get("item")
         .and_then(|item| item.get("type"))
         .and_then(Value::as_str)
-        == Some("reasoning")
-    {
-        if let Some(object) = result.get_mut("item").and_then(Value::as_object_mut) {
+        == Some("reasoning");
+    if reasoning_item && let Some(object) = result.get_mut("item").and_then(Value::as_object_mut) {
+        if !retain_raw {
             object.insert("content".to_owned(), json!([]));
+            raw_dropped = true;
         }
-        return (result, "raw_reasoning_dropped".to_owned());
+        if !retain_summaries {
+            object.insert("summary".to_owned(), json!([]));
+            summary_dropped = true;
+        }
     }
-    (result, "none".to_owned())
+    let redaction_class = match (raw_dropped, summary_dropped) {
+        (true, true) => "reasoning_dropped",
+        (true, false) => "raw_reasoning_dropped",
+        (false, true) => "reasoning_summary_dropped",
+        (false, false) => "none",
+    };
+    (result, redaction_class.to_owned())
 }
 
 fn summarize_item(item: &Value) -> Option<String> {
@@ -499,12 +696,7 @@ fn summarize_item(item: &Value) -> Option<String> {
                 .and_then(Value::as_array)
                 .map_or(0, Vec::len)
         )),
-        "collabAgentToolCall" => Some(format!(
-            "Subagent {}",
-            item.get("tool")
-                .and_then(Value::as_str)
-                .unwrap_or("activity")
-        )),
+        "collabAgentToolCall" => Some(summarize_collaboration(item)),
         "subAgentActivity" => Some(format!(
             "Subagent {}",
             item.get("kind")
@@ -514,6 +706,47 @@ fn summarize_item(item: &Value) -> Option<String> {
         "contextCompaction" => Some("Context compacted".to_owned()),
         other => Some(other.to_owned()),
     }
+}
+
+fn summarize_collaboration(item: &Value) -> String {
+    let receivers = item
+        .get("receiverThreadIds")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let targets = match receivers {
+        0 => "delegated threads".to_owned(),
+        1 => "1 delegated thread".to_owned(),
+        count => format!("{count} delegated threads"),
+    };
+    let tool = item.get("tool").and_then(Value::as_str);
+    let raw_status = item.get("status").and_then(Value::as_str);
+    let action = match (tool, raw_status) {
+        (Some("wait"), Some("inProgress")) => "Waiting for delegated threads".to_owned(),
+        (Some("wait"), Some("completed")) => "Delegated-thread wait completed".to_owned(),
+        (Some("wait"), Some("failed")) => "Delegated-thread wait failed".to_owned(),
+        (Some("spawnAgent"), _) => "Started a delegated thread".to_owned(),
+        (Some("sendInput"), _) => format!("Sent direction to {targets}"),
+        (Some("resumeAgent"), _) => format!("Continued {targets}"),
+        (Some("wait"), _) => format!("Waited for {targets}"),
+        (Some("closeAgent"), _) => format!("Stopped {targets}"),
+        (Some(tool), _) => format!("Collaboration action {tool}"),
+        (None, _) => "Collaboration activity".to_owned(),
+    };
+    let status = match raw_status {
+        Some("inProgress") => "in progress",
+        Some("completed") => "complete",
+        Some("failed") => "failed",
+        _ => "updated",
+    };
+    let prompt = item
+        .get("prompt")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| truncate(value.trim(), 120));
+    prompt.map_or_else(
+        || format!("{action} · {status}"),
+        |prompt| format!("{action} · {status} · {prompt}"),
+    )
 }
 
 fn truncate(value: &str, max: usize) -> String {
@@ -526,4 +759,161 @@ fn truncate(value: &str, max: usize) -> String {
         .collect::<String>();
     result.push('…');
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProjectionContext, ProtocolProjection, summarize_collaboration};
+    use crate::Store;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    #[test]
+    fn collaboration_summary_uses_human_action_names() {
+        assert_eq!(
+            summarize_collaboration(&json!({
+                "tool": "resumeAgent",
+                "status": "completed",
+                "receiverThreadIds": ["child-1"],
+                "prompt": "Re-check the focused test after the fix"
+            })),
+            "Continued 1 delegated thread · complete · Re-check the focused test after the fix"
+        );
+        assert_eq!(
+            summarize_collaboration(&json!({
+                "tool": "wait",
+                "status": "inProgress",
+                "receiverThreadIds": []
+            })),
+            "Waiting for delegated threads · in progress"
+        );
+    }
+
+    #[test]
+    fn usage_projection_sums_distinct_model_calls_within_a_turn() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::in_memory(&temp.path().join("artifacts")).unwrap();
+        let projection = ProtocolProjection::new(store.clone(), [], false, true);
+        let context = ProjectionContext {
+            run_id: None,
+            agent_session_id: None,
+        };
+        let first = json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "tokenUsage": {
+                "last": {
+                    "inputTokens": 100,
+                    "cachedInputTokens": 80,
+                    "cacheWriteInputTokens": 0,
+                    "outputTokens": 10,
+                    "reasoningOutputTokens": 4,
+                    "totalTokens": 110
+                },
+                "total": {
+                    "inputTokens": 100,
+                    "cachedInputTokens": 80,
+                    "cacheWriteInputTokens": 0,
+                    "outputTokens": 10,
+                    "reasoningOutputTokens": 4,
+                    "totalTokens": 110
+                },
+                "modelContextWindow": 258400
+            }
+        });
+        projection
+            .ingest_notification(&context, "thread/tokenUsage/updated", &first)
+            .unwrap();
+        projection
+            .ingest_notification(&context, "thread/tokenUsage/updated", &first)
+            .unwrap();
+        projection
+            .ingest_notification(
+                &context,
+                "thread/tokenUsage/updated",
+                &json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "tokenUsage": {
+                        "last": {
+                            "inputTokens": 150,
+                            "cachedInputTokens": 120,
+                            "cacheWriteInputTokens": 0,
+                            "outputTokens": 20,
+                            "reasoningOutputTokens": 6,
+                            "totalTokens": 170
+                        },
+                        "total": {
+                            "inputTokens": 250,
+                            "cachedInputTokens": 200,
+                            "cacheWriteInputTokens": 0,
+                            "outputTokens": 30,
+                            "reasoningOutputTokens": 10,
+                            "totalTokens": 280
+                        },
+                        "modelContextWindow": 258400
+                    }
+                }),
+            )
+            .unwrap();
+
+        let (input, cached, output, reasoning, total, samples):
+            (i64, i64, i64, i64, i64, i64) = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT input_tokens,cached_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,(SELECT count(*) FROM token_samples) FROM token_samples WHERE turn_id='turn-1' AND sample_kind='turn_total'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (input, cached, output, reasoning, total),
+            (250, 200, 30, 10, 280)
+        );
+        assert_eq!(samples, 1);
+    }
+
+    #[test]
+    fn goal_updates_do_not_overwrite_authoritative_usage() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::in_memory(&temp.path().join("artifacts")).unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO repositories(id,profile_id,profile_version,display_name,root_path,default_branch,state,created_at,updated_at,version) VALUES('repo','general',1,'repo','/repo','main','READY',1,1,1);
+                 INSERT INTO runs(id,repository_id,title,requested_objective,mode,publication_mode,state,phase,base_ref,base_sha,authority_digest,profile_digest,requested_by,created_at,updated_at,version) VALUES('run','repo','run','goal','plan_and_implement','local_only','EXECUTING','executing','main','0000000000000000000000000000000000000000','a','p','test',1,1,1);
+                 INSERT INTO agent_sessions(id,run_id,runtime_kind,role,requested_model,requested_reasoning_effort,sandbox_mode,approval_policy,cwd,state,goal_tokens_used,started_at,last_heartbeat_at,version) VALUES('agent','run','codex_controller','governor','gpt-test','high','workspace_write','never','/repo','RUNNING',777,1,1,1);",
+            )
+            .unwrap();
+        let projection = ProtocolProjection::new(store.clone(), [], false, true);
+        let context = ProjectionContext {
+            run_id: None,
+            agent_session_id: Some("agent".into()),
+        };
+        projection
+            .project_goal(
+                &context,
+                &json!({
+                    "goal": {
+                        "objective": "continue",
+                        "status": "active",
+                        "tokenBudget": 1_000,
+                        "tokensUsed": 12
+                    }
+                }),
+            )
+            .unwrap();
+        let observed: i64 = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT goal_tokens_used FROM agent_sessions WHERE id='agent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observed, 777);
+    }
 }

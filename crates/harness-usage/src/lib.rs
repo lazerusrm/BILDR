@@ -48,7 +48,10 @@ pub fn estimate(usage: &TokenUsage, pricing: &PricingSnapshot) -> Result<CostEst
             u128::from(pricing.cache_write_multiplier_denominator.max(1)),
         ),
     );
-    let cached_rate = u128::from(pricing.cached_input_microusd_per_million);
+    let cached_rate = apply_ratio(
+        u128::from(pricing.cached_input_microusd_per_million),
+        input_multiplier,
+    );
 
     let cached = u128::from(usage.cached_input_tokens);
     let non_cached = u128::from(usage.input_tokens - usage.cached_input_tokens);
@@ -270,5 +273,26 @@ mod tests {
         let at = estimate(&usage_at, &pricing()).unwrap().lower_microusd;
         let over = estimate(&usage_over, &pricing()).unwrap().lower_microusd;
         assert!(over >= at.saturating_mul(2));
+    }
+
+    #[test]
+    fn long_context_multiplier_applies_to_cached_input() {
+        let short = TokenUsage {
+            input_tokens: 100,
+            cached_input_tokens: 100,
+            cache_write_input_tokens: Some(0),
+            total_tokens: 100,
+            ..TokenUsage::default()
+        };
+        let long = TokenUsage {
+            input_tokens: 101,
+            cached_input_tokens: 101,
+            cache_write_input_tokens: Some(0),
+            total_tokens: 101,
+            ..TokenUsage::default()
+        };
+        let short_cost = estimate(&short, &pricing()).unwrap().lower_microusd;
+        let long_cost = estimate(&long, &pricing()).unwrap().lower_microusd;
+        assert!(long_cost >= short_cost.saturating_mul(2));
     }
 }

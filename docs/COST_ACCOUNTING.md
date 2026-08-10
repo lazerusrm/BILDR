@@ -27,7 +27,7 @@ output_tokens
 reasoning_output_tokens
 reported_total_tokens
 model_context_window nullable
-sample_kind cumulative | last_turn | derived_delta
+sample_kind turn_total | derived_delta
 source_event_id
 ```
 
@@ -37,12 +37,16 @@ The cost entry stores the exact pricing snapshot ID and formula explanation used
 
 Preferred order:
 
-1. App Server `last_token_usage` for a completed turn;
-2. explicit per-turn usage event;
-3. monotonic delta of cumulative thread usage;
-4. bounded/unknown estimate when cumulative counters reset or decrease.
+1. each distinct App Server `tokenUsage.last` model call, deduplicated by the
+   monotonic `tokenUsage.total` counter;
+2. the sum of those calls as the durable per-turn `turn_total` sample;
+3. a monotonic delta of cumulative thread usage when call-level detail is not
+   available;
+4. a bounded/unknown estimate when cumulative counters reset or decrease.
 
-A cumulative sample is never directly billed more than once.
+A Codex turn may contain many model calls between tools, commands, and native
+subagent waits. The ledger must retain all of them; a cumulative sample is
+never directly billed more than once.
 
 ## 4. Base formula
 
@@ -88,7 +92,7 @@ if request_input_tokens > T:
     output price *= long_context_output_multiplier
 ```
 
-Cached-input treatment follows the model's published rule in the active snapshot. If the source does not specify a component unambiguously, mark the estimate bounded and retain the assumption in `explanation`.
+Cached-input treatment follows the model's published rule in the active snapshot. The GPT-5.6 long-context input multiplier applies to cached input as well as uncached and cache-write input. If the source does not specify a component unambiguously, mark the estimate bounded and retain the assumption in `explanation`.
 
 ## 6. Model reroutes
 

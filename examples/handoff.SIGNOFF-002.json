@@ -1,0 +1,50 @@
+{
+  "schema": "harness.orchestration.handoff.v1",
+  "task_id": "SIGNOFF-002",
+  "status": "complete",
+  "base_sha": "4d6662ef0bb1f52ba40dc670830ff95e52ca1cbf",
+  "head_sha": "a1b9c02000000000000000000000000000000000",
+  "result": "Signoff approval now requires the current integrated SHA, the current packet digest, and complete acceptance evidence.",
+  "patch_artifact": "artifact:sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "commit_sha": "a1b9c02000000000000000000000000000000000",
+  "touched_paths": [
+    "crates/harness-orchestrator/src/lib.rs",
+    "crates/harness-api/src/lib.rs",
+    "openapi/harness-api.yaml"
+  ],
+  "commands": [
+    {
+      "command": "cargo test -p harness-orchestrator --lib",
+      "exit_code": 0,
+      "artifact": "artifact:sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "result_class": "success"
+    },
+    {
+      "command": "cargo xtask openapi-check",
+      "exit_code": 0,
+      "artifact": null,
+      "result_class": "success"
+    }
+  ],
+  "positive_tests": [
+    "current proved signoff packet advances"
+  ],
+  "negative_tests": [
+    "stale SHA is rejected",
+    "stale packet digest is rejected",
+    "pending acceptance is rejected"
+  ],
+  "metrics_added_or_changed": [],
+  "proof_limits": [
+    "No hosted CI runner or physical device was exercised."
+  ],
+  "checklist_recommendation": {
+    "rows": ["SIGNOFF-EVIDENCE-001"],
+    "maximum_state": "SOURCE_PROVEN"
+  },
+  "next_steps_for_orchestrator": [
+    "Run independent verification.",
+    "Re-run integrated-head validation after all accepted commits are combined."
+  ],
+  "errors": []
+}

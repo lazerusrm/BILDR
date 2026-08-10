@@ -11,8 +11,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+const SCHEMA_DIGEST_ENCODING: &str = "normalized-compact-json";
+
 #[derive(Parser)]
-#[command(name = "cargo xtask", version, about = "Harness Console build tasks")]
+#[command(name = "cargo xtask", version, about = "BILDR build tasks")]
 struct Cli {
     #[command(subcommand)]
     command: Task,
@@ -123,9 +125,12 @@ fn schema_check(root: &Path) -> Result<()> {
         root.join("config/harness.example.toml"),
     )?)?;
     let _: toml::Value = toml::from_str(&fs::read_to_string(
-        root.join("profiles/neuralmatrix/profile.toml"),
+        root.join("profiles/bildr/profile.toml"),
     )?)?;
-    println!("schema-check: {checked} JSON files and TOML defaults parsed");
+    let _: toml::Value = toml::from_str(&fs::read_to_string(
+        root.join("profiles/general/profile.toml"),
+    )?)?;
+    println!("schema-check: {checked} JSON files and both TOML profiles parsed");
     Ok(())
 }
 
@@ -263,7 +268,7 @@ fn app_server_bindings_check(root: &Path) -> Result<()> {
     require_file(&schema)?;
     let schema_bytes = fs::read(&schema)?;
     let _: Value = serde_json::from_slice(&schema_bytes)?;
-    let digest = sha256(&schema_bytes);
+    let digest = canonical_json_sha256(&schema_bytes)?;
     let config: toml::Value = toml::from_str(&fs::read_to_string(
         root.join("config/harness.example.toml"),
     )?)?;
@@ -277,6 +282,13 @@ fn app_server_bindings_check(root: &Path) -> Result<()> {
     }
     let compatibility: Value =
         serde_json::from_slice(&fs::read(root.join("generated/CODEX_COMPATIBILITY.json"))?)?;
+    if compatibility
+        .get("root_schema_sha256_encoding")
+        .and_then(Value::as_str)
+        != Some(SCHEMA_DIGEST_ENCODING)
+    {
+        bail!("generated/CODEX_COMPATIBILITY.json has the wrong schema digest encoding")
+    }
     if compatibility
         .get("root_schema_sha256")
         .and_then(Value::as_str)
@@ -312,7 +324,7 @@ fn codex_schema(root: &Path, codex: &Path) -> Result<()> {
         .path()
         .join("codex_app_server_protocol.v2.schemas.json");
     require_file(&source)?;
-    let digest = sha256(&fs::read(&source)?);
+    let digest = canonical_json_sha256(&fs::read(&source)?)?;
     let destination = root.join("generated/codex-app-server-schema");
     if destination.exists() {
         fs::remove_dir_all(&destination)?;
@@ -346,6 +358,7 @@ fn codex_schema(root: &Path, codex: &Path) -> Result<()> {
             "generated_schema_root": "generated/codex-app-server-schema",
             "root_schema": "codex_app_server_protocol.v2.schemas.json",
             "root_schema_sha256": digest,
+            "root_schema_sha256_encoding": SCHEMA_DIGEST_ENCODING,
             "generated_at": "update-with-release-metadata"
         }))?,
     )?;
@@ -357,7 +370,8 @@ fn dist(root: &Path, check_only: bool) -> Result<()> {
     for path in [
         "ui/dist/index.html",
         "config/harness.example.toml",
-        "profiles/neuralmatrix/profile.toml",
+        "profiles/general/profile.toml",
+        "profiles/bildr/profile.toml",
         "packaging/systemd/harnessd.service",
         "generated/CODEX_COMPATIBILITY.json",
         "LICENSE",
@@ -388,7 +402,7 @@ fn dist(root: &Path, check_only: bool) -> Result<()> {
     )?;
     let version = fs::read_to_string(root.join("VERSION"))?.trim().to_owned();
     let dist = root.join("dist");
-    let stage = dist.join(format!("harness-console-{version}-linux-x86_64"));
+    let stage = dist.join(format!("bildr-{version}-linux-x86_64"));
     if stage.exists() {
         fs::remove_dir_all(&stage)?;
     }
@@ -421,7 +435,7 @@ fn dist(root: &Path, check_only: bool) -> Result<()> {
             &stage.join("share/harness-console").join(path),
         )?;
     }
-    let archive = dist.join(format!("harness-console-{version}-linux-x86_64.tar.gz"));
+    let archive = dist.join(format!("bildr-{version}-linux-x86_64.tar.gz"));
     run(
         Command::new("tar")
             .arg("-C")
@@ -509,4 +523,42 @@ fn output_text(command: &mut Command, label: &str) -> Result<String> {
 
 fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn canonical_json_sha256(bytes: &[u8]) -> Result<String> {
+    let value = normalize_json(serde_json::from_slice(bytes)?);
+    Ok(sha256(&serde_json::to_vec(&value)?))
+}
+
+fn normalize_json(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut fields = map.into_iter().collect::<Vec<_>>();
+            fields.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            Value::Object(
+                fields
+                    .into_iter()
+                    .map(|(key, value)| (key, normalize_json(value)))
+                    .collect(),
+            )
+        }
+        Value::Array(values) => Value::Array(values.into_iter().map(normalize_json).collect()),
+        value => value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_json_digest_ignores_object_order() {
+        let first = br#"{"version":1,"schema":{"type":"object","required":["id"]}}"#;
+        let reordered = br#"{"schema":{"required":["id"],"type":"object"},"version":1}"#;
+
+        assert_eq!(
+            canonical_json_sha256(first).unwrap(),
+            canonical_json_sha256(reordered).unwrap()
+        );
+    }
 }

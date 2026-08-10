@@ -103,6 +103,8 @@ pub enum RunState {
     Preparing,
     ReadyForArchitecture,
     Architecting,
+    PlanAdversarialReview,
+    PlanRevisionRequired,
     PlanReviewRequired,
     ReadyToExecute,
     Executing,
@@ -150,7 +152,13 @@ impl RunState {
                 | (S::Preparing, S::ReadyForArchitecture)
                 | (S::ReadyForArchitecture, S::Architecting)
                 | (S::Architecting, S::ReadyForArchitecture)
-                | (S::Architecting, S::PlanReviewRequired)
+                | (S::Architecting, S::PlanRevisionRequired)
+                | (S::Architecting, S::PlanAdversarialReview)
+                | (S::PlanAdversarialReview, S::PlanRevisionRequired)
+                | (S::PlanAdversarialReview, S::PlanReviewRequired)
+                | (S::PlanRevisionRequired, S::Architecting)
+                | (S::PlanReviewRequired, S::PlanAdversarialReview)
+                | (S::PlanReviewRequired, S::PlanRevisionRequired)
                 | (S::PlanReviewRequired, S::Completed)
                 | (S::PlanReviewRequired, S::ReadyToExecute)
                 | (S::ReadyToExecute, S::Executing)
@@ -159,7 +167,9 @@ impl RunState {
                 | (S::IntegrationReady, S::Integrating)
                 | (S::Integrating, S::IntegrationVerification)
                 | (S::IntegrationVerification, S::FinalAudit)
+                | (S::FinalAudit, S::Executing)
                 | (S::FinalAudit, S::HumanReview)
+                | (S::HumanReview, S::Executing)
                 | (S::HumanReview, S::PublicationReady)
                 | (S::PublicationReady, S::DraftPrCreated)
                 | (S::PublicationReady, S::Completed)
@@ -170,7 +180,12 @@ impl RunState {
                 )
                 | (
                     S::Blocked,
-                    S::ReadyForArchitecture | S::PlanReviewRequired | S::ReadyToExecute
+                    S::ReadyForArchitecture
+                        | S::PlanAdversarialReview
+                        | S::PlanRevisionRequired
+                        | S::PlanReviewRequired
+                        | S::ReadyToExecute
+                        | S::Executing
                 )
                 | (S::Stopping, S::Canceled)
                 | (S::Completed | S::Canceled | S::Failed, S::Archived)
@@ -273,7 +288,10 @@ impl TaskState {
                 | (S::Verified, S::IntegrationQueued)
                 | (S::IntegrationQueued, S::Integrating)
                 | (S::Integrating, S::Integrated)
-                | (S::Integrated, S::CiProven | S::Closed)
+                | (
+                    S::Integrated,
+                    S::ChangesRequested | S::Verified | S::CiProven | S::Closed
+                )
                 | (S::CiProven, S::LiveProven | S::Closed)
                 | (S::LiveProven, S::Closed)
                 | (
@@ -330,7 +348,9 @@ pub enum RiskLevel {
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
     Architect,
+    PlanReviewer,
     Explorer,
+    Governor,
     Worker,
     HighRiskWorker,
     Integrator,
@@ -395,6 +415,14 @@ pub struct DiffBudget {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskMilestone {
+    pub id: String,
+    pub title: String,
+    pub objective: String,
+    pub success_criteria: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskPacket {
     pub schema: String,
     pub program_id: String,
@@ -415,6 +443,12 @@ pub struct TaskPacket {
     pub forbidden_paths: Vec<String>,
     pub reserved_serial_paths: Vec<String>,
     pub objective: String,
+    /// Human-reviewable, bounded outcomes inside a governor-owned objective.
+    /// Kept on the task packet so the plan remains useful even when the
+    /// governor thread is not running. Older stored packets deserialize with
+    /// an empty list and are bootstrapped by the first structured checkpoint.
+    #[serde(default)]
+    pub milestones: Vec<TaskMilestone>,
     pub non_goals: Vec<String>,
     pub success_criteria: Vec<String>,
     pub required_positive_tests: Vec<String>,
@@ -544,6 +578,10 @@ pub struct CodexRuntimeStatus {
     pub required_version: Option<String>,
     pub protocol_schema_sha256: Option<String>,
     pub schema_match: bool,
+    #[serde(default)]
+    pub native_multi_agent: bool,
+    #[serde(default)]
+    pub native_multi_agent_feature: Option<String>,
     pub pid: Option<u32>,
     pub restart_count: u32,
 }
@@ -634,6 +672,7 @@ pub struct AgentSummary {
     pub parent_agent_id: Option<AgentSessionId>,
     pub task_id: Option<TaskId>,
     pub role: AgentRole,
+    pub codex_account_id: Option<String>,
     pub nickname: Option<String>,
     pub state: String,
     pub requested_model: String,
@@ -646,11 +685,19 @@ pub struct AgentSummary {
     pub current_action: Option<String>,
     pub token_budget: Option<u64>,
     pub tokens_used: u64,
+    /// Usage charged against the currently displayed bounded allowance. This
+    /// equals `tokens_used` for fresh agents and is rebased for warm governor
+    /// turns without changing the cumulative accounting ledger.
+    #[serde(default)]
+    pub budget_tokens_used: u64,
     pub estimated_cost_lower: String,
     pub estimated_cost_upper: String,
     pub heartbeat_at: Option<String>,
     pub thread_id: Option<String>,
     pub active_turn_id: Option<String>,
+    pub context_strategy: String,
+    pub context_source_attempt_id: Option<AttemptId>,
+    pub context_reuse_reason: Option<String>,
     pub version: u64,
 }
 
@@ -702,6 +749,14 @@ pub struct ActivityItem {
     pub occurred_at: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LatestAgentMessage {
+    pub id: String,
+    pub text: String,
+    pub phase: Option<String>,
+    pub occurred_at: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct UsageSummary {
     pub input_tokens: u64,
@@ -720,6 +775,24 @@ pub struct ModelUsageSummary {
     pub turns: u64,
     pub usage: TokenUsage,
     pub cost: CostEstimate,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct UsageGroup {
+    pub id: String,
+    pub label: String,
+    pub detail: String,
+    pub turns: u64,
+    pub usage: TokenUsage,
+    pub cost: CostEstimate,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct UsageBreakdown {
+    pub total: UsageSummary,
+    pub by_account: Vec<UsageGroup>,
+    pub by_repository: Vec<UsageGroup>,
+    pub by_agent: Vec<UsageGroup>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -753,12 +826,28 @@ mod tests {
     fn run_state_blocks_false_completion_jump() {
         assert!(!RunState::Executing.can_transition_to(RunState::Completed));
         assert!(RunState::HumanReview.can_transition_to(RunState::PublicationReady));
+        assert!(RunState::HumanReview.can_transition_to(RunState::Executing));
+        assert!(RunState::FinalAudit.can_transition_to(RunState::Executing));
+    }
+
+    #[test]
+    fn plan_requires_adversarial_certification_before_approval() {
+        assert!(RunState::Architecting.can_transition_to(RunState::PlanAdversarialReview));
+        assert!(!RunState::Architecting.can_transition_to(RunState::PlanReviewRequired));
+        assert!(RunState::PlanAdversarialReview.can_transition_to(RunState::PlanRevisionRequired));
+        assert!(RunState::PlanRevisionRequired.can_transition_to(RunState::Architecting));
+        assert!(RunState::PlanAdversarialReview.can_transition_to(RunState::PlanReviewRequired));
+        assert!(RunState::PlanReviewRequired.can_transition_to(RunState::PlanRevisionRequired));
+        assert!(RunState::PlanReviewRequired.can_transition_to(RunState::PlanAdversarialReview));
     }
 
     #[test]
     fn workers_cannot_self_verify_by_transition() {
         assert!(!TaskState::Implementing.can_transition_to(TaskState::Verified));
         assert!(TaskState::Verifying.can_transition_to(TaskState::Verified));
+        assert!(TaskState::Integrated.can_transition_to(TaskState::ChangesRequested));
+        assert!(TaskState::Integrated.can_transition_to(TaskState::Verified));
+        assert!(TaskState::Integrated.can_transition_to(TaskState::CiProven));
     }
 
     #[test]

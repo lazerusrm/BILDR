@@ -13,6 +13,6 @@ A durable engineering tool cannot infer completion from agent prose. Determinist
 ## Consequences
 
 - all model outputs use schemas and remain proposals until validated;
-- a worker cannot verify itself or update NeuralMatrix completion authority;
+- a worker cannot verify itself or update repository completion authority;
 - failures route by typed class rather than blind prompt retry;
 - explicit human approval remains required for external writes.

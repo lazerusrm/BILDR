@@ -1,53 +1,63 @@
-# Harness Console UI and Interaction Specification
+# BILDR UI and Interaction Specification
 
 **Status:** implementation-ready UX specification
 **Target:** local Linux browser/PWA, desktop-first
-**Benchmark:** the clarity of the Codex app's project/thread/diff experience, extended with orchestration, worktree, evidence, usage, and approval controls
+**Benchmark:** the clarity of the Codex desktop app's project/thread experience, extended with bounded orchestration and exact-head custody
+
+> **Current interaction contract (2026-08-07).** The governor is the primary
+> human conversation. The persistent navigation is Home, Repositories, Runs,
+> Usage, Host, and Settings. Approvals are handled inline in Runs; validation
+> evidence and worktree custody remain controller-owned backend concepts, not
+> dedicated navigation destinations. This current contract supersedes older
+> screen sketches below wherever they show separate Approvals, Worktrees, or
+> Evidence pages or a multi-tab run inspector. The run workspace places the
+> authoritative **Goal** and current **Plan** above agent rows, keeps prior
+> failed/stalled architecture attempts in collapsed history, and uses a strong
+> selected-row treatment so the inspector's subject is unambiguous.
 
 ## 1. UX principles
 
-1. **The current truth is always visible.** Every mutable agent row shows its task, current goal, model, reasoning effort, worktree, branch, base/head SHA, current action, heartbeat, token use, and estimated cost.
+1. **The current truth is always visible.** Every mutable agent row shows its task, model, reasoning effort, current action, active/idle state, token use, and estimated cost; lower-level custody detail stays available without dominating the screen.
 2. **Actions, not hidden thoughts.** Show plan steps, reasoning summaries, command/file/tool activity, review findings, and model reroutes. Do not imply access to private hidden chain-of-thought. Raw reasoning storage is disabled by default.
 3. **One primary workspace.** The default run view is a dense but readable list-and-inspector layout. A DAG is optional, not the first screen.
-4. **Progressive disclosure.** The overview shows state and risk; the inspector reveals raw commands, diffs, evidence, and event payloads.
+4. **Progressive disclosure.** The overview shows state and risk; selecting a child thread changes the same activity pane and always provides an obvious route back to the governor.
 5. **Failures remain inspectable.** Failed agents and preserved worktrees do not disappear. The UI explains whether the failure is source, infrastructure, inconclusive, interrupted, superseded, or policy-blocked.
-6. **Human control is immediate.** Steer, interrupt, approve, escalate, reassign, preserve, compare, and open-editor actions are one or two clicks away.
+6. **Human control is immediate.** Steer, interrupt, continue, and approve actions live beside the governor activity that requires them.
 7. **No false green.** A passed local test, completed agent response, verified task, integrated branch, exact-head CI, and live proof are visibly distinct states.
 8. **Keyboard-first, mouse-friendly.** Common navigation and approval operations have shortcuts; every action remains accessible without memorizing them.
 
-## 2. Information architecture
+## 2. Current information architecture
 
 ```text
-Harness Console
+BILDR
 ├── Home
 │   ├── repositories
 │   ├── active runs
 │   ├── recent runs
 │   └── host/runtime health
-├── Repository
-│   ├── overview
-│   ├── new run
-│   ├── authority/context map
-│   ├── worktrees
-│   ├── validation catalog
-│   └── profile settings
-├── Run workspace
-│   ├── overview/list
-│   ├── task graph
-│   ├── changes
-│   ├── evidence
-│   ├── approvals
-│   ├── usage
-│   └── run settings
-├── Global approval center
+├── Repositories
+│   ├── discovered local checkouts
+│   ├── registration and health
+│   └── new run
+├── Runs
+│   ├── governor and task rows
+│   ├── latest governor update and meaningful activity
+│   ├── inspectable delegated child threads
+│   ├── governor steering/continuation
+│   └── inline approvals
+├── Usage
+│   ├── by Codex account
+│   ├── by repository
+│   └── by agent
 ├── Host/runtime
 │   ├── Codex App Server
 │   ├── process/resource usage
 │   ├── local runners/hardware
 │   └── logs
 └── Settings
-    ├── Codex and model defaults
-    ├── pricing snapshots
+    ├── plan approval, governor autonomy, and budgets
+    ├── Codex account names and authentication
+    ├── account handoff
     ├── retention
     ├── security
     └── appearance/accessibility
@@ -59,27 +69,27 @@ Recommended dimensions assume a 1440×900 or larger desktop. The layout remains 
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Harness Console  NeuralMatrix ▾  Run NM-20260805-014  base 4d6662e  ● App Server  Slots 4/6  $18.42  ⚠2 │
+│ BILDR           Example repo ▾  Run RUN-20260805-014 base 4d6662e  ● App Server  Slots 4/6  $18.42  ⚠2 │
 ├──────────────┬─────────────────────────────────────────────────────────────────────┬───────────────────────┤
 │ NAVIGATION   │ RUN OVERVIEW                                                        │ INSPECTOR             │
 │              │                                                                     │                       │
-│ Home         │  Production evidence identity hard-cut                              │ Task MEDIA-002        │
+│ Home         │  Exact-head validation wiring                                       │ Task CORE-002         │
 │ Repositories │  EXECUTING  5/9 tasks verified  2 running  1 blocked                │ Activity | Plan | ... │
-│  NeuralMatrix│                                                                     │                       │
+│  Example repo│                                                                     │                       │
 │ Runs         │  ┌────────────────────────────────────────────────────────────────┐ │ Goal                  │
 │  ● current   │  │ Architect  SOL · xhigh · read-only               COMPLETE      │ │ Enforce exact ...     │
 │  ○ prior     │  │ task graph 9 tasks · 6 authorities · 82k tokens · $4.17       │ │                       │
 │ Approvals 2  │  └────────────────────────────────────────────────────────────────┘ │ Luna · max            │
 │ Worktrees    │                                                                     │ workspace-write       │
 │ Evidence     │  ┌────────────────────────────────────────────────────────────────┐ │ 38.2k / 80k tokens    │
-│ Usage        │  │ MEDIA-001  Exact event camera identity           VERIFIED      │ │ $0.11 API equiv.      │
-│ Host         │  │ Terra · xhigh  agent/media-001  5e21c91                    ✓    │ │                       │
+│ Usage        │  │ CORE-001   Bind evidence to integration SHA      VERIFIED      │ │ $0.11 API equiv.      │
+│ Host         │  │ Terra · xhigh  work/core-001  5e21c91                      ✓    │ │                       │
 │ Settings     │  ├────────────────────────────────────────────────────────────────┤ │ Current action        │
-│              │  │ MEDIA-002  C2 media projection                   RUNNING       │ │ cargo test -p ...     │
-│              │  │ Luna · max  agent/media-002  command 7m12s      38.2k  $0.11   │ │ elapsed 07:12         │
+│              │  │ CORE-002   API evidence projection               RUNNING       │ │ cargo test -p ...     │
+│              │  │ Luna · max  work/core-002  command 7m12s        38.2k  $0.11   │ │ elapsed 07:12         │
 │              │  ├────────────────────────────────────────────────────────────────┤ │                       │
 │              │  │ IOS-001    Consume canonical identity             BLOCKED      │ │ Worktree             │
-│              │  │ waiting for MEDIA-002                                              /data/.../MEDIA-002  │
+│              │  │ waiting for CORE-002                                               /data/.../CORE-002   │
 │              │  └────────────────────────────────────────────────────────────────┘ │ branch · SHA          │
 │              │                                                                     │ files +4/-1            │
 ├──────────────┴─────────────────────────────────────────────────────────────────────┴───────────────────────┤
@@ -102,6 +112,21 @@ Left to right:
 
 Clicking the base SHA opens a compact provenance card: requested ref, resolved SHA, fetch timestamp, authority digest, Codex version, protocol-schema digest, profile version, and pricing snapshot IDs.
 
+### Codex account and limits strip
+
+Directly below the top bar, show the selected local Codex account, its plan,
+and each backend-exposed rate-limit window as remaining percentage plus reset
+time. The selector switches between detected and Harness-managed `CODEX_HOME`
+profiles only when no agent session is active and includes **Add Codex
+account**. Device authorization is initiated by the installed Codex binary;
+Harness shows only the OpenAI verification URL and one-time code. Missing
+windows say that no limit was exposed; the UI never invents a remaining value.
+Live/stale state is based on the last successful App Server observation.
+Hourly burn and exhaustion forecasts blend the local 24-hour and recent
+four-hour trends with the current provider-window average; longer observations
+carry more weight so brief activity bursts do not dominate the estimate.
+Credentials stay inside private Codex homes and are never rendered by Harness.
+
 ### Left rail
 
 The left rail stays narrow. It is navigation, not a second status dashboard. Counts appear only when actionable: running agents, approvals, failed validations, retained worktrees.
@@ -110,36 +135,48 @@ The left rail stays narrow. It is navigation, not a second status dashboard. Cou
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
-│ Good afternoon                                    New run                            │
+│ Good afternoon                                    New task                           │
 │                                                                                     │
 │ ACTIVE                                                                          2   │
-│ NeuralMatrix · Exact event evidence       EXECUTING     2 agents     $18.42      ›   │
-│ NeuralMatrix · CI credibility remediation VERIFYING     1 verifier   $ 6.10      ›   │
+│ Example repo · Exact event evidence       EXECUTING     2 agents     $18.42      ›   │
+│ Example repo · CI credibility remediation VERIFYING     1 verifier   $ 6.10      ›   │
 │                                                                                     │
 │ REPOSITORIES                                                                         │
-│ NeuralMatrix  main @ 4d6662e  clean  14 managed worktrees  profile healthy      ›   │
+│ Example repo  main @ 4d6662e  clean  14 managed worktrees  profile healthy      ›   │
 │                                                                                     │
 │ HOST                                                                                 │
 │ Codex 0.x pinned · schema matched · 3/6 agent slots · heavy runner idle · DB 1.4 GB  │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The primary action is **New run**. There is no empty generic chat box on the home screen; requests are always scoped to a registered repository and base.
+The primary action is **New task**. There is no empty generic chat box on the home screen; requests are always scoped to a registered repository and base.
 
-## 5. New-run composer
+### Dirty-checkout onboarding
+
+When repository inspection is blocked by a dirty primary checkout and no run
+has used that registration, the repository row offers **Create clean
+checkout**. The modal suggests a sibling directory, requires a destination that
+does not exist, and states that the selected source checkout is not modified.
+Harness clones the configured coordination branch, verifies the same origin,
+Git identity, clean state, and authority contract, then replaces the existing
+registration. The modal also explains that the source checkout supplies shared
+Git objects and must remain in place.
+
+## 5. New-task composer
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────────┐
-│ New NeuralMatrix run                                                       │
+│ New repository task                                                        │
 │                                                                            │
 │ Objective                                                                  │
 │ ┌────────────────────────────────────────────────────────────────────────┐ │
-│ │ Audit and hard-cut event media camera identity across edge and C2...  │ │
+│ │ Audit and bind signoff evidence to the integrated exact head...       │ │
 │ └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                            │
 │ Base          origin/main      resolved after Fetch & inspect              │
-│ Run mode      ○ Plan only  ● Plan + implement  ○ Review existing branch    │
-│ Risk posture  ● NeuralMatrix strict    mutable workers 3    verifier 1      │
+│ Account       ● Automatic best available  ○ Work  ○ Personal               │
+│ Plan approval ● Review before work  ○ Approve certified plan automatically │
+│ Risk posture  ● Repository strict      mutable workers 3    verifier 1      │
 │ Publication   ● Local only  ○ Draft PR after approval                      │
 │                                                                            │
 │ Advanced ▸  model overrides · budgets · allowed network · existing PR      │
@@ -148,7 +185,38 @@ The primary action is **New run**. There is no empty generic chat box on the hom
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-After fetch, show the exact SHA and any dirty-primary or remote-divergence problem before enabling **Start architecture**. The system never silently changes the requested base.
+Every new task intends implementation. After fetch, show the exact SHA and any
+dirty-primary or remote-divergence problem before enabling **Start
+architecture**. Manual plan approval is the default; automatic approval is an
+explicit global preference and per-task override. Both postures run the same
+independent adversarial certification loop; automatic approval only removes the
+human click after a plan reaches `CERTIFIED` with zero blocking findings and
+passes the controller's budget, risk, serial-path, and model-diversity gates. It
+never converts schema validity into approval. The system never silently changes
+the requested base.
+
+Creating a task and starting its architect are visibly distinct. A prepared
+task shows a prominent **Waiting to start** architecture status and says that
+planning has not begun. After **Start architecture**, the same surface becomes
+an animated **Planning** status and shows the architect's latest action. The
+right inspector mirrors that state instead of falling back to ambiguous copy
+such as `Select a task` or `No active turn`.
+
+After the architect proposes a plan, the same surface advances through
+**Adversarial review** and, when blockers exist, **Revising plan** before
+returning to review. The plan card explains whether the reviewer is checking
+feasibility/liveness, whether the architect is addressing concrete findings, or
+whether the digest is **Certified**. Approval controls are absent until
+certification. Review/revision retries remain automatic while capacity and the
+total run ceiling permit them. A repeated/oscillating or non-shrinking finding
+history stops as **Planning needs a decision** rather than consuming the rest of
+the ceiling. The plan card shows the certificate, inspected-file/critical-path
+evidence, advisory findings, revision history, planning spend, execution reserve,
+and the reason automatic approval was deferred. The operator can **Request
+changes** with a concrete blocking correction; Harness sends it through the same
+replacement-plan and re-certification loop. An explicit **Approve with budget
+override** action is shown only when the controller's remaining-budget check is
+the blocker.
 
 ## 6. Run workspace
 
@@ -163,26 +231,71 @@ The run header contains:
 - buttons: **Pause scheduling**, **Stop run**, **Open run folder**, **Export evidence**;
 - contextual primary action, such as **Review plan**, **Approve integration**, or **Create draft PR**.
 
+A persistent **Governor sessions** switcher sits above the run header. It lists
+every available run by human title and current state, shows active and total
+counts, and keeps **New task** adjacent. Switching sessions swaps the center
+workspace, inspector, usage, and event stream together; an explicit loading
+state prevents the previous governor's detail from being shown under the new
+selection. The switcher stays pinned to the top of the run workspace while the
+operator scrolls and labels the selection as `Viewing run N of M`, so similar
+task titles cannot make the current governor ambiguous. Run numbers follow
+creation order—Run 1 is the first-created session—even when the backend returns
+newest activity first.
+
+Submitting **New task** creates the prepared run and immediately launches its
+read-only architecture turn in the same user action. **Start architecture** is
+kept only as a recovery action when startup could not be admitted. Completed,
+canceled, or failed runs expose **Archive run**; archived runs keep their durable
+history and preserved worktrees, disappear from the switcher by default, and
+remain available behind **Show archived**.
+
 ### 6.2 Agent/task row
 
 Every row must fit the information below without opening the inspector:
 
 ```text
-[status] TASK-ID  title
+[status] task title
          role badge · model · effort · sandbox · parent/subagent count
          current goal or current action
-         worktree short path · branch · head SHA · files +N/-N
-         token progress / budget · API-equivalent cost · elapsed · heartbeat
-         dependency/approval/validation chips
+         thread usage / budget · API-equivalent cost
+         dependency/approval/validation state
 ```
+
+Controller-owned tasks display the role as **Governor**, the number and state
+of delegated child threads, and the governor's current reconciliation action.
+The task row, needs-help handoff, and default inspector selection always target
+the root governor rather than the most recently created child. Child threads
+show their own thread tokens and API-equivalent cost directly in the delegated
+thread list. They are selectable for read-only activity inspection, but Continue, Steer, and
+Interrupt remain governor controls so the operator does not become the child
+scheduler.
+Governor message previews follow new messages while the operator remains near
+the bottom. Manual scrollback suspends that behavior for twelve seconds. The
+full message-history surface opens at the latest message by default and uses
+the same reading grace period.
+When the governor returns control, the task reads **Waiting on you**. A child
+that is still closing reads **Finishing** until the controller reconciles it;
+late activity must not reopen a completed child as running. The same inspector
+contains timestamped Governor Messages and one Work status card with live Git
+custody state, diff totals, a bounded changed-file list, and single- versus
+multi-PR scope. Raw run IDs, worktree paths, branches, and commit hashes are
+not primary UI copy.
+The Goal and Plan cards show the governor's bounded milestone ledger, including
+completed, active, pending, and blocked outcomes. A single governor task is not
+displayed as a single generic step. Continue accepts optional brief steering;
+when left blank, Harness selects the next action from controller-owned progress
+and recent valid handoffs. Human prose never silently replaces the goal.
+`WAITING_RESOURCE` means the deterministic controller is retrying a required
+capability such as authenticated GitHub API access; no model turn or token
+budget is consumed in that state.
 
 Example:
 
 ```text
-● MEDIA-002  Project canonical camera identity through C2
+● CORE-002  Project exact-head evidence through the API
   worker · Luna · max · workspace-write · 2 read-only subagents
-  Running focused c2-api contract tests
-  …/MEDIA-002 · agent/hc/nm-014/MEDIA-002 · a1b9c02 · 4 files +183/-72
+  Running focused API contract tests
+  …/CORE-002 · work/run-014/CORE-002 · a1b9c02 · 4 files +183/-72
   38.2k / 80k · $0.11 · 12m 44s · heartbeat 8s                       [1 approval]
 ```
 
@@ -195,15 +308,25 @@ Use stable text and icons, not color alone:
 - `INTEGRATING`, `INTEGRATED`, `CI_PROVEN`, `LIVE_PROVEN`, `CLOSED`;
 - `BLOCKED`, `NEEDS_HELP`, `STALLED`, `INTERRUPTED`, `FAILED`, `SUPERSEDED`, `CANCELED`.
 
-A separate result badge uses NeuralMatrix semantics: `SUCCESS`, `NOT_SELECTED`, `SOURCE_FAILURE`, `INFRASTRUCTURE_UNAVAILABLE`, `INCONCLUSIVE`, `CANCELLED_SUPERSEDED`, `SKIPPED_DRAFT`, `QUARANTINED_FAILURE`.
+A separate result badge uses controller result semantics: `SUCCESS`,
+`NOT_SELECTED`, `SOURCE_FAILURE`, `INFRASTRUCTURE_UNAVAILABLE`,
+`INCONCLUSIVE`, `CANCELLED_SUPERSEDED`, `SKIPPED_DRAFT`, and
+`QUARANTINED_FAILURE`.
 
 ## 7. Inspector
 
-The right inspector keeps its selected agent while the center list updates. Tabs:
+The right inspector keeps its selected agent while the center list updates. Its
+default surface is a single plan-first scroll rather than a multi-tab diagnostic
+console. The first card is **Plan progress**: a compact checklist of every
+governor milestone with `Completed`, `In progress`, `Pending`, or `Blocked`
+status, followed by the governor and delegated threads currently assigned to
+the work and their present actions. This replaces the low-value Recent activity
+timeline so goal progress is visible at a glance.
 
-### Activity
+### Detailed activity
 
-A virtualized chronological stream combining:
+Detailed messages remain available from Governor Messages or the selected child
+thread. Diagnostic activity may combine:
 
 - current goal and goal updates;
 - plan-step transitions;
@@ -219,16 +342,18 @@ A virtualized chronological stream combining:
 
 Default filters hide low-value repeated reads. A **Protocol** toggle exposes raw App Server notifications for debugging.
 
-### Plan
+### Plan progress
 
-Shows the agent plan as a checklist with state, not as prose buried in a transcript. The controller task packet appears above it, clearly distinguished as authoritative execution scope.
+Shows the agent plan as a checklist with state, not as prose buried in a
+transcript. It is the inspector's primary glance surface, not a separate tab.
+The controller task packet remains authoritative execution scope.
 
 ### Diff
 
 - aggregate task diff against the task base SHA;
 - per-file tree with added/deleted counts;
 - side-by-side and unified views;
-- comments/bookmarks local to Harness Console;
+- comments/bookmarks local to BILDR;
 - badges for leased, serial, forbidden, generated, or unexpected paths;
 - one-click **Compare with verified commit**, **Open in editor**, and **Copy file:line**;
 - binary and large generated files display metadata, not inline blobs.
@@ -239,9 +364,9 @@ Shows reads, searches, writes, and ownership:
 
 ```text
 Path                                               Access      Lease             Last activity
-central/rust-c2/src/event_media.rs                  read/write  MEDIA-002         14:38:12
-shared/contracts/generated/event_media.ts           attempted   SERIAL/denied     14:29:03
-docs/architecture/PRODUCT_EVIDENCE_CONTRACT.md      read        authority         14:17:44
+crates/harness-api/src/lib.rs                       read/write  CORE-002          14:38:12
+generated/protocol/example.json                     attempted   SERIAL/denied     14:29:03
+ARCHITECTURE_AND_IMPLEMENTATION_PLAN.md             read        authority         14:17:44
 ```
 
 ### Commands
@@ -251,6 +376,27 @@ A table with command, cwd, resource class, duration, exit, result classification
 ### Evidence
 
 Shows claims, proof tier, exact SHA, validator, runner/device, result class, artifacts, and unproved claims. It must never collapse multiple proof tiers into one green check.
+
+### Execution signoff
+
+After integrated-head validation begins, show one controller-assembled packet:
+
+- exact integration SHA and packet digest;
+- every selected validator with evidence class (`custody`, `contract`, or
+  `behavioral`), proof tier, result, and artifact links;
+- platform acceptance items as `passed`, `pending attestation`, `attested`, or
+  `not selected`, with selection tied to changed paths;
+- final-auditor structured evidence and blocking/advisory findings;
+- exact-head unproved claims and total run spend.
+
+`HUMAN_REVIEW` must visibly rest. Its primary actions are **Approve signoff**
+and **Request changes**. Approval binds to the displayed packet digest and SHA.
+A rejection requires an affected repository file plus a behavioral correction
+so the controller can reopen the owning task without discarding unrelated
+verified work. Attested acceptance requires target/device identity and observed
+behavior; a checkbox with no observation is not evidence. In
+`DRAFT_PR_CREATED`, show required-CI status and a refresh action while the
+controller polls; never imply that CI authorizes merge.
 
 ### Usage
 
@@ -283,13 +429,25 @@ This screen is essential for debugging agent quality without exposing hidden rea
 Subagents are grouped beneath their parent and collapsed by default:
 
 ```text
-MEDIA-002  Luna · max                                 RUNNING
+CORE-002   Luna · max                                 RUNNING
 ├─ explore-auth-paths    Luna · medium · read-only    COMPLETE
 ├─ inspect-contract-test Luna · medium · read-only    COMPLETE
 └─ ci-triage             Luna · high · read-only      WAITING
 ```
 
 Selecting a subagent uses the same inspector. The parent row aggregates subagent tokens and cost while preserving an expandable breakdown. A graph view is available from **Task graph**, but the list remains the operational default.
+
+Run labels show effective operator posture rather than only the persistent
+lifecycle state: for example, an unfinished `EXECUTING` run is presented as
+**WORKING**, **PAUSED**, or **WAITING ON YOU** according to its live turns,
+scheduler, approvals, and task handoffs. New task creation exposes the total run
+budget. Governor continuation defaults to **Adaptive** and offers a bounded
+additional-budget slider for unusually long attempts.
+
+Plan progress starts with the complete goal rollup (completed phases and total
+outcomes), then shows every phase state, followed by the selected phase's
+granular outcomes. A selected phase count must never be presented as if it were
+the count for the entire plan.
 
 ## 9. Approval center
 
@@ -303,7 +461,7 @@ Selecting a subagent uses the same inspector. The parent row aggregates subagent
 │ [View diff] [Deny] [Approve once]                                            │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ MEDIUM  Run command with network enabled                                     │
-│ MEDIA-004 · cargo fetch --locked · worktree only                             │
+│ CORE-004 · cargo fetch --locked · worktree only                              │
 │ [View command/environment] [Deny] [Approve once]                             │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -322,13 +480,13 @@ There is no global **approve everything** action. High-risk external writes and 
 
 ```text
 Task commits                              Integration
-✓ MEDIA-001 5e21c91                       base 4d6662e
-✓ MEDIA-002 a1b9c02                       applied MEDIA-001
-✓ TEST-001  8a910af                       applying MEDIA-002 ...
+✓ CORE-001  5e21c91                       base 4d6662e
+✓ CORE-002  a1b9c02                       applied CORE-001
+✓ TEST-001  8a910af                       applying CORE-002 ...
 ! IOS-001   changes requested             pending TEST-001
 
 Serial path queue                         Evidence invalidated
-1. shared generated contracts             MEDIA-001 T1 after regeneration
+1. shared generated contracts             CORE-001 T1 after regeneration
 2. MASTER_COMPLETION_CHECKLIST             none: update not yet authorized
 ```
 
@@ -381,11 +539,37 @@ Shows:
 
 ## 14. Interaction controls
 
+Settings exposes a compact **Planning and governor autonomy** section with
+manual-by-default or automatic plan approval, automatic continuation, adaptive
+budgeting, the no-progress token envelope, the per-attempt
+ceiling, the next recommended attempt budget, sample count, and a plain-language
+reason. The recommendation is advisory and always bounded by the operator's
+ceiling. Productive same-thread continuation is visible in the activity
+timeline but does not present a false `NEEDS HELP` interruption. A cold
+rollover is labeled separately as a bounded-handoff recovery.
+Verifier findings and controller strategy corrections use the same automatic
+continuation posture and remain visible in the timeline without presenting a
+routine Resume action.
+The plan-approval control says **Approve certified plan automatically** and
+links to the invariant that every plan first passes independent adversarial
+review. The timeline shows proposed digest, reviewer findings, replacement
+revision, certification, and approval as distinct events.
+
+Settings also lists detected and Harness-managed Codex accounts. Friendly names
+may be edited for either kind. Managed accounts can be re-authenticated or
+removed; externally detected homes remain owned by their source. Automatic
+capacity handoff selects another ready account only between attempts, never by
+transplanting an active thread.
+
 ### Agent controls
 
 - **Steer:** inject a correction into the active turn; saved as an event.
 - **Interrupt:** request turn interruption, then terminate the process group only after a grace period.
 - **Retry with evidence:** create a new attempt with the failure, command artifacts, and a revised bounded objective. Never resend the same prompt blindly.
+- **Continue:** resume the unchanged goal from the structured milestone ledger;
+  operator text is optional steering context, not a required recovery script.
+- Runtime status labels context `fresh independent`, `native thread retained`,
+  or `bounded handoff`, and explains the reuse decision.
 - **Escalate model:** Luna → Terra, preserving task and evidence but starting a fresh thread when context anchoring is a concern.
 - **Request independent review:** start the configured verifier in read-only mode.
 - **Preserve worktree:** prevent cleanup.
@@ -394,6 +578,18 @@ Shows:
 ### Run controls
 
 - pause/resume scheduling;
+- when a bounded governor window or run budget is exhausted, place the next
+  window selector immediately beside **Resume work**; preselect the adaptive
+  recommendation and allow a bounded operator override without requiring
+  written steering. The selected value is the governor allowance; Harness
+  reserves bounded child-thread headroom separately so ordinary delegation does
+  not immediately exhaust the run cap. Manual continuation additions extend
+  through 50m, and the control shows the projected lifetime run cap before the
+  operator resumes;
+- new-task budget selection is labeled **Total run ceiling** and explains that
+  it covers planning, governor work, children, and review. Per-turn adaptive
+  slices are internal checkpoints and automatically continue productive work;
+  they are not separate user approvals or invitations to restate the goal;
 - stop after current commands;
 - cancel immediately with explicit warning;
 - re-plan remaining tasks from current integration SHA;
@@ -464,7 +660,7 @@ The production build is embedded into the Rust daemon so runtime installation do
 
 ## 20. UX acceptance gates
 
-The UI is ready for the first NeuralMatrix pilot only when a user can:
+The UI is ready for the first repository pilot only when a user can:
 
 1. register the repository and see a clean/pinned base;
 2. start one architect thread and watch plan, actions, tokens, and goal live;

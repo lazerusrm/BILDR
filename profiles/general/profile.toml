@@ -1,0 +1,91 @@
+schema_version = 1
+profile_id = "general"
+display_name = "General repository"
+repository = "*"
+default_branch = "auto"
+base_ref = "auto"
+completion_authority = "Independent exact-head verification and SOL final audit"
+instruction_sources = []
+required_global_authorities = []
+protected_semantics = [
+  "Preserve repository-local contributor instructions and user-owned changes",
+  "Bind verification and final audit to the exact candidate SHA",
+  "Never push, publish, or merge without an explicit controller action",
+]
+serial_paths = [
+  "Cargo.lock",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+]
+forbidden_generated_runtime_paths = [
+  ".harness-runtime/**",
+  ".omx/**",
+]
+domains = []
+
+# The general profile deliberately fails closed at integration until a repository
+# supplies at least one gate-bound behavioral validator. Patch-format success is
+# custody evidence, not proof that the changed code works.
+[validation_policy]
+review_ready = false
+integration = true
+require_behavioral_integration = true
+behavioral_required_globs = ["**"]
+require_human_signoff = true
+require_draft_pr_ci = false
+
+[concurrency]
+max_total_agent_threads = 6
+max_mutable_tasks = 3
+max_independent_verifiers = 1
+final_integration_mutable_tasks = 1
+live_certification_mutable_tasks = 1
+
+[models.architect]
+model = "gpt-5.6-sol"
+reasoning_effort = "xhigh"
+sandbox = "read-only"
+
+[models.governor]
+model = "gpt-5.6-sol"
+reasoning_effort = "xhigh"
+sandbox = "workspace-write"
+
+[models.explorer]
+model = "gpt-5.6-luna"
+reasoning_effort = "medium"
+sandbox = "read-only"
+
+[models.worker]
+model = "gpt-5.6-luna"
+reasoning_effort = "max"
+sandbox = "workspace-write"
+
+[models.worker_escalation]
+model = "gpt-5.6-terra"
+reasoning_effort = "xhigh"
+sandbox = "workspace-write"
+
+[models.integrator]
+model = "gpt-5.6-terra"
+reasoning_effort = "xhigh"
+sandbox = "workspace-write"
+
+[models.verifier]
+model = "gpt-5.6-sol"
+reasoning_effort = "xhigh"
+sandbox = "read-only"
+
+[models.final_auditor]
+model = "gpt-5.6-sol"
+reasoning_effort = "max"
+sandbox = "read-only"
+
+[[validators]]
+id = "git-diff-check"
+command = ["bash", "-lc", "git diff --check \"$HARNESS_BASE_SHA..$HARNESS_SOURCE_SHA\" --"]
+proof_tier = "T0"
+resource_class = "control"
+gates = ["integration"]
+evidence_class = "custody"

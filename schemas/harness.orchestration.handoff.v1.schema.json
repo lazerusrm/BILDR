@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:bildr:harness.orchestration.handoff.v1",
+  "title": "Repository orchestration handoff",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "task_id", "status", "base_sha", "result", "touched_paths",
+    "commands", "positive_tests", "negative_tests", "metrics_added_or_changed",
+    "proof_limits", "checklist_recommendation", "next_steps_for_orchestrator",
+    "errors"
+  ],
+  "properties": {
+    "schema": { "const": "harness.orchestration.handoff.v1" },
+    "task_id": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["complete", "partial", "blocked", "needs_help", "failed"] },
+    "base_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "head_sha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+    "result": { "type": "string", "minLength": 1 },
+    "patch_artifact": { "type": ["string", "null"] },
+    "commit_sha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+    "touched_paths": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "exit_code", "artifact", "result_class"],
+        "properties": {
+          "command": { "type": "string", "minLength": 1 },
+          "exit_code": { "type": "integer" },
+          "artifact": { "type": ["string", "null"] },
+          "result_class": {
+            "enum": [
+              "success", "not_selected", "source_failure",
+              "infrastructure_unavailable", "inconclusive",
+              "cancelled_superseded", "skipped_draft", "quarantined_failure"
+            ]
+          }
+        }
+      }
+    },
+    "positive_tests": { "type": "array", "items": { "type": "string" } },
+    "negative_tests": { "type": "array", "items": { "type": "string" } },
+    "metrics_added_or_changed": { "type": "array", "items": { "type": "string" } },
+    "proof_limits": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+    "checklist_recommendation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rows", "maximum_state"],
+      "properties": {
+        "rows": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "maximum_state": {
+          "enum": [
+            "DECLARED", "IMPLEMENTING", "SOURCE_PROVEN", "INTEGRATION_PROVEN",
+            "LIVE_PROVEN", "ROLLOUT_READY", "INTERNAL", "CANARY", "DEFAULT_ON",
+            "RETIRED", "BLOCKED"
+          ]
+        }
+      }
+    },
+    "next_steps_for_orchestrator": { "type": "array", "items": { "type": "string" } },
+    "errors": { "type": "array", "items": { "type": "string" } }
+  }
+}

@@ -85,6 +85,7 @@ pub struct NewAgentSession {
     pub task_attempt_id: Option<AttemptId>,
     pub parent_agent_session_id: Option<AgentSessionId>,
     pub runtime_kind: String,
+    pub codex_account_id: Option<String>,
     pub role: AgentRole,
     pub nickname: Option<String>,
     pub requested_model: String,
@@ -137,6 +138,25 @@ pub struct NewTaskAttempt {
     pub packet_sha256: String,
     pub base_sha: String,
     pub requested_model_route: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PriorAttemptContext {
+    pub attempt_id: AttemptId,
+    pub attempt_number: u32,
+    pub state: String,
+    pub terminal_class: Option<String>,
+    pub failure_reason: Option<String>,
+    pub worktree_path: Option<PathBuf>,
+    pub agent_id: Option<AgentSessionId>,
+    pub role: Option<String>,
+    pub requested_model: Option<String>,
+    pub effective_model: Option<String>,
+    pub requested_reasoning_effort: Option<String>,
+    pub effective_reasoning_effort: Option<String>,
+    pub tokens_used: u64,
+    pub verifier_verdict: Option<String>,
+    pub last_agent_message: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -246,6 +266,13 @@ pub struct ContextSourceRecord {
     pub included: bool,
     pub reason: String,
     pub estimated_tokens: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeSubagentActivityRecord {
+    pub parent_agent_session_id: AgentSessionId,
+    pub parent_thread_id: String,
+    pub payload: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

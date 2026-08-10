@@ -1,7 +1,7 @@
 //! Exact-base Git coordination, worktree custody, path leases, and diff checks.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     fs::{self, File, OpenOptions},
     io::Read,
     os::unix::{
@@ -16,11 +16,12 @@ use std::{
 
 use fs2::FileExt;
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use harness_domain::now_ms;
 use harness_profile::{RepositoryProfile, redact_diagnostic};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::{process::Command, sync::Mutex, time::timeout};
+use tokio::{io::AsyncWriteExt, process::Command, sync::Mutex, time::timeout};
 use tracing::debug;
 use url::Url;
 
@@ -40,6 +41,14 @@ pub struct RepositoryInspection {
     pub git_identity_name_present: bool,
     pub git_identity_email_present: bool,
     pub blockers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DiscoveredRepository {
+    pub root_path: PathBuf,
+    pub display_name: String,
+    pub origin_url: Option<String>,
+    pub is_github: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +90,15 @@ pub struct VerifiedDiff {
     pub diff_check: String,
     pub status_porcelain_v2: String,
     pub patch: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DiffSummary {
+    pub head_sha: String,
+    pub dirty: bool,
+    pub changed_paths: Vec<String>,
+    pub additions: u64,
+    pub deletions: u64,
 }
 
 impl VerifiedDiff {
@@ -133,7 +151,9 @@ impl GitManager {
         if !clean {
             blockers.push("primary checkout is dirty".to_owned());
         }
-        if current_branch.as_deref() != Some(profile.default_branch.as_str()) {
+        if profile.default_branch != "auto"
+            && current_branch.as_deref() != Some(profile.default_branch.as_str())
+        {
             blockers.push(format!(
                 "primary checkout must be on {}, observed {}",
                 profile.default_branch,
@@ -165,6 +185,182 @@ impl GitManager {
             git_identity_email_present: identity_email.is_some(),
             blockers,
         })
+    }
+
+    pub async fn discover_repositories(
+        &self,
+        search_roots: Vec<PathBuf>,
+    ) -> Result<Vec<DiscoveredRepository>, GitError> {
+        let roots = tokio::task::spawn_blocking(move || find_repository_roots(&search_roots))
+            .await
+            .map_err(|error| {
+                GitError::Protocol(format!("repository discovery task failed: {error}"))
+            })??;
+        let mut repositories = Vec::new();
+        for path in roots {
+            let Ok(root) = canonical_repo_root(&path).await else {
+                continue;
+            };
+            if root != path {
+                continue;
+            }
+            let origin_url = optional_git_text(&root, ["remote", "get-url", "origin"])
+                .await?
+                .map(|origin| sanitize_remote_url(&origin));
+            let display_name = root
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| root.display().to_string());
+            let is_github = origin_url
+                .as_deref()
+                .is_some_and(|origin| origin.to_ascii_lowercase().contains("github.com"));
+            repositories.push(DiscoveredRepository {
+                root_path: root,
+                display_name,
+                origin_url,
+                is_github,
+            });
+        }
+        repositories.sort_by(|left, right| {
+            right
+                .is_github
+                .cmp(&left.is_github)
+                .then_with(|| left.display_name.cmp(&right.display_name))
+                .then_with(|| left.root_path.cmp(&right.root_path))
+        });
+        Ok(repositories)
+    }
+
+    /// Create a clean, branch-attached coordination clone without changing the
+    /// selected source checkout. Existing source objects are used as a local
+    /// reference so the onboarding clone does not duplicate the full object DB.
+    pub async fn create_coordination_clone(
+        &self,
+        source: &Path,
+        destination: &Path,
+        profile: &RepositoryProfile,
+    ) -> Result<RepositoryInspection, GitError> {
+        let source = canonical_repo_root(source).await?;
+        if !destination.is_absolute()
+            || destination
+                .components()
+                .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+        {
+            return Err(GitError::Policy(
+                "coordination checkout destination must be an absolute normalized path".to_owned(),
+            ));
+        }
+        if destination.starts_with(&source) {
+            return Err(GitError::Policy(
+                "coordination checkout cannot be created inside the source repository".to_owned(),
+            ));
+        }
+        if fs::symlink_metadata(destination).is_ok() {
+            return Err(GitError::Policy(format!(
+                "coordination checkout destination already exists: {}",
+                destination.display()
+            )));
+        }
+        let parent = destination.parent().ok_or_else(|| {
+            GitError::Policy("coordination checkout destination has no parent".to_owned())
+        })?;
+        fs::create_dir_all(parent)?;
+        let parent = fs::canonicalize(parent)?;
+        let destination_name = destination.file_name().ok_or_else(|| {
+            GitError::Policy("coordination checkout destination has no directory name".to_owned())
+        })?;
+        let destination = parent.join(destination_name);
+        if destination.starts_with(&source) {
+            return Err(GitError::Policy(
+                "coordination checkout cannot be created inside the source repository".to_owned(),
+            ));
+        }
+        if fs::symlink_metadata(&destination).is_ok() {
+            return Err(GitError::Policy(format!(
+                "coordination checkout destination already exists: {}",
+                destination.display()
+            )));
+        }
+        let origin_url = optional_git_text(&source, ["remote", "get-url", "origin"])
+            .await?
+            .map(|origin| sanitize_remote_url(&origin))
+            .ok_or_else(|| GitError::Policy("source repository has no origin remote".to_owned()))?;
+        if origin_url.starts_with('-') || origin_url.contains(['\0', '\n', '\r']) {
+            return Err(GitError::Policy(
+                "source repository origin is unsafe for cloning".to_owned(),
+            ));
+        }
+        let staging = parent.join(format!(
+            ".harness-clone-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let branch = if profile.default_branch == "auto" {
+            optional_git_text(&source, ["branch", "--show-current"])
+                .await?
+                .ok_or_else(|| {
+                    GitError::Policy(
+                        "source repository must be on a named branch for coordination cloning"
+                            .to_owned(),
+                    )
+                })?
+        } else {
+            profile.default_branch.clone()
+        };
+        let arguments = vec![
+            "clone".to_owned(),
+            "--single-branch".to_owned(),
+            "--branch".to_owned(),
+            branch.clone(),
+            "--reference-if-able".to_owned(),
+            source.to_string_lossy().into_owned(),
+            "--".to_owned(),
+            origin_url,
+            staging.to_string_lossy().into_owned(),
+        ];
+        let clone = git_status(&parent, &arguments).await;
+        match clone {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(GitError::Command {
+                    cwd: parent,
+                    stderr: safe_stderr(&output.stderr),
+                });
+            }
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error);
+            }
+        }
+        let mut effective_profile = profile.clone();
+        effective_profile.default_branch = branch;
+        let inspection = match self.inspect(&staging, &effective_profile).await {
+            Ok(inspection) => inspection,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error);
+            }
+        };
+        if !inspection.blockers.is_empty() {
+            let blockers = inspection.blockers.join("; ");
+            let _ = fs::remove_dir_all(&staging);
+            return Err(GitError::Policy(format!(
+                "new coordination checkout failed inspection: {blockers}"
+            )));
+        }
+        if fs::symlink_metadata(&destination).is_ok() {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(GitError::Policy(format!(
+                "coordination checkout destination appeared during clone: {}",
+                destination.display()
+            )));
+        }
+        if let Err(error) = fs::rename(&staging, &destination) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error.into());
+        }
+        self.inspect(&destination, &effective_profile).await
     }
 
     pub async fn fetch_and_pin(
@@ -360,6 +556,163 @@ impl GitManager {
         })
     }
 
+    /// Materialize an attested Git tree into a clean controller-owned
+    /// worktree. The candidate may live in an alternate object directory, but
+    /// the resulting diff is still subject to the normal owned-path and budget
+    /// verification before Harness can commit it.
+    pub async fn materialize_candidate_tree(
+        &self,
+        worktree: &Path,
+        expected_base: &str,
+        alternate_object_directory: &Path,
+        tree_sha: &str,
+    ) -> Result<(), GitError> {
+        ensure_sha(expected_base)?;
+        ensure_sha(tree_sha)?;
+        let root = canonical_repo_root(worktree).await?;
+        if root != fs::canonicalize(worktree)? {
+            return Err(GitError::Policy(
+                "candidate target is not the exact managed worktree root".to_owned(),
+            ));
+        }
+        let head = git_text(&root, ["rev-parse", "HEAD"]).await?;
+        if head != expected_base {
+            return Err(GitError::Conflict(format!(
+                "candidate base {expected_base} differs from worktree head {head}"
+            )));
+        }
+        if !git_bytes(&root, ["status", "--porcelain=v2", "-z"])
+            .await?
+            .is_empty()
+        {
+            return Err(GitError::Conflict(
+                "candidate recovery requires a clean managed worktree".to_owned(),
+            ));
+        }
+        let object_directory = fs::canonicalize(alternate_object_directory)?;
+        if !object_directory.is_dir() {
+            return Err(GitError::Policy(
+                "candidate alternate object directory is not a directory".to_owned(),
+            ));
+        }
+        let alternate = object_directory.as_os_str();
+        let tree_type = Command::new("git")
+            .current_dir(&root)
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternate)
+            .args(["cat-file", "-t", tree_sha])
+            .output()
+            .await?;
+        if !tree_type.status.success() || tree_type.stdout != b"tree\n" {
+            return Err(GitError::Policy(format!(
+                "candidate object {tree_sha} is not an accessible Git tree: {}",
+                safe_stderr(&tree_type.stderr)
+            )));
+        }
+        let patch = Command::new("git")
+            .current_dir(&root)
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternate)
+            .args(["diff", "--binary", expected_base, tree_sha, "--"])
+            .output()
+            .await?;
+        if !patch.status.success() {
+            return Err(GitError::Command {
+                cwd: root.clone(),
+                stderr: safe_stderr(&patch.stderr),
+            });
+        }
+        if patch.stdout.is_empty() {
+            return Err(GitError::Policy(
+                "candidate tree is identical to the managed base".to_owned(),
+            ));
+        }
+        if patch.stdout.len() > 128 * 1024 * 1024 {
+            return Err(GitError::Policy(
+                "candidate patch exceeds the 128 MiB recovery boundary".to_owned(),
+            ));
+        }
+        let mut apply = Command::new("git")
+            .current_dir(&root)
+            .args(["apply", "--index", "--binary", "--whitespace=nowarn", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let Some(mut stdin) = apply.stdin.take() else {
+            return Err(GitError::Protocol(
+                "git apply did not expose its input pipe".to_owned(),
+            ));
+        };
+        stdin.write_all(&patch.stdout).await?;
+        drop(stdin);
+        let result = apply.wait_with_output().await?;
+        if !result.status.success() {
+            return Err(GitError::Command {
+                cwd: root,
+                stderr: safe_stderr(&result.stderr),
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn diff_summary(
+        &self,
+        worktree: &Path,
+        base_sha: &str,
+    ) -> Result<DiffSummary, GitError> {
+        ensure_sha(base_sha)?;
+        let root = canonical_repo_root(worktree).await?;
+        if root != fs::canonicalize(worktree)? {
+            return Err(GitError::Policy(
+                "worktree root did not canonicalize exactly".to_owned(),
+            ));
+        }
+        let head_sha = git_text(&root, ["rev-parse", "HEAD"]).await?;
+        let status = git_bytes(&root, ["status", "--porcelain=v2", "-z"]).await?;
+        let mut changed_paths = split_nul(
+            &git_bytes(
+                &root,
+                [
+                    "diff",
+                    "--name-only",
+                    "-z",
+                    "--find-renames",
+                    base_sha,
+                    "--",
+                ],
+            )
+            .await?,
+        )?;
+        let untracked = split_nul(
+            &git_bytes(&root, ["ls-files", "--others", "--exclude-standard", "-z"]).await?,
+        )?;
+        changed_paths.extend(untracked.iter().cloned());
+        changed_paths.sort();
+        changed_paths.dedup();
+        for path in &changed_paths {
+            validate_relative_repo_path(path)?;
+            ensure_path_stays_in(&root, path)?;
+        }
+
+        let numstat = git_text_allow_empty(
+            &root,
+            ["diff", "--numstat", "--find-renames", base_sha, "--"],
+        )
+        .await?;
+        let (mut additions, deletions, _) = parse_numstat(&numstat)?;
+        for path in &untracked {
+            if let Some(lines) = count_text_lines(&root.join(path))? {
+                additions = additions.saturating_add(lines);
+            }
+        }
+        Ok(DiffSummary {
+            head_sha,
+            dirty: !status.is_empty(),
+            changed_paths,
+            additions,
+            deletions,
+        })
+    }
+
     /// Returns a stable digest of HEAD plus every staged, unstaged, and
     /// untracked worktree change. Two consecutive snapshots must agree so an
     /// approval cannot be minted from an internally inconsistent read.
@@ -398,7 +751,7 @@ impl GitManager {
                 "cannot commit a diff that failed custody checks".to_owned(),
             ));
         }
-        reject_ai_attribution(message)?;
+        validate_public_change_metadata(message)?;
         let root = canonical_repo_root(worktree).await?;
         let name = optional_git_text(&root, ["config", "user.name"]).await?;
         let email = optional_git_text(&root, ["config", "user.email"]).await?;
@@ -412,7 +765,7 @@ impl GitManager {
         let sha = git_text(&root, ["rev-parse", "HEAD"]).await?;
         ensure_sha(&sha)?;
         let body = git_text(&root, ["log", "-1", "--pretty=%B"]).await?;
-        reject_ai_attribution(&body)?;
+        validate_public_change_metadata(&body)?;
         Ok(sha)
     }
 
@@ -510,6 +863,72 @@ impl GitManager {
         }
         Ok(self.worktree_root.join(relative))
     }
+}
+
+fn find_repository_roots(search_roots: &[PathBuf]) -> Result<Vec<PathBuf>, std::io::Error> {
+    const MAX_DEPTH: usize = 4;
+    const MAX_DIRECTORIES: usize = 20_000;
+    const MAX_REPOSITORIES: usize = 200;
+
+    let mut queue = VecDeque::new();
+    let mut queued = BTreeSet::new();
+    for root in search_roots {
+        let Ok(root) = fs::canonicalize(root) else {
+            continue;
+        };
+        if root.is_dir() && queued.insert(root.clone()) {
+            queue.push_back((root, 0_usize));
+        }
+    }
+
+    let mut visited = 0_usize;
+    let mut repositories = BTreeSet::new();
+    while let Some((directory, depth)) = queue.pop_front() {
+        visited = visited.saturating_add(1);
+        if visited > MAX_DIRECTORIES || repositories.len() >= MAX_REPOSITORIES {
+            break;
+        }
+        if is_git_checkout(&directory) {
+            repositories.insert(directory);
+            continue;
+        }
+        if depth >= MAX_DEPTH {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        let mut children = entries.filter_map(Result::ok).collect::<Vec<_>>();
+        children.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in children {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if should_skip_discovery_directory(&name) {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() && !file_type.is_symlink() {
+                queue.push_back((entry.path(), depth + 1));
+            }
+        }
+    }
+    Ok(repositories.into_iter().collect())
+}
+
+fn is_git_checkout(path: &Path) -> bool {
+    fs::symlink_metadata(path.join(".git")).is_ok_and(|metadata| {
+        !metadata.file_type().is_symlink() && (metadata.is_dir() || metadata.is_file())
+    })
+}
+
+fn should_skip_discovery_directory(name: &str) -> bool {
+    name.starts_with('.')
+        || matches!(
+            name.to_ascii_lowercase().as_str(),
+            "node_modules" | "target" | "dist" | "build" | "vendor"
+        )
 }
 
 async fn worktree_snapshot(root: &Path) -> Result<String, GitError> {
@@ -761,16 +1180,63 @@ fn count_text_lines(path: &Path) -> Result<Option<u64>, GitError> {
     ))
 }
 
-fn reject_ai_attribution(message: &str) -> Result<(), GitError> {
+pub fn validate_public_change_metadata(message: &str) -> Result<(), GitError> {
     let lower = message.to_ascii_lowercase();
-    if lower.lines().any(|line| {
-        line.starts_with("co-authored-by:")
-            && (line.contains("bot") || line.contains("ai") || line.contains("codex"))
-    }) || lower.contains("generated by ai")
-        || lower.contains("generated by codex")
-    {
+    const BLOCKED_NAMES: &[&str] = &[
+        "codex",
+        "grok",
+        "muse",
+        "claude",
+        "chatgpt",
+        "copilot",
+        "gemini",
+        "cursor",
+        "windsurf",
+        "devin",
+        "aider",
+        "openai",
+        "anthropic",
+        "deepseek",
+        "perplexity",
+        "qwen",
+        "kimi",
+        "gpt",
+        "llm",
+    ];
+    let words = lower
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let names_blocked = words.iter().any(|word| BLOCKED_NAMES.contains(word));
+    let normalized = words.join(" ");
+    let attribution_blocked = [
+        "generated",
+        "authored",
+        "written",
+        "assisted",
+        "created",
+        "committed",
+    ]
+    .iter()
+    .any(|verb| {
+        ["ai", "bot", "agent", "model", "tool"].iter().any(|actor| {
+            normalized.contains(&format!("{verb} by {actor}"))
+                || normalized.contains(&format!("{verb} by a {actor}"))
+                || normalized.contains(&format!("{verb} by an {actor}"))
+        })
+    }) || ["with help of", "with the help of"].iter().any(|prefix| {
+        ["ai", "bot", "agent", "model", "tool"]
+            .iter()
+            .any(|actor| normalized.contains(&format!("{prefix} {actor}")))
+    }) || lower.lines().any(|line| {
+        line.trim_start().starts_with("co-authored-by:")
+            && ["bot", "agent", "model", "ai"]
+                .iter()
+                .any(|actor| line.contains(actor))
+    });
+    if names_blocked || attribution_blocked {
         return Err(GitError::Policy(
-            "AI attribution or co-author trailers are forbidden".to_owned(),
+            "public change metadata contains prohibited automation attribution language".to_owned(),
         ));
     }
     Ok(())
@@ -994,9 +1460,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_ai_commit_trailers() {
-        assert!(reject_ai_attribution("fix: x\n\nCo-authored-by: Codex Bot <x@y>").is_err());
-        assert!(reject_ai_attribution("fix: exact identity").is_ok());
+    fn rejects_automation_attribution_in_public_metadata() {
+        assert!(
+            validate_public_change_metadata("fix: x\n\nCo-authored-by: automation agent <x@y>")
+                .is_err()
+        );
+        assert!(validate_public_change_metadata("created by an ai tool").is_err());
+        for name in ["codex", "grok", "muse", "claude"] {
+            assert!(validate_public_change_metadata(&format!("update from {name}")).is_err());
+        }
+        assert!(validate_public_change_metadata("provider-specific assistant name").is_ok());
+        assert!(validate_public_change_metadata("fix: exact identity").is_ok());
     }
 
     #[test]
@@ -1043,5 +1517,65 @@ mod tests {
         fs::write(repository.join("untracked.txt"), b"other-value").unwrap();
         let second_untracked = manager.worktree_fingerprint(&repository).await.unwrap();
         assert_ne!(first_untracked, second_untracked);
+    }
+
+    #[tokio::test]
+    async fn materializes_attested_tree_into_clean_worktree() {
+        let temp = TempDir::new().unwrap();
+        let repository = temp.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        fixture_git(&repository, &["init", "-b", "main"]);
+        fixture_git(&repository, &["config", "user.name", "Harness Test"]);
+        fixture_git(
+            &repository,
+            &["config", "user.email", "harness@example.invalid"],
+        );
+        fs::write(repository.join("tracked.txt"), b"original\n").unwrap();
+        fixture_git(&repository, &["add", "tracked.txt"]);
+        fixture_git(&repository, &["commit", "-m", "test: initialize fixture"]);
+        let base = String::from_utf8(
+            StdCommand::new("git")
+                .current_dir(&repository)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        fs::write(repository.join("tracked.txt"), b"candidate\n").unwrap();
+        fixture_git(&repository, &["add", "tracked.txt"]);
+        let tree = String::from_utf8(
+            StdCommand::new("git")
+                .current_dir(&repository)
+                .args(["write-tree"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        fixture_git(
+            &repository,
+            &["restore", "--staged", "--worktree", "tracked.txt"],
+        );
+
+        let manager = GitManager::new(&temp.path().join("managed-worktrees")).unwrap();
+        manager
+            .materialize_candidate_tree(&repository, &base, &repository.join(".git/objects"), &tree)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(repository.join("tracked.txt")).unwrap(),
+            "candidate\n"
+        );
+        assert!(
+            !git_bytes(&repository, ["status", "--porcelain=v2", "-z"])
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

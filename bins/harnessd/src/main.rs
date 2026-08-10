@@ -5,7 +5,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -18,7 +18,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use clap::{Parser, Subcommand};
-use harness_codex::{CodexRuntime, CodexSettings, CodexSupervisor, EventKind, probe_compatibility};
+use harness_codex::{
+    CodexRuntime, CodexRuntimeManager, CodexSettings, EventKind, probe_compatibility,
+};
 use harness_orchestrator::Orchestrator;
 use harness_profile::{HarnessConfig, ResolvedPaths, load_profile};
 use harness_store::Store;
@@ -26,7 +28,7 @@ use rust_embed::RustEmbed;
 use serde_json::json;
 use tokio::{
     net::TcpListener,
-    sync::{Mutex, mpsc},
+    sync::{mpsc, watch},
     task::JoinHandle,
 };
 use tower_http::{compression::CompressionLayer, trace::TraceLayer};
@@ -34,17 +36,13 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(
-    name = "harnessd",
-    version,
-    about = "Harness Console local control plane"
-)]
+#[command(name = "harnessd", version, about = "BILDR local control plane")]
 struct Cli {
     /// TOML configuration file. Defaults to the XDG path when present.
     #[arg(long, env = "HARNESS_CONFIG")]
     config: Option<PathBuf>,
     /// Built-in profile id or a profile TOML path.
-    #[arg(long, default_value = "neuralmatrix", env = "HARNESS_PROFILE")]
+    #[arg(long, default_value = "general", env = "HARNESS_PROFILE")]
     profile: String,
     #[command(subcommand)]
     command: Command,
@@ -139,18 +137,27 @@ async fn serve(
     let (event_tx, mut event_rx) = mpsc::channel(4_096);
     let supervisor_settings = codex_settings(&config, &paths);
 
-    let supervisor = if without_codex {
+    let preferred_account_id = store
+        .runtime_metadata("settings.active_codex_account")?
+        .and_then(|value| value.as_str().map(ToOwned::to_owned));
+    let runtime_manager = if without_codex {
         None
     } else {
-        match CodexSupervisor::start(supervisor_settings.clone(), event_tx.clone()).await {
-            Ok(supervisor) => Some(Arc::new(supervisor)),
+        match CodexRuntimeManager::start(
+            supervisor_settings.clone(),
+            event_tx.clone(),
+            preferred_account_id.as_deref(),
+        )
+        .await
+        {
+            Ok(manager) => Some(Arc::new(manager)),
             Err(error) => {
                 warn!(%error, "Codex App Server unavailable; serving inspection-only UI");
                 None
             }
         }
     };
-    let runtime = supervisor
+    let runtime = runtime_manager
         .as_ref()
         .map(|runtime| Arc::clone(runtime) as Arc<dyn CodexRuntime>);
     let orchestrator = Arc::new(
@@ -158,15 +165,10 @@ async fn serve(
             .await
             .context("failed to initialize orchestration services")?,
     );
-    let supervisor_holder = Arc::new(Mutex::new(supervisor));
     let shutting_down = Arc::new(AtomicBool::new(false));
-    let restart_count = Arc::new(AtomicU32::new(0));
     let event_orchestrator = Arc::clone(&orchestrator);
-    let event_supervisor = Arc::clone(&supervisor_holder);
+    let event_runtime = runtime_manager.clone();
     let event_shutting_down = Arc::clone(&shutting_down);
-    let event_restart_count = Arc::clone(&restart_count);
-    let restart_settings = supervisor_settings;
-    let restart_sink = event_tx;
     let event_pump: JoinHandle<()> = tokio::spawn(async move {
         while let Some(mut event) = event_rx.recv().await {
             let process_exited = event.kind == EventKind::ProcessExit;
@@ -175,11 +177,10 @@ async fn serve(
                 .get("pid")
                 .and_then(serde_json::Value::as_u64)
                 .and_then(|pid| u32::try_from(pid).ok());
-            let current_pid = event_supervisor
-                .lock()
-                .await
-                .as_ref()
-                .map(|supervisor| supervisor.pid());
+            let current_pid = match &event_runtime {
+                Some(runtime) => runtime.active_pid().await,
+                None => None,
+            };
             let stale_exit = process_exited
                 && exiting_pid.is_some()
                 && current_pid.is_some()
@@ -197,15 +198,9 @@ async fn serve(
             {
                 continue;
             }
-            event_supervisor.lock().await.take();
             let mut restarted = false;
-            while event_restart_count.load(Ordering::Acquire) < 3 {
-                let prior = event_restart_count.fetch_add(1, Ordering::AcqRel);
-                if prior >= 3 {
-                    break;
-                }
-                let ordinal = prior.saturating_add(1);
-                let backoff_seconds = 1_u64 << prior.min(2);
+            for ordinal in 1_u32..=3 {
+                let backoff_seconds = 1_u64 << (ordinal - 1).min(2);
                 warn!(
                     ordinal,
                     backoff_seconds, "restarting Codex App Server after exit"
@@ -214,14 +209,11 @@ async fn serve(
                 if event_shutting_down.load(Ordering::Acquire) {
                     break;
                 }
-                match CodexSupervisor::start(restart_settings.clone(), restart_sink.clone()).await {
-                    Ok(supervisor) => {
-                        let supervisor = Arc::new(supervisor);
-                        supervisor.set_restart_count(ordinal).await;
-                        event_orchestrator
-                            .set_runtime(Arc::clone(&supervisor) as Arc<dyn CodexRuntime>)
-                            .await;
-                        *event_supervisor.lock().await = Some(supervisor);
+                let Some(runtime) = &event_runtime else {
+                    break;
+                };
+                match runtime.restart_active().await {
+                    Ok(()) => {
                         info!(ordinal, "Codex App Server restart succeeded");
                         restarted = true;
                         break;
@@ -258,20 +250,44 @@ async fn serve(
         .with_context(|| format!("failed to bind http://{bind}"))?;
     let local_addr = listener.local_addr()?;
     let url = format!("http://{local_addr}");
-    info!(%url, database = %orchestrator.store().database_path().display(), "Harness Console ready");
+    info!(%url, database = %orchestrator.store().database_path().display(), "BILDR ready");
     if should_open_browser {
         open_browser(&url);
     }
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await;
-    info!("Harness Console stopping");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let signal_shutting_down = Arc::clone(&shutting_down);
+    let signal_task = tokio::spawn(async move {
+        shutdown_signal().await;
+        signal_shutting_down.store(true, Ordering::Release);
+        let _ = shutdown_tx.send(true);
+    });
+    let mut graceful_rx = shutdown_rx.clone();
+    let server = async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                wait_for_shutdown(&mut graceful_rx).await;
+            })
+            .await
+    };
+    tokio::pin!(server);
+    let mut deadline_rx = shutdown_rx;
+    let result = tokio::select! {
+        result = &mut server => result,
+        () = async {
+            wait_for_shutdown(&mut deadline_rx).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        } => {
+            warn!("graceful HTTP shutdown deadline elapsed; closing remaining connections");
+            Ok(())
+        }
+    };
+    info!("BILDR stopping");
     shutting_down.store(true, Ordering::Release);
+    signal_task.abort();
     maintenance_task.abort();
     event_pump.abort();
-    let supervisor = supervisor_holder.lock().await.take();
-    if let Some(supervisor) = supervisor
-        && let Err(error) = supervisor.shutdown().await
+    if let Some(runtime) = runtime_manager
+        && let Err(error) = runtime.shutdown().await
     {
         warn!(%error, "App Server shutdown reported an error");
     }
@@ -315,7 +331,7 @@ async fn doctor(
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("Harness Console doctor: ok");
+        println!("BILDR doctor: ok");
         println!(
             "  profile: {}",
             report["profile"]["id"].as_str().unwrap_or("unknown")
@@ -344,6 +360,8 @@ async fn doctor(
 fn codex_settings(config: &HarnessConfig, paths: &ResolvedPaths) -> CodexSettings {
     CodexSettings {
         binary: PathBuf::from(&config.codex.binary),
+        codex_home: env::var_os("CODEX_HOME").map(PathBuf::from),
+        managed_account_root: Some(paths.data_dir.join("codex-accounts")),
         required_version: nonempty(&config.codex.required_version),
         required_schema_sha256: nonempty(&config.codex.required_protocol_schema_sha256),
         schema_probe_root: paths.cache_dir.join("codex-schema-probes"),
@@ -464,5 +482,13 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {},
         () = terminate => {},
+    }
+}
+
+async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
+    while !*receiver.borrow_and_update() {
+        if receiver.changed().await.is_err() {
+            break;
+        }
     }
 }

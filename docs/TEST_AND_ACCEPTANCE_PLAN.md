@@ -1,10 +1,14 @@
-# Harness Console Test and Acceptance Plan
+# BILDR test and acceptance plan
 
 **Status:** implementation and release contract
 
 ## 1. Test philosophy
 
-Harness Console controls mutable source work, local processes, approvals, evidence, and Git publication. A green UI is not sufficient. Tests must establish deterministic controller behavior, exact worktree custody, protocol replayability, cost-accounting correctness, restart recovery, and fail-closed security.
+BILDR controls mutable source work, local processes, approvals, evidence, and
+Git publication. A green UI is not sufficient. Tests must establish
+deterministic controller behavior, exact worktree custody, protocol
+replayability, cost-accounting correctness, restart recovery, and fail-closed
+security.
 
 Use the lowest credible proof tier for each claim and preserve integration/system tests for cross-component behavior. Avoid arbitrary sleeps; use virtual time, controlled clocks, temporary repositories, scripted fake App Server processes, and process barriers.
 
@@ -40,7 +44,7 @@ Use a model-based/property test harness. Invariants:
 - canceled/failed tasks preserve their final diff/worktree record;
 - a retry increments attempt and never mutates the prior attempt record;
 - `INFRASTRUCTURE_UNAVAILABLE` and `INCONCLUSIVE` cannot satisfy required proof;
-- no controller transition updates NeuralMatrix completion authority automatically;
+- no controller transition updates repository completion authority automatically;
 - push/PR/merge cannot occur without their explicit human gate; merge is absent in v1.
 
 Generate random legal/illegal action sequences and verify the database plus emitted domain events.
@@ -72,6 +76,8 @@ Required scenarios:
 Maintain sanitized traces per pinned Codex version:
 
 - one-turn read-only architect;
+- independent plan-review accept and changes-requested verdicts;
+- automatic architect revision followed by a fresh plan review;
 - multi-turn mutable worker;
 - command output streaming;
 - file change and diff updates;
@@ -131,7 +137,9 @@ Playwright runs against fake App Server + temporary Git fixture.
 - see pinned base and authority digest;
 - start architect;
 - observe plan, actions, current goal, model/effort, token/cost updates;
-- complete and review task graph.
+- observe adversarial review reject a moving-target or premature-test plan;
+- observe the replacement revision reach certification;
+- confirm manual and automatic approval both reject an uncertified digest.
 
 ### Flow B: mutable task and approval
 
@@ -159,13 +167,24 @@ Playwright runs against fake App Server + temporary Git fixture.
 
 ### Flow E: integration
 
+- enable one cheap `review_ready` validator and prove its failure reopens the
+  same task through bounded remediation before any semantic reviewer is spent;
 - verify two non-overlapping task commits;
 - integrate in dependency order;
-- show invalidated proof;
-- run integration validation;
+- show attempt-head proof is historical rather than accepted for the new SHA;
+- require path-selected custody, contract, and behavioral validators to pass on
+  the clean integrated head; reject a green command that mutates the checkout;
+- run automated platform acceptance and leave device acceptance pending for a
+  SHA-bound human attestation;
 - final reviewer returns one finding;
-- remediation attempt resolves it;
-- explicit human approval creates a draft PR request.
+- remediation reopens only the task owning that file and creates a fresh
+  integration candidate;
+- final acceptance rests in `HUMAN_REVIEW`; exercise approve and reject paths
+  against the signoff packet digest;
+- explicit human approval creates a draft PR request;
+- when CI proof is profile-required, reject an empty check set and a passing
+  check set whose PR head differs from the integration SHA, then promote through
+  `CI_PROVEN` only after every required check passes on the expected head.
 
 ### Flow F: accessibility
 
@@ -227,11 +246,13 @@ Before pilot:
 
 Each fault needs a documented terminal state and recovery route; none may produce a false verified/completed state.
 
-## 12. NeuralMatrix pilot ladder
+## 12. Repository pilot ladder
 
 ### Pilot 0 — read-only architecture audit
 
-No writes, no worktree beyond inspection. Success: authority-first context, task graph, tokens/cost, goal, restart/replay.
+No writes, no worktree beyond inspection. Success: authority-first context,
+task graph, adversarial liveness/feasibility review, automatic correction of a
+blocking plan, certified digest, tokens/cost, goal, restart/replay.
 
 ### Pilot 1 — docs-only bounded change
 
@@ -251,7 +272,10 @@ Terra direct assignment, serial generated paths reserved for integrator, Sol ind
 
 ### Pilot 5 — heavy and hardware representation
 
-Select Jetson/C2 container lanes with explicit prerequisites. Success: resource scheduler, `INFRASTRUCTURE_UNAVAILABLE` semantics, artifact/runner identity. Production hardware actions remain operator-controlled.
+Select environment-specific lanes with explicit prerequisites. Success:
+resource scheduling, `INFRASTRUCTURE_UNAVAILABLE` semantics, and
+artifact/runner identity. Production hardware actions remain
+operator-controlled.
 
 ## 13. Release acceptance checklist
 
@@ -267,6 +291,6 @@ A v1 release candidate is acceptable only when:
 - listener/security/redaction tests pass;
 - Fedora/Nobara and Ubuntu/Debian packaging smoke passes;
 - daemon restart resumes an active run;
-- first four NeuralMatrix pilots complete with reviewable evidence;
+- first four repository pilots complete with reviewable evidence;
 - no automatic merge, production access, or hidden fallback exists;
 - operator runbook and protocol compatibility tuple are included in the release manifest.

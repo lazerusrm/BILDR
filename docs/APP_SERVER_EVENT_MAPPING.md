@@ -6,7 +6,11 @@
 
 ## 1. Why App Server is the integration boundary
 
-Harness Console needs more than a final response. It needs live thread, turn, plan, item, command, file-change, approval, diff, review, goal, token-usage, model-reroute, and subagent lifecycle events. The App Server protocol exposes those primitives directly and supports thread creation/resumption, turn start/steer/interrupt, review, approvals, and generated protocol schemas.
+BILDR needs more than a final response. It needs live thread, turn, plan, item,
+command, file-change, approval, diff, review, goal, token-usage, model-reroute,
+and subagent lifecycle events. The App Server protocol exposes those primitives
+directly and supports thread creation/resumption, turn start/steer/interrupt,
+review, approvals, and generated protocol schemas.
 
 The high-level SDK may be used for small utilities or tests, but `harnessd` integrates with App Server directly so the GUI does not reconstruct state by scraping terminal output.
 
@@ -58,7 +62,10 @@ Never silently switch to terminal scraping as a fallback.
 
 ## 4. Initialization
 
-The supervisor starts App Server, sends the required initialize request, waits for successful initialization, then publishes `runtime.ready`. The service name should identify Harness Console. Client capabilities and experimental flags must be explicit and versioned.
+The supervisor starts App Server, sends the required initialize request, waits
+for successful initialization, then publishes `runtime.ready`. The service
+name identifies BILDR. Client capabilities and experimental flags must be
+explicit and versioned.
 
 Initialization failure classes:
 
@@ -70,7 +77,7 @@ Initialization failure classes:
 - authentication unavailable;
 - process exits before ready.
 
-These are runtime failures, not source failures in a NeuralMatrix task.
+These are runtime failures, not source failures in a repository task.
 
 ## 5. Thread mapping
 
@@ -91,6 +98,73 @@ For mutable work, `thread/start` receives:
 - repository instruction sources as supported by the pinned version;
 - task-specific developer instructions/context packet;
 - metadata linking run/task/attempt/worktree.
+
+For a retry, Harness also injects a bounded controller-owned continuity packet
+containing the prior terminal classification, model/effort outcome, operator
+guidance, and the declared durable handoff or final agent message. Harness does
+not replay raw reasoning or an unbounded transcript, and independent verifier
+threads continue to start fresh.
+
+When the approved task packet names a controller or governor owner, this
+primary thread is projected as `governor` and uses the profile's dedicated
+Sol xhigh governor route. Native child threads remain visible under it. Harness
+sends deterministic budget checkpoints at 25, 50, 75, and 90 percent so the
+governor must reconcile delegated work and narrow the remaining plan instead
+of silently consuming the full turn.
+
+At App Server initialization Harness reads `experimentalFeature/list` and
+requires an enabled, non-deprecated `multi_agent` or `multi_agent_v2` capability
+before it launches a governor. This is capability detection, not automatic
+experimental-feature enablement. Codex remains the owner of its hosted mailbox
+operations; Harness observes and governs them through protocol events.
+
+When an incomplete productive governor returns without a source diff and the
+repository, account, model, sandbox, and worktree custody are unchanged,
+Harness starts another bounded `turn/start` on the same thread. A failed warm
+continuation falls back to the controller-owned bounded handoff and a fresh
+attempt. Verifier, integrator, and changed-custody work always use fresh
+threads.
+
+If the App Server continues a governor past 110 percent of its declared token
+budget, Harness interrupts the turn after the 90-percent handoff checkpoint and
+records `agent.governor.budget_hard_stop`. The preserved worktree and handoff
+remain retryable; the scheduler does not silently fund an unbounded turn.
+
+Codex 0.147.0 announces delegated children through parent-thread
+`item/started` or `item/completed` notifications whose item type is
+`subAgentActivity`. Harness uses `agentThreadId` as the child thread identity
+and `agentPath` as its display name, then attributes subsequent child-thread
+events and token usage to that visible child session. The enforced
+`<family>_<effort>__<purpose>` child name supplies the requested route until a
+runtime effective-model event is available; unstructured names fall back to
+the parent route rather than guessing. The older
+`thread/started.thread.parentThreadId` shape remains supported.
+
+The governor remains an active App Server turn while a native `wait_agent`
+tool call is pending, but no model tokens are generated during the blocked
+wait. Harness prompts governors to use a five-minute wait rather than repeated
+default-interval polls; native child completion resumes the parent early. No
+external hook or synthetic keepalive turn is used.
+
+For Codex 0.147.0, the `turn/start` response can race with a
+`turn/started` notification and the two observed turn IDs are not assumed to be
+interchangeable. The notification is authoritative for `active_turn_id`; a
+late response may fill an empty projection but must never overwrite that
+notification. Steering and interruption always use the projected notification
+ID.
+
+When the approved objective requires GitHub, the controller must first pass the
+authenticated GitHub capability probe and then start the Codex turn with
+`sandboxPolicy.networkAccess: true`. A task that does not require an external
+network remains network-isolated. This prevents a Harness-created DNS denial
+from being misreported as a bad credential.
+
+The 0.147.0 App Server is launched with
+`sandbox_workspace_write.network_access=true` so the initial thread context and
+native children do not materialize the default network-off sandbox before the
+first `turn/start` override arrives. Harness still sends
+`networkAccess: false` for every non-GitHub turn. This changes only the network
+boundary; filesystem writes remain restricted to the leased worktree.
 
 For read-only agents, use the inspection/integration worktree as appropriate with read-only sandbox policy.
 
@@ -130,6 +204,12 @@ Supported controller operations:
 - list/filter threads for recovery and reconciliation.
 
 The daemon enforces one active mutable turn per task. A native subagent may run concurrently only within the configured total thread limit and inherited sandbox boundary.
+
+A failed or governor-interrupted native child is terminal only for that child.
+It must not transition the parent task to `NEEDS_HELP`, release the parent path
+lease, fail the attempt, or preserve the governor's active worktree. The
+governor checkpoint receives the child disposition and remains responsible for
+reconciling or replacing the bounded assignment.
 
 ### Interrupt sequence
 
@@ -183,7 +263,7 @@ Exact method names and fields are generated from the pinned schema. The table be
 | approval request/resolution | `approval.*` | approval center and blocked state |
 | context compaction | `agent.context.compacted` | context inspector and quality diagnostics |
 | goal set/update/clear | `agent.goal.*` | current goal and budget card |
-| collab/subagent spawn/wait/resume/end | `agent.child.*` | parent/child tree, model/effort/effective status |
+| collab/subagent spawn/message/follow-up/wait/interrupt/list/end | `agent.child.*` | readable governor collaboration timeline, parent/child tree, model/effort/effective status |
 | review item/finding | `review.*` | finding list and verdict |
 | rate-limit update | `usage.rate_limit.*` | host/run usage view |
 
@@ -229,7 +309,11 @@ This is why write-owning parallel tasks are top-level controller sessions in sep
 
 ## 12. Token usage mapping
 
-Store both cumulative and last-turn values if supplied. The durable cost ledger uses per-turn `last_token_usage` or a monotonic delta, never repeatedly charges cumulative totals.
+Store both cumulative and last-call values if supplied. In Codex 0.147.0,
+`tokenUsage.last` describes one model call inside a turn; tool-heavy turns can
+emit many distinct calls. The durable ledger deduplicates notifications by the
+monotonic `tokenUsage.total` counter, then sums each distinct `last` call into
+one turn total. It never charges the cumulative value directly.
 
 Expected token components:
 

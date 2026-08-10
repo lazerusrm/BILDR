@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    name: Contribution metadata
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate public metadata
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        shell: bash
+        run: |
+          {
+            if [[ "$EVENT_NAME" == "pull_request" ]]; then
+              printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY"
+              git log --format=%B "$BASE_SHA..$HEAD_SHA"
+            elif [[ "$BEFORE_SHA" =~ ^0+$ ]] || ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+              git log -1 --format=%B "$HEAD_SHA"
+            else
+              git log --format=%B "$BEFORE_SHA..$HEAD_SHA"
+            fi
+          } | bash .github/scripts/check-contribution-metadata.sh
+      - name: Validate public tree
+        run: bash .github/scripts/check-repository-policy.sh
+
+  quality:
+    name: Build and test
+    needs: metadata
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Install browser dependencies
+        run: npm --prefix ui ci && npm --prefix ui exec -- playwright install --with-deps chromium
+      - name: Validate browser application
+        run: |
+          npm --prefix ui run typecheck
+          npm --prefix ui test
+          npm --prefix ui run build
+          npm --prefix ui run test:e2e
+      - name: Validate Rust workspace
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --workspace --all-targets
+      - name: Validate contracts
+        run: |
+          cargo xtask schema-check
+          cargo xtask openapi-check
+          cargo xtask app-server-bindings-check

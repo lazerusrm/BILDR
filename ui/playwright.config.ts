@@ -1,4 +1,11 @@
+import { existsSync } from "node:fs";
 import { defineConfig } from "@playwright/test";
+
+const configuredBrowser = process.env.HARNESS_CHROMIUM;
+const systemBrowser = ["/usr/bin/chromium-browser", "/usr/bin/chromium"].find(
+  existsSync,
+);
+const executablePath = configuredBrowser || systemBrowser;
 
 export default defineConfig({
   testDir: "./tests/e2e",
@@ -13,7 +20,7 @@ export default defineConfig({
     headless: true,
     viewport: { width: 1440, height: 960 },
     launchOptions: {
-      executablePath: process.env.HARNESS_CHROMIUM || "/usr/bin/chromium-browser",
+      ...(executablePath ? { executablePath } : {}),
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
     },
   },

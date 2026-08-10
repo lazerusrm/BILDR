@@ -1,12 +1,12 @@
 //! Version-pinned Codex App Server supervision over JSONL stdio.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -37,6 +37,8 @@ static NEXT_SCHEMA_PROBE: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug)]
 pub struct CodexSettings {
     pub binary: PathBuf,
+    pub codex_home: Option<PathBuf>,
+    pub managed_account_root: Option<PathBuf>,
     pub required_version: Option<String>,
     pub required_schema_sha256: Option<String>,
     pub schema_probe_root: PathBuf,
@@ -49,6 +51,8 @@ impl Default for CodexSettings {
     fn default() -> Self {
         Self {
             binary: PathBuf::from("codex"),
+            codex_home: None,
+            managed_account_root: None,
             required_version: None,
             required_schema_sha256: None,
             schema_probe_root: std::env::temp_dir().join("harness-console-schema-probes"),
@@ -76,6 +80,45 @@ pub struct CodexEvent {
     pub method: String,
     pub request_id: Option<Value>,
     pub message: Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CodexRateLimitWindow {
+    pub kind: String,
+    pub used_percent: u32,
+    pub remaining_percent: u32,
+    pub window_duration_mins: Option<u64>,
+    pub resets_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CodexRateLimit {
+    pub limit_id: String,
+    pub limit_name: Option<String>,
+    pub plan_type: Option<String>,
+    pub windows: Vec<CodexRateLimitWindow>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CodexAccountProfile {
+    pub id: String,
+    pub label: String,
+    pub codex_home: PathBuf,
+    pub selected: bool,
+    pub state: String,
+    pub account_type: Option<String>,
+    pub email: Option<String>,
+    pub plan_type: Option<String>,
+    pub rate_limits: Vec<CodexRateLimit>,
+    pub observed_at: Option<i64>,
+    pub detail: Option<String>,
+    pub managed: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CodexAccountsSnapshot {
+    pub selected_account_id: Option<String>,
+    pub accounts: Vec<CodexAccountProfile>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -130,12 +173,32 @@ impl CodexSupervisor {
         let mut command = Command::new(&settings.binary);
         command
             .arg("app-server")
+            // Codex 0.147.0 can materialize the first command sandbox from the
+            // thread-start defaults before a turn-level network override is
+            // reflected in turn context. Start workspace-write threads with
+            // network available, then let Harness narrow non-GitHub turns back
+            // to networkAccess=false in turn/start.
+            .arg("--config")
+            .arg("sandbox_workspace_write.network_access=true")
             .arg("--listen")
             .arg("stdio://")
+            // Harness persists App Server stderr diagnostics. Do not inherit a
+            // broad operator RUST_LOG filter that can turn span enter/exit
+            // telemetry into an unbounded durable event stream.
+            .env("RUST_LOG", "warn")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(codex_home) = &settings.codex_home {
+            command.env("CODEX_HOME", codex_home);
+        }
+        if let Some(github_config) = host_github_config_dir() {
+            // Point every App Server account at the host's existing gh store.
+            // This delegates access to that store without copying or rendering
+            // a token, and remains stable if a worker changes its cwd.
+            command.env("GH_CONFIG_DIR", github_config);
+        }
         #[cfg(unix)]
         command.process_group(0);
         let mut child = command.spawn().map_err(|source| CodexError::Spawn {
@@ -165,6 +228,8 @@ impl CodexSupervisor {
             required_version: compatibility.required_version.clone(),
             protocol_schema_sha256: Some(compatibility.schema_sha256.clone()),
             schema_match: compatibility.schema_match,
+            native_multi_agent: false,
+            native_multi_agent_feature: None,
             pid: Some(pid),
             restart_count: 0,
         }));
@@ -220,10 +285,28 @@ impl CodexSupervisor {
             let _ = supervisor.shutdown().await;
             return Err(error);
         }
+        let multi_agent = supervisor.native_multi_agent_capability().await;
         {
             let mut status = supervisor.status.write().await;
             status.state = "ready".to_owned();
-            status.detail = Some("App Server initialized; version and schema matched".to_owned());
+            match multi_agent {
+                Ok(Some(feature)) => {
+                    status.native_multi_agent = true;
+                    status.native_multi_agent_feature = Some(feature.clone());
+                    status.detail = Some(format!(
+                        "App Server initialized; native multi-agent ready via {feature}"
+                    ));
+                }
+                Ok(None) => {
+                    status.detail =
+                        Some("App Server initialized; native multi-agent is disabled".to_owned());
+                }
+                Err(error) => {
+                    status.detail = Some(format!(
+                        "App Server initialized; native multi-agent capability probe failed: {error}"
+                    ));
+                }
+            }
         }
         info!(pid, version = %supervisor.compatibility.version, "Codex App Server ready");
         Ok(supervisor)
@@ -235,7 +318,7 @@ impl CodexSupervisor {
             json!({
                 "clientInfo": {
                     "name": self.settings.service_name,
-                    "title": "Harness Console",
+                    "title": "BILDR",
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "capabilities": {
@@ -245,6 +328,16 @@ impl CodexSupervisor {
         )
         .await?;
         self.notify("initialized", json!({})).await
+    }
+
+    async fn native_multi_agent_capability(&self) -> Result<Option<String>, CodexError> {
+        let response = self
+            .request(
+                "experimentalFeature/list",
+                json!({"cursor": null, "limit": 100, "threadId": null}),
+            )
+            .await?;
+        select_native_multi_agent_feature(&response)
     }
 
     #[must_use]
@@ -279,6 +372,70 @@ impl CodexSupervisor {
 
     pub async fn set_restart_count(&self, restart_count: u32) {
         self.status.write().await.restart_count = restart_count;
+    }
+
+    pub async fn account_profile(&self, mut profile: CodexAccountProfile) -> CodexAccountProfile {
+        profile.selected = true;
+        let account = self
+            .request(
+                "account/read",
+                json!({
+                    "refreshToken": false,
+                }),
+            )
+            .await;
+        match account {
+            Ok(response) => {
+                let account = response.get("account");
+                let account_type = account
+                    .and_then(|value| value.get("type"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                let email = account
+                    .and_then(|value| value.get("email"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                let plan_type = account
+                    .and_then(|value| value.get("planType"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                if account_type.is_some() {
+                    profile.account_type = account_type;
+                }
+                if email.is_some() {
+                    profile.email = email;
+                }
+                if plan_type.is_some() {
+                    profile.plan_type = plan_type;
+                }
+                profile.state = if account.is_some_and(|value| !value.is_null()) {
+                    "ready".to_owned()
+                } else {
+                    "signed_out".to_owned()
+                };
+            }
+            Err(error) => {
+                profile.state = "unavailable".to_owned();
+                profile.detail = Some(error.to_string());
+                profile.observed_at = Some(harness_domain::now_ms());
+                return profile;
+            }
+        }
+
+        match self.request("account/rateLimits/read", Value::Null).await {
+            Ok(response) => {
+                profile.rate_limits = parse_rate_limits(&response);
+                if profile.plan_type.is_none() {
+                    profile.plan_type = profile
+                        .rate_limits
+                        .iter()
+                        .find_map(|limit| limit.plan_type.clone());
+                }
+            }
+            Err(error) => profile.detail = Some(error.to_string()),
+        }
+        profile.observed_at = Some(harness_domain::now_ms());
+        profile
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, CodexError> {
@@ -394,6 +551,18 @@ pub struct StartTurn {
 #[async_trait]
 pub trait CodexRuntime: Send + Sync {
     async fn runtime_status(&self) -> CodexRuntimeStatus;
+    async fn codex_accounts(&self) -> Result<CodexAccountsSnapshot, CodexError> {
+        Ok(CodexAccountsSnapshot {
+            selected_account_id: None,
+            accounts: Vec::new(),
+        })
+    }
+    async fn select_codex_account(
+        &self,
+        _account_id: &str,
+    ) -> Result<CodexAccountsSnapshot, CodexError> {
+        Err(CodexError::AccountSwitchUnsupported)
+    }
     async fn start_thread(&self, request: StartThread) -> Result<Value, CodexError>;
     async fn resume_thread(&self, thread_id: &str) -> Result<Value, CodexError>;
     async fn start_turn(&self, request: StartTurn) -> Result<Value, CodexError>;
@@ -545,6 +714,694 @@ impl CodexRuntime for CodexSupervisor {
     }
 }
 
+#[derive(Clone)]
+pub struct CodexRuntimeManager {
+    settings: Arc<CodexSettings>,
+    durable_sink: mpsc::Sender<CodexEvent>,
+    profiles: Arc<RwLock<Vec<CodexAccountProfile>>>,
+    active_account_id: Arc<RwLock<Option<String>>>,
+    active: Arc<RwLock<Option<Arc<CodexSupervisor>>>>,
+    switch_lock: Arc<Mutex<()>>,
+    restart_count: Arc<AtomicU32>,
+}
+
+impl CodexRuntimeManager {
+    pub async fn start(
+        settings: CodexSettings,
+        durable_sink: mpsc::Sender<CodexEvent>,
+        preferred_account_id: Option<&str>,
+    ) -> Result<Self, CodexError> {
+        let profiles = discover_codex_accounts(
+            settings.codex_home.as_deref(),
+            settings.managed_account_root.as_deref(),
+        )
+        .await?;
+        let selected = preferred_account_id
+            .and_then(|id| profiles.iter().find(|profile| profile.id == id))
+            .or_else(|| {
+                settings.codex_home.as_ref().and_then(|home| {
+                    profiles
+                        .iter()
+                        .find(|profile| profile.codex_home.as_path() == home.as_path())
+                })
+            })
+            .or_else(|| profiles.first())
+            .cloned()
+            .ok_or(CodexError::NoCodexAccountHomes)?;
+        let mut selected_settings = settings.clone();
+        selected_settings.codex_home = Some(selected.codex_home.clone());
+        let supervisor =
+            Arc::new(CodexSupervisor::start(selected_settings, durable_sink.clone()).await?);
+        let selected = supervisor.account_profile(selected).await;
+        let selected_id = selected.id.clone();
+        let profiles = profiles
+            .into_iter()
+            .map(|profile| {
+                if profile.id == selected_id {
+                    selected.clone()
+                } else {
+                    profile
+                }
+            })
+            .collect();
+        Ok(Self {
+            settings: Arc::new(settings),
+            durable_sink,
+            profiles: Arc::new(RwLock::new(profiles)),
+            active_account_id: Arc::new(RwLock::new(Some(selected_id))),
+            active: Arc::new(RwLock::new(Some(supervisor))),
+            switch_lock: Arc::new(Mutex::new(())),
+            restart_count: Arc::new(AtomicU32::new(0)),
+        })
+    }
+
+    pub async fn active_pid(&self) -> Option<u32> {
+        self.active
+            .read()
+            .await
+            .as_ref()
+            .map(|supervisor| supervisor.pid())
+    }
+
+    pub async fn restart_active(&self) -> Result<(), CodexError> {
+        let _guard = self.switch_lock.lock().await;
+        let account_id = self
+            .active_account_id
+            .read()
+            .await
+            .clone()
+            .ok_or(CodexError::NoCodexAccountHomes)?;
+        let profile = self
+            .profiles
+            .read()
+            .await
+            .iter()
+            .find(|profile| profile.id == account_id)
+            .cloned()
+            .ok_or_else(|| CodexError::UnknownAccount(account_id.clone()))?;
+        let mut settings = self.settings.as_ref().clone();
+        settings.codex_home = Some(profile.codex_home.clone());
+        let supervisor =
+            Arc::new(CodexSupervisor::start(settings, self.durable_sink.clone()).await?);
+        let restart_count = self.restart_count.fetch_add(1, Ordering::AcqRel) + 1;
+        supervisor.set_restart_count(restart_count).await;
+        let telemetry = supervisor.account_profile(profile).await;
+        *self.active.write().await = Some(supervisor);
+        self.replace_profile(telemetry).await;
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) -> Result<(), CodexError> {
+        if let Some(supervisor) = self.active.write().await.take() {
+            supervisor.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    async fn active_supervisor(&self) -> Result<Arc<CodexSupervisor>, CodexError> {
+        self.active
+            .read()
+            .await
+            .clone()
+            .ok_or(CodexError::Disconnected)
+    }
+
+    async fn refresh_discovery(&self) -> Result<(), CodexError> {
+        let active_home = self
+            .profiles
+            .read()
+            .await
+            .iter()
+            .find(|profile| profile.selected)
+            .map(|profile| profile.codex_home.clone())
+            .or_else(|| self.settings.codex_home.clone());
+        let discovered = discover_codex_accounts(
+            active_home.as_deref(),
+            self.settings.managed_account_root.as_deref(),
+        )
+        .await?;
+        let existing = self
+            .profiles
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .map(|profile| (profile.id.clone(), profile))
+            .collect::<BTreeMap<_, _>>();
+        let selected = self.active_account_id.read().await.clone();
+        *self.profiles.write().await = discovered
+            .into_iter()
+            .map(|mut profile| {
+                if let Some(prior) = existing.get(&profile.id) {
+                    let prior_is_newer = prior.observed_at.unwrap_or_default()
+                        >= profile.observed_at.unwrap_or_default();
+                    if prior_is_newer {
+                        let discovered_label = profile.label;
+                        profile = prior.clone();
+                        if discovered_label != account_label(&profile.codex_home) {
+                            profile.label = discovered_label;
+                        }
+                    }
+                }
+                profile.selected = selected.as_deref() == Some(profile.id.as_str());
+                profile
+            })
+            .collect();
+        Ok(())
+    }
+
+    async fn replace_profile(&self, profile: CodexAccountProfile) {
+        let mut profiles = self.profiles.write().await;
+        for current in profiles.iter_mut() {
+            current.selected = current.id == profile.id;
+            if current.id == profile.id {
+                *current = profile.clone();
+            }
+        }
+    }
+
+    async fn accounts_snapshot(&self, refresh: bool) -> Result<CodexAccountsSnapshot, CodexError> {
+        self.refresh_discovery().await?;
+        if refresh {
+            let selected_id = self.active_account_id.read().await.clone();
+            let profile = {
+                let profiles = self.profiles.read().await;
+                profiles
+                    .iter()
+                    .find(|profile| Some(profile.id.as_str()) == selected_id.as_deref())
+                    .cloned()
+            };
+            if let Some(profile) = profile {
+                let supervisor = self.active_supervisor().await?;
+                let telemetry = supervisor.account_profile(profile).await;
+                self.replace_profile(telemetry).await;
+            }
+        }
+        Ok(CodexAccountsSnapshot {
+            selected_account_id: self.active_account_id.read().await.clone(),
+            accounts: self.profiles.read().await.clone(),
+        })
+    }
+
+    async fn switch_account(&self, account_id: &str) -> Result<CodexAccountsSnapshot, CodexError> {
+        let _guard = self.switch_lock.lock().await;
+        self.refresh_discovery().await?;
+        let profile = self
+            .profiles
+            .read()
+            .await
+            .iter()
+            .find(|profile| profile.id == account_id)
+            .cloned()
+            .ok_or_else(|| CodexError::UnknownAccount(account_id.to_owned()))?;
+        let mut settings = self.settings.as_ref().clone();
+        settings.codex_home = Some(profile.codex_home.clone());
+        let replacement =
+            Arc::new(CodexSupervisor::start(settings, self.durable_sink.clone()).await?);
+        let telemetry = replacement.account_profile(profile).await;
+        let old = self.active.write().await.replace(replacement);
+        *self.active_account_id.write().await = Some(account_id.to_owned());
+        self.restart_count.store(0, Ordering::Release);
+        self.replace_profile(telemetry).await;
+        if let Some(old) = old {
+            old.shutdown().await?;
+        }
+        self.accounts_snapshot(false).await
+    }
+}
+
+#[async_trait]
+impl CodexRuntime for CodexRuntimeManager {
+    async fn runtime_status(&self) -> CodexRuntimeStatus {
+        match self.active_supervisor().await {
+            Ok(supervisor) => supervisor.runtime_status().await,
+            Err(error) => CodexRuntimeStatus {
+                state: "unavailable".to_owned(),
+                detail: Some(error.to_string()),
+                version: None,
+                required_version: self.settings.required_version.clone(),
+                protocol_schema_sha256: None,
+                schema_match: false,
+                native_multi_agent: false,
+                native_multi_agent_feature: None,
+                pid: None,
+                restart_count: self.restart_count.load(Ordering::Acquire),
+            },
+        }
+    }
+
+    async fn codex_accounts(&self) -> Result<CodexAccountsSnapshot, CodexError> {
+        self.accounts_snapshot(true).await
+    }
+
+    async fn select_codex_account(
+        &self,
+        account_id: &str,
+    ) -> Result<CodexAccountsSnapshot, CodexError> {
+        self.switch_account(account_id).await
+    }
+
+    async fn start_thread(&self, request: StartThread) -> Result<Value, CodexError> {
+        self.active_supervisor().await?.start_thread(request).await
+    }
+
+    async fn resume_thread(&self, thread_id: &str) -> Result<Value, CodexError> {
+        self.active_supervisor()
+            .await?
+            .resume_thread(thread_id)
+            .await
+    }
+
+    async fn start_turn(&self, request: StartTurn) -> Result<Value, CodexError> {
+        self.active_supervisor().await?.start_turn(request).await
+    }
+
+    async fn steer_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        message: &str,
+    ) -> Result<Value, CodexError> {
+        self.active_supervisor()
+            .await?
+            .steer_turn(thread_id, turn_id, message)
+            .await
+    }
+
+    async fn interrupt_turn(&self, thread_id: &str, turn_id: &str) -> Result<Value, CodexError> {
+        self.active_supervisor()
+            .await?
+            .interrupt_turn(thread_id, turn_id)
+            .await
+    }
+
+    async fn set_goal(
+        &self,
+        thread_id: &str,
+        objective: &str,
+        token_budget: Option<u64>,
+    ) -> Result<Value, CodexError> {
+        self.active_supervisor()
+            .await?
+            .set_goal(thread_id, objective, token_budget)
+            .await
+    }
+
+    async fn start_review(
+        &self,
+        thread_id: &str,
+        target: Value,
+        detached: bool,
+    ) -> Result<Value, CodexError> {
+        self.active_supervisor()
+            .await?
+            .start_review(thread_id, target, detached)
+            .await
+    }
+
+    async fn respond_rpc(&self, id: Value, result: Value) -> Result<(), CodexError> {
+        self.active_supervisor()
+            .await?
+            .respond_rpc(id, result)
+            .await
+    }
+
+    async fn respond_rpc_error(
+        &self,
+        id: Value,
+        code: i64,
+        message: &str,
+    ) -> Result<(), CodexError> {
+        self.active_supervisor()
+            .await?
+            .respond_rpc_error(id, code, message)
+            .await
+    }
+}
+
+fn select_native_multi_agent_feature(response: &Value) -> Result<Option<String>, CodexError> {
+    let features = response
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CodexError::Protocol("experimentalFeature/list response lacks data".to_owned())
+        })?;
+    for name in ["multi_agent_v2", "multi_agent"] {
+        if features.iter().any(|feature| {
+            feature.get("name").and_then(Value::as_str) == Some(name)
+                && feature.get("enabled").and_then(Value::as_bool) == Some(true)
+                && !matches!(
+                    feature.get("stage").and_then(Value::as_str),
+                    Some("deprecated" | "removed")
+                )
+        }) {
+            return Ok(Some(name.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_rate_limits(response: &Value) -> Vec<CodexRateLimit> {
+    let snapshots = response
+        .get("rateLimitsByLimitId")
+        .and_then(Value::as_object)
+        .filter(|values| !values.is_empty())
+        .map(|values| {
+            values
+                .iter()
+                .map(|(id, snapshot)| (id.clone(), snapshot))
+                .collect::<Vec<_>>()
+        })
+        .or_else(|| {
+            response
+                .get("rateLimits")
+                .filter(|value| value.is_object())
+                .map(|snapshot| {
+                    vec![(
+                        snapshot
+                            .get("limitId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("codex")
+                            .to_owned(),
+                        snapshot,
+                    )]
+                })
+        })
+        .unwrap_or_default();
+    let mut limits = snapshots
+        .into_iter()
+        .map(|(fallback_id, snapshot)| {
+            let mut windows = Vec::new();
+            for (kind, key) in [("primary", "primary"), ("secondary", "secondary")] {
+                let Some(window) = snapshot.get(key).filter(|value| value.is_object()) else {
+                    continue;
+                };
+                let used_percent = window
+                    .get("usedPercent")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+                    .min(100) as u32;
+                windows.push(CodexRateLimitWindow {
+                    kind: kind.to_owned(),
+                    used_percent,
+                    remaining_percent: 100_u32.saturating_sub(used_percent),
+                    window_duration_mins: window.get("windowDurationMins").and_then(Value::as_u64),
+                    resets_at: window.get("resetsAt").and_then(Value::as_i64),
+                });
+            }
+            CodexRateLimit {
+                limit_id: snapshot
+                    .get("limitId")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&fallback_id)
+                    .to_owned(),
+                limit_name: snapshot
+                    .get("limitName")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                plan_type: snapshot
+                    .get("planType")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                windows,
+            }
+        })
+        .collect::<Vec<_>>();
+    limits.sort_by(|left, right| left.limit_id.cmp(&right.limit_id));
+    limits
+}
+
+async fn discover_codex_accounts(
+    configured_home: Option<&Path>,
+    managed_account_root: Option<&Path>,
+) -> Result<Vec<CodexAccountProfile>, CodexError> {
+    let mut candidates = BTreeSet::new();
+    let headroom = discover_headroom_codex_accounts().await;
+    if let Some(path) = configured_home {
+        candidates.insert(path.to_path_buf());
+    }
+    if let Some(path) = std::env::var_os("CODEX_HOME") {
+        candidates.insert(PathBuf::from(path));
+    }
+    if let Some(paths) = std::env::var_os("HARNESS_CODEX_ACCOUNT_HOMES") {
+        candidates.extend(std::env::split_paths(&paths));
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        candidates.insert(home.join(".codex"));
+        discover_named_account_dirs(&home, &mut candidates).await?;
+        discover_named_account_dirs(&home.join(".config"), &mut candidates).await?;
+    }
+    if let Some(root) = managed_account_root {
+        discover_managed_account_dirs(root, &mut candidates).await?;
+    }
+    candidates.extend(headroom.keys().cloned());
+
+    let mut canonical = BTreeSet::new();
+    for candidate in candidates {
+        if canonical.len() >= 16 {
+            break;
+        }
+        let Ok(metadata) = fs::metadata(&candidate).await else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let path = fs::canonicalize(&candidate).await?;
+        canonical.insert(path);
+    }
+    Ok(canonical
+        .into_iter()
+        .map(|codex_home| {
+            let metadata = headroom.get(&codex_home);
+            let managed = managed_account_root.is_some_and(|root| codex_home.starts_with(root));
+            CodexAccountProfile {
+                id: account_id(&codex_home),
+                label: metadata
+                    .map(|value| value.label.clone())
+                    .unwrap_or_else(|| account_label(&codex_home)),
+                codex_home,
+                selected: false,
+                state: metadata
+                    .map(|value| value.state.clone())
+                    .unwrap_or_else(|| "detected".to_owned()),
+                account_type: metadata.map(|_| "headroom".to_owned()),
+                email: metadata.and_then(|value| value.email.clone()),
+                plan_type: metadata.and_then(|value| value.plan_type.clone()),
+                rate_limits: metadata
+                    .map(|value| value.rate_limits.clone())
+                    .unwrap_or_default(),
+                observed_at: metadata.and_then(|value| value.observed_at),
+                detail: metadata.map(|value| value.detail.clone()),
+                managed,
+            }
+        })
+        .collect())
+}
+
+async fn discover_managed_account_dirs(
+    root: &Path,
+    candidates: &mut BTreeSet<PathBuf>,
+) -> Result<(), CodexError> {
+    let Ok(mut entries) = fs::read_dir(root).await else {
+        return Ok(());
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        if candidates.len() >= 16 {
+            break;
+        }
+        let path = entry.path();
+        if fs::metadata(path.join("auth.json")).await.is_ok() {
+            candidates.insert(path);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Default)]
+struct HeadroomCodexAccount {
+    label: String,
+    state: String,
+    email: Option<String>,
+    plan_type: Option<String>,
+    rate_limits: Vec<CodexRateLimit>,
+    observed_at: Option<i64>,
+    detail: String,
+}
+
+async fn discover_headroom_codex_accounts() -> BTreeMap<PathBuf, HeadroomCodexAccount> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return BTreeMap::new();
+    };
+    let root = std::env::var_os("HEADROOM_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".headroom"));
+    let Ok(config_bytes) = fs::read(root.join("config.json")).await else {
+        return BTreeMap::new();
+    };
+    let Ok(config) = serde_json::from_slice::<Value>(&config_bytes) else {
+        return BTreeMap::new();
+    };
+    let usage = fs::read(root.join("state/usage-private.json"))
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let usage_by_name = usage
+        .as_ref()
+        .and_then(|value| value.get("accounts"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|account| Some((account.get("name")?.as_str()?.to_owned(), account.clone())))
+        .collect::<BTreeMap<_, _>>();
+    let mut accounts = BTreeMap::new();
+    for account in config
+        .get("accounts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if account.get("provider").and_then(Value::as_str) != Some("codex") {
+            continue;
+        }
+        let Some(label) = account.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(path) = account.get("home").and_then(Value::as_str) else {
+            continue;
+        };
+        let path = PathBuf::from(path);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            home.join(path)
+        };
+        let Ok(path) = fs::canonicalize(path).await else {
+            continue;
+        };
+        let snapshot = usage_by_name.get(label);
+        let routable = snapshot
+            .and_then(|value| value.get("routable"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let ok = snapshot
+            .and_then(|value| value.get("ok"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let stale = snapshot
+            .and_then(|value| value.get("stale"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let windows = snapshot
+            .and_then(|value| value.get("windows"))
+            .and_then(Value::as_object);
+        let mut rate_limits = windows
+            .into_iter()
+            .flat_map(|values| values.iter())
+            .filter_map(|(id, window)| {
+                let used_percent = window.get("used_percent")?.as_f64()?.clamp(0.0, 100.0);
+                Some(CodexRateLimit {
+                    limit_id: id.clone(),
+                    limit_name: Some(if id == "7d" {
+                        "Weekly".to_owned()
+                    } else {
+                        id.trim_start_matches("scoped:").to_owned()
+                    }),
+                    plan_type: snapshot
+                        .and_then(|value| value.get("plan"))
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    windows: vec![CodexRateLimitWindow {
+                        kind: "primary".to_owned(),
+                        used_percent: used_percent.round() as u32,
+                        remaining_percent: (100.0 - used_percent).round() as u32,
+                        window_duration_mins: window.get("window_minutes").and_then(Value::as_u64),
+                        resets_at: window.get("resets_at").and_then(Value::as_i64),
+                    }],
+                })
+            })
+            .collect::<Vec<_>>();
+        rate_limits.sort_by(|left, right| left.limit_id.cmp(&right.limit_id));
+        let observed_at = windows
+            .into_iter()
+            .flat_map(|values| values.values())
+            .filter_map(|window| window.get("observed_at").and_then(Value::as_i64))
+            .max()
+            .map(|seconds| seconds.saturating_mul(1_000));
+        accounts.insert(
+            path,
+            HeadroomCodexAccount {
+                label: label.to_owned(),
+                state: if ok && routable && !stale {
+                    "ready".to_owned()
+                } else if ok {
+                    "detected".to_owned()
+                } else {
+                    "unavailable".to_owned()
+                },
+                email: snapshot
+                    .and_then(|value| value.get("email"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                plan_type: snapshot
+                    .and_then(|value| value.get("plan"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                rate_limits,
+                observed_at,
+                detail: if stale {
+                    "Headroom account detected; limit snapshot is stale".to_owned()
+                } else if routable {
+                    "Headroom account ready for the next bounded attempt".to_owned()
+                } else {
+                    "Headroom account is currently held or out of capacity".to_owned()
+                },
+            },
+        );
+    }
+    accounts
+}
+
+async fn discover_named_account_dirs(
+    parent: &Path,
+    candidates: &mut BTreeSet<PathBuf>,
+) -> Result<(), CodexError> {
+    let Ok(mut entries) = fs::read_dir(parent).await else {
+        return Ok(());
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        if candidates.len() >= 16 {
+            break;
+        }
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if name == ".codex"
+            || name.starts_with(".codex-")
+            || name.starts_with(".codex_")
+            || name.starts_with("codex-")
+            || name.starts_with("codex_")
+        {
+            let path = entry.path();
+            if fs::metadata(path.join("auth.json")).await.is_ok() {
+                candidates.insert(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn account_id(path: &Path) -> String {
+    let digest = Sha256::digest(path.as_os_str().as_encoded_bytes());
+    format!("codex-{}", &hex::encode(digest)[..12])
+}
+
+fn account_label(path: &Path) -> String {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some(".codex") => "codex-main".to_owned(),
+        Some(name) => name.trim_start_matches('.').to_owned(),
+        None => "codex-account".to_owned(),
+    }
+}
+
 /// Probe the installed Codex CLI without starting a persistent App Server.
 ///
 /// Both the semantic version and the generated root protocol schema are checked
@@ -555,6 +1412,9 @@ pub async fn probe_compatibility(settings: &CodexSettings) -> Result<Compatibili
         .arg("--version")
         .stdin(Stdio::null())
         .kill_on_drop(true);
+    if let Some(codex_home) = &settings.codex_home {
+        version_command.env("CODEX_HOME", codex_home);
+    }
     let version_output = timeout(settings.request_timeout, version_command.output())
         .await
         .map_err(|_| CodexError::Timeout {
@@ -593,6 +1453,9 @@ pub async fn probe_compatibility(settings: &CodexSettings) -> Result<Compatibili
         .arg(&probe_dir)
         .stdin(Stdio::null())
         .kill_on_drop(true);
+    if let Some(codex_home) = &settings.codex_home {
+        schema_command.env("CODEX_HOME", codex_home);
+    }
     let result = timeout(settings.request_timeout, schema_command.output())
         .await
         .map_err(|_| CodexError::Timeout {
@@ -601,7 +1464,7 @@ pub async fn probe_compatibility(settings: &CodexSettings) -> Result<Compatibili
     let schema_result = match result {
         Ok(Ok(output)) if output.status.success() => {
             let schema_path = probe_dir.join("codex_app_server_protocol.v2.schemas.json");
-            let result = sha256_file(&schema_path).await;
+            let result = canonical_json_sha256_file(&schema_path).await;
             let _ = fs::remove_dir_all(&probe_dir).await;
             result
         }
@@ -637,9 +1500,32 @@ pub async fn probe_compatibility(settings: &CodexSettings) -> Result<Compatibili
     })
 }
 
-async fn sha256_file(path: &Path) -> Result<String, CodexError> {
+async fn canonical_json_sha256_file(path: &Path) -> Result<String, CodexError> {
     let bytes = fs::read(path).await?;
-    Ok(hex::encode(Sha256::digest(bytes)))
+    canonical_json_sha256(&bytes)
+}
+
+fn canonical_json_sha256(bytes: &[u8]) -> Result<String, CodexError> {
+    let value = normalize_json(serde_json::from_slice(bytes)?);
+    let canonical = serde_json::to_vec(&value)?;
+    Ok(hex::encode(Sha256::digest(canonical)))
+}
+
+fn normalize_json(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut fields = map.into_iter().collect::<Vec<_>>();
+            fields.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            Value::Object(
+                fields
+                    .into_iter()
+                    .map(|(key, value)| (key, normalize_json(value)))
+                    .collect(),
+            )
+        }
+        Value::Array(values) => Value::Array(values.into_iter().map(normalize_json).collect()),
+        value => value,
+    }
 }
 
 fn ulid_like() -> String {
@@ -970,6 +1856,22 @@ fn request_key(id: &Value) -> String {
     }
 }
 
+fn host_github_config_dir() -> Option<PathBuf> {
+    std::env::var_os("GH_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .map(|path| path.join("gh"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|path| path.join(".config/gh"))
+        })
+        .filter(|path| path.is_dir())
+}
+
 #[derive(Debug, Error)]
 pub enum CodexError {
     #[error("failed to spawn {binary}: {source}")]
@@ -989,6 +1891,12 @@ pub enum CodexError {
     MissingPipe(&'static str),
     #[error("App Server disconnected")]
     Disconnected,
+    #[error("no local Codex account homes were detected")]
+    NoCodexAccountHomes,
+    #[error("unknown Codex account profile: {0}")]
+    UnknownAccount(String),
+    #[error("this Codex runtime does not support account switching")]
+    AccountSwitchUnsupported,
     #[error("App Server request {method} timed out")]
     Timeout { method: String },
     #[error("App Server {method} failed with {code}: {message}")]
@@ -998,6 +1906,8 @@ pub enum CodexError {
         message: String,
         data: Option<Value>,
     },
+    #[error("App Server protocol error: {0}")]
+    Protocol(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
@@ -1012,6 +1922,27 @@ mod tests {
     fn request_keys_preserve_string_ids() {
         assert_eq!(request_key(&json!(7)), "7");
         assert_eq!(request_key(&json!("rpc-7")), "rpc-7");
+    }
+
+    #[test]
+    fn native_multi_agent_feature_prefers_enabled_v2_and_rejects_removed_flags() {
+        let selected = select_native_multi_agent_feature(&json!({
+            "data": [
+                {"name": "multi_agent", "enabled": true, "stage": "stable"},
+                {"name": "multi_agent_v2", "enabled": true, "stage": "beta"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(selected.as_deref(), Some("multi_agent_v2"));
+
+        let unavailable = select_native_multi_agent_feature(&json!({
+            "data": [
+                {"name": "multi_agent", "enabled": true, "stage": "removed"},
+                {"name": "multi_agent_v2", "enabled": false, "stage": "beta"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(unavailable, None);
     }
 
     #[tokio::test]
@@ -1039,5 +1970,38 @@ mod tests {
             "[probable secret-bearing diagnostic redacted]"
         );
         assert_eq!(redact_diagnostic_line("runtime ready"), "runtime ready");
+    }
+
+    #[test]
+    fn schema_digest_ignores_json_object_order() {
+        let first = br#"{"version":1,"schema":{"type":"object","required":["id"]}}"#;
+        let reordered = br#"{"schema":{"required":["id"],"type":"object"},"version":1}"#;
+
+        assert_eq!(
+            canonical_json_sha256(first).unwrap(),
+            canonical_json_sha256(reordered).unwrap()
+        );
+    }
+
+    #[test]
+    fn rate_limit_parser_preserves_backend_windows_and_remaining_capacity() {
+        let parsed = parse_rate_limits(&json!({
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "limitId": "codex",
+                    "planType": "pro",
+                    "primary": {
+                        "usedPercent": 4,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1786630416
+                    }
+                }
+            }
+        }));
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].limit_id, "codex");
+        assert_eq!(parsed[0].windows[0].remaining_percent, 96);
+        assert_eq!(parsed[0].windows[0].window_duration_mins, Some(10_080));
     }
 }
