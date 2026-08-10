@@ -96,8 +96,15 @@ For mutable work, `thread/start` receives:
 - sandbox mode and approval policy;
 - service name;
 - repository instruction sources as supported by the pinned version;
-- task-specific developer instructions/context packet;
+- one stable developer policy containing the role, trust boundary, autonomy,
+  external-action boundary, and evidence-grounding rules;
 - metadata linking run/task/attempt/worktree.
+
+The first `turn/start` carries the volatile context packet, objective, task or
+review data, and output request exactly once. Repository content never enters
+`developerInstructions`, and a schema supplied through the protocol is not
+reproduced in prompt prose. This separation keeps the instruction hierarchy
+honest and preserves a reusable prompt prefix.
 
 For a retry, Harness also injects a bounded controller-owned continuity packet
 containing the prior terminal classification, model/effort outcome, operator
@@ -108,9 +115,12 @@ threads continue to start fresh.
 When the approved task packet names a controller or governor owner, this
 primary thread is projected as `governor` and uses the profile's dedicated
 Sol xhigh governor route. Native child threads remain visible under it. Harness
-sends deterministic budget checkpoints at 25, 50, 75, and 90 percent so the
-governor must reconcile delegated work and narrow the remaining plan instead
-of silently consuming the full turn.
+sends two deterministic progress audits during a long turn. The first checks
+whether activity is producing code or behavioral evidence; the second asks the
+governor to materialize one concrete outcome and return a tool-grounded
+checkpoint. Exact token counts remain controller telemetry rather than
+model-facing countdown prose, and the controller still hard-stops at the
+configured boundary.
 
 At App Server initialization Harness reads `experimentalFeature/list` and
 requires an enabled, non-deprecated `multi_agent` or `multi_agent_v2` capability

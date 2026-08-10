@@ -79,14 +79,14 @@ Recommended dimensions assume a 1440×900 or larger desktop. The layout remains 
 │ Runs         │  ┌────────────────────────────────────────────────────────────────┐ │ Goal                  │
 │  ● current   │  │ Architect  SOL · xhigh · read-only               COMPLETE      │ │ Enforce exact ...     │
 │  ○ prior     │  │ task graph 9 tasks · 6 authorities · 82k tokens · $4.17       │ │                       │
-│ Approvals 2  │  └────────────────────────────────────────────────────────────────┘ │ Luna · max            │
+│ Approvals 2  │  └────────────────────────────────────────────────────────────────┘ │ Luna · high           │
 │ Worktrees    │                                                                     │ workspace-write       │
 │ Evidence     │  ┌────────────────────────────────────────────────────────────────┐ │ 38.2k / 80k tokens    │
 │ Usage        │  │ CORE-001   Bind evidence to integration SHA      VERIFIED      │ │ $0.11 API equiv.      │
 │ Host         │  │ Terra · xhigh  work/core-001  5e21c91                      ✓    │ │                       │
 │ Settings     │  ├────────────────────────────────────────────────────────────────┤ │ Current action        │
 │              │  │ CORE-002   API evidence projection               RUNNING       │ │ cargo test -p ...     │
-│              │  │ Luna · max  work/core-002  command 7m12s        38.2k  $0.11   │ │ elapsed 07:12         │
+│              │  │ Luna · high work/core-002  command 7m12s        38.2k  $0.11   │ │ elapsed 07:12         │
 │              │  ├────────────────────────────────────────────────────────────────┤ │                       │
 │              │  │ IOS-001    Consume canonical identity             BLOCKED      │ │ Worktree             │
 │              │  │ waiting for CORE-002                                               /data/.../CORE-002   │
@@ -293,7 +293,7 @@ Example:
 
 ```text
 ● CORE-002  Project exact-head evidence through the API
-  worker · Luna · max · workspace-write · 2 read-only subagents
+  worker · Luna · high · workspace-write · 2 read-only subagents
   Running focused API contract tests
   …/CORE-002 · work/run-014/CORE-002 · a1b9c02 · 4 files +183/-72
   38.2k / 80k · $0.11 · 12m 44s · heartbeat 8s                       [1 approval]
@@ -402,7 +402,7 @@ controller polls; never imply that CI authorizes merge.
 
 ```text
 Model                  Turns  Input   Cached  Cache write  Output  Reasoning  API-equiv.
-gpt-5.6-luna / max        14  31.0k    18.2k       2.1k     7.2k      3.8k       $0.11
+gpt-5.6-luna / high       14  31.0k    18.2k       2.1k     7.2k      3.8k       $0.11
 Read-only subagents         2  12.4k     8.1k       0.0k     2.0k      0.7k       $0.03
 Total                       16  43.4k    26.3k       2.1k     9.2k      4.5k       $0.14
 ```
@@ -429,7 +429,7 @@ This screen is essential for debugging agent quality without exposing hidden rea
 Subagents are grouped beneath their parent and collapsed by default:
 
 ```text
-CORE-002   Luna · max                                 RUNNING
+CORE-002   Luna · high                                RUNNING
 ├─ explore-auth-paths    Luna · medium · read-only    COMPLETE
 ├─ inspect-contract-test Luna · medium · read-only    COMPLETE
 └─ ci-triage             Luna · high · read-only      WAITING

@@ -4,10 +4,8 @@ model = "gpt-5.6-sol"
 model_reasoning_effort = "xhigh"
 sandbox_mode = "read-only"
 developer_instructions = """
-Review from a fresh context. Attempt to disprove every stated invariant and
-completion recommendation. Prioritize hidden fallback or repair, producer and
-consumer mismatch, wrong identity or tenancy, weak negative tests, stale or
-non-exact evidence, partial hard cuts, unsafe lifecycle errors, and claims beyond
-the executed proof tier. Lead with ranked findings and exact file references.
-Return ACCEPT, REMEDIATE, or REJECT_ARCHITECTURE; do not edit files.
+From a fresh context, try to falsify whether the implementation delivers the
+task's requested behavior and whether its claims match controller evidence.
+Prioritize material semantic defects and proof gaps. Return the supplied verdict
+schema with ranked findings and inspected-file evidence; do not edit files.
 """

@@ -4,11 +4,9 @@ model = "gpt-5.6-sol"
 model_reasoning_effort = "xhigh"
 sandbox_mode = "read-only"
 developer_instructions = """
-Follow CONTRIBUTING.md and the task's named authorities. Read the active
-authority chain before source.
-Do not implement. Produce a machine-valid task graph with exact base SHA,
-authority refs, checklist rows, dependencies, owned paths, serial paths,
-positive and negative tests, metrics, evidence limits, and stop conditions.
-Do not authorize compatibility, fallback, normalization, repair, dual authority,
-or completion claims without the required proof.
+Plan the shortest credible path from the current repository to the requested
+behavior. Put a runnable vertical slice and authoritative pipeline feedback
+early, then add regressions after the behavior and code shape are credible.
+Treat custody metadata as a boundary receipt, not implementation work. Return
+the supplied plan schema and do not implement the plan.
 """

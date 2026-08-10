@@ -807,10 +807,10 @@ The controller renders the stop condition and routes it to user, architect, or i
 | Role             | Model           | Effort   | Sandbox         | Purpose                                                                    |
 | ---------------- | --------------- | -------- | --------------- | -------------------------------------------------------------------------- |
 | architect        | `gpt-5.6-sol`   | `xhigh`  | read-only       | authority map, invariants, task graph                                      |
-| plan reviewer    | `gpt-5.6-sol`   | `xhigh`  | read-only       | adversarial plan liveness, feasibility, evidence, and test-timing review   |
+| plan reviewer    | `gpt-5.6-terra` | `xhigh`  | read-only       | diverse adversarial plan liveness, feasibility, and evidence review        |
 | governor         | `gpt-5.6-sol`   | `xhigh`  | workspace-write | preserve goal intent, bound/delegate work, reconcile evidence and failures |
 | explorer         | `gpt-5.6-luna`  | `medium` | read-only       | bounded source/test/contract discovery                                     |
-| normal worker    | `gpt-5.6-luna`  | `max`    | workspace-write | narrow implementation and focused proof                                    |
+| normal worker    | `gpt-5.6-luna`  | `high`   | workspace-write | narrow implementation and focused proof                                    |
 | CI triage        | `gpt-5.6-luna`  | `high`   | read-only       | classify logs/result semantics                                             |
 | high-risk worker | `gpt-5.6-terra` | `xhigh`  | workspace-write | contracts, persistence, security, native, cross-domain                     |
 | integrator       | `gpt-5.6-terra` | `xhigh`  | workspace-write | serial integration/conflict/evidence invalidation                          |
@@ -823,8 +823,14 @@ These are policy defaults, not hard-coded universal truth. Store them in the rep
 
 - Sol is spent where global correctness, goal governance, and adversarial review have the highest leverage.
 - Terra receives tasks whose semantics span components or whose failure could create subtle compatibility/security/persistence debt.
-- Luna handles many bounded tasks economically, but uses a high effort for implementation because the scope has already been constrained.
+- Luna handles many bounded tasks economically at high effort because the scope has already been constrained.
 - Read-only exploration uses lower effort and compact outputs to reduce repeated expensive repo rediscovery.
+
+Effort is a measured routing control, not a synonym for quality. Keep the
+highest settings for roles where deeper global reasoning changes the outcome,
+such as architecture, governance, and final audit. Compare the configured
+setting with one lower level on representative completed runs before raising a
+routine role. Do not compensate for an unclear task by increasing effort.
 
 ### 7.3 Model reroutes
 
@@ -863,10 +869,15 @@ governor's autonomy window or prevent automatic verifier remediation.
 
 ### 7.5 Budget behavior
 
-- 50%: confirm bounded child assignments and the next concrete completion criterion.
-- 75%: reconcile repeated children and persist durable evidence.
-- 90%: ask agent to converge on required proof/handoff.
+- 50%: send one outcome audit: compare activity with success criteria and tool
+  evidence, and change strategy if it is not producing code, behavioral proof,
+  or a concrete external blocker.
+- 85%: ask for one concrete outcome, candidate materialization, and a
+  tool-grounded checkpoint. Remind the governor that productive incomplete work
+  continues automatically across turn boundaries.
 - 100%: hard-stop the attempt; never silently widen its bound.
+- exact percentages and token counts remain controller telemetry and are not
+  repeated in model-facing checkpoint prose;
 - run creation exposes the total goal envelope, defaulted from operator settings;
   a human continuation may explicitly add a bounded allowance to the next
   governor attempt, and the controller raises the run cap only enough to admit
@@ -1125,6 +1136,31 @@ Do not continuously append all layers and all prior turns into one unbounded con
 Codex memory may inform future heuristics after a run, but immediate retry and
 supervision state is Harness-owned durable data and must not depend on
 asynchronous memory generation.
+
+#### Prompt assembly contract
+
+- `thread/start` receives one stable developer policy: role, instruction trust,
+  read/write autonomy, external-action boundaries, controller ownership, and
+  evidence-grounded reporting. Repository text and task-specific context never
+  enter this layer.
+- `turn/start` receives the volatile repository evidence, task packet, current
+  controller facts, and requested output exactly once. Put reusable source
+  evidence before the volatile context receipt, and put the objective and action
+  request after long evidence so the model sees the decision it must make last.
+- State each rule once. Specify the outcome, why it matters, hard constraints,
+  approval boundary, success evidence, and output contract. Prescribe a tool or
+  step sequence only when the controller has evidence that the sequence is
+  required; otherwise allow the selected model to choose the implementation.
+- Supply structured-output schemas through the protocol instead of copying them
+  into prompt prose. Expose only tools relevant to the role and sandbox, with
+  concise tool descriptions.
+- Ground long-run progress and completion claims in observed tool results.
+  Do not request hidden reasoning transcripts. Do not repeat remaining-token or
+  context-window countdowns in prose; the controller enforces budgets outside
+  the task narrative.
+- Keep the core contract model-neutral. Add a model-specific instruction only
+  for a measured failure on representative runs, and remove obsolete tuning
+  when stronger default behavior makes it unnecessary.
 
 ### 10.3 Repository map v1
 

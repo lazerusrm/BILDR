@@ -65,28 +65,36 @@ pub struct ContextPacket {
 impl ContextPacket {
     #[must_use]
     pub fn prompt_prefix(&self) -> String {
-        let mut output = format!(
-            "Harness context packet {}\nBase SHA: {}\nTask: {}\n\nProtected semantics:\n",
-            self.digest, self.base_sha, self.task_id
-        );
+        let mut output = "Controller-protected semantics:\n".to_owned();
         for rule in &self.protected_semantics {
             output.push_str("- ");
             output.push_str(rule);
             output.push('\n');
         }
+        output.push_str("\n<repository_evidence>\n");
         for source in self.sources.iter().filter(|source| source.included) {
-            output.push_str("\n--- SOURCE: ");
+            output.push_str("\n<source>\nPath: ");
             output.push_str(&source.path);
-            output.push_str(" (sha256 ");
+            output.push_str("\nKind: ");
+            output.push_str(&source.kind);
+            output.push_str("\nSHA-256: ");
             output.push_str(source.sha256.as_deref().unwrap_or("unavailable"));
-            output.push_str(") ---\n");
+            output.push_str("\nContent:\n");
             if let Some(content) = &source.content {
                 output.push_str(content);
                 if !content.ends_with('\n') {
                     output.push('\n');
                 }
             }
+            output.push_str("</source>\n");
         }
+        output.push_str("</repository_evidence>\n\nContext receipt:\nPacket: ");
+        output.push_str(&self.digest);
+        output.push_str("\nBase SHA: ");
+        output.push_str(&self.base_sha);
+        output.push_str("\nTask: ");
+        output.push_str(&self.task_id);
+        output.push('\n');
         output
     }
 }
@@ -786,5 +794,41 @@ mod tests {
             normalize_relative("docs/./README.md").unwrap(),
             "docs/README.md"
         );
+    }
+
+    #[test]
+    fn prompt_prefix_keeps_reusable_evidence_before_volatile_receipt() {
+        let packet = ContextPacket {
+            schema: "harness-context/v1".to_owned(),
+            base_sha: "base-sha".to_owned(),
+            task_id: "task-7".to_owned(),
+            profile_id: "general".to_owned(),
+            profile_digest: "profile-digest".to_owned(),
+            instruction_digest: "instruction-digest".to_owned(),
+            sources: vec![ContextSource {
+                path: "CONTRIBUTING.md".to_owned(),
+                kind: "instruction".to_owned(),
+                sha256: Some("source-digest".to_owned()),
+                bytes: 18,
+                included: true,
+                reason: "selected".to_owned(),
+                content: Some("stable source text".to_owned()),
+            }],
+            repository_map: RepositoryMap::default(),
+            protected_semantics: vec!["Preserve user changes".to_owned()],
+            context_bytes: 18,
+            estimated_tokens: 5,
+            digest: "packet-digest".to_owned(),
+        };
+
+        let prompt = packet.prompt_prefix();
+        let source = prompt.find("stable source text").unwrap();
+        let receipt = prompt.find("Context receipt:").unwrap();
+        let volatile_digest = prompt.find("packet-digest").unwrap();
+
+        assert!(source < receipt);
+        assert!(receipt < volatile_digest);
+        assert!(prompt.contains("<repository_evidence>"));
+        assert!(prompt.contains("Controller-protected semantics:"));
     }
 }

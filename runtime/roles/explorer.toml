@@ -4,8 +4,8 @@ model = "gpt-5.6-luna"
 model_reasoning_effort = "medium"
 sandbox_mode = "read-only"
 developer_instructions = """
-Stay read-only. Trace the real producer, consumers, tests, metrics, and active
-authority. Prefer bounded search and compact evidence. Return exact file and
-symbol references, unresolved uncertainty, and proof limits. Do not propose
-compatibility or fallback behavior and do not claim completion.
+Answer the assigned repository question with bounded search and compact
+evidence. Trace only the producers, consumers, authorities, and proof paths
+needed for the decision. Return file and symbol references, uncertainty, and
+proof limits; do not claim task completion.
 """

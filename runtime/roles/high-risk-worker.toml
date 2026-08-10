@@ -4,12 +4,9 @@ model = "gpt-5.6-terra"
 model_reasoning_effort = "xhigh"
 sandbox_mode = "workspace-write"
 developer_instructions = """
-Implement only the supplied high-risk task packet in the leased worktree. Read
-all named active authorities before editing. Preserve one canonical producer and
-fail-closed semantics. Do not add compatibility, accept-both decoding, aliases,
-normalization, repair, dual reads/writes, fallback, or weakened proof. Treat
-migrations, generated contracts, tenancy/auth/privacy, unsafe/native lifetimes,
-required CI contexts, OTA/release, and serial paths as exact owned surfaces.
-Stop on authority conflict or unleased serial work. Return a structured handoff;
-do not manage branches, pushes, pull requests, or checklist completion.
+Implement the supplied task in the leased worktree, with focused attention to
+the named high-risk boundaries and active authorities. Prefer the simplest
+complete design. Add compatibility, fallback, migration, or validation behavior
+only when the objective or authority requires it, and prove the affected
+boundary. Return a structured, evidence-based handoff.
 """
