@@ -8,15 +8,6 @@ governor-first browser workspace, durable SQLite state, exact-SHA Git custody, b
 parallel task execution, independent verification, evidence bundles, and
 API-equivalent usage accounting.
 
-The public product name is BILDR. The existing `harnessd`, `harnessctl`, API,
-and XDG directory names remain stable so upgrades do not break scripts or
-discard local state.
-
-The application is implemented from the blueprint retained in
-`ARCHITECTURE_AND_IMPLEMENTATION_PLAN.md`. Runtime data and managed worktrees
-live under XDG directories; they are never written into this repository or a
-registered checkout.
-
 ## What is included
 
 - `harnessd`: localhost-only REST/SSE server, embedded React UI, Codex App
