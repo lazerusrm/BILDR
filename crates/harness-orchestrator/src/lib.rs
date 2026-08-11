@@ -5969,6 +5969,8 @@ impl Orchestrator {
                 if event.method == "thread/tokenUsage/updated" {
                     let observed_turn_id = value_text(payload, &[&["turnId"]]);
                     let session_budget_stop = if let Some(agent_id) = agent_id.as_ref() {
+                        self.steer_agent_at_session_budget_checkpoint(agent_id, observed_turn_id)
+                            .await?;
                         self.interrupt_agent_at_session_budget(agent_id, observed_turn_id)
                             .await?
                     } else {
@@ -7764,6 +7766,81 @@ impl Orchestrator {
             }
         }
         Ok(false)
+    }
+
+    async fn steer_agent_at_session_budget_checkpoint(
+        &self,
+        agent_id: &AgentSessionId,
+        observed_turn_id: Option<&str>,
+    ) -> Result<(), OrchestratorError> {
+        let agent = self.store.agent(agent_id)?;
+        if !session_budget_checkpoint_needed(
+            agent.role,
+            &agent.state,
+            agent.token_budget,
+            agent.tokens_used,
+            agent.active_turn_id.as_deref(),
+            observed_turn_id,
+        ) {
+            return Ok(());
+        }
+        let (Some(thread_id), Some(turn_id), Some(budget)) = (
+            agent.thread_id.as_deref(),
+            agent.active_turn_id.as_deref(),
+            agent.token_budget,
+        ) else {
+            return Ok(());
+        };
+        let metadata_key = format!("session-budget-checkpoint:{agent_id}:{turn_id}");
+        if self.store.runtime_metadata(&metadata_key)?.is_some() {
+            return Ok(());
+        }
+        let message = session_budget_checkpoint_message(agent.role);
+        match self
+            .runtime()
+            .await?
+            .steer_turn(thread_id, turn_id, message)
+            .await
+        {
+            Ok(_) => {
+                self.store.put_runtime_metadata(
+                    &metadata_key,
+                    &json!({
+                        "checkpoint_percent": 75,
+                        "tokens_used": agent.tokens_used,
+                        "token_budget": budget,
+                        "turn_id": turn_id,
+                        "role": agent.role,
+                    }),
+                )?;
+                self.store.update_agent_state(
+                    agent_id,
+                    "STEERED",
+                    Some("Session token budget checkpoint delivered"),
+                    None,
+                    None,
+                    None,
+                )?;
+                self.emit_agent_event(
+                    &self.store.agent_context(agent_id)?.0,
+                    agent_id,
+                    "agent.session_budget.checkpoint",
+                    json!({
+                        "checkpoint_percent": 75,
+                        "tokens_used": agent.tokens_used,
+                        "token_budget": budget,
+                        "turn_id": turn_id,
+                        "role": agent.role,
+                    }),
+                )?;
+            }
+            Err(error) => warn!(
+                %agent_id,
+                %error,
+                "could not deliver session token-budget checkpoint"
+            ),
+        }
+        Ok(())
     }
 
     async fn finalize_worker(&self, agent_id: &AgentSessionId) -> Result<(), OrchestratorError> {
@@ -12669,6 +12746,48 @@ fn session_budget_hard_stop_needed(
         && active_turn_id == observed_turn_id
 }
 
+fn session_budget_checkpoint_needed(
+    role: AgentRole,
+    agent_state: &str,
+    token_budget: Option<u64>,
+    tokens_used: u64,
+    active_turn_id: Option<&str>,
+    observed_turn_id: Option<&str>,
+) -> bool {
+    role != AgentRole::Governor
+        && matches!(agent_state, "RUNNING" | "STEERED")
+        && token_budget.is_some_and(|budget| {
+            budget > 0
+                && tokens_used < budget
+                && tokens_used.saturating_mul(100) >= budget.saturating_mul(75)
+        })
+        && active_turn_id.is_some()
+        && active_turn_id == observed_turn_id
+}
+
+fn session_budget_checkpoint_message(role: AgentRole) -> &'static str {
+    match role {
+        AgentRole::Architect => {
+            "Controller token-budget checkpoint: stop tools and return your best complete schema-valid plan now. Do not begin further repository discovery or implementation."
+        }
+        AgentRole::PlanReviewer => {
+            "Controller token-budget checkpoint: stop tools and return your best complete schema-valid review verdict now. Do not begin further repository discovery."
+        }
+        AgentRole::FinalAuditor => {
+            "Controller token-budget checkpoint: stop tools and return your best complete schema-valid final-audit verdict now. Do not begin further repository discovery."
+        }
+        AgentRole::Verifier => {
+            "Controller token-budget checkpoint: stop tools and return your best complete schema-valid verifier verdict now. Do not begin further repository discovery."
+        }
+        AgentRole::Interviewer => {
+            "Controller token-budget checkpoint: stop tools and return your best complete schema-valid interview turn now. Do not ask additional questions unless required by the response contract."
+        }
+        _ => {
+            "Controller token-budget checkpoint: stop tools and return your best complete handoff now. Name changes, checks and results, residual risk, anything unproved, and the next action if incomplete."
+        }
+    }
+}
+
 fn terminal_turn_failure_class(status: &str, session_budget_interrupted: bool) -> &'static str {
     if status == "interrupted" && session_budget_interrupted {
         "budget_exhausted"
@@ -14924,6 +15043,77 @@ mod tests {
             Some("turn-current"),
             Some("turn-current"),
         ));
+    }
+
+    #[test]
+    fn session_budget_checkpoint_requires_current_non_governor_turn_before_ceiling() {
+        assert!(session_budget_checkpoint_needed(
+            AgentRole::Architect,
+            "RUNNING",
+            Some(120_000),
+            90_000,
+            Some("turn-current"),
+            Some("turn-current"),
+        ));
+        assert!(!session_budget_checkpoint_needed(
+            AgentRole::Architect,
+            "RUNNING",
+            Some(120_000),
+            89_999,
+            Some("turn-current"),
+            Some("turn-current"),
+        ));
+        assert!(!session_budget_checkpoint_needed(
+            AgentRole::Architect,
+            "RUNNING",
+            Some(120_000),
+            120_000,
+            Some("turn-current"),
+            Some("turn-current"),
+        ));
+        assert!(!session_budget_checkpoint_needed(
+            AgentRole::Governor,
+            "RUNNING",
+            Some(120_000),
+            101_000,
+            Some("turn-current"),
+            Some("turn-current"),
+        ));
+        assert!(!session_budget_checkpoint_needed(
+            AgentRole::Architect,
+            "RUNNING",
+            Some(120_000),
+            101_000,
+            Some("turn-current"),
+            Some("turn-prior"),
+        ));
+        for terminal_or_stopping in ["INTERRUPTED", "STOPPING", "WAITING_APPROVAL"] {
+            assert!(!session_budget_checkpoint_needed(
+                AgentRole::Architect,
+                terminal_or_stopping,
+                Some(120_000),
+                101_000,
+                Some("turn-current"),
+                Some("turn-current"),
+            ));
+        }
+    }
+
+    #[test]
+    fn session_budget_checkpoint_messages_preserve_each_role_contract() {
+        for (role, expected) in [
+            (AgentRole::Architect, "schema-valid plan"),
+            (AgentRole::PlanReviewer, "schema-valid review verdict"),
+            (AgentRole::FinalAuditor, "schema-valid final-audit verdict"),
+            (AgentRole::Verifier, "schema-valid verifier verdict"),
+            (AgentRole::Interviewer, "schema-valid interview turn"),
+            (AgentRole::Worker, "complete handoff"),
+        ] {
+            let message = session_budget_checkpoint_message(role);
+            assert!(message.contains("stop tools and return your best complete"));
+            assert!(message.contains(expected));
+        }
+        assert!(!session_budget_checkpoint_message(AgentRole::Worker).contains("schema-valid"));
     }
 
     #[test]
