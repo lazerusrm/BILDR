@@ -13372,6 +13372,25 @@ mod tests {
     }
 
     #[test]
+    fn intent_interview_output_schema_types_every_top_level_property() {
+        let schema: Value = serde_json::from_str(INTENT_INTERVIEW_TURN_SCHEMA).unwrap();
+        let properties = schema["properties"].as_object().unwrap();
+        for field in [
+            "schema",
+            "status",
+            "question",
+            "why_it_matters",
+            "recommended_answer",
+            "brief",
+        ] {
+            assert!(
+                properties[field].get("type").is_some(),
+                "response-format property {field} needs an explicit JSON Schema type"
+            );
+        }
+    }
+
+    #[test]
     fn interviewer_prompt_keeps_human_intent_separate_from_implementation_planning() {
         let instructions =
             agent_developer_instructions(AgentRole::Interviewer, SandboxMode::ReadOnly);

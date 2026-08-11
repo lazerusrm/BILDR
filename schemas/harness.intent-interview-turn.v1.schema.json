@@ -14,9 +14,11 @@
   ],
   "properties": {
     "schema": {
+      "type": "string",
       "const": "harness.intent-interview-turn.v1"
     },
     "status": {
+      "type": "string",
       "enum": ["question", "ready"]
     },
     "question": {
