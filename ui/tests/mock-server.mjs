@@ -205,6 +205,16 @@ const worker = {
   heartbeat_at: now,
   thread_id: "thread-worker",
   active_turn_id: "turn-worker",
+  active_turn_started_at: new Date(Date.now() - 65_000).toISOString(),
+  active_turn_usage: {
+    input_tokens: 25000,
+    cached_input_tokens: 12800,
+    cache_write_input_tokens: 0,
+    output_tokens: 2620,
+    reasoning_output_tokens: 1700,
+    total_tokens: 27620,
+    model_context_window: 258400,
+  },
   version: 7,
 };
 const worktrees = [

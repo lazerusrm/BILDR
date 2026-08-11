@@ -1627,6 +1627,11 @@ components:
         heartbeat_at: {type: string, format: date-time}
         thread_id: {type: string}
         active_turn_id: {type: string}
+        active_turn_started_at: {type: [string, 'null'], format: date-time}
+        active_turn_usage:
+          anyOf:
+            - {$ref: '#/components/schemas/TokenUsage'}
+            - {type: 'null'}
         context_strategy: {type: string, enum: [fresh_independent, bounded_handoff]}
         context_source_attempt_id: {type: string}
         context_reuse_reason: {type: string}

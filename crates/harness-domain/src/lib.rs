@@ -699,6 +699,8 @@ pub struct AgentSummary {
     pub heartbeat_at: Option<String>,
     pub thread_id: Option<String>,
     pub active_turn_id: Option<String>,
+    pub active_turn_started_at: Option<String>,
+    pub active_turn_usage: Option<TokenUsage>,
     pub context_strategy: String,
     pub context_source_attempt_id: Option<AttemptId>,
     pub context_reuse_reason: Option<String>,

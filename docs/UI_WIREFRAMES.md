@@ -201,7 +201,9 @@ selected, the prepared run enters **Clarifying intent** instead of starting the
 architect. The selected governor model uses a read-only repository view and
 asks one material question at a time. The workspace shows the question,
 rationale, current concise brief, **Continue interview**, **Use brief and
-plan**, and **Skip interview**. Confirmation starts a fresh architect thread
+plan**, and **Skip interview**. While a turn is active, the panel shows its
+current activity, elapsed time, and live input, cached-input, output,
+reasoning-output, and turn-total token counters. Confirmation starts a fresh architect thread
 with the original objective and confirmed brief. The transcript remains in run
 history and is not planning input. Automatic plan approval does not answer or
 confirm interview questions.
@@ -213,17 +215,33 @@ an animated **Planning** status and shows the architect's latest action. The
 right inspector mirrors that state instead of falling back to ambiguous copy
 such as `Select a task` or `No active turn`.
 
+If a completed architect response uses a repository-native or otherwise invalid
+plan shape, the surface remains in **Planning** while a focused output repair
+re-expresses the completed work in the controller schema. It shows the repair
+turn's live activity and usage instead of asking the operator to buy the same
+repository investigation again. Repeated invalid repairs stop with the exact
+rejection and an explicit retry action.
+
+Mechanical packet fields owned by the controller are canonicalized without a
+new model turn. The UI must not present that canonicalization as renewed
+architecture work or increase the displayed attempt count. A follow-up repair
+turn is reserved for substantive or non-adaptable output defects.
+
 After the architect proposes a plan, the same surface advances through
 **Adversarial review** and, when blockers exist, **Revising plan** before
 returning to review. The plan card explains whether the reviewer is checking
 feasibility/liveness, whether the architect is addressing concrete findings, or
 whether the digest is **Certified**. Approval controls are absent until
 certification. Review/revision retries remain automatic while capacity and the
-total run ceiling permit them. A repeated/oscillating or non-shrinking finding
-history stops as **Planning needs a decision** rather than consuming the rest of
-the ceiling. The plan card shows the certificate, inspected-file/critical-path
-evidence, advisory findings, revision history, planning spend, execution reserve,
-and the reason automatic approval was deferred. The operator can **Request
+total run ceiling permit them. A verdict-only continuation reuses the same
+reviewer row and thread; the UI labels it **Finalizing review** and does not
+present it as a fresh repository review. Reaching the authoritative run ceiling
+stops the active turn and shows the run as paused rather than leaving a working
+spinner. A repeated/oscillating or non-shrinking finding history stops as
+**Planning needs a decision** rather than consuming the rest of the ceiling.
+The plan card shows the certificate, inspected-file/critical-path evidence,
+advisory findings, revision history, planning spend, execution reserve, and the
+reason automatic approval was deferred. The operator can **Request
 changes** with a concrete blocking correction; Harness sends it through the same
 replacement-plan and re-certification loop. An explicit **Approve with budget
 override** action is shown only when the controller's remaining-budget check is

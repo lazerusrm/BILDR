@@ -983,13 +983,21 @@ kbd {
 }
 .intent-working,
 .intent-recovery {
-  display: flex;
-  align-items: center;
-  gap: 12px;
   border: 1px solid var(--line);
   border-radius: 9px;
   padding: 12px;
   background: var(--panel);
+}
+.intent-working {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+.intent-recovery {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 .intent-working .runtime-spinner {
   width: 24px;
@@ -999,18 +1007,18 @@ kbd {
   border-top-color: var(--accent);
   animation: spin 900ms linear infinite;
 }
-.intent-working strong,
-.intent-working span,
+.intent-working-copy strong,
+.intent-working-copy span,
 .intent-recovery strong,
 .intent-recovery span {
   display: block;
 }
-.intent-working strong,
+.intent-working-copy strong,
 .intent-recovery strong {
   color: var(--soft);
   font-size: 11px;
 }
-.intent-working span,
+.intent-working-copy span,
 .intent-recovery span {
   margin-top: 3px;
   color: var(--muted);
@@ -1182,6 +1190,78 @@ kbd {
 .architecture-status-facts > span {
   color: var(--muted);
   font-size: 10px;
+}
+.live-turn-telemetry {
+  grid-column: 1 / -1;
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+  border-top: 1px solid var(--line);
+  padding-top: 9px;
+}
+.live-turn-heading {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 7px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+}
+.live-turn-heading > i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent), transparent 82%);
+}
+.live-turn-heading > strong {
+  overflow: hidden;
+  color: var(--soft);
+  font-size: 10px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.live-turn-heading > span {
+  color: var(--faint);
+  font-size: 9px;
+  white-space: nowrap;
+}
+.live-turn-metrics {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(74px, 1fr));
+  gap: 6px;
+  margin: 0;
+}
+.live-turn-metrics > div {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 6px 7px;
+  background: color-mix(in srgb, var(--panel-2), transparent 18%);
+}
+.live-turn-metrics dt,
+.live-turn-metrics dd {
+  overflow: hidden;
+  margin: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.live-turn-metrics dt {
+  color: var(--faint);
+  font-size: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.live-turn-metrics dd {
+  margin-top: 2px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.live-turn-awaiting {
+  color: var(--faint);
+  font-size: 9px;
 }
 .goal-plan-card {
   min-width: 0;

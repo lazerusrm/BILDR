@@ -2039,6 +2039,9 @@ function RunWorkspace({
     visibleArchitectureAgents.find(
       (agent) => agent.active_turn_id && activeAgentState(agent.state),
     ) || visibleArchitectureAgents.at(-1);
+  const interviewAgent = detail.intent_interview?.agent_id
+    ? agents.find((agent) => agent.id === detail.intent_interview?.agent_id)
+    : undefined;
   const focusTask = tasks.find(
     (task) => task.id === selectedTaskId && retryableState(task.state),
   );
@@ -2202,6 +2205,7 @@ function RunWorkspace({
       {detail.intent_interview && (
         <IntentInterviewPanel
           interview={detail.intent_interview}
+          interviewer={interviewAgent}
           runState={run.state}
           busy={busy}
           onStart={onStartInterview}
@@ -2350,6 +2354,7 @@ function RunWorkspace({
 
 function IntentInterviewPanel({
   interview,
+  interviewer,
   runState,
   busy,
   onStart,
@@ -2358,6 +2363,7 @@ function IntentInterviewPanel({
   onSkip,
 }: {
   interview: IntentInterviewSnapshot;
+  interviewer?: Agent;
   runState: string;
   busy: string;
   onStart: () => void;
@@ -2415,7 +2421,7 @@ function IntentInterviewPanel({
       {working ? (
         <div className="intent-working">
           <div className="runtime-spinner" aria-hidden="true" />
-          <div>
+          <div className="intent-working-copy">
             <strong>
               {interview.turn_count > 1
                 ? "Updating the intent brief"
@@ -2426,6 +2432,14 @@ function IntentInterviewPanel({
               It cannot start planning until you confirm or skip this interview.
             </span>
           </div>
+          <LiveTurnTelemetry
+            agent={interviewer?.active_turn_id ? interviewer : undefined}
+            fallbackAction={
+              interview.turn_count > 1
+                ? "Updating the intent brief from your answer"
+                : "Finding the highest-leverage question"
+            }
+          />
         </div>
       ) : interview.status === "waiting_for_human" && latestQuestion ? (
         <>
@@ -2600,6 +2614,14 @@ function ArchitectureStatusPanel({
             : "SOL · xhigh thinking"}
         </span>
       </div>
+      {planning && (
+        <LiveTurnTelemetry
+          agent={architect?.active_turn_id ? architect : undefined}
+          fallbackAction={
+            starting ? "Opening the planning turn" : planningStateTitle(run.state)
+          }
+        />
+      )}
     </section>
   );
 }
@@ -3351,7 +3373,78 @@ function TaskRuntimePanel({
             : "Waiting for first agent heartbeat"}
         </span>
       </div>
+      {activeTurn && (
+        <LiveTurnTelemetry
+          agent={agent}
+          fallbackAction="Waiting for the first activity event"
+        />
+      )}
     </section>
+  );
+}
+
+export function LiveTurnTelemetry({
+  agent,
+  fallbackAction,
+}: {
+  agent?: Agent;
+  fallbackAction: string;
+}) {
+  const [clock, setClock] = useState(() => Date.now());
+  const startedAt = agent?.active_turn_started_at;
+  useEffect(() => {
+    if (!startedAt) return;
+    setClock(Date.now());
+    const timer = window.setInterval(() => setClock(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [startedAt]);
+  const usage = agent?.active_turn_usage;
+  const value = (tokens?: number) =>
+    usage && tokens !== undefined ? formatTokens(tokens) : "—";
+  return (
+    <div
+      className={`live-turn-telemetry ${usage ? "has-usage" : "awaiting-usage"}`}
+      role="group"
+      aria-label="Live turn telemetry"
+    >
+      <div className="live-turn-heading">
+        <i aria-hidden="true" />
+        <strong aria-live="polite">
+          {agent?.current_action || fallbackAction}
+        </strong>
+        <span>
+          {startedAt ? formatTurnElapsed(startedAt, clock) : "Starting turn"}
+          {agent?.heartbeat_at ? ` · activity ${timeAgo(agent.heartbeat_at)}` : ""}
+        </span>
+      </div>
+      <dl className="live-turn-metrics" aria-label="Current turn token usage">
+        <div>
+          <dt>Input</dt>
+          <dd>{value(usage?.input_tokens)}</dd>
+        </div>
+        <div>
+          <dt>Cached input</dt>
+          <dd>{value(usage?.cached_input_tokens)}</dd>
+        </div>
+        <div>
+          <dt>Output</dt>
+          <dd>{value(usage?.output_tokens)}</dd>
+        </div>
+        <div title="Reasoning tokens are included in output">
+          <dt>Reasoning in output</dt>
+          <dd>{value(usage?.reasoning_output_tokens)}</dd>
+        </div>
+        <div>
+          <dt>Turn total</dt>
+          <dd>{value(usage?.total_tokens)}</dd>
+        </div>
+      </dl>
+      {!usage && (
+        <span className="live-turn-awaiting">
+          Waiting for the first model-usage update
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -6220,6 +6313,16 @@ function elapsed(value: string) {
   const ms = Math.max(0, Date.now() - new Date(value).getTime());
   const minutes = Math.floor(ms / 60_000);
   if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+export function formatTurnElapsed(value: string, now = Date.now()) {
+  const started = new Date(value).getTime();
+  if (Number.isNaN(started)) return "—";
+  const seconds = Math.max(0, Math.floor((now - started) / 1_000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
   const hours = Math.floor(minutes / 60);
   return `${hours}h ${minutes % 60}m`;
 }

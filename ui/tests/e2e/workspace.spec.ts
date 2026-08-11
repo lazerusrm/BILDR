@@ -40,6 +40,12 @@ test("renders the governor-first run workspace and usage breakdown", async ({
   await expect(page.getByText("Recent activity", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Needs your approval")).toBeVisible();
   await expect(page.getByText("Message the governor")).toBeVisible();
+  const liveTurn = page.getByRole("group", {
+    name: "Live turn telemetry",
+  });
+  await expect(liveTurn).toContainText("Input");
+  await expect(liveTurn).toContainText("25.0k");
+  await expect(liveTurn).toContainText("Reasoning in output");
   await expect(page.locator(".statusbar")).toContainText("Live updates");
   const main = page.locator("main");
   await main.evaluate((element) => {
@@ -159,4 +165,92 @@ test("completes a deep interview and hands the confirmed brief to planning", asy
   await expect(
     page.getByRole("region", { name: "Governor sessions" }),
   ).toContainText("PLANNING");
+});
+
+test("shows live token progress while the deep interviewer is working", async ({
+  page,
+}) => {
+  let interviewerStarted = false;
+  await page.route(
+    "**/api/v1/runs/run-03JHARNESS/interview/start",
+    async (route) => {
+      interviewerStarted = true;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          operation: "start_intent_interview",
+          accepted: true,
+        }),
+      });
+    },
+  );
+  await page.route("**/api/v1/runs/run-03JHARNESS", async (route) => {
+    const response = await route.fetch();
+    if (!interviewerStarted) {
+      await route.fulfill({ response });
+      return;
+    }
+    const detail = await response.json();
+    detail.intent_interview = {
+      ...detail.intent_interview,
+      status: "running",
+      agent_id: "agent-interviewer-live",
+      turn_count: 1,
+      started_at: new Date(Date.now() - 35_000).toISOString(),
+    };
+    detail.agents = [
+      {
+        id: "agent-interviewer-live",
+        role: "interviewer",
+        state: "RUNNING",
+        requested_model: "gpt-5.6-sol",
+        effective_model: "gpt-5.6-sol",
+        requested_reasoning_effort: "xhigh",
+        effective_reasoning_effort: "xhigh",
+        sandbox_mode: "read-only",
+        cwd: "/state/worktrees/run/inspection",
+        current_action: "Inspecting the authoritative workflow",
+        token_budget: 120000,
+        tokens_used: 18640,
+        estimated_cost_lower: "$0.94",
+        estimated_cost_upper: "$0.94",
+        heartbeat_at: new Date().toISOString(),
+        thread_id: "thread-interviewer-live",
+        active_turn_id: "turn-interviewer-live",
+        active_turn_started_at: new Date(Date.now() - 35_000).toISOString(),
+        active_turn_usage: {
+          input_tokens: 18000,
+          cached_input_tokens: 14400,
+          cache_write_input_tokens: 0,
+          output_tokens: 640,
+          reasoning_output_tokens: 220,
+          total_tokens: 18640,
+          model_context_window: 258400,
+        },
+        version: 2,
+      },
+    ];
+    await route.fulfill({ response, json: detail });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "New task" }).click();
+  await page
+    .getByRole("textbox", { name: "What should the governor accomplish?" })
+    .fill("Clarify the authoritative workflow before planning.");
+  await page
+    .getByRole("checkbox", { name: /Deep interview before planning/ })
+    .check();
+  await page.getByRole("button", { name: "Create and start task" }).click();
+
+  const telemetry = page.getByRole("group", {
+    name: "Live turn telemetry",
+  });
+  await expect(page.getByRole("heading", { name: "Deep interview" })).toBeVisible();
+  await expect(telemetry).toContainText("Inspecting the authoritative workflow");
+  await expect(telemetry).toContainText("18.0k");
+  await expect(telemetry).toContainText("14.4k");
+  await expect(telemetry).toContainText("640");
+  await expect(telemetry).toContainText("Reasoning in output");
 });

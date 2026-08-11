@@ -350,7 +350,13 @@ On mismatch, the UI and historical database remain available but new execution i
 - resumed threads retain their task/attempt identity;
 - native subagents appear as child sessions linked to the parent thread/task;
 - an active turn is not the same as an active command; both are tracked;
-- `thread/goal/set` initializes the objective/token budget and updates on material remediation or phase change.
+- `thread/goal/set` is reserved for the persistent governor thread, whose goal
+  may continue across turns and updates on material remediation or phase
+  change;
+- interview, architecture, review, verification, and audit are
+  controller-bounded turns. They never install an App Server auto-continuing
+  goal; the controller alone decides whether their completed result needs a
+  distinct follow-up turn.
 
 ### 4.6 Activity projection
 
@@ -455,6 +461,28 @@ brief or explicitly skips the interview. A fresh architect thread receives the
 original objective and confirmed brief, never the raw transcript. Automatic
 plan approval cannot confirm or skip an interview.
 
+The controller-owned plan response schema remains authoritative even when the
+repository contains its own planning formats. If an architect completes useful
+discovery but returns a schema-invalid final object, the controller starts a
+focused serialization-repair turn from that response after the turn reaches a
+safe boundary. The repair does not repeat repository inspection. It restates
+the controller shape, preserves the useful critical path, and receives the same
+independent adversarial review as any other plan. Two failed automatic shape
+repairs stop with the concrete rejection visible for an operator decision;
+explicit retry starts a new bounded repair cycle. The total run-token ceiling
+remains authoritative.
+
+Controller-owned packet facts do not justify another model turn. Before plan
+validation, the controller binds the run identity, pinned base SHA, general-run
+owner and execution route, reviewer route, active authorities, forbidden
+runtime paths, lease and handoff metadata, and empty optional lists. It may
+derive checklist rows directly from the architect's milestone titles. It does
+not invent or repair the substantive objective, custody, milestones, success
+criteria, evidence, proof limits, or budgets. A response with a useful semantic
+plan therefore advances to adversarial review even if it omits mechanical
+packet boilerplate; a response with a broken critical path still requires
+revision.
+
 `PLAN_REVIEW_REQUIRED` means the current plan digest and its base/profile/authority
 bindings have already passed a fresh, read-only adversarial review with zero
 blocking findings; it does not mean merely schema-valid. Automatic plan approval may perform the certified
@@ -462,6 +490,18 @@ blocking findings; it does not mean merely schema-valid. Automatic plan approval
 `PLAN_ADVERSARIAL_REVIEW`. Blocking findings create a complete replacement plan
 revision and repeat review automatically. Advisory findings remain on the
 certificate and enter execution context without buying another planning round.
+Review inspection is bounded to the executable critical path rather than a
+second product inventory. If a review turn ends before emitting its structured
+verdict, one verdict-only continuation may reuse that same native thread and
+its inspected evidence; it cannot call tools or restart discovery. A fresh
+reviewer is used only when that bounded recovery is unavailable or fails.
+
+The run-token ceiling governs active work as well as future scheduling. Reaching
+it pauses the scheduler and interrupts the active turn; the controller never
+lets an already-running model continue spending merely because the next state
+transition has not happened yet. Before a fresh review turn, the controller
+also reserves enough remaining budget for the already-known context and plan
+input; it pauses without sending the request when that input cannot fit.
 Repeated/oscillating finding fingerprints or three non-shrinking review rounds
 pause as `plan_review_deadlocked` with the findings history for an operator
 decision; this is evidence-based convergence detection, not a raw review-count

@@ -764,8 +764,10 @@ fn truncate(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{ProjectionContext, ProtocolProjection, summarize_collaboration};
-    use crate::Store;
+    use crate::{NewAgentSession, Store};
+    use harness_domain::{AgentRole, AgentSessionId, RunId, SandboxMode};
     use serde_json::json;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     #[test]
@@ -872,6 +874,107 @@ mod tests {
             (250, 200, 30, 10, 280)
         );
         assert_eq!(samples, 1);
+    }
+
+    #[test]
+    fn active_agent_summary_exposes_authoritative_turn_usage() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::in_memory(&temp.path().join("artifacts")).unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO repositories(id,profile_id,profile_version,display_name,root_path,default_branch,state,created_at,updated_at,version) VALUES('repo','general',1,'repo','/repo','main','READY',1,1,1);
+                 INSERT INTO runs(id,repository_id,title,requested_objective,mode,publication_mode,state,phase,base_ref,base_sha,authority_digest,profile_digest,requested_by,created_at,updated_at,version) VALUES('run','repo','run','goal','plan_and_implement','local_only','INTERVIEWING','interviewing','main','0000000000000000000000000000000000000000','a','p','test',1,1,1);",
+            )
+            .unwrap();
+        let agent_id = AgentSessionId::from("agent");
+        let run_id = RunId::from("run");
+        store
+            .create_agent_session(&NewAgentSession {
+                id: agent_id.clone(),
+                run_id: run_id.clone(),
+                task_attempt_id: None,
+                parent_agent_session_id: None,
+                runtime_kind: "codex_controller".to_owned(),
+                codex_account_id: None,
+                role: AgentRole::Interviewer,
+                nickname: Some("intent-interviewer".to_owned()),
+                requested_model: "gpt-test".to_owned(),
+                requested_reasoning_effort: "high".to_owned(),
+                sandbox_mode: SandboxMode::ReadOnly,
+                approval_policy: "never".to_owned(),
+                cwd: PathBuf::from("/repo"),
+                state: "STARTING".to_owned(),
+                current_goal: Some("goal".to_owned()),
+                token_budget: Some(1_000),
+            })
+            .unwrap();
+        store
+            .attach_codex_thread(&agent_id, "thread-1", None, "codex", None, None)
+            .unwrap();
+        store
+            .attach_codex_turn(
+                &agent_id,
+                "thread-1",
+                "turn-1",
+                Some("gpt-test"),
+                Some("high"),
+                true,
+            )
+            .unwrap();
+        let projection = ProtocolProjection::new(store.clone(), [], false, true);
+        let context = ProjectionContext {
+            run_id: Some(run_id),
+            agent_session_id: Some(agent_id.clone()),
+        };
+        projection
+            .ingest_notification(
+                &context,
+                "thread/tokenUsage/updated",
+                &json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "tokenUsage": {
+                        "last": {
+                            "inputTokens": 100,
+                            "cachedInputTokens": 80,
+                            "cacheWriteInputTokens": 0,
+                            "outputTokens": 10,
+                            "reasoningOutputTokens": 4,
+                            "totalTokens": 110
+                        },
+                        "total": {
+                            "inputTokens": 100,
+                            "cachedInputTokens": 80,
+                            "cacheWriteInputTokens": 0,
+                            "outputTokens": 10,
+                            "reasoningOutputTokens": 4,
+                            "totalTokens": 110
+                        },
+                        "modelContextWindow": 258400
+                    }
+                }),
+            )
+            .unwrap();
+
+        let active = store.agent(&agent_id).unwrap();
+        assert!(active.active_turn_started_at.is_some());
+        assert_eq!(active.active_turn_usage.unwrap().total_tokens, 110);
+
+        projection
+            .ingest_notification(
+                &context,
+                "turn/completed",
+                &json!({
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "completed"}
+                }),
+            )
+            .unwrap();
+        let completed = store.agent(&agent_id).unwrap();
+        assert!(completed.active_turn_started_at.is_none());
+        assert!(completed.active_turn_usage.is_none());
     }
 
     #[test]
