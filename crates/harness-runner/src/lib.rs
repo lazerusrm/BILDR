@@ -15,7 +15,7 @@ use thiserror::Error;
 use tokio::{
     fs::{self, File},
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::Command,
+    process::{Child, Command},
     sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
     time::timeout,
@@ -287,11 +287,11 @@ impl CommandRunner {
             Ok(status) => (status?, false),
             Err(_) => {
                 warn!(command_id, pid, "controlled command timed out");
-                terminate_process_group(pid).await;
+                terminate_managed_process(&mut child, pid);
                 let status = match timeout(Duration::from_secs(5), child.wait()).await {
                     Ok(status) => status?,
                     Err(_) => {
-                        kill_process_group(pid).await;
+                        kill_managed_process(&mut child, pid);
                         child.wait().await?
                     }
                 };
@@ -389,24 +389,75 @@ async fn join_capture(
     task.await.map_err(RunnerError::Join)?
 }
 
-async fn terminate_process_group(pid: Option<u32>) {
-    send_process_group_signal(pid, "TERM").await;
+fn terminate_managed_process(child: &mut Child, pid: Option<u32>) {
+    signal_managed_process(child, pid, ManagedSignal::Terminate);
 }
 
-async fn kill_process_group(pid: Option<u32>) {
-    send_process_group_signal(pid, "KILL").await;
+fn kill_managed_process(child: &mut Child, pid: Option<u32>) {
+    signal_managed_process(child, pid, ManagedSignal::Kill);
 }
 
-async fn send_process_group_signal(pid: Option<u32>, signal: &str) {
-    let Some(pid) = pid else { return };
-    let target = format!("-{pid}");
-    let _ = Command::new("kill")
-        .args([format!("-{signal}"), target])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
+#[derive(Clone, Copy)]
+enum ManagedSignal {
+    Terminate,
+    Kill,
+}
+
+fn signal_managed_process(child: &mut Child, pid: Option<u32>, signal: ManagedSignal) {
+    #[cfg(unix)]
+    if signal_isolated_process_group(pid, signal) {
+        return;
+    }
+
+    // If the platform cannot prove that the child owns an isolated process
+    // group, target only the owned child. A broad group signal must never be
+    // allowed to reach the controller or its service runner.
+    if let Err(error) = child.start_kill() {
+        warn!(?pid, %error, "failed to terminate managed child process");
+    }
+}
+
+#[cfg(unix)]
+fn signal_isolated_process_group(pid: Option<u32>, signal: ManagedSignal) -> bool {
+    use rustix::io::Errno;
+    use rustix::process::{Pid, Signal, getpgid, getpgrp, kill_process_group};
+
+    let Some(raw_pid) = pid.and_then(|pid| i32::try_from(pid).ok()) else {
+        return false;
+    };
+    let Some(pid) = Pid::from_raw(raw_pid) else {
+        return false;
+    };
+    let process_group = match getpgid(Some(pid)) {
+        Ok(process_group) => process_group,
+        Err(Errno::SRCH) => return true,
+        Err(error) => {
+            warn!(%pid, %error, "could not verify managed child process group");
+            return false;
+        }
+    };
+    let controller_group = getpgrp();
+    if process_group != pid || process_group == controller_group {
+        warn!(
+            %pid,
+            %process_group,
+            %controller_group,
+            "refusing to signal a process group not isolated for the managed child"
+        );
+        return false;
+    }
+
+    let signal = match signal {
+        ManagedSignal::Terminate => Signal::TERM,
+        ManagedSignal::Kill => Signal::KILL,
+    };
+    match kill_process_group(process_group, signal) {
+        Ok(()) | Err(Errno::SRCH) => true,
+        Err(error) => {
+            warn!(%pid, %process_group, %error, "failed to signal managed child process group");
+            false
+        }
+    }
 }
 
 fn shell_escape_for_display(value: &str) -> String {
@@ -529,15 +580,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_is_not_reported_as_source_failure() {
+    async fn timeout_terminates_descendants_without_source_failure() {
         let temp = TempDir::new().unwrap();
         let runner = CommandRunner::new(temp.path().join("spool"), ResourceManager::default())
             .await
             .unwrap();
         let result = runner
             .run(CommandSpec {
-                program: "/usr/bin/sleep".to_owned(),
-                args: vec!["2".to_owned()],
+                program: "/bin/sh".to_owned(),
+                args: vec!["-c".to_owned(), "sleep 30 & wait".to_owned()],
                 cwd: temp.path().to_path_buf(),
                 resource_class: ResourceClass::Control,
                 timeout_ms: 50,
