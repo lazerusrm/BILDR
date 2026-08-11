@@ -77,6 +77,9 @@ const MAX_HANDOFF_BYTES: u64 = 128 * 1024;
 const PLAN_NONSHRINKING_REVIEW_WINDOW: usize = 3;
 const MAX_AUTOMATIC_ARCHITECTURE_OUTPUT_REPAIRS: u64 = 2;
 const MAX_ARCHITECTURE_REPAIR_SOURCE_CHARS: usize = 64_000;
+const ARCHITECT_SESSION_TOKEN_BUDGET: u64 = 120_000;
+const PLAN_REVIEWER_SESSION_TOKEN_BUDGET: u64 = 120_000;
+const FINAL_AUDITOR_SESSION_TOKEN_BUDGET: u64 = 120_000;
 const ARCHITECT_TASK_OUTPUT_FIELDS: &[&str] = &[
     "task_id",
     "title",
@@ -160,7 +163,7 @@ fn agent_prompt_layers(
 fn agent_developer_instructions(role: AgentRole, sandbox: SandboxMode) -> String {
     let access = match sandbox {
         SandboxMode::ReadOnly => {
-            "This is a read-only assignment. Inspect and report; do not modify repository or system state."
+            "This is a read-only assignment. Inspect and report; do not modify repository or system state. Keep repository reads bounded: exclude dependency, build, generated, and minified trees unless they are explicitly in scope, and cap search columns as well as result lines because one bundled line can be enormous."
         }
         SandboxMode::WorkspaceWrite => {
             "Make the requested in-scope local changes and run relevant non-destructive checks without asking first. Write only in the leased worktree and packet-owned paths. Pause only for a destructive or irreversible action, an external write, work outside custody, a material scope change, a genuine authority conflict, or input or credentials only the user can provide."
@@ -3846,7 +3849,7 @@ impl Orchestrator {
             cwd: PathBuf::from(&inspection.path),
             state: "STARTING".to_owned(),
             current_goal: Some(run.objective.clone()),
-            token_budget: Some(self.config.orchestration.default_task_token_budget),
+            token_budget: Some(ARCHITECT_SESSION_TOKEN_BUDGET),
         })?;
         self.store.transition_run(
             run_id,
@@ -3874,7 +3877,7 @@ impl Orchestrator {
                 SandboxMode::ReadOnly,
                 text_requires_github(&run.objective),
                 &run.objective,
-                Some(self.config.orchestration.default_task_token_budget),
+                Some(ARCHITECT_SESSION_TOKEN_BUDGET),
                 prompt,
                 Some(run_plan_output_schema()?),
             )
@@ -3933,7 +3936,7 @@ impl Orchestrator {
             cwd: PathBuf::from(&inspection.path),
             state: "STARTING".to_owned(),
             current_goal: Some("Repair the completed architecture response shape".to_owned()),
-            token_budget: Some(self.config.orchestration.default_task_token_budget),
+            token_budget: Some(ARCHITECT_SESSION_TOKEN_BUDGET),
         })?;
         self.store.transition_run(
             &run.id,
@@ -3965,7 +3968,7 @@ impl Orchestrator {
                 SandboxMode::ReadOnly,
                 false,
                 &run.objective,
-                Some(self.config.orchestration.default_task_token_budget),
+                Some(ARCHITECT_SESSION_TOKEN_BUDGET),
                 prompt,
                 Some(run_plan_output_schema()?),
             )
@@ -4206,7 +4209,7 @@ impl Orchestrator {
             current_goal: Some(format!(
                 "Adversarially certify implementation plan revision {revision}"
             )),
-            token_budget: Some(self.config.orchestration.default_task_token_budget),
+            token_budget: Some(PLAN_REVIEWER_SESSION_TOKEN_BUDGET),
         })?;
         let intent_section =
             intent_brief_prompt_section(intent_binding.as_ref().map(|(brief, _)| brief))?;
@@ -4229,7 +4232,7 @@ impl Orchestrator {
                 SandboxMode::ReadOnly,
                 text_requires_github(&run.objective),
                 &format!("Adversarially certify implementation plan revision {revision}"),
-                Some(self.config.orchestration.default_task_token_budget),
+                Some(PLAN_REVIEWER_SESSION_TOKEN_BUDGET),
                 prompt,
                 Some(model_output_schema(plan_review_schema())),
             )
@@ -4359,7 +4362,7 @@ impl Orchestrator {
         );
         self.store.prepare_agent_continuation(
             &reviewer.id,
-            self.config.orchestration.default_task_token_budget,
+            PLAN_REVIEWER_SESSION_TOKEN_BUDGET,
             "Finalizing the existing adversarial review without repeated inspection",
         )?;
         let runtime = self.runtime().await?;
@@ -4863,7 +4866,7 @@ impl Orchestrator {
             current_goal: Some(format!(
                 "Revise implementation plan after adversarial review revision {revision}"
             )),
-            token_budget: Some(self.config.orchestration.default_task_token_budget),
+            token_budget: Some(ARCHITECT_SESSION_TOKEN_BUDGET),
         })?;
         self.store.transition_run(
             run_id,
@@ -4890,7 +4893,7 @@ impl Orchestrator {
                 SandboxMode::ReadOnly,
                 text_requires_github(&run.objective),
                 &format!("Revise implementation plan after adversarial review revision {revision}"),
-                Some(self.config.orchestration.default_task_token_budget),
+                Some(ARCHITECT_SESSION_TOKEN_BUDGET),
                 prompt,
                 Some(run_plan_output_schema()?),
             )
@@ -10094,7 +10097,7 @@ impl Orchestrator {
             cwd: worktree.to_path_buf(),
             state: "STARTING".to_owned(),
             current_goal: Some(packet.objective.clone()),
-            token_budget: Some(self.config.orchestration.default_task_token_budget),
+            token_budget: Some(FINAL_AUDITOR_SESSION_TOKEN_BUDGET),
         })?;
         let plan = self
             .store
@@ -10119,7 +10122,7 @@ impl Orchestrator {
             SandboxMode::ReadOnly,
             text_requires_github(&run.objective),
             &packet.objective,
-            Some(self.config.orchestration.default_task_token_budget),
+            Some(FINAL_AUDITOR_SESSION_TOKEN_BUDGET),
             prompt,
             Some(model_output_schema(verifier_schema())),
         )
