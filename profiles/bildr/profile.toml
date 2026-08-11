@@ -18,6 +18,10 @@ required_global_authorities = [
   "SECURITY.md",
 ]
 
+# The full architecture plan remains mandatory and exact-head-bound, but the
+# context compiler supplies its receipt and requires targeted read-only lookup.
+receipt_only_authorities = ["ARCHITECTURE_AND_IMPLEMENTATION_PLAN.md"]
+
 protected_semantics = [
   "Keep the service bound to localhost",
   "Bind evidence, review, and publication to the exact candidate SHA",

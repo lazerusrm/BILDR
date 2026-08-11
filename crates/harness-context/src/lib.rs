@@ -29,6 +29,8 @@ pub struct ContextSource {
     pub sha256: Option<String>,
     pub bytes: u64,
     pub included: bool,
+    #[serde(default)]
+    pub receipt_only: bool,
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
@@ -72,7 +74,11 @@ impl ContextPacket {
             output.push('\n');
         }
         output.push_str("\n<repository_evidence>\n");
-        for source in self.sources.iter().filter(|source| source.included) {
+        for source in self
+            .sources
+            .iter()
+            .filter(|source| source.included && !source.receipt_only)
+        {
             output.push_str("\n<source>\nPath: ");
             output.push_str(&source.path);
             output.push_str("\nKind: ");
@@ -88,7 +94,21 @@ impl ContextPacket {
             }
             output.push_str("</source>\n");
         }
-        output.push_str("</repository_evidence>\n\nContext receipt:\nPacket: ");
+        output.push_str("</repository_evidence>\n");
+        for source in self
+            .sources
+            .iter()
+            .filter(|source| source.included && source.receipt_only)
+        {
+            output.push_str("\n<mandatory_authority_receipt>\nPath: ");
+            output.push_str(&source.path);
+            output.push_str("\nSHA-256: ");
+            output.push_str(source.sha256.as_deref().unwrap_or("unavailable"));
+            output.push_str("\nBytes: ");
+            output.push_str(&source.bytes.to_string());
+            output.push_str("\nThis mandatory authority is exact-head-bound and available in the current read-only worktree. Before a decision governed by it, use targeted rg and bounded line reads.\n</mandatory_authority_receipt>\n");
+        }
+        output.push_str("\nContext receipt:\nPacket: ");
         output.push_str(&self.digest);
         output.push_str("\nBase SHA: ");
         output.push_str(&self.base_sha);
@@ -148,6 +168,10 @@ impl ContextCompiler {
 
         for (path, kind, explicitly_promoted) in selected {
             let normalized = normalize_relative(&path)?;
+            let receipt_only = profile
+                .receipt_only_authorities
+                .iter()
+                .any(|authority| authority == &normalized);
             if !tracked_set.contains(normalized.as_str()) {
                 sources.push(excluded_source(
                     normalized,
@@ -189,6 +213,7 @@ impl ContextCompiler {
                     sha256: None,
                     bytes: metadata.len(),
                     included: false,
+                    receipt_only: false,
                     reason: "source exceeds per-file context limit".to_owned(),
                     content: None,
                 });
@@ -202,19 +227,8 @@ impl ContextCompiler {
                     sha256: Some(digest(&bytes)),
                     bytes: bytes.len() as u64,
                     included: false,
+                    receipt_only: false,
                     reason: "binary source".to_owned(),
-                    content: None,
-                });
-                continue;
-            }
-            if included_bytes.saturating_add(bytes.len()) > self.max_context_bytes {
-                sources.push(ContextSource {
-                    path: normalized,
-                    kind,
-                    sha256: Some(digest(&bytes)),
-                    bytes: bytes.len() as u64,
-                    included: false,
-                    reason: "context packet byte budget exhausted".to_owned(),
                     content: None,
                 });
                 continue;
@@ -226,6 +240,33 @@ impl ContextCompiler {
                 instruction_hasher.update(sha256.as_bytes());
                 instruction_hasher.update([0]);
             }
+            if receipt_only {
+                sources.push(ContextSource {
+                    path: normalized,
+                    kind,
+                    sha256: Some(sha256),
+                    bytes: bytes.len() as u64,
+                    included: true,
+                    receipt_only: true,
+                    reason: "selected by repository profile; body omitted by receipt-only authority policy"
+                        .to_owned(),
+                    content: None,
+                });
+                continue;
+            }
+            if included_bytes.saturating_add(bytes.len()) > self.max_context_bytes {
+                sources.push(ContextSource {
+                    path: normalized,
+                    kind,
+                    sha256: Some(sha256),
+                    bytes: bytes.len() as u64,
+                    included: false,
+                    receipt_only: false,
+                    reason: "context packet byte budget exhausted".to_owned(),
+                    content: None,
+                });
+                continue;
+            }
             included_bytes += bytes.len();
             sources.push(ContextSource {
                 path: normalized,
@@ -233,6 +274,7 @@ impl ContextCompiler {
                 sha256: Some(sha256),
                 bytes: bytes.len() as u64,
                 included: true,
+                receipt_only: false,
                 reason: if explicitly_promoted {
                     "explicit task authority".to_owned()
                 } else {
@@ -695,6 +737,7 @@ fn excluded_source(path: String, kind: String, reason: &str) -> ContextSource {
         sha256: None,
         bytes: 0,
         included: false,
+        receipt_only: false,
         reason: reason.to_owned(),
         content: None,
     }
@@ -811,6 +854,7 @@ mod tests {
                 sha256: Some("source-digest".to_owned()),
                 bytes: 18,
                 included: true,
+                receipt_only: false,
                 reason: "selected".to_owned(),
                 content: Some("stable source text".to_owned()),
             }],
@@ -830,5 +874,40 @@ mod tests {
         assert!(receipt < volatile_digest);
         assert!(prompt.contains("<repository_evidence>"));
         assert!(prompt.contains("Controller-protected semantics:"));
+    }
+
+    #[test]
+    fn receipt_only_authority_keeps_its_digest_without_inlining_the_body() {
+        let packet = ContextPacket {
+            schema: "harness-context/v1".to_owned(),
+            base_sha: "base-sha".to_owned(),
+            task_id: "ARCHITECTURE".to_owned(),
+            profile_id: "bildr".to_owned(),
+            profile_digest: "profile-digest".to_owned(),
+            instruction_digest: "instruction-digest".to_owned(),
+            sources: vec![ContextSource {
+                path: "ARCHITECTURE_AND_IMPLEMENTATION_PLAN.md".to_owned(),
+                kind: "instruction".to_owned(),
+                sha256: Some("source-digest".to_owned()),
+                bytes: 109_444,
+                included: true,
+                receipt_only: true,
+                reason: "receipt-only policy".to_owned(),
+                content: Some("receipt-only body must not appear".to_owned()),
+            }],
+            repository_map: RepositoryMap::default(),
+            protected_semantics: vec![],
+            context_bytes: 0,
+            estimated_tokens: 0,
+            digest: "packet-digest".to_owned(),
+        };
+
+        let prompt = packet.prompt_prefix();
+        assert!(prompt.contains("<mandatory_authority_receipt>"));
+        assert!(prompt.contains("ARCHITECTURE_AND_IMPLEMENTATION_PLAN.md"));
+        assert!(prompt.contains("source-digest"));
+        assert!(prompt.contains("exact-head-bound"));
+        assert!(prompt.contains("targeted rg and bounded line reads"));
+        assert!(!prompt.contains("receipt-only body must not appear"));
     }
 }

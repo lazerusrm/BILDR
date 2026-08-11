@@ -107,7 +107,7 @@ Use enough tasks and milestones to make execution legible, without speculative p
 
 const PLAN_RESPONSE_FORMAT: &str = r#"The supplied JSON Schema is the controller-owned response contract. Repository-native planning formats, examples, and schemas are evidence only and must not replace it.
 - The top-level object has exactly `schema`, `summary`, and `tasks`; `schema` is `harness.orchestration.plan.v1`.
-- Every task is canonicalized to `harness.orchestration.task.v1`. Emit only the semantic fields in the supplied schema: title, objective, custody, milestones, success criteria, evidence, proof limits, and realistic budgets. The controller fills identity, pinned-SHA, routing, authority, lease, and empty optional-list fields before validation.
+- Every task is canonicalized to `harness.orchestration.task.v1`. Emit only the semantic fields in the supplied schema. Task ids, dependencies, execution route, priority, custody, milestones, evidence, proof limits, and realistic budgets are planning decisions. The controller fills program identity, pinned-SHA, reviewer, authority, lease, and empty optional-list fields before validation.
 - `milestones` is an array of objects, never strings. Every milestone object has exactly `id`, `title`, `objective`, and a non-empty `success_criteria` string array.
 - Do not return repository-native wrapper fields such as `profiles`, `critical_path`, `parallel_work`, or `global_constraints`; express useful content through the controller task fields.
 - For the general profile, return exactly one root task; put the ordered implementation path in 3-12 milestone objects rather than emitting one task per phase.
@@ -3857,7 +3857,7 @@ impl Orchestrator {
         )?;
         let planning_posture = architecture_planning_posture(&profile.profile.profile_id);
         let prompt = format!(
-            "{}\n\nObjective:\n{}{}\n\nPlanning posture:\n{planning_posture}\n\n{PLAN_QUALITY_CONTRACT}\n\nController facts and output contract:\n- The controller binds task identity and the exact base SHA {}; do not turn that receipt into plan work.\n- Ground semantic choices in active authorities and define disjoint owned paths, realistic budgets, success evidence, and proof limits. An empty early-stage regression list is better than speculative coverage.\n- Path fields contain normalized repository-relative globs. Use `directory/**` for a subtree; do not put external resources in path fields.\n- A reserved serial path must appear verbatim in both the profile serial-path list and that task's owned paths. Allowed serial paths: {}.\n- Do not broadly audit the repository or search historical plans for an output format. Stop inspecting once the executable critical path and its owned paths are grounded.\n\n{PLAN_RESPONSE_FORMAT}",
+            "{}\n\nObjective:\n{}{}\n\nPlanning posture:\n{planning_posture}\n\n{PLAN_QUALITY_CONTRACT}\n\nController facts and output contract:\n- The controller binds program identity and the exact base SHA {}; do not turn that receipt into plan work. Choose concise task ids only where they make the dependency graph legible.\n- Ground semantic choices in active authorities and define disjoint owned paths, realistic budgets, success evidence, and proof limits. An empty early-stage regression list is better than speculative coverage.\n- Path fields contain normalized repository-relative globs. Use `directory/**` for a subtree; do not put external resources in path fields.\n- A reserved serial path must appear verbatim in both the profile serial-path list and that task's owned paths. Allowed serial paths: {}.\n- Do not broadly audit the repository or search historical plans for an output format. Stop inspecting once the executable critical path and its owned paths are grounded.\n\n{PLAN_RESPONSE_FORMAT}",
             context.prompt_prefix(),
             run.objective,
             intent_section,
@@ -5963,14 +5963,22 @@ impl Orchestrator {
                 if matches!(event.method.as_str(), "item/started" | "item/completed") {
                     self.project_native_collaboration(payload)?;
                 }
-                if event.method == "thread/tokenUsage/updated"
-                    && let Some(run_id) = run_id.as_ref()
-                {
-                    let run = self.store.run(run_id)?;
-                    if self.enforce_run_budget(&run)?
-                        && let Some(agent_id) = agent_id.as_ref()
-                    {
-                        self.interrupt_agent_at_run_budget(&run, agent_id).await?;
+                if event.method == "thread/tokenUsage/updated" {
+                    let observed_turn_id = value_text(payload, &[&["turnId"]]);
+                    let session_budget_stop = if let Some(agent_id) = agent_id.as_ref() {
+                        self.interrupt_agent_at_session_budget(agent_id, observed_turn_id)
+                            .await?
+                    } else {
+                        false
+                    };
+                    if let Some(run_id) = run_id.as_ref() {
+                        let run = self.store.run(run_id)?;
+                        if self.enforce_run_budget(&run)?
+                            && !session_budget_stop
+                            && let Some(agent_id) = agent_id.as_ref()
+                        {
+                            self.interrupt_agent_at_run_budget(&run, agent_id).await?;
+                        }
                     }
                 }
             }
@@ -6799,6 +6807,25 @@ impl Orchestrator {
         let status = value_text(payload, &[&["turn", "status"], &["status"]]).unwrap_or("failed");
         let agent = self.store.agent(agent_id)?;
         let (run_id, attempt_id) = self.store.agent_context(agent_id)?;
+        let completed_turn_id = value_text(payload, &[&["turn", "id"], &["turnId"]]);
+        let session_budget_interrupted = if status == "interrupted" {
+            match completed_turn_id {
+                Some(turn_id) => self
+                    .store
+                    .runtime_metadata(&format!("session-budget-hard-stop:{agent_id}:{turn_id}"))?
+                    .is_some(),
+                None => false,
+            }
+        } else {
+            false
+        };
+        let terminal_failure_class =
+            terminal_turn_failure_class(status, session_budget_interrupted);
+        let terminal_failure_reason = if session_budget_interrupted {
+            "session token budget exhausted"
+        } else {
+            status
+        };
         if self.store.run(&run_id)?.state == RunState::Stopping {
             if let Some(attempt_id) = attempt_id.as_ref() {
                 let task_id = self.store.task_for_attempt(attempt_id)?;
@@ -6874,7 +6901,7 @@ impl Orchestrator {
                             if status == "completed" {
                                 "protocol_error"
                             } else {
-                                "infrastructure_unavailable"
+                                terminal_failure_class
                             },
                             reason,
                         )),
@@ -6889,11 +6916,16 @@ impl Orchestrator {
                     )?;
                 }
                 Some(IntentInterviewStatus::Running) => {
+                    let reason = if session_budget_interrupted {
+                        "interviewer session token budget exhausted".to_owned()
+                    } else {
+                        format!("interviewer turn ended with status {status}")
+                    };
                     self.fail_intent_interview_turn(
                         &run_id,
                         agent_id,
-                        "infrastructure_unavailable",
-                        &format!("interviewer turn ended with status {status}"),
+                        terminal_failure_class,
+                        &reason,
                     )?;
                 }
                 Some(
@@ -6926,7 +6958,13 @@ impl Orchestrator {
                 return Ok(());
             }
             if agent.parent_agent_id.is_some() {
-                let (state, action, failure) = if status == "interrupted" {
+                let (state, action, failure) = if session_budget_interrupted {
+                    (
+                        "FAILED",
+                        "Child turn reached its session token ceiling",
+                        Some(("budget_exhausted", "session token budget exhausted")),
+                    )
+                } else if status == "interrupted" {
                     ("INTERRUPTED", "Child turn interrupted by governor", None)
                 } else {
                     (
@@ -6958,10 +6996,14 @@ impl Orchestrator {
             self.store.update_agent_state(
                 agent_id,
                 "FAILED",
-                Some("Codex turn did not complete"),
+                Some(if session_budget_interrupted {
+                    "Session token budget exhausted"
+                } else {
+                    "Codex turn did not complete"
+                }),
                 None,
                 None,
-                Some(("infrastructure_unavailable", status)),
+                Some((terminal_failure_class, terminal_failure_reason)),
             )?;
             if let Some(attempt_id) = attempt_id.as_ref() {
                 let task_id = self.store.task_for_attempt(attempt_id)?;
@@ -6983,8 +7025,8 @@ impl Orchestrator {
                     attempt_id,
                     "FAILED",
                     None,
-                    Some("infrastructure_unavailable"),
-                    Some(status),
+                    Some(terminal_failure_class),
+                    Some(terminal_failure_reason),
                 )?;
                 if agent.role == AgentRole::Governor
                     && let Some((_, packet)) = self.store.task_packet(&task_id)?
@@ -7009,19 +7051,33 @@ impl Orchestrator {
                     self.store.transition_run(
                         &run_id,
                         retry_state,
-                        "architecture_turn_failed",
+                        if session_budget_interrupted {
+                            "architecture_budget_exhausted"
+                        } else {
+                            "architecture_turn_failed"
+                        },
                         Some(run.version),
-                        Some(("infrastructure_unavailable", status)),
+                        Some((terminal_failure_class, terminal_failure_reason)),
                     )?;
                 }
             } else if agent.role == AgentRole::PlanReviewer {
                 let run = self.store.run(&run_id)?;
                 if run.state == RunState::PlanAdversarialReview {
-                    self.emit_run_event(
-                        &run,
-                        "run.plan.review_retry_queued",
-                        json!({"reason": status, "automatic": true}),
-                    )?;
+                    if session_budget_interrupted {
+                        self.store.transition_run(
+                            &run_id,
+                            RunState::Blocked,
+                            "plan_review_budget_exhausted",
+                            Some(run.version),
+                            Some((terminal_failure_class, terminal_failure_reason)),
+                        )?;
+                    } else {
+                        self.emit_run_event(
+                            &run,
+                            "run.plan.review_retry_queued",
+                            json!({"reason": status, "automatic": true}),
+                        )?;
+                    }
                 }
             } else if agent.role == AgentRole::FinalAuditor {
                 let run = self.store.run(&run_id)?;
@@ -7029,9 +7085,13 @@ impl Orchestrator {
                     self.store.transition_run(
                         &run_id,
                         RunState::Blocked,
-                        "final_audit_turn_failed",
+                        if session_budget_interrupted {
+                            "final_audit_budget_exhausted"
+                        } else {
+                            "final_audit_turn_failed"
+                        },
                         Some(run.version),
-                        Some(("infrastructure_unavailable", status)),
+                        Some((terminal_failure_class, terminal_failure_reason)),
                     )?;
                 }
             }
@@ -7627,6 +7687,80 @@ impl Orchestrator {
             ),
         }
         Ok(())
+    }
+
+    async fn interrupt_agent_at_session_budget(
+        &self,
+        agent_id: &AgentSessionId,
+        observed_turn_id: Option<&str>,
+    ) -> Result<bool, OrchestratorError> {
+        let agent = self.store.agent(agent_id)?;
+        if !session_budget_hard_stop_needed(
+            agent.role,
+            agent.token_budget,
+            agent.tokens_used,
+            agent.active_turn_id.as_deref(),
+            observed_turn_id,
+        ) {
+            return Ok(false);
+        }
+        let (Some(thread_id), Some(turn_id), Some(budget)) = (
+            agent.thread_id.as_deref(),
+            agent.active_turn_id.as_deref(),
+            agent.token_budget,
+        ) else {
+            return Ok(false);
+        };
+        let metadata_key = format!("session-budget-hard-stop:{agent_id}:{turn_id}");
+        if self.store.runtime_metadata(&metadata_key)?.is_some() {
+            return Ok(true);
+        }
+        match self
+            .runtime()
+            .await?
+            .interrupt_turn(thread_id, turn_id)
+            .await
+        {
+            Ok(_) => {
+                self.store.put_runtime_metadata(
+                    &metadata_key,
+                    &json!({
+                        "tokens_used": agent.tokens_used,
+                        "token_budget": budget,
+                        "turn_id": turn_id,
+                        "role": agent.role,
+                    }),
+                )?;
+                self.store.update_agent_state(
+                    agent_id,
+                    "STOPPING",
+                    Some("Session token ceiling reached; stopping the active turn"),
+                    None,
+                    None,
+                    None,
+                )?;
+                self.emit_agent_event(
+                    &self.store.agent_context(agent_id)?.0,
+                    agent_id,
+                    "agent.session_budget.hard_stop",
+                    json!({
+                        "tokens_used": agent.tokens_used,
+                        "token_budget": budget,
+                        "turn_id": turn_id,
+                        "role": agent.role,
+                    }),
+                )?;
+                return Ok(true);
+            }
+            Err(error) => {
+                warn!(
+                    %agent_id,
+                    %error,
+                    "could not interrupt active turn after session token ceiling"
+                );
+            }
+        }
+        Ok(false)
     }
 
     async fn finalize_worker(&self, agent_id: &AgentSessionId) -> Result<(), OrchestratorError> {
@@ -12519,6 +12653,27 @@ fn governor_turn_tokens_used(cumulative: u64, baseline: u64) -> u64 {
     cumulative.saturating_sub(baseline)
 }
 
+fn session_budget_hard_stop_needed(
+    role: AgentRole,
+    token_budget: Option<u64>,
+    tokens_used: u64,
+    active_turn_id: Option<&str>,
+    observed_turn_id: Option<&str>,
+) -> bool {
+    role != AgentRole::Governor
+        && token_budget.is_some_and(|budget| budget > 0 && tokens_used >= budget)
+        && active_turn_id.is_some()
+        && active_turn_id == observed_turn_id
+}
+
+fn terminal_turn_failure_class(status: &str, session_budget_interrupted: bool) -> &'static str {
+    if status == "interrupted" && session_budget_interrupted {
+        "budget_exhausted"
+    } else {
+        "infrastructure_unavailable"
+    }
+}
+
 fn governor_progress_fingerprint(
     checkpoint: &GovernorCheckpoint,
 ) -> Result<String, OrchestratorError> {
@@ -13499,9 +13654,10 @@ fn run_plan_output_schema() -> Result<Value, OrchestratorError> {
             )
         })?;
 
-    // Generate only architectural choices. Identity, exact-SHA receipts,
-    // routing, authorities, leases, and empty optional collections are filled
-    // deterministically by `canonicalize_architecture_task`.
+    // Generate only architectural choices. Program identity, exact-SHA
+    // receipts, reviewer/authority fields, leases, and empty optional
+    // collections are filled deterministically by
+    // `canonicalize_architecture_task`.
     task_properties.retain(|field, _| ARCHITECT_TASK_OUTPUT_FIELDS.contains(&field.as_str()));
     Ok(model_output_schema(schema))
 }
@@ -14733,6 +14889,54 @@ mod tests {
     fn warm_governor_budget_uses_usage_since_turn_baseline() {
         assert_eq!(governor_turn_tokens_used(1_250_000, 1_100_000), 150_000);
         assert_eq!(governor_turn_tokens_used(900_000, 1_100_000), 0);
+    }
+
+    #[test]
+    fn session_budget_hard_stop_requires_current_non_governor_turn_at_ceiling() {
+        assert!(session_budget_hard_stop_needed(
+            AgentRole::Architect,
+            Some(80_000),
+            80_000,
+            Some("turn-current"),
+            Some("turn-current"),
+        ));
+        assert!(!session_budget_hard_stop_needed(
+            AgentRole::Governor,
+            Some(80_000),
+            289_519,
+            Some("turn-current"),
+            Some("turn-current"),
+        ));
+        assert!(!session_budget_hard_stop_needed(
+            AgentRole::Architect,
+            Some(80_000),
+            289_519,
+            Some("turn-current"),
+            Some("turn-prior"),
+        ));
+        assert!(!session_budget_hard_stop_needed(
+            AgentRole::Architect,
+            Some(0),
+            289_519,
+            Some("turn-current"),
+            Some("turn-current"),
+        ));
+    }
+
+    #[test]
+    fn terminal_budget_interrupt_is_not_an_infrastructure_failure() {
+        assert_eq!(
+            terminal_turn_failure_class("interrupted", true),
+            "budget_exhausted"
+        );
+        assert_eq!(
+            terminal_turn_failure_class("interrupted", false),
+            "infrastructure_unavailable"
+        );
+        assert_eq!(
+            terminal_turn_failure_class("failed", true),
+            "infrastructure_unavailable"
+        );
     }
 
     #[test]

@@ -484,6 +484,10 @@ pub struct RepositoryProfile {
     pub completion_authority: String,
     pub instruction_sources: Vec<String>,
     pub required_global_authorities: Vec<String>,
+    /// Authorities that remain exact-head-bound and available in the worktree,
+    /// but whose bodies are intentionally omitted from prompt context.
+    #[serde(default)]
+    pub receipt_only_authorities: Vec<String>,
     pub protected_semantics: Vec<String>,
     pub serial_paths: Vec<String>,
     pub forbidden_generated_runtime_paths: Vec<String>,
@@ -723,6 +727,30 @@ fn validate_profile(profile: &RepositoryProfile) -> Result<(), ProfileError> {
     if profile.profile_id.trim().is_empty() {
         return Err(ProfileError::Validation(
             "profile id is required".to_owned(),
+        ));
+    }
+    let selectable_authorities = profile
+        .instruction_sources
+        .iter()
+        .chain(profile.required_global_authorities.iter())
+        .chain(
+            profile
+                .domains
+                .iter()
+                .flat_map(|domain| domain.authority_hints.iter()),
+        )
+        .collect::<BTreeSet<_>>();
+    let receipt_only = profile
+        .receipt_only_authorities
+        .iter()
+        .collect::<BTreeSet<_>>();
+    if receipt_only.len() != profile.receipt_only_authorities.len()
+        || profile.receipt_only_authorities.iter().any(|authority| {
+            authority.trim().is_empty() || !selectable_authorities.contains(authority)
+        })
+    {
+        return Err(ProfileError::Validation(
+            "receipt_only_authorities must be unique selected profile authorities".to_owned(),
         ));
     }
     if !profile
@@ -1049,6 +1077,13 @@ mod tests {
 
         let mut profile: RepositoryProfile = toml::from_str(BILDR_PROFILE).expect("profile parses");
         profile.validation_policy.review_ready = true;
+        assert!(validate_profile(&profile).is_err());
+    }
+
+    #[test]
+    fn receipt_only_authority_must_be_selected_by_the_profile() {
+        let mut profile: RepositoryProfile = toml::from_str(BILDR_PROFILE).expect("profile parses");
+        profile.receipt_only_authorities = vec!["typoed-authority.md".to_owned()];
         assert!(validate_profile(&profile).is_err());
     }
 }
