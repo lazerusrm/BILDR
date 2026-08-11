@@ -3302,7 +3302,9 @@ impl Orchestrator {
                 &run.objective,
                 Some(self.config.orchestration.default_task_token_budget),
                 prompt,
-                Some(serde_json::from_str(INTENT_INTERVIEW_TURN_SCHEMA)?),
+                Some(model_output_schema(serde_json::from_str(
+                    INTENT_INTERVIEW_TURN_SCHEMA,
+                )?)),
             )
             .await
         {
@@ -3426,7 +3428,9 @@ impl Orchestrator {
                     text_requires_github(&run.objective),
                 ),
                 approval_policy: "never".to_owned(),
-                output_schema: Some(serde_json::from_str(INTENT_INTERVIEW_TURN_SCHEMA)?),
+                output_schema: Some(model_output_schema(serde_json::from_str(
+                    INTENT_INTERVIEW_TURN_SCHEMA,
+                )?)),
                 reasoning_summary: self.config.codex.reasoning_summary.clone(),
             })
             .await
@@ -4208,7 +4212,7 @@ impl Orchestrator {
                 &format!("Adversarially certify implementation plan revision {revision}"),
                 Some(self.config.orchestration.default_task_token_budget),
                 prompt,
-                Some(plan_review_schema()),
+                Some(model_output_schema(plan_review_schema())),
             )
             .await
         {
@@ -4360,7 +4364,7 @@ impl Orchestrator {
                 cwd: cwd.clone(),
                 sandbox_policy: sandbox_policy(SandboxMode::ReadOnly, &cwd, false),
                 approval_policy: "never".to_owned(),
-                output_schema: Some(plan_review_schema()),
+                output_schema: Some(model_output_schema(plan_review_schema())),
                 reasoning_summary: self.config.codex.reasoning_summary.clone(),
             })
             .await
@@ -5663,7 +5667,9 @@ impl Orchestrator {
                 Some(packet.token_budget),
                 prompt,
                 if governing {
-                    Some(serde_json::from_str(GOVERNOR_CHECKPOINT_SCHEMA)?)
+                    Some(model_output_schema(serde_json::from_str(
+                        GOVERNOR_CHECKPOINT_SCHEMA,
+                    )?))
                 } else {
                     None
                 },
@@ -8474,7 +8480,9 @@ impl Orchestrator {
                     packet_requires_github(packet),
                 ),
                 approval_policy,
-                output_schema: Some(serde_json::from_str(GOVERNOR_CHECKPOINT_SCHEMA)?),
+                output_schema: Some(model_output_schema(serde_json::from_str(
+                    GOVERNOR_CHECKPOINT_SCHEMA,
+                )?)),
                 reasoning_summary: self.config.codex.reasoning_summary.clone(),
             })
             .await?;
@@ -8793,7 +8801,7 @@ impl Orchestrator {
                 &format!("Verify {}", packet.objective),
                 Some(packet.token_budget / 2),
                 prompt,
-                Some(verifier_schema()),
+                Some(model_output_schema(verifier_schema())),
             )
             .await
         {
@@ -9960,7 +9968,7 @@ impl Orchestrator {
             &packet.objective,
             Some(self.config.orchestration.default_task_token_budget),
             prompt,
-            Some(verifier_schema()),
+            Some(model_output_schema(verifier_schema())),
         )
         .await?;
         self.emit_agent_event(
@@ -13476,8 +13484,12 @@ fn run_plan_output_schema() -> Result<Value, OrchestratorError> {
     // Omitting this free-form map also keeps the generation schema within the
     // strict Structured Outputs subset, which requires closed objects.
     task_properties.remove("dependency_shas");
+    Ok(model_output_schema(schema))
+}
+
+fn model_output_schema(mut schema: Value) -> Value {
     normalize_structured_output_schema(&mut schema);
-    Ok(schema)
+    schema
 }
 
 fn normalize_structured_output_schema(value: &mut Value) {
@@ -13492,6 +13504,15 @@ fn normalize_structured_output_schema(value: &mut Value) {
                     Value::Array(properties.keys().cloned().map(Value::String).collect()),
                 );
             }
+            if !object.contains_key("type") {
+                let inferred = object
+                    .get("const")
+                    .map(json_schema_type)
+                    .or_else(|| object.get("enum").and_then(infer_enum_schema_type));
+                if let Some(inferred) = inferred {
+                    object.insert("type".to_owned(), inferred);
+                }
+            }
             for child in object.values_mut() {
                 normalize_structured_output_schema(child);
             }
@@ -13503,6 +13524,37 @@ fn normalize_structured_output_schema(value: &mut Value) {
         }
         _ => {}
     }
+}
+
+fn infer_enum_schema_type(value: &Value) -> Option<Value> {
+    let values = value.as_array()?;
+    let mut types = Vec::new();
+    for value in values {
+        let candidate = json_schema_type(value);
+        if !types.contains(&candidate) {
+            types.push(candidate);
+        }
+    }
+    match types.as_slice() {
+        [] => None,
+        [single] => Some(single.clone()),
+        _ => Some(Value::Array(types)),
+    }
+}
+
+fn json_schema_type(value: &Value) -> Value {
+    Value::String(
+        match value {
+            Value::Null => "null",
+            Value::Bool(_) => "boolean",
+            Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        }
+        .to_owned(),
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -14286,7 +14338,7 @@ mod tests {
     }
 
     #[test]
-    fn architect_uses_a_strict_output_compatible_projection_of_the_plan_schema() {
+    fn model_output_schemas_match_the_strict_api_subset() {
         fn assert_compatible(value: &Value, path: &str) {
             match value {
                 Value::Object(object) => {
@@ -14330,6 +14382,12 @@ mod tests {
                             "free-form object is not supported at {path}"
                         );
                     }
+                    if object.contains_key("const") || object.contains_key("enum") {
+                        assert!(
+                            object.contains_key("type"),
+                            "const and enum schemas need an explicit type at {path}"
+                        );
+                    }
                     for (key, child) in object {
                         assert_compatible(child, &format!("{path}/{key}"));
                     }
@@ -14358,7 +14416,21 @@ mod tests {
                 .is_none(),
             "the controller-owned free-form map must not reach Structured Outputs"
         );
-        assert_compatible(&output, "$root");
+        for (name, schema) in [
+            ("plan", output),
+            (
+                "interview",
+                model_output_schema(serde_json::from_str(INTENT_INTERVIEW_TURN_SCHEMA).unwrap()),
+            ),
+            ("plan-review", model_output_schema(plan_review_schema())),
+            ("verifier", model_output_schema(verifier_schema())),
+            (
+                "governor",
+                model_output_schema(serde_json::from_str(GOVERNOR_CHECKPOINT_SCHEMA).unwrap()),
+            ),
+        ] {
+            assert_compatible(&schema, name);
+        }
     }
 
     #[test]
