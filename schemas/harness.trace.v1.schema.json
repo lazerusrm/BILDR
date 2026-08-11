@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:harness:trace.v1",
+  "title": "Harness branch-aware trace manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "trace_id",
+    "run_id",
+    "source_event_range",
+    "runtime_digest",
+    "redaction_policy_digest",
+    "nodes",
+    "edges",
+    "branches",
+    "sha256"
+  ],
+  "properties": {
+    "schema": {"const": "harness.trace.v1"},
+    "trace_id": {"type": "string", "minLength": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "task_attempt_id": {"type": ["string", "null"]},
+    "source_event_range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["first_id", "last_id"],
+      "properties": {
+        "first_id": {"type": "integer", "minimum": 1},
+        "last_id": {"type": "integer", "minimum": 1}
+      }
+    },
+    "runtime_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "redaction_policy_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "sensitivity": {"enum": ["public", "internal", "confidential", "restricted"]},
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "content_sha256", "source_event_ids", "redaction_class"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "kind": {"enum": ["system_message", "developer_message", "user_message", "model_message", "reasoning_summary", "tool_request", "tool_result", "command", "file_read", "file_change", "approval_request", "approval_decision", "compaction", "subagent_spawn", "subagent_join", "validation", "finding", "operator_feedback", "outcome"]},
+          "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "source_event_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "integer", "minimum": 1}},
+          "redaction_class": {"enum": ["none", "secret_removed", "private_reasoning_removed", "customer_data_removed", "content_withheld"]},
+          "timestamp_ms": {"type": ["integer", "null"]},
+          "metadata": {"type": "object"}
+        }
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["from", "to", "kind"],
+        "properties": {
+          "from": {"type": "string", "minLength": 1},
+          "to": {"type": "string", "minLength": 1},
+          "kind": {"enum": ["next", "context_parent", "tool_result_of", "spawned_by", "joined_into", "compacted_from", "retry_of", "derived_from", "supersedes"]}
+        }
+      }
+    },
+    "branches": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "root_node_id", "leaf_node_id", "node_ids"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "root_node_id": {"type": "string", "minLength": 1},
+          "leaf_node_id": {"type": "string", "minLength": 1},
+          "node_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+        }
+      }
+    },
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

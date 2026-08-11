@@ -1,0 +1,20 @@
+{
+  "schema": "harness.experiment.v1",
+  "experiment_id": "experiment_context_order_v1",
+  "candidate_id": "candidate_context_order_v1",
+  "champion_bundle_id": "bundle_champion_v1",
+  "challenger_bundle_id": "bundle_context_order_v1",
+  "taskset_revisions": ["taskset_context_v1@1"],
+  "grader_bundle_ids": ["grader_context_v1@1"],
+  "runtime_policy_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "stages": [
+    {"kind": "development", "state": "passed", "sample_count": 20, "successful_pairs": 20, "evidence_ids": ["evidence_dev"]},
+    {"kind": "holdout", "state": "pending", "sample_count": 0, "successful_pairs": 0, "evidence_ids": []}
+  ],
+  "statistics": {"method": "paired_bootstrap", "confidence_level": 0.95, "minimum_pairs": 20, "result": "pending"},
+  "hard_gate_results": [{"gate_id": "required_authority_present", "passed": true, "evidence": "evidence_dev"}],
+  "reward_integrity": "pending",
+  "state": "offline_passed",
+  "evidence_ids": ["evidence_dev"],
+  "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+}

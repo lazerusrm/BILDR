@@ -1,0 +1,18 @@
+{
+  "schema": "harness.knowledge-item.v1",
+  "knowledge_id": "knowledge_context_priority_v1",
+  "kind": "procedure",
+  "statement": "Place required task authority before optional supporting sources when compiling a bounded context packet.",
+  "scope": {"repository": "lazerusrm/BILDR", "task_families": ["context_compilation"], "model_families": [], "runtime_classes": ["local"]},
+  "evidence": [
+    {"kind": "experiment", "id": "experiment_context_order_v1", "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    {"kind": "human_review", "id": "review_context_order_v1", "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+  ],
+  "confidence": 0.9,
+  "review": {"state": "accepted", "reviewer": "operator", "note": "Accepted for the bounded context compiler only."},
+  "freshness": {"created_at": "2026-08-11T19:00:00Z", "revalidate_after": "2026-09-11T19:00:00Z", "expires_at": "2026-11-11T19:00:00Z"},
+  "contradicts": [],
+  "supersedes": [],
+  "state": "active",
+  "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+}

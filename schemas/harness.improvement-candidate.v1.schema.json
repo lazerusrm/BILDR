@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:harness:improvement-candidate.v1",
+  "title": "Harness improvement candidate",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "candidate_id", "parent_bundle_id", "target_scope", "target_failure_classes", "hypothesis", "edits", "predictions", "risk_class", "required_tasksets", "required_ablations", "budget", "rollback_bundle_id", "state", "sha256"],
+  "properties": {
+    "schema": {"const": "harness.improvement-candidate.v1"},
+    "candidate_id": {"type": "string", "minLength": 1},
+    "parent_bundle_id": {"type": "string", "minLength": 1},
+    "target_scope": {"type": "object"},
+    "target_failure_classes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "hypothesis": {"type": "string", "minLength": 1},
+    "edits": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["component_id", "operation", "before_digest", "after_digest", "risk_class", "rationale"],
+        "properties": {
+          "component_id": {"type": "string", "minLength": 1},
+          "operation": {"enum": ["add", "delete", "replace"]},
+          "before_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+          "after_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+          "risk_class": {"enum": ["green", "amber"]},
+          "rationale": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "predictions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["signal_id", "direction", "minimum_delta", "reason"],
+        "properties": {
+          "signal_id": {"type": "string", "minLength": 1},
+          "direction": {"enum": ["increase", "decrease", "unchanged"]},
+          "minimum_delta": {"type": "number"},
+          "reason": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "risk_class": {"enum": ["green", "amber"]},
+    "required_tasksets": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "required_ablations": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_eval_tokens", "max_cost_microusd", "max_wall_seconds"],
+      "properties": {
+        "max_eval_tokens": {"type": "integer", "minimum": 1},
+        "max_cost_microusd": {"type": "integer", "minimum": 0},
+        "max_wall_seconds": {"type": "integer", "minimum": 1}
+      }
+    },
+    "rollback_bundle_id": {"type": "string", "minLength": 1},
+    "state": {"enum": ["proposed", "validated", "rejected", "experiment_ready", "superseded"]},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

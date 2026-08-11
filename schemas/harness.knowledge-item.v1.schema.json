@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:harness:knowledge-item.v1",
+  "title": "Harness evidence-backed knowledge item",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "knowledge_id", "kind", "statement", "scope", "evidence", "confidence", "review", "freshness", "state", "sha256"],
+  "properties": {
+    "schema": {"const": "harness.knowledge-item.v1"},
+    "knowledge_id": {"type": "string", "minLength": 1},
+    "kind": {"enum": ["fact", "procedure", "warning", "heuristic", "anti_pattern"]},
+    "statement": {"type": "string", "minLength": 1},
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "task_families", "model_families", "runtime_classes"],
+      "properties": {
+        "repository": {"type": ["string", "null"]},
+        "task_families": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "model_families": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "runtime_classes": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "id", "digest"],
+        "properties": {
+          "kind": {"enum": ["trace", "outcome", "validation", "finding", "experiment", "human_review"]},
+          "id": {"type": "string", "minLength": 1},
+          "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "reviewer"],
+      "properties": {
+        "state": {"enum": ["unreviewed", "accepted", "rejected", "needs_revalidation"]},
+        "reviewer": {"type": ["string", "null"]},
+        "note": {"type": ["string", "null"]}
+      }
+    },
+    "freshness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["created_at", "revalidate_after", "expires_at"],
+      "properties": {
+        "created_at": {"type": "string", "format": "date-time"},
+        "revalidate_after": {"type": "string", "format": "date-time"},
+        "expires_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "contradicts": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "supersedes": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "state": {"enum": ["candidate", "active", "expired", "contradicted", "superseded", "rejected"]},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

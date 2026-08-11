@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:harness:promotion-decision.v1",
+  "title": "Harness promotion decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "promotion_id", "experiment_id", "candidate_id", "from_bundle_id", "to_bundle_id", "safety_anchor_digest", "scope", "required_receipts", "decision", "decided_by", "decided_at", "rollback", "sha256"],
+  "properties": {
+    "schema": {"const": "harness.promotion-decision.v1"},
+    "promotion_id": {"type": "string", "minLength": 1},
+    "experiment_id": {"type": "string", "minLength": 1},
+    "candidate_id": {"type": "string", "minLength": 1},
+    "from_bundle_id": {"type": "string", "minLength": 1},
+    "to_bundle_id": {"type": "string", "minLength": 1},
+    "safety_anchor_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "scope": {"type": "object"},
+    "required_receipts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["offline", "holdout", "shadow", "canary", "reward_integrity", "statistics"],
+      "properties": {
+        "offline": {"type": "string", "minLength": 1},
+        "holdout": {"type": "string", "minLength": 1},
+        "shadow": {"type": "string", "minLength": 1},
+        "canary": {"type": ["string", "null"]},
+        "reward_integrity": {"type": "string", "minLength": 1},
+        "statistics": {"type": "string", "minLength": 1}
+      }
+    },
+    "decision": {"enum": ["promote", "reject", "defer", "rollback"]},
+    "decided_by": {"type": "string", "minLength": 1},
+    "decided_at": {"type": "string", "format": "date-time"},
+    "activation_not_before": {"type": ["string", "null"], "format": "date-time"},
+    "rollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_bundle_id", "automatic_triggers", "tested_evidence_id"],
+      "properties": {
+        "target_bundle_id": {"type": "string", "minLength": 1},
+        "automatic_triggers": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "tested_evidence_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

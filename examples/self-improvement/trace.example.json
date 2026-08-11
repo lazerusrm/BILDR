@@ -1,0 +1,23 @@
+{
+  "schema": "harness.trace.v1",
+  "trace_id": "trace_example",
+  "run_id": "run_example",
+  "task_attempt_id": "attempt_example",
+  "source_event_range": {"first_id": 1, "last_id": 4},
+  "runtime_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "redaction_policy_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "sensitivity": "internal",
+  "nodes": [
+    {"id": "n1", "kind": "user_message", "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "source_event_ids": [1], "redaction_class": "none", "timestamp_ms": 1, "metadata": {}},
+    {"id": "n2", "kind": "model_message", "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "source_event_ids": [2], "redaction_class": "private_reasoning_removed", "timestamp_ms": 2, "metadata": {}},
+    {"id": "n3", "kind": "tool_request", "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "source_event_ids": [3], "redaction_class": "none", "timestamp_ms": 3, "metadata": {}},
+    {"id": "n4", "kind": "tool_result", "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "source_event_ids": [4], "redaction_class": "none", "timestamp_ms": 4, "metadata": {}}
+  ],
+  "edges": [
+    {"from": "n1", "to": "n2", "kind": "next"},
+    {"from": "n2", "to": "n3", "kind": "next"},
+    {"from": "n3", "to": "n4", "kind": "tool_result_of"}
+  ],
+  "branches": [{"id": "branch_main", "root_node_id": "n1", "leaf_node_id": "n4", "node_ids": ["n1", "n2", "n3", "n4"]}],
+  "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+}

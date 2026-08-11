@@ -1,0 +1,27 @@
+{
+  "schema": "harness.improvement-candidate.v1",
+  "candidate_id": "candidate_context_order_v1",
+  "parent_bundle_id": "bundle_champion_v1",
+  "target_scope": {"task_family": "context_compilation"},
+  "target_failure_classes": ["context_budget_exhaustion"],
+  "hypothesis": "Ordering task authority before large supporting sources will reduce truncation without losing required authority.",
+  "edits": [{
+    "component_id": "context.selection.order",
+    "operation": "replace",
+    "before_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "after_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "risk_class": "green",
+    "rationale": "Prioritize mandatory evidence before optional support."
+  }],
+  "predictions": [
+    {"signal_id": "required_authority_present", "direction": "unchanged", "minimum_delta": 0, "reason": "Required sources remain pinned."},
+    {"signal_id": "context_tokens", "direction": "decrease", "minimum_delta": -0.05, "reason": "Optional sources are admitted after mandatory sources."}
+  ],
+  "risk_class": "green",
+  "required_tasksets": ["taskset_context_v1"],
+  "required_ablations": ["no_change_control"],
+  "budget": {"max_eval_tokens": 1000000, "max_cost_microusd": 10000000, "max_wall_seconds": 3600},
+  "rollback_bundle_id": "bundle_champion_v1",
+  "state": "proposed",
+  "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+}
