@@ -99,6 +99,16 @@ const INTENT_INTERVIEW_CONTRACT: &str = r#"Clarify the human's intended final sh
 - Do not design the implementation plan, prescribe speculative internals, demand exhaustive detail, repeat answered questions, or turn uncertainty into arbitrary constraints.
 - Keep the brief concise, concrete, and outcome-oriented. It is the durable handoff; the raw conversation is not planner input."#;
 
+const INTENT_INTERVIEW_RESPONSE_FORMAT: &str = r#"Use exactly one of these JSON shapes. These examples define the wire shape, not the substance of the interview.
+
+Question:
+{"schema":"harness.intent-interview-turn.v1","status":"question","question":"One material question","why_it_matters":"Why the answer changes the result or acceptance","recommended_answer":null,"brief":null}
+
+Ready:
+{"schema":"harness.intent-interview-turn.v1","status":"ready","question":null,"why_it_matters":null,"recommended_answer":null,"brief":{"refined_objective":"Outcome to achieve","intended_final_shape":["Observable final result"],"hard_constraints":[],"preferences":[],"non_goals":[],"acceptance_examples":["Authoritative behavior check"],"planner_may_decide":["Implementation details not fixed by the human"],"assumptions_to_validate":[]}}
+
+For a question, `brief` must be null. `recommended_answer` may be a concise optional starting point, but it is never human intent unless the human adopts it. For ready, `brief` must be complete and `question` must be null. Include every key shown."#;
+
 #[derive(Debug)]
 struct AgentPromptLayers {
     developer_instructions: String,
@@ -370,6 +380,8 @@ pub struct IntentInterviewMessage {
     pub kind: String,
     pub text: String,
     pub why_it_matters: Option<String>,
+    #[serde(default)]
+    pub suggested_answer: Option<String>,
     pub recorded_at: String,
 }
 
@@ -400,13 +412,28 @@ enum IntentInterviewTurnStatus {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+struct IntentInterviewTurnWire {
+    #[serde(default)]
+    schema: Option<String>,
+    status: IntentInterviewTurnStatus,
+    #[serde(default)]
+    question: Option<String>,
+    #[serde(default, alias = "why_this_matters", alias = "rationale")]
+    why_it_matters: Option<String>,
+    #[serde(default, alias = "suggested_answer")]
+    recommended_answer: Option<String>,
+    #[serde(default)]
+    brief: Option<Value>,
+}
+
+#[derive(Clone, Debug)]
 struct IntentInterviewTurn {
     schema: String,
     status: IntentInterviewTurnStatus,
     question: Option<String>,
     why_it_matters: Option<String>,
-    brief: IntentBrief,
+    recommended_answer: Option<String>,
+    brief: Option<IntentBrief>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -3232,7 +3259,7 @@ impl Orchestrator {
         snapshot.last_error = None;
         self.store_intent_interview_snapshot(run_id, &snapshot)?;
         let prompt = format!(
-            "Intent interview for this run.\n\nOriginal request:\n{}\n\nPinned repository base: {}{}\n\n{INTENT_INTERVIEW_CONTRACT}\n\nInspect only repository facts needed to choose the next question. Return a question when a material intent decision remains; otherwise return the ready brief. Return only JSON matching the supplied output schema.",
+            "Intent interview for this run.\n\nOriginal request:\n{}\n\nPinned repository base: {}{}\n\n{INTENT_INTERVIEW_CONTRACT}\n\n{INTENT_INTERVIEW_RESPONSE_FORMAT}\n\nInspect only repository facts needed to choose the next question. Return a question when a material intent decision remains; otherwise return the ready brief. Return only the JSON object.",
             run.objective, run.base_sha, recovery_context,
         );
         if let Err(error) = self
@@ -3346,6 +3373,7 @@ impl Orchestrator {
             kind: response_kind.to_owned(),
             text: message.to_owned(),
             why_it_matters: None,
+            suggested_answer: None,
             recorded_at: timestamp,
         });
         self.store.prepare_agent_continuation(
@@ -3355,7 +3383,7 @@ impl Orchestrator {
         )?;
         self.store_intent_interview_snapshot(run_id, &snapshot)?;
         let prompt = format!(
-            "Human response:\n{message}\n\nUpdate the complete brief from the established conversation. Do not revisit resolved decisions. Ask the single next highest-leverage question only if its answer could materially change the intended result or acceptance; otherwise return the ready brief. Return only JSON matching the supplied output schema."
+            "Human response:\n{message}\n\nUpdate the complete brief from the established conversation. Do not revisit resolved decisions. Ask the single next highest-leverage question only if its answer could materially change the intended result or acceptance; otherwise return the ready brief.\n\n{INTENT_INTERVIEW_RESPONSE_FORMAT}\n\nReturn only the JSON object."
         );
         let turn_result: Result<Value, OrchestratorError> = async {
             runtime
@@ -5829,10 +5857,7 @@ impl Orchestrator {
         match agent.role {
             AgentRole::Interviewer => {
                 if self.store.run(&run_id)?.state == RunState::Interviewing {
-                    let result = parse_json_text::<IntentInterviewTurn>(text).and_then(|turn| {
-                        validate_intent_interview_turn(&turn)?;
-                        Ok(turn)
-                    });
+                    let result = parse_intent_interview_turn(text);
                     match result {
                         Ok(turn) => {
                             self.apply_intent_interview_turn(&run_id, agent_id, turn)
@@ -5942,30 +5967,44 @@ impl Orchestrator {
         {
             return Ok(());
         }
-        let digest = packet_digest(&turn.brief)?;
+        let IntentInterviewTurn {
+            status: turn_status,
+            question,
+            why_it_matters,
+            recommended_answer,
+            brief,
+            ..
+        } = turn;
         let timestamp = format_timestamp(now_ms());
-        let (status, kind, text) = match turn.status {
+        let (status, kind, text, event_digest) = match turn_status {
             IntentInterviewTurnStatus::Question => (
                 IntentInterviewStatus::WaitingForHuman,
                 "question",
-                turn.question.clone().expect("validated interview question"),
+                question.expect("validated interview question"),
+                None,
             ),
-            IntentInterviewTurnStatus::Ready => (
-                IntentInterviewStatus::ReadyForConfirmation,
-                "brief_ready",
-                "The intent brief is ready for confirmation.".to_owned(),
-            ),
+            IntentInterviewTurnStatus::Ready => {
+                let brief = brief.expect("validated ready interview brief");
+                let digest = packet_digest(&brief)?;
+                snapshot.draft_brief = Some(brief);
+                snapshot.draft_digest = Some(digest.clone());
+                (
+                    IntentInterviewStatus::ReadyForConfirmation,
+                    "brief_ready",
+                    "The intent brief is ready for confirmation.".to_owned(),
+                    Some(digest),
+                )
+            }
         };
         snapshot.status = status;
-        snapshot.draft_brief = Some(turn.brief);
-        snapshot.draft_digest = Some(digest.clone());
         snapshot.updated_at = timestamp.clone();
         snapshot.last_error = None;
         snapshot.messages.push(IntentInterviewMessage {
             role: "interviewer".to_owned(),
             kind: kind.to_owned(),
             text,
-            why_it_matters: turn.why_it_matters,
+            why_it_matters,
+            suggested_answer: recommended_answer,
             recorded_at: timestamp,
         });
         self.store_intent_interview_snapshot(run_id, &snapshot)?;
@@ -5990,7 +6029,7 @@ impl Orchestrator {
             json!({
                 "status": status,
                 "turn_count": snapshot.turn_count,
-                "draft_digest": digest,
+                "draft_digest": event_digest,
             }),
         )?;
         Ok(())
@@ -11016,29 +11055,56 @@ fn new_intent_interview_snapshot() -> IntentInterviewSnapshot {
     }
 }
 
-fn validate_intent_interview_turn(turn: &IntentInterviewTurn) -> Result<(), OrchestratorError> {
-    if turn.schema != "harness.intent-interview-turn.v1" {
+fn parse_intent_interview_turn(text: &str) -> Result<IntentInterviewTurn, OrchestratorError> {
+    let wire = parse_json_text::<IntentInterviewTurnWire>(text)?;
+    if wire
+        .schema
+        .as_deref()
+        .is_some_and(|schema| schema != "harness.intent-interview-turn.v1")
+    {
         return Err(OrchestratorError::Validation(
             "intent interview turn has an unknown schema".to_owned(),
         ));
     }
-    let objective = turn.brief.refined_objective.trim();
+    let brief = match wire.status {
+        IntentInterviewTurnStatus::Question => None,
+        IntentInterviewTurnStatus::Ready => Some(
+            wire.brief
+                .ok_or_else(|| {
+                    OrchestratorError::Validation(
+                        "ready interview turn needs a complete intent brief".to_owned(),
+                    )
+                })
+                .and_then(|brief| serde_json::from_value(brief).map_err(Into::into))?,
+        ),
+    };
+    let turn = IntentInterviewTurn {
+        schema: "harness.intent-interview-turn.v1".to_owned(),
+        status: wire.status,
+        question: wire.question,
+        why_it_matters: wire.why_it_matters,
+        recommended_answer: wire.recommended_answer,
+        brief,
+    };
+    validate_intent_interview_turn(&turn)?;
+    Ok(turn)
+}
+
+fn validate_intent_brief(brief: &IntentBrief) -> Result<(), OrchestratorError> {
+    let objective = brief.refined_objective.trim();
     if objective.is_empty() || objective.chars().count() > 12_000 {
         return Err(OrchestratorError::Validation(
             "intent brief needs a bounded refined objective".to_owned(),
         ));
     }
     for (field, values) in [
-        ("intended_final_shape", &turn.brief.intended_final_shape),
-        ("hard_constraints", &turn.brief.hard_constraints),
-        ("preferences", &turn.brief.preferences),
-        ("non_goals", &turn.brief.non_goals),
-        ("acceptance_examples", &turn.brief.acceptance_examples),
-        ("planner_may_decide", &turn.brief.planner_may_decide),
-        (
-            "assumptions_to_validate",
-            &turn.brief.assumptions_to_validate,
-        ),
+        ("intended_final_shape", &brief.intended_final_shape),
+        ("hard_constraints", &brief.hard_constraints),
+        ("preferences", &brief.preferences),
+        ("non_goals", &brief.non_goals),
+        ("acceptance_examples", &brief.acceptance_examples),
+        ("planner_may_decide", &brief.planner_may_decide),
+        ("assumptions_to_validate", &brief.assumptions_to_validate),
     ] {
         if values.len() > 32
             || values
@@ -11049,6 +11115,15 @@ fn validate_intent_interview_turn(turn: &IntentInterviewTurn) -> Result<(), Orch
                 "intent brief field {field} contains an invalid item"
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_intent_interview_turn(turn: &IntentInterviewTurn) -> Result<(), OrchestratorError> {
+    if turn.schema != "harness.intent-interview-turn.v1" {
+        return Err(OrchestratorError::Validation(
+            "intent interview turn has an unknown schema".to_owned(),
+        ));
     }
     match turn.status {
         IntentInterviewTurnStatus::Question => {
@@ -11066,9 +11141,13 @@ fn validate_intent_interview_turn(turn: &IntentInterviewTurn) -> Result<(), Orch
                     "ready interview turn must not include another question".to_owned(),
                 ));
             }
-            if turn.brief.intended_final_shape.is_empty()
-                || turn.brief.acceptance_examples.is_empty()
-            {
+            let brief = turn.brief.as_ref().ok_or_else(|| {
+                OrchestratorError::Validation(
+                    "ready interview turn needs a complete intent brief".to_owned(),
+                )
+            })?;
+            validate_intent_brief(brief)?;
+            if brief.intended_final_shape.is_empty() || brief.acceptance_examples.is_empty() {
                 return Err(OrchestratorError::Validation(
                     "ready intent brief needs a final shape and at least one acceptance example"
                         .to_owned(),
@@ -11083,6 +11162,15 @@ fn validate_intent_interview_turn(turn: &IntentInterviewTurn) -> Result<(), Orch
     {
         return Err(OrchestratorError::Validation(
             "interview question rationale must be non-empty and bounded when present".to_owned(),
+        ));
+    }
+    if turn
+        .recommended_answer
+        .as_ref()
+        .is_some_and(|answer| answer.trim().is_empty() || answer.chars().count() > 4_000)
+    {
+        return Err(OrchestratorError::Validation(
+            "suggested interview answer must be non-empty and bounded when present".to_owned(),
         ));
     }
     Ok(())
@@ -13219,7 +13307,8 @@ mod tests {
             status: IntentInterviewTurnStatus::Question,
             question: Some("Which observable result matters most?".to_owned()),
             why_it_matters: Some("It determines acceptance.".to_owned()),
-            brief: brief.clone(),
+            recommended_answer: None,
+            brief: None,
         };
         assert!(validate_intent_interview_turn(&question).is_ok());
 
@@ -13231,14 +13320,55 @@ mod tests {
         assert!(validate_intent_interview_turn(&incomplete).is_err());
 
         let ready = IntentInterviewTurn {
-            brief: IntentBrief {
+            brief: Some(IntentBrief {
                 intended_final_shape: vec!["The behavior works on the primary path".to_owned()],
                 acceptance_examples: vec!["The authoritative pipeline exercises it".to_owned()],
                 ..brief
-            },
+            }),
             ..incomplete
         };
         assert!(validate_intent_interview_turn(&ready).is_ok());
+    }
+
+    #[test]
+    fn intent_interview_normalizes_the_captured_live_question_shape() {
+        let turn = parse_intent_interview_turn(
+            r#"{
+                "status": "question",
+                "question": "Should working require simulator fixtures and staging validation?",
+                "recommended_answer": "Yes—record both results separately.",
+                "why_this_matters": "Without staging access, the report cannot certify integration.",
+                "unrecognized_advisory_field": "ignored on a conversational turn"
+            }"#,
+        )
+        .expect("captured live response should normalize");
+
+        assert_eq!(turn.status, IntentInterviewTurnStatus::Question);
+        assert_eq!(
+            turn.why_it_matters.as_deref(),
+            Some("Without staging access, the report cannot certify integration.")
+        );
+        assert_eq!(
+            turn.recommended_answer.as_deref(),
+            Some("Yes—record both results separately.")
+        );
+        assert!(turn.brief.is_none());
+    }
+
+    #[test]
+    fn intent_interview_ready_turn_still_requires_a_strict_complete_brief() {
+        let missing = parse_intent_interview_turn(
+            r#"{"status":"ready","question":null,"why_it_matters":null}"#,
+        );
+        assert!(missing.is_err());
+
+        let partial = parse_intent_interview_turn(
+            r#"{
+                "status": "ready",
+                "brief": {"refined_objective": "Ship it"}
+            }"#,
+        );
+        assert!(partial.is_err());
     }
 
     #[test]
@@ -13249,6 +13379,8 @@ mod tests {
         assert!(instructions.contains("do not plan or implement"));
         assert!(INTENT_INTERVIEW_CONTRACT.contains("one highest-leverage question at a time"));
         assert!(INTENT_INTERVIEW_CONTRACT.contains("raw conversation is not planner input"));
+        assert!(INTENT_INTERVIEW_RESPONSE_FORMAT.contains("For a question, `brief` must be null"));
+        assert!(INTENT_INTERVIEW_RESPONSE_FORMAT.contains("Include every key shown"));
     }
 
     #[test]

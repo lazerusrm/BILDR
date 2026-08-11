@@ -4,7 +4,14 @@
   "title": "Intent interview turn",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "status", "question", "why_it_matters", "brief"],
+  "required": [
+    "schema",
+    "status",
+    "question",
+    "why_it_matters",
+    "recommended_answer",
+    "brief"
+  ],
   "properties": {
     "schema": {
       "const": "harness.intent-interview-turn.v1"
@@ -20,8 +27,12 @@
       "type": ["string", "null"],
       "maxLength": 2000
     },
+    "recommended_answer": {
+      "type": ["string", "null"],
+      "maxLength": 4000
+    },
     "brief": {
-      "type": "object",
+      "type": ["object", "null"],
       "additionalProperties": false,
       "required": [
         "refined_objective",

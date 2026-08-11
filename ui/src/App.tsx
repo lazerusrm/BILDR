@@ -2434,6 +2434,11 @@ function IntentInterviewPanel({
             {latestQuestion.why_it_matters && (
               <span>{latestQuestion.why_it_matters}</span>
             )}
+            {latestQuestion.suggested_answer && (
+              <span>
+                Suggested starting point: {latestQuestion.suggested_answer}
+              </span>
+            )}
           </div>
           <form className="intent-response" onSubmit={submitResponse}>
             <label>

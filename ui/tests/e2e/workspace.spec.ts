@@ -118,3 +118,45 @@ test("makes a prepared task's idle architecture state explicit", async ({
   await deepInterview.check();
   await expect(deepInterview).toBeChecked();
 });
+
+test("completes a deep interview and hands the confirmed brief to planning", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "New task" }).click();
+  await page
+    .getByRole("textbox", { name: "What should the governor accomplish?" })
+    .fill("Prove the requested behavior through the authoritative workflow.");
+  await page
+    .getByRole("checkbox", { name: /Deep interview before planning/ })
+    .check();
+  await page.getByRole("button", { name: "Create and start task" }).click();
+
+  await expect(page.getByRole("heading", { name: "Deep interview" })).toBeVisible();
+  await expect(
+    page.getByText(
+      "Which observable result must the authoritative workflow prove?",
+    ),
+  ).toBeVisible();
+  await expect(page.getByText(/Suggested starting point:/)).toContainText(
+    "Exercise the primary workflow",
+  );
+
+  await page
+    .getByRole("textbox", { name: "Your answer" })
+    .fill("Exercise the primary workflow and verify the visible result.");
+  await page.getByRole("button", { name: "Send answer" }).click();
+
+  await expect(page.getByText("Intended final shape", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText(
+      "A headless user flow exercises the behavior from task creation through its result.",
+    ),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Use brief and plan" }).click();
+
+  await expect(page.getByText("Confirmed intent", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("region", { name: "Governor sessions" }),
+  ).toContainText("PLANNING");
+});

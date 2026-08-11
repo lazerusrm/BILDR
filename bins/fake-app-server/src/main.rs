@@ -403,16 +403,8 @@ fn scripted_response(input: &str, objective: Option<&str>) -> String {
             "status": "question",
             "question": "What observable final behavior matters most when this task is complete?",
             "why_it_matters": "This determines the acceptance example without prescribing an implementation.",
-            "brief": {
-                "refined_objective": objective.unwrap_or("Complete the requested repository change"),
-                "intended_final_shape": [],
-                "hard_constraints": [],
-                "preferences": [],
-                "non_goals": [],
-                "acceptance_examples": [],
-                "planner_may_decide": ["Implementation details not specified by the human"],
-                "assumptions_to_validate": []
-            }
+            "recommended_answer": null,
+            "brief": null
         })
         .to_string();
     }
@@ -422,6 +414,7 @@ fn scripted_response(input: &str, objective: Option<&str>) -> String {
             "status": "ready",
             "question": null,
             "why_it_matters": null,
+            "recommended_answer": null,
             "brief": {
                 "refined_objective": objective.unwrap_or("Complete the requested repository change"),
                 "intended_final_shape": ["The requested behavior is observable on the authoritative path"],

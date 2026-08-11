@@ -2,7 +2,9 @@ import { createReadStream, existsSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { extname, join, normalize } from "node:path";
 
-const root = normalize(join(import.meta.dirname, "..", "dist"));
+const root = normalize(
+  process.env.HARNESS_UI_DIST || join(import.meta.dirname, "..", "dist"),
+);
 const sha = "0123456789abcdef0123456789abcdef01234567";
 const now = new Date().toISOString();
 const repository = {
@@ -124,6 +126,26 @@ const preparedRun = {
   created_at: new Date(Date.parse(now) + 60_000).toISOString(),
   version: 1,
 };
+let interviewRun;
+let interviewSnapshot;
+const interviewBrief = {
+  refined_objective:
+    "Prove the requested behavior on the authoritative user path.",
+  intended_final_shape: [
+    "The requested behavior is observable in the primary workflow.",
+  ],
+  hard_constraints: ["Preserve existing unrelated behavior."],
+  preferences: [],
+  non_goals: ["Unrelated repository redesign."],
+  acceptance_examples: [
+    "A headless user flow exercises the behavior from task creation through its result.",
+  ],
+  planner_may_decide: ["Implementation details not fixed by the human."],
+  assumptions_to_validate: [
+    "The authoritative workflow is available in the repository.",
+  ],
+};
+const interviewDigest = "e".repeat(64);
 const task = {
   id: "task-1",
   run_id: run.id,
@@ -301,6 +323,18 @@ const detail = {
   preferred_codex_account_id: null,
 };
 
+const interviewRunDetail = () => ({
+  ...detail,
+  run: interviewRun,
+  intent_interview: interviewSnapshot,
+  tasks: [],
+  agents: [],
+  worktrees: [],
+  approvals: [],
+  plan: null,
+  plan_digest: null,
+});
+
 const json = (response, value, status = 200) => {
   response.writeHead(status, {
     "content-type": "application/json",
@@ -354,7 +388,10 @@ const apiResponse = (pathname) => {
   }
   if (pathname === "/api/v1/settings") return settings;
   if (pathname === "/api/v1/runs")
-    return { items: [preparedRun, run], next_cursor: null };
+    return {
+      items: [preparedRun, run, ...(interviewRun ? [interviewRun] : [])],
+      next_cursor: null,
+    };
   if (pathname === "/api/v1/approvals") return [approval];
   if (pathname === "/api/v1/worktrees") return worktrees;
   if (pathname === `/api/v1/runs/${run.id}`) return detail;
@@ -369,8 +406,13 @@ const apiResponse = (pathname) => {
       plan_digest: null,
     };
   }
+  if (interviewRun && pathname === `/api/v1/runs/${interviewRun.id}`) {
+    return interviewRunDetail();
+  }
   if (pathname === `/api/v1/runs/${run.id}/usage`) return usage;
   if (pathname === `/api/v1/runs/${preparedRun.id}/usage`) return usage;
+  if (interviewRun && pathname === `/api/v1/runs/${interviewRun.id}/usage`)
+    return usage;
   if (pathname === "/api/v1/usage") return usageBreakdown;
   if (pathname === `/api/v1/runs/${run.id}/evidence`) {
     return {
@@ -414,6 +456,120 @@ const apiResponse = (pathname) => {
   return undefined;
 };
 
+const mutationResponse = (pathname) => {
+  if (pathname === "/api/v1/runs") {
+    interviewRun = {
+      ...preparedRun,
+      id: "run-03JHARNESS",
+      title: "Authoritative workflow proof",
+      objective:
+        "Prove the requested behavior through the authoritative workflow.",
+      state: "INTERVIEWING",
+      phase: "interviewing",
+      created_at: new Date(Date.parse(now) + 120_000).toISOString(),
+      version: 1,
+    };
+    interviewSnapshot = {
+      schema: "harness.intent-interview.v1",
+      status: "not_started",
+      agent_id: null,
+      turn_count: 0,
+      messages: [],
+      draft_brief: null,
+      draft_digest: null,
+      confirmed_brief: null,
+      confirmed_digest: null,
+      started_at: null,
+      updated_at: now,
+      confirmed_at: null,
+      skipped_at: null,
+      last_error: null,
+    };
+    return interviewRun;
+  }
+  if (
+    interviewRun &&
+    pathname === `/api/v1/runs/${interviewRun.id}/interview/start`
+  ) {
+    interviewSnapshot = {
+      ...interviewSnapshot,
+      status: "waiting_for_human",
+      agent_id: "agent-interviewer",
+      turn_count: 1,
+      started_at: now,
+      updated_at: now,
+      messages: [
+        {
+          role: "interviewer",
+          kind: "question",
+          text: "Which observable result must the authoritative workflow prove?",
+          why_it_matters:
+            "The answer determines acceptance without fixing an implementation.",
+          suggested_answer:
+            "Exercise the primary workflow from user action through the visible result.",
+          recorded_at: now,
+        },
+      ],
+    };
+    return { operation: "start_intent_interview", accepted: true };
+  }
+  if (
+    interviewRun &&
+    pathname === `/api/v1/runs/${interviewRun.id}/interview/respond`
+  ) {
+    interviewSnapshot = {
+      ...interviewSnapshot,
+      status: "ready_for_confirmation",
+      turn_count: 2,
+      updated_at: now,
+      draft_brief: interviewBrief,
+      draft_digest: interviewDigest,
+      messages: [
+        ...interviewSnapshot.messages,
+        {
+          role: "human",
+          kind: "answer",
+          text: "Exercise the primary workflow and verify the visible result.",
+          why_it_matters: null,
+          suggested_answer: null,
+          recorded_at: now,
+        },
+        {
+          role: "interviewer",
+          kind: "brief_ready",
+          text: "The intent brief is ready for confirmation.",
+          why_it_matters: null,
+          suggested_answer: null,
+          recorded_at: now,
+        },
+      ],
+    };
+    return { operation: "respond_to_intent_interview", accepted: true };
+  }
+  if (
+    interviewRun &&
+    pathname === `/api/v1/runs/${interviewRun.id}/interview/confirm`
+  ) {
+    interviewRun = {
+      ...interviewRun,
+      state: "ARCHITECTING",
+      phase: "architecting",
+      started_at: now,
+      version: interviewRun.version + 1,
+    };
+    interviewSnapshot = {
+      ...interviewSnapshot,
+      status: "confirmed",
+      confirmed_brief: interviewBrief,
+      confirmed_digest: interviewDigest,
+      confirmed_at: now,
+      updated_at: now,
+    };
+    return { operation: "confirm_intent_interview", accepted: true };
+  }
+  return undefined;
+};
+
 const contentTypes = {
   ".css": "text/css; charset=utf-8",
   ".html": "text/html; charset=utf-8",
@@ -444,7 +600,9 @@ const server = createServer((request, response) => {
     return;
   }
   if (url.pathname.startsWith("/api/v1/")) {
-    const value = apiResponse(url.pathname);
+    const mutation =
+      request.method === "POST" ? mutationResponse(url.pathname) : undefined;
+    const value = mutation === undefined ? apiResponse(url.pathname) : mutation;
     return value === undefined
       ? json(response, { error: { message: "mock route not found" } }, 404)
       : json(response, value);

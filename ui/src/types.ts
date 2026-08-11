@@ -194,6 +194,7 @@ export interface IntentInterviewSnapshot {
     kind: "question" | "answer" | "direction" | "brief_ready" | string;
     text: string;
     why_it_matters?: string | null;
+    suggested_answer?: string | null;
     recorded_at: string;
   }>;
   draft_brief?: IntentBrief | null;
