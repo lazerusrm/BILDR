@@ -3853,7 +3853,7 @@ impl Orchestrator {
                 &run.objective,
                 Some(self.config.orchestration.default_task_token_budget),
                 prompt,
-                Some(serde_json::from_str(RUN_PLAN_SCHEMA)?),
+                Some(run_plan_output_schema()?),
             )
             .await
         {
@@ -3944,7 +3944,7 @@ impl Orchestrator {
                 &run.objective,
                 Some(self.config.orchestration.default_task_token_budget),
                 prompt,
-                Some(serde_json::from_str(RUN_PLAN_SCHEMA)?),
+                Some(run_plan_output_schema()?),
             )
             .await
         {
@@ -4869,7 +4869,7 @@ impl Orchestrator {
                 &format!("Revise implementation plan after adversarial review revision {revision}"),
                 Some(self.config.orchestration.default_task_token_budget),
                 prompt,
-                Some(serde_json::from_str(RUN_PLAN_SCHEMA)?),
+                Some(run_plan_output_schema()?),
             )
             .await
         {
@@ -13461,6 +13461,50 @@ fn plan_review_schema() -> Value {
     })
 }
 
+fn run_plan_output_schema() -> Result<Value, OrchestratorError> {
+    let mut schema = serde_json::from_str::<Value>(RUN_PLAN_SCHEMA)?;
+    let task_properties = schema
+        .pointer_mut("/$defs/task/properties")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            OrchestratorError::Protocol(
+                "embedded run-plan schema has no task properties".to_owned(),
+            )
+        })?;
+
+    // Dependency SHAs are controller facts populated after dependencies land.
+    // Omitting this free-form map also keeps the generation schema within the
+    // strict Structured Outputs subset, which requires closed objects.
+    task_properties.remove("dependency_shas");
+    normalize_structured_output_schema(&mut schema);
+    Ok(schema)
+}
+
+fn normalize_structured_output_schema(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            // The repository contract retains uniqueness constraints for
+            // validation, but the model API does not accept this keyword.
+            object.remove("uniqueItems");
+            if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+                object.insert(
+                    "required".to_owned(),
+                    Value::Array(properties.keys().cloned().map(Value::String).collect()),
+                );
+            }
+            for child in object.values_mut() {
+                normalize_structured_output_schema(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_structured_output_schema(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PlanReviewVerdict {
@@ -14239,6 +14283,82 @@ mod tests {
                 "response-format property {field} needs an explicit JSON Schema type"
             );
         }
+    }
+
+    #[test]
+    fn architect_uses_a_strict_output_compatible_projection_of_the_plan_schema() {
+        fn assert_compatible(value: &Value, path: &str) {
+            match value {
+                Value::Object(object) => {
+                    for unsupported in [
+                        "uniqueItems",
+                        "allOf",
+                        "not",
+                        "dependentRequired",
+                        "dependentSchemas",
+                        "if",
+                        "then",
+                        "else",
+                    ] {
+                        assert!(
+                            !object.contains_key(unsupported),
+                            "unsupported keyword {unsupported} at {path}"
+                        );
+                    }
+                    if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+                        assert_eq!(
+                            object.get("additionalProperties"),
+                            Some(&Value::Bool(false)),
+                            "object must be closed at {path}"
+                        );
+                        let required = object["required"]
+                            .as_array()
+                            .expect("object properties need a required list")
+                            .iter()
+                            .map(|entry| entry.as_str().expect("required entry must be text"))
+                            .collect::<BTreeSet<_>>();
+                        let property_names = properties.keys().map(String::as_str).collect();
+                        assert_eq!(
+                            required, property_names,
+                            "all fields must be required at {path}"
+                        );
+                    }
+                    if object.get("type").and_then(Value::as_str) == Some("object") {
+                        assert_eq!(
+                            object.get("additionalProperties"),
+                            Some(&Value::Bool(false)),
+                            "free-form object is not supported at {path}"
+                        );
+                    }
+                    for (key, child) in object {
+                        assert_compatible(child, &format!("{path}/{key}"));
+                    }
+                }
+                Value::Array(items) => {
+                    for (index, item) in items.iter().enumerate() {
+                        assert_compatible(item, &format!("{path}/{index}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let authoritative: Value = serde_json::from_str(RUN_PLAN_SCHEMA).unwrap();
+        assert!(
+            authoritative
+                .pointer("/$defs/strings/uniqueItems")
+                .is_some(),
+            "the full validation contract should retain uniqueness"
+        );
+
+        let output = run_plan_output_schema().unwrap();
+        assert!(
+            output
+                .pointer("/$defs/task/properties/dependency_shas")
+                .is_none(),
+            "the controller-owned free-form map must not reach Structured Outputs"
+        );
+        assert_compatible(&output, "$root");
     }
 
     #[test]
