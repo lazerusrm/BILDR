@@ -476,6 +476,28 @@ impl Store {
         Ok(())
     }
 
+    pub fn mark_worktree_removed(&self, id: &WorktreeId) -> Result<(), StoreError> {
+        let timestamp = now_ms();
+        let changed = self.connection()?.execute(
+            "UPDATE worktrees SET state='REMOVED',removed_at=coalesce(removed_at,?2),reconciled_at=?2,version=version+1 WHERE id=?1",
+            params![id.as_str(), timestamp],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::NotFound(format!("worktree {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn worktree_has_active_path_lease(&self, id: &WorktreeId) -> Result<bool, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM worktrees w JOIN path_leases p ON p.task_attempt_id=w.task_attempt_id WHERE w.id=?1 AND p.released_at IS NULL AND p.expires_at>?2)",
+                params![id.as_str(), now_ms()],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn set_worktree_composed_base(
         &self,
         id: &WorktreeId,

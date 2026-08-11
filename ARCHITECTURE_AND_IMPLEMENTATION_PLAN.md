@@ -1112,16 +1112,45 @@ Conflict resolution invalidates any proof that depended on changed lines/artifac
 
 ### 9.9 Cleanup
 
+The coordination checkout is never an execution workspace and is never cleaned
+by BILDR. Repository preflight requires it to be clean. Every mutable agent and
+integration command runs in a controller-created worktree.
+
+During retries, the controller keeps the current and immediately previous task
+worktrees so the next attempt can inspect its direct predecessor. It removes
+older superseded worktrees only when Git reports them clean and no live agent,
+path lease, or explicit operator preservation applies. Branches, commits,
+attempt records, findings, and content-addressed evidence remain durable.
+
+After a successful run reaches `COMPLETED`, the controller removes every safe
+managed worktree with non-forced `git worktree remove`, records each database
+tombstone, and runs `git worktree prune`. Cleanup uses one background hygiene
+lane, so large deletions neither block orchestration nor compete with each
+other. A failed removal is not overridden; the cleanup report becomes
+`attention_required` and identifies the retained worktree.
+
+The controller binds this policy when it creates the run. Upgrading BILDR does
+not retroactively delete worktrees from runs created under an older policy.
+
 No worktree is removed when it has:
 
 - a live process/session;
 - active lease;
 - unarchived uncommitted diff;
-- unpushed commit the user has not declared disposable;
+- a HEAD that differs from the controller's durable record;
 - preservation flag;
 - unresolved evidence reference.
 
-Cleanup is controller-owned, dry-run capable, and followed by `git worktree prune`. Global Docker/cache pruning is never implicit.
+Controller commands receive command-scoped temporary, home, cache, config,
+data, and state directories unless the command explicitly needs an allowlisted
+host location. After required stdout and stderr are copied into the artifact
+store, the controller discards the command spool. This rule is
+build-system-neutral: ignored build output lives inside the disposable
+worktree, whether a repository uses Cargo, npm, Gradle, CMake, or another tool.
+
+Global compiler, package-manager, container, and operating-system cache pruning
+is never implicit. Those caches can be shared with unrelated work and need a
+separate operator-reviewed storage policy.
 
 ---
 
@@ -1927,10 +1956,14 @@ Default examples:
 raw projected protocol events     90 days
 full command logs                 30 days unless evidence-pinned
 run/task/evidence manifests       durable until explicit archive/delete
-completed removable worktrees    7–30 days or explicit cleanup
+completed removable worktrees    immediately after durable signoff
 failed/preserved worktrees        no automatic removal
 pricing/profile/schema snapshots  permanent while referenced
 ```
+
+Only the checkout is disposable. Git commits, branch refs, task records,
+evidence, and explicit operator pins remain. Dirty, active, leased, or pinned
+worktrees are retained and reported for attention.
 
 Run archival is a non-destructive terminal-state transition. Only completed,
 canceled, or failed runs may be archived; their manifests, usage, events, and

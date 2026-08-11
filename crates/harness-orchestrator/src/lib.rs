@@ -697,6 +697,7 @@ pub struct Orchestrator {
     runtime: Arc<RwLock<Option<Arc<dyn CodexRuntime>>>>,
     yolo_mode: Arc<AtomicBool>,
     operation_lock: Arc<Mutex<()>>,
+    hygiene_lock: Arc<Mutex<()>>,
     account_logins: Arc<Mutex<BTreeMap<String, CodexAccountLoginEntry>>>,
 }
 
@@ -760,6 +761,7 @@ impl Orchestrator {
             runtime: Arc::new(RwLock::new(runtime)),
             yolo_mode: Arc::new(AtomicBool::new(yolo_mode)),
             operation_lock: Arc::new(Mutex::new(())),
+            hygiene_lock: Arc::new(Mutex::new(())),
             account_logins: Arc::new(Mutex::new(BTreeMap::new())),
         };
         orchestrator.reconcile_native_subagents()?;
@@ -823,6 +825,26 @@ impl Orchestrator {
         for run in &runs {
             self.store
                 .heartbeat_run_path_leases(&run.id, self.config.orchestration.lease_ttl_seconds)?;
+        }
+        for run in self.store.list_runs(None, true)? {
+            if !self.run_is_hygiene_eligible(&run)? {
+                continue;
+            }
+            let hygiene_status = self
+                .store
+                .runtime_metadata(&format!("run-hygiene:{}", run.id))?
+                .and_then(|value| {
+                    value
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                });
+            if !matches!(
+                hygiene_status.as_deref(),
+                Some("clean" | "attention_required")
+            ) {
+                self.schedule_completed_run_hygiene(&run.id);
+            }
         }
         let runtime_ready = match self.runtime.read().await.as_ref() {
             Some(runtime) => {
@@ -942,26 +964,33 @@ impl Orchestrator {
             })
             .await;
         match outcome {
-            Ok(outcome) if outcome.succeeded() => {
-                let remaining = outcome.stdout.preview.trim();
-                let detail = remaining
-                    .parse::<u64>()
-                    .map(|remaining| format!(
-                        "Controller preflight proved authenticated GitHub API access; rate-limit remaining {remaining}."
-                    ))
-                    .unwrap_or_else(|_| {
-                        "Controller preflight proved authenticated GitHub API access; the remaining limit was not parseable."
-                            .to_owned()
-                    });
-                GithubCapability {
-                    ready: true,
-                    summary: detail,
+            Ok(outcome) => {
+                let capability = if outcome.succeeded() {
+                    let remaining = outcome.stdout.preview.trim();
+                    let detail = remaining
+                        .parse::<u64>()
+                        .map(|remaining| format!(
+                            "Controller preflight proved authenticated GitHub API access; rate-limit remaining {remaining}."
+                        ))
+                        .unwrap_or_else(|_| {
+                            "Controller preflight proved authenticated GitHub API access; the remaining limit was not parseable."
+                                .to_owned()
+                        });
+                    GithubCapability {
+                        ready: true,
+                        summary: detail,
+                    }
+                } else {
+                    GithubCapability {
+                        ready: false,
+                        summary: classify_github_failure(&outcome.stderr.preview),
+                    }
+                };
+                if let Err(error) = self.runner.discard(&outcome).await {
+                    warn!(%error, command_id = %outcome.command_id, "could not discard GitHub preflight spool");
                 }
+                capability
             }
-            Ok(outcome) => GithubCapability {
-                ready: false,
-                summary: classify_github_failure(&outcome.stderr.preview),
-            },
             Err(error) => GithubCapability {
                 ready: false,
                 summary: format!(
@@ -2287,6 +2316,14 @@ impl Orchestrator {
             head_sha: Some(inspection_worktree.head_sha),
             state: "READY".to_owned(),
         })?;
+        self.store.put_runtime_metadata(
+            &run_hygiene_policy_key(&run_id),
+            &json!({
+                "schema": "harness.run-hygiene-policy.v1",
+                "enabled": true,
+                "bound_at": now_ms(),
+            }),
+        )?;
         let (next_state, phase) = if deep_interview {
             (RunState::Interviewing, "interviewing")
         } else {
@@ -2695,22 +2732,294 @@ impl Orchestrator {
         })
     }
 
-    pub fn preserve_worktree(
+    pub async fn preserve_worktree(
         &self,
         worktree_id: &WorktreeId,
         reason: Option<&str>,
+        actor: &str,
     ) -> Result<harness_domain::WorktreeSummary, OrchestratorError> {
-        self.store.update_worktree(
-            worktree_id,
-            "PRESERVED",
+        let _guard = self.hygiene_lock.lock().await;
+        let worktree = self
+            .store
+            .list_worktrees(None)?
+            .into_iter()
+            .find(|worktree| &worktree.id == worktree_id)
+            .ok_or_else(|| OrchestratorError::Protocol("worktree disappeared".to_owned()))?;
+        if worktree.state == "REMOVED" {
+            return Err(OrchestratorError::Conflict(
+                "a removed worktree cannot be preserved".to_owned(),
+            ));
+        }
+        let reason = reason.unwrap_or("preserved by operator");
+        self.store
+            .update_worktree(worktree_id, "PRESERVED", None, Some(reason))?;
+        self.store.put_runtime_metadata(
+            &worktree_explicit_preservation_key(worktree_id),
+            &json!({"actor": actor, "reason": reason, "preserved_at": now_ms()}),
+        )?;
+        self.store.record_human_action(
+            Some(&worktree.run_id),
             None,
-            Some(reason.unwrap_or("preserved by operator")),
+            actor,
+            "preserve_worktree",
+            "worktree",
+            worktree_id.as_str(),
+            &json!({"reason": reason}),
         )?;
         self.store
             .list_worktrees(None)?
             .into_iter()
             .find(|worktree| &worktree.id == worktree_id)
             .ok_or_else(|| OrchestratorError::Protocol("updated worktree disappeared".to_owned()))
+    }
+
+    fn worktree_is_explicitly_preserved(
+        &self,
+        worktree: &WorktreeSummary,
+    ) -> Result<bool, OrchestratorError> {
+        Ok(self
+            .store
+            .runtime_metadata(&worktree_explicit_preservation_key(&worktree.id))?
+            .is_some()
+            || worktree.preserved_reason.as_deref() == Some("preserved by operator"))
+    }
+
+    fn run_is_hygiene_eligible(&self, run: &RunSummary) -> Result<bool, OrchestratorError> {
+        if !self.run_hygiene_policy_enabled(&run.id)? {
+            return Ok(false);
+        }
+        if run.state == RunState::Completed {
+            return Ok(true);
+        }
+        if run.state != RunState::Archived {
+            return Ok(false);
+        }
+        Ok(self
+            .store
+            .runtime_metadata(&run_hygiene_eligibility_key(&run.id))?
+            .and_then(|value| value.get("eligible").and_then(Value::as_bool))
+            .unwrap_or(false))
+    }
+
+    fn run_hygiene_policy_enabled(&self, run_id: &RunId) -> Result<bool, OrchestratorError> {
+        Ok(self
+            .store
+            .runtime_metadata(&run_hygiene_policy_key(run_id))?
+            .and_then(|value| value.get("enabled").and_then(Value::as_bool))
+            .unwrap_or(false))
+    }
+
+    async fn remove_disposable_worktrees(
+        &self,
+        run: &RunSummary,
+        worktrees: Vec<WorktreeSummary>,
+        reason: &str,
+    ) -> Result<Value, OrchestratorError> {
+        let repository = self.store.repository(&run.repository_id)?;
+        let active_agents = self
+            .store
+            .list_agents(&run.id)?
+            .into_iter()
+            .filter(|agent| agent_state_consumes_capacity(&agent.state))
+            .collect::<Vec<_>>();
+        let mut removed = Vec::new();
+        let mut pinned = Vec::new();
+        let mut retained = Vec::new();
+
+        for worktree in worktrees {
+            if worktree.state == "REMOVED" {
+                continue;
+            }
+            if self.worktree_is_explicitly_preserved(&worktree)? {
+                pinned.push(worktree.id.to_string());
+                continue;
+            }
+            let path = Path::new(&worktree.path);
+            if active_agents
+                .iter()
+                .any(|agent| Path::new(&agent.cwd).starts_with(path))
+            {
+                retained.push(json!({
+                    "worktree_id": worktree.id,
+                    "reason": "active agent still owns the worktree",
+                }));
+                continue;
+            }
+            if self.store.worktree_has_active_path_lease(&worktree.id)? {
+                retained.push(json!({
+                    "worktree_id": worktree.id,
+                    "reason": "active path lease still references the worktree",
+                }));
+                continue;
+            }
+            if path.exists() {
+                let expected_head = worktree
+                    .head_sha
+                    .as_deref()
+                    .unwrap_or(worktree.base_sha.as_str());
+                match self.git.head_sha(path).await {
+                    Ok(actual_head) if actual_head != expected_head => {
+                        retained.push(json!({
+                            "worktree_id": worktree.id,
+                            "reason": "worktree HEAD changed outside the controller's durable record",
+                            "expected_head_sha": expected_head,
+                            "actual_head_sha": actual_head,
+                        }));
+                        continue;
+                    }
+                    Err(error) => {
+                        retained.push(json!({
+                            "worktree_id": worktree.id,
+                            "reason": error.to_string(),
+                        }));
+                        continue;
+                    }
+                    Ok(_) => {}
+                }
+            }
+            let removal = if path.exists() {
+                self.git
+                    .remove_worktree(Path::new(&repository.root_path), path, false)
+                    .await
+            } else {
+                self.git
+                    .prune_worktrees(Path::new(&repository.root_path))
+                    .await
+            };
+            match removal {
+                Ok(()) => {
+                    self.store.mark_worktree_removed(&worktree.id)?;
+                    removed.push(worktree.id.to_string());
+                }
+                Err(error) => retained.push(json!({
+                    "worktree_id": worktree.id,
+                    "reason": error.to_string(),
+                })),
+            }
+        }
+
+        Ok(json!({
+            "reason": reason,
+            "removed_worktree_ids": removed,
+            "explicitly_preserved_worktree_ids": pinned,
+            "retained_worktrees": retained,
+        }))
+    }
+
+    async fn compact_superseded_task_worktrees(
+        &self,
+        run: &RunSummary,
+        task_id: &TaskId,
+    ) -> Result<(), OrchestratorError> {
+        let _guard = self.hygiene_lock.lock().await;
+        if !self.run_hygiene_policy_enabled(&run.id)? {
+            return Ok(());
+        }
+        let worktrees = self
+            .store
+            .list_worktrees(Some(&run.id))?
+            .into_iter()
+            .filter(|worktree| {
+                worktree.kind == "task"
+                    && worktree.task_id.as_ref() == Some(task_id)
+                    && worktree.state != "REMOVED"
+            })
+            .skip(2)
+            .collect::<Vec<_>>();
+        if worktrees.is_empty() {
+            return Ok(());
+        }
+        let report = self
+            .remove_disposable_worktrees(
+                run,
+                worktrees,
+                "older retry worktree superseded by durable continuity",
+            )
+            .await?;
+        self.store.emit_domain_event(
+            Some(&run.id),
+            "task",
+            task_id.as_str(),
+            "task.worktrees.compacted",
+            &report,
+            None,
+        )?;
+        Ok(())
+    }
+
+    async fn reconcile_completed_run_hygiene_locked(
+        &self,
+        run_id: &RunId,
+    ) -> Result<(), OrchestratorError> {
+        let run = self.store.run(run_id)?;
+        if !self.run_is_hygiene_eligible(&run)? {
+            return Ok(());
+        }
+        let metadata_key = format!("run-hygiene:{run_id}");
+        if self
+            .store
+            .runtime_metadata(&metadata_key)?
+            .and_then(|value| {
+                value
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .is_some_and(|status| matches!(status.as_str(), "clean" | "attention_required"))
+        {
+            return Ok(());
+        }
+        self.store.put_runtime_metadata(
+            &metadata_key,
+            &json!({
+                "schema": "harness.run-hygiene.v1",
+                "status": "running",
+                "started_at": now_ms(),
+            }),
+        )?;
+        let mut report = self
+            .remove_disposable_worktrees(
+                &run,
+                self.store.list_worktrees(Some(run_id))?,
+                "successful run completed with durable evidence",
+            )
+            .await?;
+        let repository = self.store.repository(&run.repository_id)?;
+        let profile = self.profile_for_run(&run)?;
+        let inspection = self
+            .git
+            .inspect(Path::new(&repository.root_path), &profile.profile)
+            .await?;
+        let retained_count = report["retained_worktrees"].as_array().map_or(0, Vec::len);
+        let status = if inspection.clean && retained_count == 0 {
+            "clean"
+        } else {
+            "attention_required"
+        };
+        report["schema"] = json!("harness.run-hygiene.v1");
+        report["status"] = json!(status);
+        report["primary_checkout_clean"] = json!(inspection.clean);
+        report["completed_at"] = json!(now_ms());
+        self.store.put_runtime_metadata(&metadata_key, &report)?;
+        self.emit_run_event(&run, "run.hygiene.completed", report)?;
+        Ok(())
+    }
+
+    fn schedule_completed_run_hygiene(&self, run_id: &RunId) {
+        let orchestrator = self.clone();
+        let run_id = run_id.clone();
+        let _cleanup = tokio::spawn(async move {
+            let lock = Arc::clone(&orchestrator.hygiene_lock);
+            let Ok(_guard) = lock.try_lock_owned() else {
+                return;
+            };
+            if let Err(error) = orchestrator
+                .reconcile_completed_run_hygiene_locked(&run_id)
+                .await
+            {
+                warn!(%error, %run_id, "completed-run hygiene remains pending");
+            }
+        });
     }
 
     pub async fn stop_run(
@@ -2802,6 +3111,16 @@ impl Orchestrator {
             return Err(OrchestratorError::Conflict(
                 "run must be stopped or completed before it can be archived".to_owned(),
             ));
+        }
+        if run.state == RunState::Completed && self.run_hygiene_policy_enabled(run_id)? {
+            self.store.put_runtime_metadata(
+                &run_hygiene_eligibility_key(run_id),
+                &json!({
+                    "eligible": true,
+                    "completed_before_archive": true,
+                    "recorded_at": now_ms(),
+                }),
+            )?;
         }
         let archived = self.store.transition_run(
             run_id,
@@ -4364,6 +4683,7 @@ impl Orchestrator {
                 Some(run.version),
                 None,
             )?;
+            self.schedule_completed_run_hygiene(run_id);
             return Ok(operation("approve_plan", run_id.as_str()));
         }
         self.store.transition_run(
@@ -4915,6 +5235,17 @@ impl Orchestrator {
                     .map(|value| value.source_attempt_id.as_str()),
             }),
         )?;
+        let orchestrator = self.clone();
+        let cleanup_run = run.clone();
+        let cleanup_task_id = task.id.clone();
+        let _cleanup = tokio::spawn(async move {
+            if let Err(error) = orchestrator
+                .compact_superseded_task_worktrees(&cleanup_run, &cleanup_task_id)
+                .await
+            {
+                warn!(run_id = %cleanup_run.id, task_id = %cleanup_task_id, %error, "superseded worktree cleanup remains pending");
+            }
+        });
         Ok(())
     }
 
@@ -9300,6 +9631,9 @@ impl Orchestrator {
                 "signed_packet_digest": current_packet.packet_digest,
             }),
         )?;
+        if run.state == RunState::Completed {
+            self.schedule_completed_run_hygiene(run_id);
+        }
         Ok(operation("approve_signoff", run_id.as_str()))
     }
 
@@ -9953,16 +10287,26 @@ impl Orchestrator {
             stderr_artifact_id: Some(stderr),
             error: None,
         })?;
-        if !result.succeeded() {
+        let succeeded = result.succeeded();
+        let url = result
+            .stdout
+            .preview
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .to_owned();
+        if let Err(error) = self.runner.discard(&result).await {
+            warn!(%error, command_id = %result.command_id, "could not discard publication command spool");
+        }
+        if !succeeded {
             return Err(OrchestratorError::Blocked(
                 "gh could not create the draft PR; publication logs were retained".to_owned(),
             ));
         }
-        let url = result.stdout.preview.lines().last().unwrap_or_default();
         self.store.put_runtime_metadata(
             &format!("draft-pr:{run_id}"),
             &json!({
-                "url": url,
+                "url": &url,
                 "head_sha": &request.expected_head_sha,
                 "branch": branch,
             }),
@@ -9974,7 +10318,7 @@ impl Orchestrator {
             "publish_draft_pr",
             "run",
             run_id.as_str(),
-            &json!({"head_sha": request.expected_head_sha, "branch": branch, "url": url}),
+            &json!({"head_sha": request.expected_head_sha, "branch": branch, "url": &url}),
         )?;
         let mut updated = self.store.transition_run(
             run_id,
@@ -9986,7 +10330,7 @@ impl Orchestrator {
         self.emit_run_event(
             &updated,
             "run.draft_pr.created",
-            json!({"head_sha": request.expected_head_sha, "branch": branch, "url": url}),
+            json!({"head_sha": request.expected_head_sha, "branch": branch, "url": &url}),
         )?;
         if !profile.profile.validation_policy.require_draft_pr_ci {
             updated = self.store.transition_run(
@@ -10008,6 +10352,7 @@ impl Orchestrator {
                     "reason": "repository profile does not require draft-PR CI proof",
                 }),
             )?;
+            self.schedule_completed_run_hygiene(run_id);
         }
         Ok(operation("publish_draft_pr", run_id.as_str()))
     }
@@ -10203,6 +10548,9 @@ impl Orchestrator {
                 "checks": &checks,
             }),
         )?;
+        if let Err(error) = self.runner.discard(&result).await {
+            warn!(%error, command_id = %result.command_id, "could not discard CI observation spool");
+        }
         if actor != "controller-ci-poller" {
             self.store.record_human_action(
                 Some(run_id),
@@ -10235,6 +10583,7 @@ impl Orchestrator {
                 "run.ci_proven",
                 json!({"head_sha": &integration_sha, "checks": &checks}),
             )?;
+            self.schedule_completed_run_hygiene(run_id);
         }
         Ok(operation("refresh_draft_pr_ci", run_id.as_str()))
     }
@@ -10354,8 +10703,8 @@ impl Orchestrator {
             signal: result.signal,
             timed_out: result.timed_out,
             result_class: result.result_class,
-            stdout_artifact_id: Some(stdout_id),
-            stderr_artifact_id: Some(stderr_id),
+            stdout_artifact_id: Some(stdout_id.clone()),
+            stderr_artifact_id: Some(stderr_id.clone()),
             error: (!source_unchanged).then(|| {
                 json!({
                     "reason": "validator mutated the source worktree",
@@ -10434,6 +10783,13 @@ impl Orchestrator {
                 },
             ],
         })?;
+        let stdout_path = self.store.artifact(&stdout_id)?.storage_path;
+        let stderr_path = self.store.artifact(&stderr_id)?.storage_path;
+        if let Err(error) = self.runner.discard(&result).await {
+            warn!(%error, command_id = %result.command_id, "could not discard validator command spool");
+        }
+        result.stdout.path = stdout_path;
+        result.stderr.path = stderr_path;
         Ok(ValidationOutcome {
             validation_id,
             command_id,
@@ -10627,6 +10983,18 @@ fn plan_review_metadata_key(run_id: &RunId, revision: u64) -> String {
 
 fn intent_interview_metadata_key(run_id: &RunId) -> String {
     format!("intent-interview:{run_id}")
+}
+
+fn worktree_explicit_preservation_key(worktree_id: &WorktreeId) -> String {
+    format!("worktree-explicit-preservation:{worktree_id}")
+}
+
+fn run_hygiene_eligibility_key(run_id: &RunId) -> String {
+    format!("run-hygiene-eligible:{run_id}")
+}
+
+fn run_hygiene_policy_key(run_id: &RunId) -> String {
+    format!("run-hygiene-policy:{run_id}")
 }
 
 fn new_intent_interview_snapshot() -> IntentInterviewSnapshot {

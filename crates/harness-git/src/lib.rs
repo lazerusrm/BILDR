@@ -815,6 +815,9 @@ impl GitManager {
         force: bool,
     ) -> Result<(), GitError> {
         let root = canonical_repo_root(repository).await?;
+        let lock = self.process_lock(&root).await;
+        let _guard = lock.lock().await;
+        let _file_lock = RepoFileLock::acquire(&root)?;
         let managed = fs::canonicalize(worktree)?;
         if !managed.starts_with(self.worktree_root.as_ref()) {
             return Err(GitError::Policy(
@@ -837,6 +840,14 @@ impl GitManager {
                 .ok_or_else(|| GitError::Policy("non-UTF-8 path".to_owned()))?,
         );
         git_ok(&root, args).await?;
+        git_ok(&root, ["worktree", "prune"]).await
+    }
+
+    pub async fn prune_worktrees(&self, repository: &Path) -> Result<(), GitError> {
+        let root = canonical_repo_root(repository).await?;
+        let lock = self.process_lock(&root).await;
+        let _guard = lock.lock().await;
+        let _file_lock = RepoFileLock::acquire(&root)?;
         git_ok(&root, ["worktree", "prune"]).await
     }
 
@@ -1577,5 +1588,73 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn clean_worktree_removal_discards_ignored_output_but_refuses_source_debris() {
+        let temp = TempDir::new().unwrap();
+        let repository = temp.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        fixture_git(&repository, &["init", "-b", "main"]);
+        fixture_git(&repository, &["config", "user.name", "Harness Test"]);
+        fixture_git(
+            &repository,
+            &["config", "user.email", "harness@example.invalid"],
+        );
+        fs::write(repository.join(".gitignore"), b"target/\n").unwrap();
+        fs::write(repository.join("tracked.txt"), b"original\n").unwrap();
+        fixture_git(&repository, &["add", ".gitignore", "tracked.txt"]);
+        fixture_git(&repository, &["commit", "-m", "test: initialize fixture"]);
+        let base = String::from_utf8(
+            StdCommand::new("git")
+                .current_dir(&repository)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let manager = GitManager::new(&temp.path().join("managed-worktrees")).unwrap();
+
+        let disposable = manager
+            .create_worktree(&WorktreeSpec {
+                repository_root: repository.clone(),
+                relative_path: PathBuf::from("run/disposable"),
+                base_sha: base.clone(),
+                branch: None,
+            })
+            .await
+            .unwrap();
+        fs::create_dir_all(disposable.path.join("target/debug")).unwrap();
+        fs::write(
+            disposable.path.join("target/debug/generated-output"),
+            b"disposable",
+        )
+        .unwrap();
+        manager
+            .remove_worktree(&repository, &disposable.path, false)
+            .await
+            .unwrap();
+        assert!(!disposable.path.exists());
+
+        let dirty = manager
+            .create_worktree(&WorktreeSpec {
+                repository_root: repository.clone(),
+                relative_path: PathBuf::from("run/dirty"),
+                base_sha: base,
+                branch: None,
+            })
+            .await
+            .unwrap();
+        fs::write(dirty.path.join("untracked-source.txt"), b"preserve me").unwrap();
+        assert!(
+            manager
+                .remove_worktree(&repository, &dirty.path, false)
+                .await
+                .is_err()
+        );
+        assert!(dirty.path.exists());
     }
 }

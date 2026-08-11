@@ -196,6 +196,18 @@ impl CommandRunner {
         let command_id = Ulid::generate().to_string();
         let command_dir = self.spool_root.join(&command_id);
         fs::create_dir_all(&command_dir).await?;
+        let temporary_dir = command_dir.join("tmp");
+        let cache_dir = command_dir.join("cache");
+        let home_dir = command_dir.join("home");
+        let config_dir = command_dir.join("config");
+        let data_dir = command_dir.join("data");
+        let state_dir = command_dir.join("state");
+        fs::create_dir(&temporary_dir).await?;
+        fs::create_dir(&cache_dir).await?;
+        fs::create_dir(&home_dir).await?;
+        fs::create_dir(&config_dir).await?;
+        fs::create_dir(&data_dir).await?;
+        fs::create_dir(&state_dir).await?;
         let stdout_path = command_dir.join("stdout.log");
         let stderr_path = command_dir.join("stderr.log");
 
@@ -221,6 +233,31 @@ impl CommandRunner {
         }
         for (key, value) in &spec.environment {
             command.env(key, value);
+        }
+        // Controller commands get command-scoped disposable roots regardless
+        // of the host environment. This contains generic temporary files and
+        // standards-compliant tool caches without assuming a build system.
+        command
+            .env("TMPDIR", &temporary_dir)
+            .env("TMP", &temporary_dir)
+            .env("TEMP", &temporary_dir)
+            .env("XDG_CACHE_HOME", &cache_dir);
+        let host_home_allowed = spec.environment.contains_key("HOME")
+            || spec.inherited_environment.iter().any(|item| item == "HOME");
+        if !host_home_allowed {
+            command.env("HOME", &home_dir);
+        }
+        for (key, value) in [
+            ("XDG_CONFIG_HOME", &config_dir),
+            ("XDG_DATA_HOME", &data_dir),
+            ("XDG_STATE_HOME", &state_dir),
+        ] {
+            if !host_home_allowed
+                && !spec.environment.contains_key(key)
+                && !spec.inherited_environment.iter().any(|item| item == key)
+            {
+                command.env(key, value);
+            }
         }
 
         let started_at_ms = now_ms();
@@ -289,6 +326,28 @@ impl CommandRunner {
             stdout,
             stderr,
         })
+    }
+
+    /// Remove a completed command's disposable spool after callers have
+    /// copied any durable evidence into the artifact store.
+    pub async fn discard(&self, outcome: &CommandOutcome) -> Result<(), RunnerError> {
+        if outcome.command_id.parse::<Ulid>().is_err() {
+            return Err(RunnerError::Invalid(
+                "command outcome has an invalid managed identifier".to_owned(),
+            ));
+        }
+        let command_dir = self.spool_root.join(&outcome.command_id);
+        if outcome.stdout.path.parent() != Some(command_dir.as_path())
+            || outcome.stderr.path.parent() != Some(command_dir.as_path())
+        {
+            return Err(RunnerError::Invalid(
+                "command outcome is outside the managed spool".to_owned(),
+            ));
+        }
+        if fs::try_exists(&command_dir).await? {
+            fs::remove_dir_all(command_dir).await?;
+        }
+        Ok(())
     }
 }
 
@@ -404,7 +463,69 @@ mod tests {
         assert!(result.succeeded());
         assert_eq!(result.stdout.bytes, 300);
         assert!(result.stdout.preview_truncated);
-        assert_eq!(fs::read(result.stdout.path).await.unwrap().len(), 300);
+        assert_eq!(fs::read(&result.stdout.path).await.unwrap().len(), 300);
+        let command_dir = result.stdout.path.parent().unwrap().to_path_buf();
+        runner.discard(&result).await.unwrap();
+        assert!(!command_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn command_temporary_and_cache_paths_are_disposable_and_scoped() {
+        let temp = TempDir::new().unwrap();
+        let runner = CommandRunner::new(temp.path().join("spool"), ResourceManager::default())
+            .await
+            .unwrap();
+        let result = runner
+            .run(CommandSpec {
+                program: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "test -d \"$TMPDIR\" && test -d \"$XDG_CACHE_HOME\" && test -d \"$HOME\" && printf '%s\\n%s\\n%s' \"$TMPDIR\" \"$XDG_CACHE_HOME\" \"$HOME\""
+                        .to_owned(),
+                ],
+                cwd: temp.path().to_path_buf(),
+                resource_class: ResourceClass::Control,
+                timeout_ms: 5_000,
+                inherited_environment: vec![],
+                environment: BTreeMap::new(),
+                stdin: None,
+            })
+            .await
+            .unwrap();
+        assert!(result.succeeded());
+        let command_dir = result.stdout.path.parent().unwrap().to_path_buf();
+        for path in result.stdout.preview.lines() {
+            assert!(Path::new(path).starts_with(&command_dir));
+        }
+        runner.discard(&result).await.unwrap();
+        assert!(!command_dir.exists());
+
+        let allowed_home = temp.path().join("allowed-home");
+        fs::create_dir(&allowed_home).await.unwrap();
+        let result = runner
+            .run(CommandSpec {
+                program: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "printf '%s\\n%s' \"$HOME\" \"${XDG_CONFIG_HOME-unset}\"".to_owned(),
+                ],
+                cwd: temp.path().to_path_buf(),
+                resource_class: ResourceClass::Control,
+                timeout_ms: 5_000,
+                inherited_environment: vec![],
+                environment: BTreeMap::from([(
+                    "HOME".to_owned(),
+                    allowed_home.to_string_lossy().into_owned(),
+                )]),
+                stdin: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            result.stdout.preview,
+            format!("{}\nunset", allowed_home.to_string_lossy())
+        );
+        runner.discard(&result).await.unwrap();
     }
 
     #[tokio::test]

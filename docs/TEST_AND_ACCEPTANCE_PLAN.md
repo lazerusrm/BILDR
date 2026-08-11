@@ -49,6 +49,10 @@ Use a model-based/property test harness. Invariants:
   human confirm or skip action;
 - interview replies create completed turns on one interview thread; architecture
   and plan review receive only the confirmed brief, not the raw transcript;
+- successful completion removes safe managed checkouts but keeps Git commits,
+  task records, and evidence durable;
+- cleanup never changes the coordination checkout or forces removal of dirty,
+  leased, active, or explicitly preserved worktrees;
 - push/PR/merge cannot occur without their explicit human gate; merge is absent in v1.
 
 Generate random legal/illegal action sequences and verify the database plus emitted domain events.
@@ -73,7 +77,13 @@ Required scenarios:
 12. invalidate previous validation after conflict resolution or regeneration;
 13. never remove a worktree with a live PID, lease, or unarchived diff;
 14. reconcile after an external human edit and require re-verification;
-15. show remote advancement without silently rebasing the run.
+15. show remote advancement without silently rebasing the run;
+16. remove ignored build output with a clean completed worktree, independent of
+    the repository's build system;
+17. retain the current and immediately previous retry worktrees, then compact
+    older safe attempts;
+18. remove successful-run worktrees non-forcibly and emit a durable hygiene
+    report that identifies anything retained.
 
 ## 5. App Server replay suite
 

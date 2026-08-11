@@ -1136,10 +1136,16 @@ async fn preserve_worktree(
 ) -> Result<Json<harness_domain::WorktreeSummary>, ApiError> {
     authenticate(&state, &headers, true)?;
     reject_long_note(body.reason.as_deref())?;
-    Ok(Json(state.orchestrator.preserve_worktree(
-        &WorktreeId::from(worktree_id),
-        body.reason.as_deref(),
-    )?))
+    Ok(Json(
+        state
+            .orchestrator
+            .preserve_worktree(
+                &WorktreeId::from(worktree_id),
+                body.reason.as_deref(),
+                "local-user",
+            )
+            .await?,
+    ))
 }
 
 async fn run_evidence(

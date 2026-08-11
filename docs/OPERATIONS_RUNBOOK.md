@@ -329,6 +329,32 @@ killing it would manufacture an infrastructure stall.
 Never delete a managed worktree by hand while a run is active. Preservation is
 the safe default for conflicts and failed attempts.
 
+## Run hygiene
+
+BILDR keeps the registered coordination checkout read-only and requires it to
+be clean at run preflight. Mutable work uses separate managed worktrees.
+
+On a successful completion, BILDR removes clean managed worktrees without
+`--force`, prunes stale Git worktree registrations, and marks the database rows
+`REMOVED`. One background hygiene lane serializes deletions without blocking
+normal orchestration. BILDR retains a worktree when an agent or lease is active,
+the operator has pinned it, or Git finds tracked or untracked source changes. The
+`run.hygiene.completed` event reports `clean` or `attention_required` and lists
+anything retained. Failed and canceled runs remain preserved for diagnosis.
+The policy is bound when a run is created. An upgrade does not automatically
+delete worktrees that belong to older runs.
+
+Retries keep the current and immediately previous task worktrees for direct
+continuity. Older retry worktrees are compacted when they are clean and safe;
+their Git commits and durable evidence remain available.
+
+Controller-run commands use disposable command-local temporary, home, cache,
+config, data, and state directories unless a command explicitly needs an
+allowlisted host location. BILDR copies required logs into the
+content-addressed artifact store before deleting the spool. It does not
+automatically prune shared Cargo, npm, Gradle, Docker, compiler, or
+operating-system caches.
+
 ## Codex compatibility upgrade
 
 The protocol tuple is deliberate. To evaluate a new Codex CLI:

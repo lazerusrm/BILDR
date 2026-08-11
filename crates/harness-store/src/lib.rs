@@ -442,4 +442,51 @@ mod tests {
             6_000_000
         );
     }
+
+    #[test]
+    fn worktree_removal_state_waits_for_path_lease_release() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::in_memory(&temp.path().join("artifacts")).unwrap();
+        {
+            let connection = store.connection().unwrap();
+            connection
+                .pragma_update(None, "foreign_keys", false)
+                .unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO worktrees(id,run_id,task_attempt_id,kind,path,base_sha,state,created_at,version)
+                       VALUES('worktree-a','run-a','attempt-a','task','/tmp/worktree-a','base','PRESERVED',1,1);
+                     INSERT INTO path_leases(id,run_id,task_attempt_id,path_glob,normalized_prefix,lease_kind,base_sha,acquired_at,heartbeat_at,expires_at)
+                       VALUES('lease-a','run-a','attempt-a','src/**','src','write','base',1,1,9223372036854775807);",
+                )
+                .unwrap();
+        }
+        let worktree_id = harness_domain::WorktreeId::from("worktree-a");
+        let attempt_id = harness_domain::AttemptId::from("attempt-a");
+        assert!(store.worktree_has_active_path_lease(&worktree_id).unwrap());
+
+        store
+            .release_path_leases(&attempt_id, "fixture completed")
+            .unwrap();
+        assert!(!store.worktree_has_active_path_lease(&worktree_id).unwrap());
+        store.mark_worktree_removed(&worktree_id).unwrap();
+
+        let worktree = store
+            .list_worktrees(None)
+            .unwrap()
+            .into_iter()
+            .find(|worktree| worktree.id == worktree_id)
+            .unwrap();
+        assert_eq!(worktree.state, "REMOVED");
+        let removed_at: Option<i64> = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT removed_at FROM worktrees WHERE id='worktree-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(removed_at.is_some());
+    }
 }
