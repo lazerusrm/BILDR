@@ -6,7 +6,7 @@
   "target_failure_classes": ["context_budget_exhaustion"],
   "hypothesis": "Ordering task authority before large supporting sources will reduce truncation without losing required authority.",
   "edits": [{
-    "component_id": "context.selection.order",
+    "component_id": "context_source_ordering",
     "operation": "replace",
     "before_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "after_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",

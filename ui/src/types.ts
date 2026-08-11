@@ -27,21 +27,21 @@ export type RunState =
 
 export interface ComponentStatus {
   state: string;
-  detail?: string;
+  detail: string | null;
 }
 
 export interface RuntimeStatus {
   daemon: ComponentStatus;
   codex: {
     state: string;
-    detail?: string;
-    version?: string;
-    required_version?: string;
-    protocol_schema_sha256?: string;
+    detail: string | null;
+    version: string | null;
+    required_version: string | null;
+    protocol_schema_sha256: string | null;
     schema_match: boolean;
     native_multi_agent: boolean;
-    native_multi_agent_feature?: string;
-    pid?: number;
+    native_multi_agent_feature: string | null;
+    pid: number | null;
     restart_count: number;
   };
   database: ComponentStatus;
@@ -54,6 +54,17 @@ export interface RuntimeStatus {
     active_verifiers: number;
     max_verifiers: number;
     queued_tasks: number;
+  };
+  self_improvement: {
+    configured_mode: "disabled" | "observe_only";
+    effective_mode: "disabled" | "observe_only";
+    anchor_sha256: string;
+    configured_anchor_sha256: string;
+    anchor_match: boolean;
+    observation_enabled: boolean;
+    candidate_generation_enabled: boolean;
+    candidate_execution_enabled: boolean;
+    detail: string | null;
   };
 }
 

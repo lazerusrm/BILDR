@@ -21,13 +21,27 @@
         "additionalProperties": false,
         "required": ["component_id", "operation", "before_digest", "after_digest", "risk_class", "rationale"],
         "properties": {
-          "component_id": {"type": "string", "minLength": 1},
+          "component_id": {"enum": ["context_source_ordering", "token_budget", "read_only_probe_parameters", "retry_timing", "cache_summary_policy", "role_prompts", "planning_contracts", "skills", "procedural_memory", "model_effort_routing", "delegation_strategy", "validator_selection", "validator_thresholds", "knowledge_retrieval", "compaction_handoff"]},
           "operation": {"enum": ["add", "delete", "replace"]},
           "before_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
           "after_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
           "risk_class": {"enum": ["green", "amber"]},
           "rationale": {"type": "string", "minLength": 1}
-        }
+        },
+        "oneOf": [
+          {
+            "properties": {
+              "component_id": {"enum": ["context_source_ordering", "token_budget", "read_only_probe_parameters", "retry_timing", "cache_summary_policy"]},
+              "risk_class": {"const": "green"}
+            }
+          },
+          {
+            "properties": {
+              "component_id": {"enum": ["role_prompts", "planning_contracts", "skills", "procedural_memory", "model_effort_routing", "delegation_strategy", "validator_selection", "validator_thresholds", "knowledge_retrieval", "compaction_handoff"]},
+              "risk_class": {"const": "amber"}
+            }
+          }
+        ]
       }
     },
     "predictions": {
@@ -61,5 +75,17 @@
     "rollback_bundle_id": {"type": "string", "minLength": 1},
     "state": {"enum": ["proposed", "validated", "rejected", "experiment_ready", "superseded"]},
     "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
-  }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"risk_class": {"const": "green"}}},
+      "then": {
+        "properties": {
+          "edits": {
+            "items": {"properties": {"risk_class": {"const": "green"}}}
+          }
+        }
+      }
+    }
+  ]
 }

@@ -1059,7 +1059,7 @@ function TopBar({
       <div className="top-spacer" />
       <div
         className={`top-pill ${runtime?.codex.state === "ready" ? "healthy" : "unhealthy"}`}
-        title={runtime?.codex.detail}
+        title={runtime?.codex.detail ?? undefined}
       >
         <i className="status-dot" />
         <span>App Server {runtime?.codex.version || "offline"}</span>

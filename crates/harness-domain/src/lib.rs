@@ -602,12 +602,215 @@ pub struct SchedulerStatus {
     pub queued_tasks: u32,
 }
 
+/// Deliberately closed: later modes cannot become active until a reviewed build
+/// adds both the enum member and its capability implementation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImprovementMode {
+    #[default]
+    Disabled,
+    ObserveOnly,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImprovementRuntimeStatus {
+    pub configured_mode: ImprovementMode,
+    pub effective_mode: ImprovementMode,
+    pub anchor_sha256: String,
+    pub configured_anchor_sha256: String,
+    pub anchor_match: bool,
+    pub observation_enabled: bool,
+    pub candidate_generation_enabled: bool,
+    pub candidate_execution_enabled: bool,
+    pub detail: Option<String>,
+}
+
+impl ImprovementRuntimeStatus {
+    #[must_use]
+    pub fn from_config(
+        configured_mode: ImprovementMode,
+        anchor_sha256: &str,
+        configured_anchor_sha256: &str,
+        anchor_match: bool,
+    ) -> Self {
+        let observation_enabled = anchor_match && configured_mode == ImprovementMode::ObserveOnly;
+        Self {
+            configured_mode,
+            effective_mode: if observation_enabled {
+                ImprovementMode::ObserveOnly
+            } else {
+                ImprovementMode::Disabled
+            },
+            anchor_sha256: anchor_sha256.to_owned(),
+            configured_anchor_sha256: configured_anchor_sha256.to_owned(),
+            anchor_match,
+            observation_enabled,
+            // SI-001 exposes no candidate-producing or candidate-running path.
+            candidate_generation_enabled: false,
+            candidate_execution_enabled: false,
+            detail: (!anchor_match).then(|| {
+                "frozen safety-anchor digest mismatch; improvement capabilities are disabled"
+                    .to_owned()
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImprovementDimension {
+    ContextSourceOrdering,
+    TokenBudget,
+    ReadOnlyProbeParameters,
+    RetryTiming,
+    CacheSummaryPolicy,
+    RolePrompts,
+    PlanningContracts,
+    Skills,
+    ProceduralMemory,
+    ModelEffortRouting,
+    DelegationStrategy,
+    ValidatorSelection,
+    ValidatorThresholds,
+    KnowledgeRetrieval,
+    CompactionHandoff,
+    ControllerStateMachines,
+    GitWorktreePathCustody,
+    SandboxNetworkPolicy,
+    ApprovalSemantics,
+    SecretHandlingRedaction,
+    EvidenceResultSemantics,
+    TasksetHoldoutAccess,
+    GraderPromotionIsolation,
+    ExternalWritesPublicationMerge,
+    DatabaseIntegrityMigration,
+    FrozenSafetyAnchor,
+}
+
+impl ImprovementDimension {
+    #[must_use]
+    pub const fn risk_class(self) -> ImprovementRiskClass {
+        match self {
+            Self::ContextSourceOrdering
+            | Self::TokenBudget
+            | Self::ReadOnlyProbeParameters
+            | Self::RetryTiming
+            | Self::CacheSummaryPolicy => ImprovementRiskClass::Green,
+            Self::RolePrompts
+            | Self::PlanningContracts
+            | Self::Skills
+            | Self::ProceduralMemory
+            | Self::ModelEffortRouting
+            | Self::DelegationStrategy
+            | Self::ValidatorSelection
+            | Self::ValidatorThresholds
+            | Self::KnowledgeRetrieval
+            | Self::CompactionHandoff => ImprovementRiskClass::Amber,
+            _ => ImprovementRiskClass::Red,
+        }
+    }
+}
+
+impl FromStr for ImprovementDimension {
+    type Err = CandidateEditValidationError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let dimension = match value {
+            "context_source_ordering" => Self::ContextSourceOrdering,
+            "token_budget" => Self::TokenBudget,
+            "read_only_probe_parameters" => Self::ReadOnlyProbeParameters,
+            "retry_timing" => Self::RetryTiming,
+            "cache_summary_policy" => Self::CacheSummaryPolicy,
+            "role_prompts" => Self::RolePrompts,
+            "planning_contracts" => Self::PlanningContracts,
+            "skills" => Self::Skills,
+            "procedural_memory" => Self::ProceduralMemory,
+            "model_effort_routing" => Self::ModelEffortRouting,
+            "delegation_strategy" => Self::DelegationStrategy,
+            "validator_selection" => Self::ValidatorSelection,
+            "validator_thresholds" => Self::ValidatorThresholds,
+            "knowledge_retrieval" => Self::KnowledgeRetrieval,
+            "compaction_handoff" => Self::CompactionHandoff,
+            "controller_state_machines" => Self::ControllerStateMachines,
+            "git_worktree_path_custody" => Self::GitWorktreePathCustody,
+            "sandbox_network_policy" => Self::SandboxNetworkPolicy,
+            "approval_semantics" => Self::ApprovalSemantics,
+            "secret_handling_redaction" => Self::SecretHandlingRedaction,
+            "evidence_result_semantics" => Self::EvidenceResultSemantics,
+            "taskset_holdout_access" => Self::TasksetHoldoutAccess,
+            "grader_promotion_isolation" => Self::GraderPromotionIsolation,
+            "external_writes_publication_merge" => Self::ExternalWritesPublicationMerge,
+            "database_integrity_migration" => Self::DatabaseIntegrityMigration,
+            "frozen_safety_anchor" => Self::FrozenSafetyAnchor,
+            _ => {
+                return Err(CandidateEditValidationError::UnknownDimension(
+                    value.to_owned(),
+                ));
+            }
+        };
+        Ok(dimension)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImprovementRiskClass {
+    Green,
+    Amber,
+    Red,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum CandidateEditValidationError {
+    #[error("unknown improvement dimension: {0}")]
+    UnknownDimension(String),
+    #[error("protected Red improvement dimension: {0}")]
+    ProtectedDimension(String),
+    #[error("improvement dimension {dimension} requires risk class {expected:?}, not {actual:?}")]
+    ContradictoryRiskClass {
+        dimension: String,
+        expected: ImprovementRiskClass,
+        actual: ImprovementRiskClass,
+    },
+}
+
+/// Candidate edits are limited to the explicit Green and Amber action space.
+pub fn validate_candidate_edit_dimension(
+    value: &str,
+) -> Result<ImprovementDimension, CandidateEditValidationError> {
+    let dimension = ImprovementDimension::from_str(value)?;
+    if dimension.risk_class() == ImprovementRiskClass::Red {
+        return Err(CandidateEditValidationError::ProtectedDimension(
+            value.to_owned(),
+        ));
+    }
+    Ok(dimension)
+}
+
+/// A wire candidate must label each editable dimension with its fixed taxonomy.
+pub fn validate_candidate_edit(
+    value: &str,
+    risk_class: ImprovementRiskClass,
+) -> Result<ImprovementDimension, CandidateEditValidationError> {
+    let dimension = validate_candidate_edit_dimension(value)?;
+    let expected = dimension.risk_class();
+    if risk_class != expected {
+        return Err(CandidateEditValidationError::ContradictoryRiskClass {
+            dimension: value.to_owned(),
+            expected,
+            actual: risk_class,
+        });
+    }
+    Ok(dimension)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeStatus {
     pub daemon: ComponentStatus,
     pub codex: CodexRuntimeStatus,
     pub database: ComponentStatus,
     pub scheduler: SchedulerStatus,
+    pub self_improvement: ImprovementRuntimeStatus,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -880,5 +1083,53 @@ mod tests {
             ..TokenUsage::default()
         };
         assert!(usage.validate().is_err());
+    }
+
+    #[test]
+    fn candidate_edits_reject_all_red_and_unknown_dimensions() {
+        for dimension in [
+            "controller_state_machines",
+            "git_worktree_path_custody",
+            "sandbox_network_policy",
+            "approval_semantics",
+            "secret_handling_redaction",
+            "evidence_result_semantics",
+            "taskset_holdout_access",
+            "grader_promotion_isolation",
+            "external_writes_publication_merge",
+            "database_integrity_migration",
+            "frozen_safety_anchor",
+        ] {
+            assert!(matches!(
+                validate_candidate_edit_dimension(dimension),
+                Err(CandidateEditValidationError::ProtectedDimension(_))
+            ));
+        }
+        assert!(matches!(
+            validate_candidate_edit_dimension("a_later_dimension"),
+            Err(CandidateEditValidationError::UnknownDimension(_))
+        ));
+        assert!(validate_candidate_edit_dimension("context_source_ordering").is_ok());
+        assert!(validate_candidate_edit_dimension("role_prompts").is_ok());
+    }
+
+    #[test]
+    fn candidate_edit_risk_must_match_the_fixed_dimension_taxonomy() {
+        assert!(
+            validate_candidate_edit("context_source_ordering", ImprovementRiskClass::Green).is_ok()
+        );
+        assert!(validate_candidate_edit("role_prompts", ImprovementRiskClass::Amber).is_ok());
+        assert!(matches!(
+            validate_candidate_edit("role_prompts", ImprovementRiskClass::Green),
+            Err(CandidateEditValidationError::ContradictoryRiskClass { .. })
+        ));
+        assert!(matches!(
+            validate_candidate_edit("frozen_safety_anchor", ImprovementRiskClass::Red),
+            Err(CandidateEditValidationError::ProtectedDimension(_))
+        ));
+        assert!(matches!(
+            validate_candidate_edit("later_dimension", ImprovementRiskClass::Green),
+            Err(CandidateEditValidationError::UnknownDimension(_))
+        ));
     }
 }

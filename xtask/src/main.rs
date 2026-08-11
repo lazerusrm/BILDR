@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -12,6 +12,13 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 const SCHEMA_DIGEST_ENCODING: &str = "normalized-compact-json";
+const JSON_SCHEMA_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
+
+#[derive(Clone, Debug)]
+struct SchemaDocument {
+    path: PathBuf,
+    value: Value,
+}
 
 #[derive(Parser)]
 #[command(name = "cargo xtask", version, about = "BILDR build tasks")]
@@ -107,20 +114,12 @@ fn check(root: &Path) -> Result<()> {
 }
 
 fn schema_check(root: &Path) -> Result<()> {
-    let mut checked = 0_usize;
-    for directory in [root.join("schemas"), root.join("examples")] {
-        for entry in WalkDir::new(directory).into_iter().filter_map(Result::ok) {
-            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-            let _: Value = serde_json::from_slice(&fs::read(entry.path())?)
-                .with_context(|| format!("invalid JSON: {}", entry.path().display()))?;
-            checked += 1;
-        }
+    let schemas = load_schema_catalog(&root.join("schemas"))?;
+    let registry = schema_registry(&schemas)?;
+    for schema in schemas.values() {
+        compile_schema(&schema.path, &schema.value, &registry)?;
     }
-    if checked < 4 {
-        bail!("expected schemas and examples, found only {checked} JSON files")
-    }
+    let examples = validate_schema_examples(&root.join("examples"), &schemas, &registry)?;
     let _: toml::Value = toml::from_str(&fs::read_to_string(
         root.join("config/harness.example.toml"),
     )?)?;
@@ -130,8 +129,157 @@ fn schema_check(root: &Path) -> Result<()> {
     let _: toml::Value = toml::from_str(&fs::read_to_string(
         root.join("profiles/general/profile.toml"),
     )?)?;
-    println!("schema-check: {checked} JSON files and both TOML profiles parsed");
+    println!(
+        "schema-check: {} Draft 2020-12 schemas and {examples} examples conform; config and profiles parsed",
+        schemas.len()
+    );
     Ok(())
+}
+
+fn load_schema_catalog(directory: &Path) -> Result<BTreeMap<String, SchemaDocument>> {
+    let mut documents = BTreeMap::new();
+    let mut ids = BTreeMap::<String, PathBuf>::new();
+    for path in json_paths(directory)? {
+        let value = read_json(&path)?;
+        if value.get("$schema").and_then(Value::as_str) != Some(JSON_SCHEMA_2020_12) {
+            bail!(
+                "schema {} must declare {JSON_SCHEMA_2020_12}",
+                path.display()
+            )
+        }
+        let id = required_string(&value, "$id", &path)?;
+        if let Some(first) = ids.insert(id.to_owned(), path.clone()) {
+            bail!(
+                "duplicate schema $id {id} in {} and {}",
+                first.display(),
+                path.display()
+            )
+        }
+        let discriminator = value
+            .pointer("/properties/schema/const")
+            .and_then(Value::as_str)
+            .with_context(|| {
+                format!(
+                    "schema {} has no string properties.schema.const discriminator",
+                    path.display()
+                )
+            })?;
+        let discriminator = discriminator.to_owned();
+        if let Some(first) = documents.insert(
+            discriminator.clone(),
+            SchemaDocument {
+                path: path.clone(),
+                value,
+            },
+        ) {
+            bail!(
+                "duplicate schema discriminator {discriminator} in {} and {}",
+                first.path.display(),
+                path.display()
+            )
+        }
+    }
+    if documents.is_empty() {
+        bail!("no JSON schemas found under {}", directory.display())
+    }
+    Ok(documents)
+}
+
+fn schema_registry(schemas: &BTreeMap<String, SchemaDocument>) -> Result<jsonschema::Registry<'_>> {
+    let mut registry = jsonschema::Registry::new();
+    for schema in schemas.values() {
+        let id = required_string(&schema.value, "$id", &schema.path)?;
+        registry = registry
+            .add(id, &schema.value)
+            .with_context(|| format!("invalid schema $id {id} in {}", schema.path.display()))?;
+    }
+    registry
+        .prepare()
+        .context("failed to prepare local JSON Schema registry")
+}
+
+fn validate_schema_examples(
+    directory: &Path,
+    schemas: &BTreeMap<String, SchemaDocument>,
+    registry: &jsonschema::Registry<'_>,
+) -> Result<usize> {
+    let openapi_examples = directory.join("openapi");
+    let paths = json_paths(directory)?
+        .into_iter()
+        .filter(|path| !path.starts_with(&openapi_examples))
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        bail!("no JSON examples found under {}", directory.display())
+    }
+    for path in &paths {
+        let value = read_json(path)?;
+        validate_schema_example(path, &value, schemas, registry)?;
+    }
+    Ok(paths.len())
+}
+
+fn validate_schema_example(
+    path: &Path,
+    value: &Value,
+    schemas: &BTreeMap<String, SchemaDocument>,
+    registry: &jsonschema::Registry<'_>,
+) -> Result<()> {
+    let discriminator = required_string(value, "schema", path)?;
+    let schema = schemas.get(discriminator).with_context(|| {
+        format!(
+            "example {} names undocumented schema {discriminator}",
+            path.display()
+        )
+    })?;
+    let validator = compile_schema(&schema.path, &schema.value, registry)?;
+    if let Err(error) = validator.validate(value) {
+        bail!(
+            "example {} does not conform to {}: {error}",
+            path.display(),
+            schema.path.display()
+        )
+    }
+    Ok(())
+}
+
+fn compile_schema(
+    path: &Path,
+    value: &Value,
+    registry: &jsonschema::Registry<'_>,
+) -> Result<jsonschema::Validator> {
+    jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .with_registry(registry)
+        .should_validate_formats(true)
+        .build(value)
+        .with_context(|| format!("invalid Draft 2020-12 schema: {}", path.display()))
+}
+
+fn required_string<'a>(value: &'a Value, key: &str, path: &Path) -> Result<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("{} has no non-empty {key}", path.display()))
+}
+
+fn read_json(path: &Path) -> Result<Value> {
+    serde_json::from_slice(&fs::read(path)?)
+        .with_context(|| format!("invalid JSON: {}", path.display()))
+}
+
+fn json_paths(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in WalkDir::new(directory) {
+        let entry = entry.with_context(|| format!("cannot walk {}", directory.display()))?;
+        if entry.file_type().is_file()
+            && entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+        {
+            paths.push(entry.into_path());
+        }
+    }
+    paths.sort();
+    Ok(paths)
 }
 
 fn openapi_check(root: &Path) -> Result<()> {
@@ -151,6 +299,16 @@ fn openapi_check(root: &Path) -> Result<()> {
         if yaml_pointer(&value, pointer).is_none() {
             bail!("unresolved OpenAPI reference #{pointer}")
         }
+    }
+    let runtime_status_schema = runtime_status_schema(&value)?;
+    let runtime_status_fixture =
+        read_json(&root.join("examples/openapi/runtime-status.example.json"))?;
+    let registry = jsonschema::Registry::new()
+        .prepare()
+        .context("failed to prepare OpenAPI JSON Schema registry")?;
+    let runtime_status_validator = compile_schema(&path, &runtime_status_schema, &registry)?;
+    if let Err(error) = runtime_status_validator.validate(&runtime_status_fixture) {
+        bail!("RuntimeStatus fixture does not conform to OpenAPI: {error}")
     }
     let documented_routes = mapping
         .get("paths")
@@ -179,11 +337,28 @@ fn openapi_check(root: &Path) -> Result<()> {
         )
     }
     println!(
-        "openapi-check: {} local references resolved; {} router paths match",
+        "openapi-check: {} local references resolved; RuntimeStatus fixture conforms; {} router paths match",
         pointers.len(),
         documented_routes.len()
     );
     Ok(())
+}
+
+fn runtime_status_schema(openapi: &serde_yaml::Value) -> Result<Value> {
+    let mut schema = serde_json::to_value(openapi)
+        .context("OpenAPI document cannot be represented as JSON Schema input")?;
+    let object = schema
+        .as_object_mut()
+        .context("OpenAPI JSON Schema input must be an object")?;
+    object.insert(
+        "$schema".to_owned(),
+        Value::String(JSON_SCHEMA_2020_12.to_owned()),
+    );
+    object.insert(
+        "$ref".to_owned(),
+        Value::String("#/components/schemas/RuntimeStatus".to_owned()),
+    );
+    Ok(schema)
 }
 
 fn rust_router_paths(source: &str) -> BTreeSet<String> {
@@ -550,6 +725,7 @@ fn normalize_json(value: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn canonical_json_digest_ignores_object_order() {
@@ -559,6 +735,195 @@ mod tests {
         assert_eq!(
             canonical_json_sha256(first).unwrap(),
             canonical_json_sha256(reordered).unwrap()
+        );
+    }
+
+    #[test]
+    fn schema_compilation_rejects_malformed_keywords_and_references() {
+        let registry = jsonschema::Registry::new().prepare().unwrap();
+        let malformed = json!({
+            "$schema": JSON_SCHEMA_2020_12,
+            "$id": "urn:harness:malformed",
+            "type": 42
+        });
+        assert!(compile_schema(Path::new("malformed.json"), &malformed, &registry).is_err());
+
+        let unresolved = json!({
+            "$schema": JSON_SCHEMA_2020_12,
+            "$id": "urn:harness:unresolved",
+            "$ref": "#/$defs/missing"
+        });
+        assert!(compile_schema(Path::new("unresolved.json"), &unresolved, &registry).is_err());
+    }
+
+    #[test]
+    fn schema_catalog_rejects_missing_or_duplicate_identity() {
+        let missing_id = tempfile::tempdir().unwrap();
+        fs::write(
+            missing_id.path().join("schema.json"),
+            json!({
+                "$schema": JSON_SCHEMA_2020_12,
+                "properties": {"schema": {"const": "harness.example.v1"}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(load_schema_catalog(missing_id.path()).is_err());
+
+        let missing_discriminator = tempfile::tempdir().unwrap();
+        fs::write(
+            missing_discriminator.path().join("schema.json"),
+            json!({
+                "$schema": JSON_SCHEMA_2020_12,
+                "$id": "urn:harness:missing-discriminator"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(load_schema_catalog(missing_discriminator.path()).is_err());
+
+        let duplicate_id = tempfile::tempdir().unwrap();
+        for (name, discriminator) in [
+            ("first", "harness.first.v1"),
+            ("second", "harness.second.v1"),
+        ] {
+            fs::write(
+                duplicate_id.path().join(format!("{name}.json")),
+                json!({
+                    "$schema": JSON_SCHEMA_2020_12,
+                    "$id": "urn:harness:duplicate",
+                    "properties": {"schema": {"const": discriminator}}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        assert!(load_schema_catalog(duplicate_id.path()).is_err());
+
+        let duplicate_discriminator = tempfile::tempdir().unwrap();
+        for name in ["first", "second"] {
+            fs::write(
+                duplicate_discriminator.path().join(format!("{name}.json")),
+                json!({
+                    "$schema": JSON_SCHEMA_2020_12,
+                    "$id": format!("urn:harness:{name}"),
+                    "properties": {"schema": {"const": "harness.example.v1"}}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        assert!(load_schema_catalog(duplicate_discriminator.path()).is_err());
+    }
+
+    #[test]
+    fn schema_compilation_resolves_catalog_references() {
+        let root = json!({
+            "$schema": JSON_SCHEMA_2020_12,
+            "$id": "urn:harness:root",
+            "type": "object",
+            "properties": {"value": {"$ref": "urn:harness:target"}}
+        });
+        let target =
+            json!({"$schema": JSON_SCHEMA_2020_12, "$id": "urn:harness:target", "type": "string"});
+        let catalog = BTreeMap::from([
+            (
+                "harness.root.v1".to_owned(),
+                SchemaDocument {
+                    path: PathBuf::from("root.json"),
+                    value: root,
+                },
+            ),
+            (
+                "harness.target.v1".to_owned(),
+                SchemaDocument {
+                    path: PathBuf::from("target.json"),
+                    value: target,
+                },
+            ),
+        ]);
+        let registry = schema_registry(&catalog).unwrap();
+        let validator = compile_schema(
+            &catalog["harness.root.v1"].path,
+            &catalog["harness.root.v1"].value,
+            &registry,
+        )
+        .unwrap();
+        assert!(validator.is_valid(&json!({"value": "resolved"})));
+        assert!(!validator.is_valid(&json!({"value": 42})));
+    }
+
+    #[test]
+    fn candidate_schema_enforces_component_risk_pairings() {
+        let registry = jsonschema::Registry::new().prepare().unwrap();
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../schemas/harness.improvement-candidate.v1.schema.json"
+        ))
+        .unwrap();
+        let validator =
+            compile_schema(Path::new("candidate.schema.json"), &schema, &registry).unwrap();
+        let example: Value = serde_json::from_str(include_str!(
+            "../../examples/self-improvement/candidate.example.json"
+        ))
+        .unwrap();
+        assert!(validator.is_valid(&example));
+
+        let mut role_prompts_green = example.clone();
+        role_prompts_green["edits"][0]["component_id"] = json!("role_prompts");
+        assert!(!validator.is_valid(&role_prompts_green));
+
+        let mut underclassified = example.clone();
+        underclassified["edits"][0]["component_id"] = json!("role_prompts");
+        underclassified["edits"][0]["risk_class"] = json!("amber");
+        assert!(!validator.is_valid(&underclassified));
+
+        for component_id in ["frozen_safety_anchor", "unknown_component"] {
+            let mut forbidden = example.clone();
+            forbidden["edits"][0]["component_id"] = json!(component_id);
+            assert!(!validator.is_valid(&forbidden));
+        }
+    }
+
+    #[test]
+    fn example_validation_rejects_unknown_discriminators_and_extra_fields() {
+        let schema_path = PathBuf::from("shape.schema.json");
+        let schema = json!({
+            "$schema": JSON_SCHEMA_2020_12,
+            "$id": "urn:harness:shape.v1",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["schema", "value"],
+            "properties": {
+                "schema": {"const": "harness.shape.v1"},
+                "value": {"type": "string"}
+            }
+        });
+        let catalog = BTreeMap::from([(
+            "harness.shape.v1".to_owned(),
+            SchemaDocument {
+                path: schema_path,
+                value: schema,
+            },
+        )]);
+        let registry = schema_registry(&catalog).unwrap();
+
+        assert!(
+            validate_schema_example(
+                Path::new("unknown.json"),
+                &json!({"schema": "harness.shape.v2", "value": "ok"}),
+                &catalog,
+                &registry,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_schema_example(
+                Path::new("extra.json"),
+                &json!({"schema": "harness.shape.v1", "value": "ok", "extra": true}),
+                &catalog,
+                &registry,
+            )
+            .is_err()
         );
     }
 }

@@ -1305,6 +1305,7 @@ impl Orchestrator {
                 max_verifiers: self.config.orchestration.max_independent_verifiers,
                 queued_tasks,
             },
+            self_improvement: self.config.self_improvement_runtime_status(),
         }
     }
 

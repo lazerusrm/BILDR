@@ -7,12 +7,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use harness_domain::{PricingSnapshot, ResourceClass};
+use harness_domain::{ImprovementMode, ImprovementRuntimeStatus, PricingSnapshot, ResourceClass};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const DEFAULT_CONFIG: &str = include_str!("../../../config/harness.example.toml");
+const FROZEN_SAFETY_ANCHOR: &str =
+    include_str!("../../../config/self-improvement/frozen-safety-anchor.v1.md");
+/// SHA-256 of `config/self-improvement/frozen-safety-anchor.v1.md` bytes.
+pub const FROZEN_SAFETY_ANCHOR_SHA256: &str =
+    "197cd971adb684a42509253054dc6987910a5b35fceac0d7f208449d42e50d77";
 const GENERAL_PROFILE: &str = include_str!("../../../profiles/general/profile.toml");
 const BILDR_PROFILE: &str = include_str!("../../../profiles/bildr/profile.toml");
 
@@ -29,6 +34,8 @@ pub struct HarnessConfig {
     pub storage: StorageConfig,
     pub usage: UsageConfig,
     pub pricing: PricingConfig,
+    #[serde(default)]
+    pub self_improvement: SelfImprovementConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -133,6 +140,29 @@ pub struct UsageConfig {
 #[serde(deny_unknown_fields)]
 pub struct PricingConfig {
     pub snapshots: Vec<PriceSnapshotConfig>,
+}
+
+/// The only shipped improvement capability is passive observation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelfImprovementConfig {
+    #[serde(default)]
+    pub mode: ImprovementMode,
+    #[serde(default = "default_frozen_safety_anchor_sha256")]
+    pub safety_anchor_sha256: String,
+}
+
+impl Default for SelfImprovementConfig {
+    fn default() -> Self {
+        Self {
+            mode: ImprovementMode::Disabled,
+            safety_anchor_sha256: default_frozen_safety_anchor_sha256(),
+        }
+    }
+}
+
+fn default_frozen_safety_anchor_sha256() -> String {
+    FROZEN_SAFETY_ANCHOR_SHA256.to_owned()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -366,6 +396,19 @@ impl HarnessConfig {
             snapshot.to_domain()?;
         }
         Ok(())
+    }
+
+    #[must_use]
+    pub fn self_improvement_runtime_status(&self) -> ImprovementRuntimeStatus {
+        let calculated = hex::encode(Sha256::digest(FROZEN_SAFETY_ANCHOR.as_bytes()));
+        let anchor_match = calculated == FROZEN_SAFETY_ANCHOR_SHA256
+            && self.self_improvement.safety_anchor_sha256 == FROZEN_SAFETY_ANCHOR_SHA256;
+        ImprovementRuntimeStatus::from_config(
+            self.self_improvement.mode,
+            FROZEN_SAFETY_ANCHOR_SHA256,
+            &self.self_improvement.safety_anchor_sha256,
+            anchor_match,
+        )
     }
 
     pub fn resolve_paths(&self) -> Result<ResolvedPaths, ProfileError> {
@@ -902,6 +945,34 @@ mod tests {
         validate_profile(&general).expect("general profile validates");
         assert_eq!(general.repository, "*");
         assert!(!general.validation_policy.require_draft_pr_ci);
+        let improvement = config.self_improvement_runtime_status();
+        assert_eq!(improvement.effective_mode, ImprovementMode::Disabled);
+        assert!(improvement.anchor_match);
+        assert!(!improvement.candidate_generation_enabled);
+        assert!(!improvement.candidate_execution_enabled);
+    }
+
+    #[test]
+    fn frozen_anchor_digest_is_reproducible_and_mismatch_fails_closed() {
+        assert_eq!(
+            hex::encode(Sha256::digest(FROZEN_SAFETY_ANCHOR.as_bytes())),
+            FROZEN_SAFETY_ANCHOR_SHA256
+        );
+        let mut config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
+        config.self_improvement.mode = ImprovementMode::ObserveOnly;
+        config.self_improvement.safety_anchor_sha256 = "not-a-digest".to_owned();
+        let status = config.self_improvement_runtime_status();
+        assert_eq!(status.effective_mode, ImprovementMode::Disabled);
+        assert!(!status.anchor_match);
+        assert!(!status.observation_enabled);
+        assert_eq!(status.configured_anchor_sha256, "not-a-digest");
+    }
+
+    #[test]
+    fn unsupported_improvement_modes_cannot_enable_future_capabilities() {
+        let unsupported =
+            DEFAULT_CONFIG.replace("mode = \"disabled\"", "mode = \"shadow_allowed\"");
+        assert!(toml::from_str::<HarnessConfig>(&unsupported).is_err());
     }
 
     #[test]

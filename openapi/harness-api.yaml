@@ -1124,30 +1124,35 @@ components:
     RuntimeStatus:
       type: object
       additionalProperties: false
-      required: [daemon, codex, database, scheduler]
+      required: [daemon, codex, database, scheduler, self_improvement]
       properties:
         daemon: {$ref: '#/components/schemas/ComponentStatus'}
         codex: {$ref: '#/components/schemas/CodexRuntime'}
         database: {$ref: '#/components/schemas/ComponentStatus'}
         scheduler: {$ref: '#/components/schemas/SchedulerStatus'}
+        self_improvement: {$ref: '#/components/schemas/SelfImprovementRuntimeStatus'}
     ComponentStatus:
       type: object
       additionalProperties: false
-      required: [state]
+      required: [state, detail]
       properties:
         state: {enum: [ready, degraded, unavailable, disabled]}
-        detail: {type: string}
+        detail: {type: [string, 'null']}
     CodexRuntime:
-      allOf:
-        - {$ref: '#/components/schemas/ComponentStatus'}
-        - type: object
-          properties:
-            version: {type: string}
-            required_version: {type: string}
-            protocol_schema_sha256: {type: string}
-            schema_match: {type: boolean}
-            pid: {type: integer}
-            restart_count: {type: integer}
+      type: object
+      additionalProperties: false
+      required: [state, detail, version, required_version, protocol_schema_sha256, schema_match, native_multi_agent, native_multi_agent_feature, pid, restart_count]
+      properties:
+        state: {enum: [ready, degraded, unavailable, disabled, starting]}
+        detail: {type: [string, 'null']}
+        version: {type: [string, 'null']}
+        required_version: {type: [string, 'null']}
+        protocol_schema_sha256: {type: [string, 'null']}
+        schema_match: {type: boolean}
+        native_multi_agent: {type: boolean}
+        native_multi_agent_feature: {type: [string, 'null']}
+        pid: {type: [integer, 'null']}
+        restart_count: {type: integer}
     SchedulerStatus:
       type: object
       additionalProperties: false
@@ -1161,6 +1166,20 @@ components:
         active_verifiers: {type: integer}
         max_verifiers: {type: integer}
         queued_tasks: {type: integer}
+    SelfImprovementRuntimeStatus:
+      type: object
+      additionalProperties: false
+      required: [configured_mode, effective_mode, anchor_sha256, configured_anchor_sha256, anchor_match, observation_enabled, candidate_generation_enabled, candidate_execution_enabled, detail]
+      properties:
+        configured_mode: {enum: [disabled, observe_only]}
+        effective_mode: {enum: [disabled, observe_only]}
+        anchor_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        configured_anchor_sha256: {type: string}
+        anchor_match: {type: boolean}
+        observation_enabled: {type: boolean}
+        candidate_generation_enabled: {type: boolean}
+        candidate_execution_enabled: {type: boolean}
+        detail: {type: [string, 'null']}
     CodexAccountsSnapshot:
       type: object
       additionalProperties: false
