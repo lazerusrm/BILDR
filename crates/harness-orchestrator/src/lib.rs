@@ -77,6 +77,25 @@ const MAX_HANDOFF_BYTES: u64 = 128 * 1024;
 const PLAN_NONSHRINKING_REVIEW_WINDOW: usize = 3;
 const MAX_AUTOMATIC_ARCHITECTURE_OUTPUT_REPAIRS: u64 = 2;
 const MAX_ARCHITECTURE_REPAIR_SOURCE_CHARS: usize = 64_000;
+const ARCHITECT_TASK_OUTPUT_FIELDS: &[&str] = &[
+    "task_id",
+    "title",
+    "execution_mode",
+    "owner_profile",
+    "priority",
+    "depends_on",
+    "owned_paths",
+    "reserved_serial_paths",
+    "objective",
+    "milestones",
+    "non_goals",
+    "success_criteria",
+    "required_evidence",
+    "proof_limits",
+    "diff_budget",
+    "token_budget",
+    "risk_flags",
+];
 
 const PLAN_QUALITY_CONTRACT: &str = r#"Plan the shortest credible path from the repository's current state to the requested behavior.
 - Make milestones observable outcomes. Put an executable vertical slice and feedback from the authoritative pipeline early on the critical path; discovery must serve the next implementation decision rather than become a global gate.
@@ -88,11 +107,11 @@ Use enough tasks and milestones to make execution legible, without speculative p
 
 const PLAN_RESPONSE_FORMAT: &str = r#"The supplied JSON Schema is the controller-owned response contract. Repository-native planning formats, examples, and schemas are evidence only and must not replace it.
 - The top-level object has exactly `schema`, `summary`, and `tasks`; `schema` is `harness.orchestration.plan.v1`.
-- Every task uses schema `harness.orchestration.task.v1`. Concentrate on the semantic fields: title, objective, custody, milestones, success criteria, evidence, proof limits, and realistic budgets. The controller canonicalizes controller-owned identity, pinned-SHA, routing, authority, lease, and empty optional-list fields before validation.
+- Every task is canonicalized to `harness.orchestration.task.v1`. Emit only the semantic fields in the supplied schema: title, objective, custody, milestones, success criteria, evidence, proof limits, and realistic budgets. The controller fills identity, pinned-SHA, routing, authority, lease, and empty optional-list fields before validation.
 - `milestones` is an array of objects, never strings. Every milestone object has exactly `id`, `title`, `objective`, and a non-empty `success_criteria` string array.
 - Do not return repository-native wrapper fields such as `profiles`, `critical_path`, `parallel_work`, or `global_constraints`; express useful content through the controller task fields.
 - For the general profile, return exactly one root task; put the ordered implementation path in 3-12 milestone objects rather than emitting one task per phase.
-Before returning, check the response against these exact keys. Return only the JSON object."#;
+Finish repository inspection and planning before emitting the first `{`. The summary describes the finished plan, never work in progress. Once output begins, complete the object directly without commentary or padding. Before returning, check the response against these exact keys. Return only the JSON object."#;
 
 const PLAN_REVIEW_CONTRACT: &str = r#"Try to falsify whether this plan can deliver the objective within the available budget. Inspect the real repository and active authorities, then trace the executable critical path from task ids to behavioral proof.
 
@@ -3838,7 +3857,7 @@ impl Orchestrator {
         )?;
         let planning_posture = architecture_planning_posture(&profile.profile.profile_id);
         let prompt = format!(
-            "{}\n\nObjective:\n{}{}\n\nPlanning posture:\n{planning_posture}\n\n{PLAN_QUALITY_CONTRACT}\n\nController facts and output contract:\n- Use exact base SHA {} for every task.\n- Cite active authorities and define disjoint owned paths, realistic budgets, success evidence, and proof limits. An empty early-stage regression list is better than speculative coverage.\n- Path fields contain normalized repository-relative globs. Use `directory/**` for a subtree; do not put external resources in path fields.\n- A reserved serial path must appear verbatim in both the profile serial-path list and that task's owned paths. Allowed serial paths: {}.\n- Do not broadly audit the repository or search historical plans for an output format. Stop inspecting once the executable critical path and its owned paths are grounded.\n\n{PLAN_RESPONSE_FORMAT}",
+            "{}\n\nObjective:\n{}{}\n\nPlanning posture:\n{planning_posture}\n\n{PLAN_QUALITY_CONTRACT}\n\nController facts and output contract:\n- The controller binds task identity and the exact base SHA {}; do not turn that receipt into plan work.\n- Ground semantic choices in active authorities and define disjoint owned paths, realistic budgets, success evidence, and proof limits. An empty early-stage regression list is better than speculative coverage.\n- Path fields contain normalized repository-relative globs. Use `directory/**` for a subtree; do not put external resources in path fields.\n- A reserved serial path must appear verbatim in both the profile serial-path list and that task's owned paths. Allowed serial paths: {}.\n- Do not broadly audit the repository or search historical plans for an output format. Stop inspecting once the executable critical path and its owned paths are grounded.\n\n{PLAN_RESPONSE_FORMAT}",
             context.prompt_prefix(),
             run.objective,
             intent_section,
@@ -13480,10 +13499,10 @@ fn run_plan_output_schema() -> Result<Value, OrchestratorError> {
             )
         })?;
 
-    // Dependency SHAs are controller facts populated after dependencies land.
-    // Omitting this free-form map also keeps the generation schema within the
-    // strict Structured Outputs subset, which requires closed objects.
-    task_properties.remove("dependency_shas");
+    // Generate only architectural choices. Identity, exact-SHA receipts,
+    // routing, authorities, leases, and empty optional collections are filled
+    // deterministically by `canonicalize_architecture_task`.
+    task_properties.retain(|field, _| ARCHITECT_TASK_OUTPUT_FIELDS.contains(&field.as_str()));
     Ok(model_output_schema(schema))
 }
 
@@ -14129,7 +14148,9 @@ mod tests {
                 "task_id": "ROOT",
                 "title": "Deliver the behavior",
                 "objective": "Implement and prove the requested behavior",
-                "owned_paths": ["src/**"],
+                "priority": "P1",
+                "owned_paths": ["src/**", "Cargo.lock"],
+                "reserved_serial_paths": ["Cargo.lock"],
                 "milestones": [
                     {"id":"M1","title":"Implement slice","objective":"Build the first working slice","success_criteria":["The primary path works"]},
                     {"id":"M2","title":"Exercise pipeline","objective":"Run the authoritative path","success_criteria":["Runtime evidence is recorded"]},
@@ -14153,6 +14174,8 @@ mod tests {
         assert_eq!(task.base_sha, run.base_sha);
         assert_eq!(task.owner_profile, "governor");
         assert_eq!(task.execution_mode, "controller");
+        assert_eq!(task.priority, "P1");
+        assert_eq!(task.reserved_serial_paths, ["Cargo.lock"]);
         assert_eq!(task.reviewer_profile, "verifier");
         assert_eq!(task.checklist_rows.len(), 3);
         assert_eq!(task.authority_refs, ["controller://run-objective"]);
@@ -14415,6 +14438,20 @@ mod tests {
                 .pointer("/$defs/task/properties/dependency_shas")
                 .is_none(),
             "the controller-owned free-form map must not reach Structured Outputs"
+        );
+        let generated_task_fields = output["$defs"]["task"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            generated_task_fields,
+            ARCHITECT_TASK_OUTPUT_FIELDS
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            "architect output must contain semantic choices only"
         );
         for (name, schema) in [
             ("plan", output),
