@@ -56,7 +56,9 @@ safe built-in defaults and the built-in `general` profile. Profiles are bound
 to each repository registration, so one daemon can operate general repositories
 and the BILDR checkout without weakening either. The UI registers new checkouts
 as `general`; use `harnessctl repo add --profile bildr` for this repository's
-stricter contract. The daemon `--profile` flag is
+stricter contract. A custom profile ID resolves from
+`$XDG_CONFIG_HOME/harness-console/profiles/<id>.toml`; an explicit TOML path is
+also accepted when registering from the CLI. The daemon `--profile` flag is
 the default/doctor profile, not a global override for repositories already in
 the database. To install an editable config:
 

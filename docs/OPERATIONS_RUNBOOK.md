@@ -37,6 +37,11 @@ When an XDG variable is absent, normal `~/.config`, `~/.local/share`,
 database are created private to the user. Repository-local `.harness-runtime`
 state is forbidden.
 
+Registered custom profile IDs resolve from
+`$XDG_CONFIG_HOME/harness-console/profiles/<id>.toml`. Keep repository-specific
+policy there when it should not ship as part of BILDR. A missing custom profile
+fails closed and reports the expected installed path.
+
 ## Build and install
 
 ```bash

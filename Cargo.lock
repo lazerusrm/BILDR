@@ -930,6 +930,7 @@ dependencies = [
  "hex",
  "serde",
  "sha2",
+ "tempfile",
  "thiserror",
  "toml",
 ]

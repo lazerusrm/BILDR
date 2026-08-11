@@ -633,7 +633,23 @@ pub fn load_profile(id_or_path: &str, config_dir: &Path) -> Result<LoadedProfile
             (PathBuf::from("builtin:bildr"), BILDR_PROFILE.to_owned())
         }
     } else {
-        let source = PathBuf::from(id_or_path);
+        let requested = PathBuf::from(id_or_path);
+        let installed = profile_id_is_safe(id_or_path).then(|| {
+            config_dir
+                .join("profiles")
+                .join(format!("{id_or_path}.toml"))
+        });
+        let source = installed
+            .as_ref()
+            .filter(|path| path.exists())
+            .cloned()
+            .or_else(|| requested.exists().then_some(requested))
+            .ok_or_else(|| {
+                installed.map_or_else(
+                    || ProfileError::Missing(PathBuf::from(id_or_path)),
+                    ProfileError::Missing,
+                )
+            })?;
         let text = fs::read_to_string(&source)?;
         (source, text)
     };
@@ -645,6 +661,13 @@ pub fn load_profile(id_or_path: &str, config_dir: &Path) -> Result<LoadedProfile
         source,
         digest,
     })
+}
+
+fn profile_id_is_safe(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn validate_profile(profile: &RepositoryProfile) -> Result<(), ProfileError> {
@@ -848,6 +871,7 @@ pub enum ProfileError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn supplied_config_and_profile_parse() {
@@ -878,6 +902,28 @@ mod tests {
         validate_profile(&general).expect("general profile validates");
         assert_eq!(general.repository, "*");
         assert!(!general.validation_policy.require_draft_pr_ci);
+    }
+
+    #[test]
+    fn custom_profile_ids_resolve_from_local_configuration() {
+        let config = TempDir::new().expect("temporary config directory");
+        let profiles = config.path().join("profiles");
+        fs::create_dir(&profiles).expect("profile directory");
+        let source = profiles.join("custom.toml");
+        fs::write(
+            &source,
+            GENERAL_PROFILE.replace("profile_id = \"general\"", "profile_id = \"custom\""),
+        )
+        .expect("custom profile");
+
+        let loaded = load_profile("custom", config.path()).expect("custom profile loads");
+        assert_eq!(loaded.source, source);
+        assert_eq!(loaded.profile.profile_id, "custom");
+
+        assert!(matches!(
+            load_profile("missing", config.path()),
+            Err(ProfileError::Missing(path)) if path == profiles.join("missing.toml")
+        ));
     }
 
     #[test]
