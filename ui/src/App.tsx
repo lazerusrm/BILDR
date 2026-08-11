@@ -46,6 +46,8 @@ import type {
   CodexAccountsSnapshot,
   CodexRateLimitWindow,
   GovernorCheckpoint,
+  IntentBrief,
+  IntentInterviewSnapshot,
   LatestAgentMessage,
   OperatorSettings,
   Repository,
@@ -647,6 +649,34 @@ export default function App() {
                   "start",
                   () => api.post(`/runs/${currentRun.id}/start-architecture`),
                   "Architect started",
+                )
+              }
+              onStartInterview={() =>
+                runAction(
+                  "interview-start",
+                  () => api.startIntentInterview(currentRun.id),
+                  "Intent interview started",
+                )
+              }
+              onInterviewRespond={(response) =>
+                runAction(
+                  "interview-respond",
+                  () => api.respondToIntentInterview(currentRun.id, response),
+                  "Response sent",
+                )
+              }
+              onInterviewConfirm={(digest) =>
+                runAction(
+                  "interview-confirm",
+                  () => api.confirmIntentInterview(currentRun.id, digest),
+                  "Intent brief confirmed; architect started",
+                )
+              }
+              onInterviewSkip={() =>
+                runAction(
+                  "interview-skip",
+                  () => api.skipIntentInterview(currentRun.id),
+                  "Interview skipped; architect started",
                 )
               }
               onPause={(additionalTokenBudget = 0) =>
@@ -1922,6 +1952,10 @@ function RunWorkspace({
   selectedAgentId,
   onSelect,
   onStart,
+  onStartInterview,
+  onInterviewRespond,
+  onInterviewConfirm,
+  onInterviewSkip,
   onPause,
   onApprove,
   onRequestPlanChanges,
@@ -1944,6 +1978,10 @@ function RunWorkspace({
   selectedAgentId?: string;
   onSelect: (task?: string, agent?: string) => void;
   onStart: () => void;
+  onStartInterview: () => void;
+  onInterviewRespond: (response: string) => void;
+  onInterviewConfirm: (digest: string) => void;
+  onInterviewSkip: () => void;
   onPause: (additionalTokenBudget?: number) => void;
   onApprove: (allowBudgetOverride?: boolean) => void;
   onRequestPlanChanges: (finding: string) => void;
@@ -2161,6 +2199,17 @@ function RunWorkspace({
           note={run.scheduler_paused ? "scheduler paused" : "active wall time"}
         />
       </div>
+      {detail.intent_interview && (
+        <IntentInterviewPanel
+          interview={detail.intent_interview}
+          runState={run.state}
+          busy={busy}
+          onStart={onStartInterview}
+          onRespond={onInterviewRespond}
+          onConfirm={onInterviewConfirm}
+          onSkip={onInterviewSkip}
+        />
+      )}
       {(run.state === "READY_FOR_ARCHITECTURE" ||
         planningRunState(run.state) ||
         busy === "start") && (
@@ -2278,18 +2327,224 @@ function RunWorkspace({
             <Network size={20} />
             <div>
               <strong>
-                {planningRunState(run.state)
+                {run.state === "INTERVIEWING"
+                  ? "Clarifying the intended result"
+                  : planningRunState(run.state)
                   ? planningStateTitle(run.state)
                   : "Waiting to start planning"}
               </strong>
               <span>
-                {planningRunState(run.state)
+                {run.state === "INTERVIEWING"
+                  ? "Answer the current question, confirm the resulting brief, or skip the interview to continue from the original request."
+                  : planningRunState(run.state)
                   ? "Implementation begins only after independent plan certification and the configured approval policy."
                   : "Select Start architecture to begin repository research."}
               </span>
             </div>
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+function IntentInterviewPanel({
+  interview,
+  runState,
+  busy,
+  onStart,
+  onRespond,
+  onConfirm,
+  onSkip,
+}: {
+  interview: IntentInterviewSnapshot;
+  runState: string;
+  busy: string;
+  onStart: () => void;
+  onRespond: (response: string) => void;
+  onConfirm: (digest: string) => void;
+  onSkip: () => void;
+}) {
+  const [response, setResponse] = useState("");
+  useEffect(() => setResponse(""), [interview.turn_count]);
+  const working =
+    interview.status === "running" ||
+    busy === "interview-start" ||
+    busy === "interview-respond";
+  const latestQuestion = [...interview.messages]
+    .reverse()
+    .find((item) => item.kind === "question");
+  const submitResponse = (event: FormEvent) => {
+    event.preventDefault();
+    const value = response.trim();
+    if (!value) return;
+    onRespond(value);
+  };
+
+  if (interview.status === "skipped" && runState !== "INTERVIEWING") {
+    return null;
+  }
+  if (interview.status === "confirmed" && interview.confirmed_brief) {
+    return (
+      <section className="intent-interview-panel confirmed">
+        <header>
+          <div>
+            <span className="eyebrow">Confirmed intent</span>
+            <h2>Planning brief</h2>
+          </div>
+          <StatusBadge value="CONFIRMED" />
+        </header>
+        <p>
+          The architect and independent plan reviewer receive this brief as the
+          human-approved description of the intended final shape.
+        </p>
+        <IntentBriefView brief={interview.confirmed_brief} />
+      </section>
+    );
+  }
+
+  return (
+    <section className={`intent-interview-panel ${working ? "working" : ""}`}>
+      <header>
+        <div>
+          <span className="eyebrow">Before planning</span>
+          <h2>Deep interview</h2>
+        </div>
+        <StatusBadge value={working ? "WORKING" : interview.status} />
+      </header>
+      {working ? (
+        <div className="intent-working">
+          <div className="runtime-spinner" aria-hidden="true" />
+          <div>
+            <strong>
+              {interview.turn_count > 1
+                ? "Updating the intent brief"
+                : "Finding the highest-leverage question"}
+            </strong>
+            <span>
+              The selected governor model is using a read-only repository view.
+              It cannot start planning until you confirm or skip this interview.
+            </span>
+          </div>
+        </div>
+      ) : interview.status === "waiting_for_human" && latestQuestion ? (
+        <>
+          <div className="intent-question">
+            <strong>{latestQuestion.text}</strong>
+            {latestQuestion.why_it_matters && (
+              <span>{latestQuestion.why_it_matters}</span>
+            )}
+          </div>
+          <form className="intent-response" onSubmit={submitResponse}>
+            <label>
+              <span>Your answer</span>
+              <textarea
+                rows={4}
+                value={response}
+                onChange={(event) => setResponse(event.target.value)}
+                placeholder="Describe the result or tradeoff you want. You can leave implementation choices to the planner."
+              />
+            </label>
+            <button
+              className="button primary"
+              disabled={!!busy || !response.trim()}
+            >
+              Send answer
+            </button>
+          </form>
+        </>
+      ) : interview.status === "ready_for_confirmation" &&
+        interview.draft_brief ? (
+        <>
+          <p>
+            Review the durable handoff below. Confirming starts a fresh architect
+            thread; the conversation transcript is not used as planning input.
+          </p>
+          <IntentBriefView brief={interview.draft_brief} />
+          <div className="intent-confirm-actions">
+            <button
+              className="button primary"
+              disabled={!!busy || !interview.draft_digest}
+              onClick={() =>
+                interview.draft_digest && onConfirm(interview.draft_digest)
+              }
+            >
+              <Check size={14} />
+              Use brief and plan
+            </button>
+          </div>
+          <form className="intent-response revise" onSubmit={submitResponse}>
+            <label>
+              <span>Request one change before planning</span>
+              <textarea
+                rows={3}
+                value={response}
+                onChange={(event) => setResponse(event.target.value)}
+                placeholder="For example: make the mobile behavior a requirement, not a preference."
+              />
+            </label>
+            <button className="button" disabled={!!busy || !response.trim()}>
+              Continue interview
+            </button>
+          </form>
+        </>
+      ) : (
+        <div className="intent-recovery">
+          <div>
+            <strong>
+              {interview.status === "failed"
+                ? "The interview turn did not complete"
+                : "The interview is ready to start"}
+            </strong>
+            <span>
+              {interview.last_error ||
+                "The interviewer asks only questions that can materially change the intended result."}
+            </span>
+          </div>
+          <button className="button primary" onClick={onStart} disabled={!!busy}>
+            <Bot size={14} />
+            {interview.status === "failed" ? "Retry interview" : "Start interview"}
+          </button>
+        </div>
+      )}
+      {runState === "INTERVIEWING" && (
+        <button className="intent-skip" onClick={onSkip} disabled={!!busy}>
+          Skip interview and plan from the original request
+        </button>
+      )}
+    </section>
+  );
+}
+
+function IntentBriefView({ brief }: { brief: IntentBrief }) {
+  const sections: Array<[string, string[]]> = [
+    ["Intended final shape", brief.intended_final_shape],
+    ["Hard constraints", brief.hard_constraints],
+    ["Preferences", brief.preferences],
+    ["Acceptance examples", brief.acceptance_examples],
+    ["Non-goals", brief.non_goals],
+    ["Planner may decide", brief.planner_may_decide],
+    ["Assumptions to validate", brief.assumptions_to_validate],
+  ];
+  return (
+    <div className="intent-brief">
+      <div className="intent-objective">
+        <span>Refined objective</span>
+        <strong>{brief.refined_objective}</strong>
+      </div>
+      <div className="intent-brief-grid">
+        {sections
+          .filter(([, values]) => values.length > 0)
+          .map(([label, values]) => (
+            <div key={label}>
+              <span>{label}</span>
+              <ul>
+                {values.map((value) => (
+                  <li key={value}>{value}</li>
+                ))}
+              </ul>
+            </div>
+          ))}
       </div>
     </div>
   );
@@ -5022,6 +5277,7 @@ function NewRunModal({
   const [repository, setRepository] = useState(repositories[0]?.id || "");
   const [objective, setObjective] = useState("");
   const [automaticPlanApproval, setAutomaticPlanApproval] = useState(false);
+  const [deepInterview, setDeepInterview] = useState(false);
   const [codexAccountId, setCodexAccountId] = useState("");
   const [publication, setPublication] = useState("local_only");
   const [governorModel, setGovernorModel] = useState("gpt-5.6-sol");
@@ -5052,10 +5308,15 @@ function NewRunModal({
         governorEffort,
         automaticPlanApproval,
         runTokenBudget,
+        deepInterview,
         codexAccountId || undefined,
       );
       try {
-        await api.startArchitecture(run.id);
+        if (run.state === "INTERVIEWING") {
+          await api.startIntentInterview(run.id);
+        } else {
+          await api.startArchitecture(run.id);
+        }
         await onDone(run);
       } catch (caught) {
         await onDone(run, message(caught));
@@ -5084,6 +5345,20 @@ function NewRunModal({
             placeholder="Describe the outcome, important constraints, and what must remain unchanged."
             required
           />
+        </label>
+        <label className={`interview-option ${deepInterview ? "selected" : ""}`}>
+          <input
+            type="checkbox"
+            checked={deepInterview}
+            onChange={(event) => setDeepInterview(event.target.checked)}
+          />
+          <span>
+            <strong>Deep interview before planning</strong>
+            <small>
+              Optional · clarify the intended final shape one material decision
+              at a time, then confirm a concise brief before the architect starts.
+            </small>
+          </span>
         </label>
         <div className="form-grid">
           <label className="field">
@@ -5587,6 +5862,7 @@ export function effectiveRunPosture(run: Run, detail?: RunDetail) {
       return "QUEUED";
   }
   if (run.scheduler_paused) return "PAUSED";
+  if (run.state === "INTERVIEWING") return "CLARIFYING INTENT";
   if (run.state === "READY_FOR_ARCHITECTURE") return "READY TO PLAN";
   if (run.state === "PLAN_ADVERSARIAL_REVIEW") return "REVIEWING PLAN";
   if (run.state === "PLAN_REVISION_REQUIRED") return "REVISING PLAN";

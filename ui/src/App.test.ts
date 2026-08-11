@@ -116,6 +116,12 @@ describe("workspace presentation helpers", () => {
         state: "PLAN_REVISION_REQUIRED",
       }),
     ).toBe("REVISING PLAN");
+    expect(
+      effectiveRunPosture({
+        ...run,
+        state: "INTERVIEWING",
+      }),
+    ).toBe("CLARIFYING INTENT");
   });
 
   it("smooths recent burn against the longer window and resets history on replenishment", () => {

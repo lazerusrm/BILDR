@@ -173,6 +173,7 @@ Git objects and must remain in place.
 │ │ Audit and bind signoff evidence to the integrated exact head...       │ │
 │ └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                            │
+│ Interview     □ Deep interview before planning                             │
 │ Base          origin/main      resolved after Fetch & inspect              │
 │ Account       ● Automatic best available  ○ Work  ○ Personal               │
 │ Plan approval ● Review before work  ○ Approve certified plan automatically │
@@ -194,6 +195,16 @@ human click after a plan reaches `CERTIFIED` with zero blocking findings and
 passes the controller's budget, risk, serial-path, and model-diversity gates. It
 never converts schema validity into approval. The system never silently changes
 the requested base.
+
+**Deep interview before planning** is optional and off by default. When
+selected, the prepared run enters **Clarifying intent** instead of starting the
+architect. The selected governor model uses a read-only repository view and
+asks one material question at a time. The workspace shows the question,
+rationale, current concise brief, **Continue interview**, **Use brief and
+plan**, and **Skip interview**. Confirmation starts a fresh architect thread
+with the original objective and confirmed brief. The transcript remains in run
+history and is not planning input. Automatic plan approval does not answer or
+confirm interview questions.
 
 Creating a task and starting its architect are visibly distinct. A prepared
 task shows a prominent **Waiting to start** architecture status and says that
@@ -242,9 +253,11 @@ task titles cannot make the current governor ambiguous. Run numbers follow
 creation order—Run 1 is the first-created session—even when the backend returns
 newest activity first.
 
-Submitting **New task** creates the prepared run and immediately launches its
-read-only architecture turn in the same user action. **Start architecture** is
-kept only as a recovery action when startup could not be admitted. Completed,
+Submitting **New task** creates the prepared run and immediately launches either
+its optional read-only interview turn or its read-only architecture turn in the
+same user action. Confirming or skipping the interview launches architecture;
+the corresponding start controls remain as recovery actions when startup could
+not be admitted. Completed,
 canceled, or failed runs expose **Archive run**; archived runs keep their durable
 history and preserved worktrees, disappear from the switcher by default, and
 remain available behind **Show archived**.

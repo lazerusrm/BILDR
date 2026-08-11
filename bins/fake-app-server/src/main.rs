@@ -397,7 +397,45 @@ fn input_text(params: &Value) -> String {
 }
 
 fn scripted_response(input: &str, objective: Option<&str>) -> String {
-    if input.contains("read-only architecture agent") {
+    if input.contains("Intent interview for this run.") {
+        return json!({
+            "schema": "harness.intent-interview-turn.v1",
+            "status": "question",
+            "question": "What observable final behavior matters most when this task is complete?",
+            "why_it_matters": "This determines the acceptance example without prescribing an implementation.",
+            "brief": {
+                "refined_objective": objective.unwrap_or("Complete the requested repository change"),
+                "intended_final_shape": [],
+                "hard_constraints": [],
+                "preferences": [],
+                "non_goals": [],
+                "acceptance_examples": [],
+                "planner_may_decide": ["Implementation details not specified by the human"],
+                "assumptions_to_validate": []
+            }
+        })
+        .to_string();
+    }
+    if input.contains("Human response:") {
+        return json!({
+            "schema": "harness.intent-interview-turn.v1",
+            "status": "ready",
+            "question": null,
+            "why_it_matters": null,
+            "brief": {
+                "refined_objective": objective.unwrap_or("Complete the requested repository change"),
+                "intended_final_shape": ["The requested behavior is observable on the authoritative path"],
+                "hard_constraints": [],
+                "preferences": [],
+                "non_goals": ["Unrelated repository redesign"],
+                "acceptance_examples": ["The human's stated outcome works in the authoritative pipeline"],
+                "planner_may_decide": ["Implementation details not specified by the human"],
+                "assumptions_to_validate": ["The authoritative pipeline is available in the repository"]
+            }
+        })
+        .to_string();
+    }
+    if input.contains("Planning posture:") && input.contains("Plan the shortest credible path") {
         let base_sha = extract_after(input, "Every task must use base SHA ", 40)
             .or_else(|| extract_after(input, "Base SHA: ", 40))
             .filter(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
@@ -414,10 +452,10 @@ fn scripted_response(input: &str, objective: Option<&str>) -> String {
                 "state": "proposed",
                 "priority": "P1",
                 "execution_mode": "agent",
-                "owner_profile": "worker",
+                "owner_profile": "governor",
                 "reviewer_profile": "verifier",
                 "checklist_rows": ["Run deterministic adapter smoke"],
-                "authority_refs": ["CONTRIBUTING.md"],
+                "authority_refs": ["README.md"],
                 "base_sha": base_sha,
                 "dependency_shas": {},
                 "depends_on": [],
@@ -425,6 +463,26 @@ fn scripted_response(input: &str, objective: Option<&str>) -> String {
                 "forbidden_paths": [".harness-runtime/**"],
                 "reserved_serial_paths": [],
                 "objective": objective.unwrap_or("Exercise the Harness execution path"),
+                "milestones": [
+                    {
+                        "id": "slice",
+                        "title": "Create the bounded behavior slice",
+                        "objective": "Make the requested behavior observable with the smallest credible change.",
+                        "success_criteria": ["A candidate exists in the leased worktree"]
+                    },
+                    {
+                        "id": "exercise",
+                        "title": "Exercise the authoritative path",
+                        "objective": "Run the smallest behavior check that can falsify the candidate.",
+                        "success_criteria": ["The authoritative check records its result"]
+                    },
+                    {
+                        "id": "signoff",
+                        "title": "Add focused proof and prepare signoff",
+                        "objective": "Protect the accepted behavior without freezing provisional internals.",
+                        "success_criteria": ["Controller evidence covers the accepted behavior"]
+                    }
+                ],
                 "non_goals": ["Do not make external writes"],
                 "success_criteria": ["The bounded work is independently reviewable"],
                 "required_positive_tests": ["git diff --check"],
@@ -440,6 +498,26 @@ fn scripted_response(input: &str, objective: Option<&str>) -> String {
                 "handoff_path": "controller://fake-handoff",
                 "risk_flags": []
             }]
+        })
+        .to_string();
+    }
+    if input.contains("Try to falsify whether this plan can deliver the objective") {
+        return json!({
+            "verdict": "accept",
+            "summary": "The deterministic plan has one bounded governor-owned critical path and an early behavior check.",
+            "findings": [],
+            "evidence": {
+                "inspected_files": ["README.md"],
+                "critical_path": [{
+                    "task_id": "FAKE-001",
+                    "why_critical": "It owns the complete bounded behavior slice.",
+                    "behavioral_proof": "The authoritative check exercises the candidate before focused hardening."
+                }],
+                "failure_modes": [{
+                    "failure_mode": "The candidate could fail the authoritative behavior check.",
+                    "mitigation": "Revise the bounded slice before adding regression coverage."
+                }]
+            }
         })
         .to_string();
     }

@@ -126,6 +126,21 @@ to a new architect revision automatically and reviewed again. Temporary
 review/revision startup failures remain queued; the total run token ceiling is
 the stopping authority.
 
+When **Deep interview before planning** is selected, run creation stops in
+`INTERVIEWING`. The selected governor model asks one material question per
+completed read-only turn. Reply in the run workspace until the brief is ready,
+then choose **Use brief and plan**. Choose **Skip interview** at any point to
+plan from the original request. Confirmation and skip are explicit local-user
+actions; automatic plan approval cannot perform them. A confirmed brief is
+durable, is passed to a fresh architect and plan reviewer without the raw
+transcript, and is bound by digest into the plan certificate.
+
+If an interview turn fails, use **Retry interview**. The controller restores
+the durable questions, responses, and current draft in a new read-only thread.
+If architecture cannot start after confirmation or skip, the run remains
+`READY_FOR_ARCHITECTURE`; use **Start architecture** after the runtime or
+capacity issue clears.
+
 The approve command accepts only the exact digest in `CERTIFIED` state. Manual
 approval is the default. Automatic plan approval runs the identical
 review/revision loop and performs only the final certified-to-approved

@@ -188,6 +188,7 @@ class HarnessApi {
     governorReasoningEffort: string,
     automaticPlanApproval: boolean,
     runTokenBudget: number,
+    deepInterview: boolean,
     codexAccountId?: string,
   ) {
     return this.post<Run>("/runs", {
@@ -199,12 +200,31 @@ class HarnessApi {
       governor_reasoning_effort: governorReasoningEffort,
       automatic_plan_approval: automaticPlanApproval,
       run_token_budget: runTokenBudget,
+      deep_interview: deepInterview,
       codex_account_id: codexAccountId || null,
     });
   }
 
   startArchitecture(runId: string) {
     return this.post(`/runs/${runId}/start-architecture`);
+  }
+
+  startIntentInterview(runId: string) {
+    return this.post(`/runs/${runId}/interview/start`);
+  }
+
+  respondToIntentInterview(runId: string, message: string) {
+    return this.post(`/runs/${runId}/interview/respond`, { message });
+  }
+
+  confirmIntentInterview(runId: string, briefDigest: string) {
+    return this.post(`/runs/${runId}/interview/confirm`, {
+      brief_digest: briefDigest,
+    });
+  }
+
+  skipIntentInterview(runId: string) {
+    return this.post(`/runs/${runId}/interview/skip`);
   }
 
   archiveRun(runId: string) {

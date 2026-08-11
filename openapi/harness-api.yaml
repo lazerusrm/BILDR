@@ -342,6 +342,83 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/OperationAccepted'}
         '409': {$ref: '#/components/responses/Conflict'}
+  /runs/{runId}/interview/start:
+    post:
+      tags: [Runs]
+      operationId: startIntentInterview
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      responses:
+        '202':
+          description: The first read-only interview turn started.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /runs/{runId}/interview/respond:
+    post:
+      tags: [Runs]
+      operationId: respondToIntentInterview
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [message]
+              properties:
+                message: {type: string, minLength: 1, maxLength: 12000}
+      responses:
+        '202':
+          description: A new turn started on the existing interview thread.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /runs/{runId}/interview/confirm:
+    post:
+      tags: [Runs]
+      operationId: confirmIntentInterview
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [brief_digest]
+              properties:
+                brief_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+      responses:
+        '202':
+          description: The brief was confirmed and architecture started.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /runs/{runId}/interview/skip:
+    post:
+      tags: [Runs]
+      operationId: skipIntentInterview
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      responses:
+        '202':
+          description: The optional interview was skipped and architecture started.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+        '409': {$ref: '#/components/responses/Conflict'}
   /runs/{runId}/plan/approve:
     post:
       tags: [Runs]
@@ -1252,6 +1329,10 @@ components:
         governor_reasoning_effort: {enum: [low, medium, high, xhigh, max]}
         automatic_plan_approval: {type: boolean, default: false}
         codex_account_id: {type: [string, 'null']}
+        deep_interview:
+          type: boolean
+          default: false
+          description: Pause before architecture for a human-confirmed intent interview.
     Run:
       type: object
       additionalProperties: false
@@ -1276,6 +1357,59 @@ components:
         scheduler_paused: {type: boolean}
         run_token_budget: {type: integer, minimum: 500000, maximum: 1000000000}
         version: {type: integer}
+    IntentBrief:
+      type: object
+      additionalProperties: false
+      required: [refined_objective, intended_final_shape, hard_constraints, preferences, non_goals, acceptance_examples, planner_may_decide, assumptions_to_validate]
+      properties:
+        refined_objective: {type: string, minLength: 1, maxLength: 12000}
+        intended_final_shape: {$ref: '#/components/schemas/IntentBriefItems'}
+        hard_constraints: {$ref: '#/components/schemas/IntentBriefItems'}
+        preferences: {$ref: '#/components/schemas/IntentBriefItems'}
+        non_goals: {$ref: '#/components/schemas/IntentBriefItems'}
+        acceptance_examples: {$ref: '#/components/schemas/IntentBriefItems'}
+        planner_may_decide: {$ref: '#/components/schemas/IntentBriefItems'}
+        assumptions_to_validate: {$ref: '#/components/schemas/IntentBriefItems'}
+    IntentBriefItems:
+      type: array
+      maxItems: 32
+      items: {type: string, minLength: 1, maxLength: 4000}
+    IntentInterview:
+      type: object
+      additionalProperties: false
+      required: [schema, status, agent_id, turn_count, messages, draft_brief, draft_digest, confirmed_brief, confirmed_digest, started_at, updated_at, confirmed_at, skipped_at, last_error]
+      properties:
+        schema: {const: harness.intent-interview.v1}
+        status: {enum: [not_started, running, waiting_for_human, ready_for_confirmation, confirmed, skipped, failed]}
+        agent_id: {type: [string, 'null']}
+        turn_count: {type: integer, minimum: 0}
+        messages:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [role, kind, text, why_it_matters, recorded_at]
+            properties:
+              role: {enum: [human, interviewer]}
+              kind: {enum: [question, answer, direction, brief_ready]}
+              text: {type: string}
+              why_it_matters: {type: [string, 'null']}
+              recorded_at: {type: string, format: date-time}
+        draft_brief:
+          anyOf:
+            - {$ref: '#/components/schemas/IntentBrief'}
+            - {type: 'null'}
+        draft_digest: {type: [string, 'null'], pattern: '^[0-9a-f]{64}$'}
+        confirmed_brief:
+          anyOf:
+            - {$ref: '#/components/schemas/IntentBrief'}
+            - {type: 'null'}
+        confirmed_digest: {type: [string, 'null'], pattern: '^[0-9a-f]{64}$'}
+        started_at: {type: [string, 'null'], format: date-time}
+        updated_at: {type: string, format: date-time}
+        confirmed_at: {type: [string, 'null'], format: date-time}
+        skipped_at: {type: [string, 'null'], format: date-time}
+        last_error: {type: [string, 'null']}
     PlanReviewFinding:
       type: object
       additionalProperties: false
@@ -1326,6 +1460,7 @@ components:
         base_sha: {$ref: '#/components/schemas/GitSha'}
         profile_digest: {type: string}
         authority_digest: {type: string}
+        intent_brief_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
         reviewer_agent_id: {type: string}
         reviewer: {type: object}
         summary: {type: string}
@@ -1364,6 +1499,11 @@ components:
         packet_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
         run_id: {type: string}
         objective: {type: string}
+        intent_brief:
+          anyOf:
+            - {$ref: '#/components/schemas/IntentBrief'}
+            - {type: 'null'}
+        intent_brief_digest: {type: [string, 'null'], pattern: '^[0-9a-f]{64}$'}
         plan_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
         plan_revision: {type: integer}
         plan_review_history: {type: array, items: {$ref: '#/components/schemas/PlanReviewRecord'}}
@@ -1395,9 +1535,13 @@ components:
     RunDetail:
       type: object
       additionalProperties: false
-      required: [run, tasks, agents, worktrees, approvals, plan_review_history, planning_tokens_used, signoff_packet, draft_pr_ci, automatic_plan_approval]
+      required: [run, intent_interview, tasks, agents, worktrees, approvals, plan_review_history, planning_tokens_used, signoff_packet, draft_pr_ci, automatic_plan_approval]
       properties:
         run: {$ref: '#/components/schemas/Run'}
+        intent_interview:
+          anyOf:
+            - {$ref: '#/components/schemas/IntentInterview'}
+            - {type: 'null'}
         tasks: {type: array, items: {$ref: '#/components/schemas/Task'}}
         agents: {type: array, items: {$ref: '#/components/schemas/AgentSummary'}}
         worktrees: {type: array, items: {$ref: '#/components/schemas/Worktree'}}

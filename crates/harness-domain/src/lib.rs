@@ -101,6 +101,7 @@ pub fn format_timestamp(milliseconds: i64) -> String {
 pub enum RunState {
     Created,
     Preparing,
+    Interviewing,
     ReadyForArchitecture,
     Architecting,
     PlanAdversarialReview,
@@ -149,7 +150,8 @@ impl RunState {
         matches!(
             (self, next),
             (S::Created, S::Preparing)
-                | (S::Preparing, S::ReadyForArchitecture)
+                | (S::Preparing, S::Interviewing | S::ReadyForArchitecture)
+                | (S::Interviewing, S::ReadyForArchitecture)
                 | (S::ReadyForArchitecture, S::Architecting)
                 | (S::Architecting, S::ReadyForArchitecture)
                 | (S::Architecting, S::PlanRevisionRequired)
@@ -180,7 +182,8 @@ impl RunState {
                 )
                 | (
                     S::Blocked,
-                    S::ReadyForArchitecture
+                    S::Interviewing
+                        | S::ReadyForArchitecture
                         | S::PlanAdversarialReview
                         | S::PlanRevisionRequired
                         | S::PlanReviewRequired
@@ -347,6 +350,7 @@ pub enum RiskLevel {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
+    Interviewer,
     Architect,
     PlanReviewer,
     Explorer,
@@ -839,6 +843,14 @@ mod tests {
         assert!(RunState::PlanAdversarialReview.can_transition_to(RunState::PlanReviewRequired));
         assert!(RunState::PlanReviewRequired.can_transition_to(RunState::PlanRevisionRequired));
         assert!(RunState::PlanReviewRequired.can_transition_to(RunState::PlanAdversarialReview));
+    }
+
+    #[test]
+    fn optional_interview_has_one_human_gate_before_architecture() {
+        assert!(RunState::Preparing.can_transition_to(RunState::Interviewing));
+        assert!(RunState::Preparing.can_transition_to(RunState::ReadyForArchitecture));
+        assert!(RunState::Interviewing.can_transition_to(RunState::ReadyForArchitecture));
+        assert!(!RunState::Interviewing.can_transition_to(RunState::Architecting));
     }
 
     #[test]

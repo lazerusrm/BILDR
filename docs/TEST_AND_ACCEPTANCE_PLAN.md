@@ -45,6 +45,10 @@ Use a model-based/property test harness. Invariants:
 - a retry increments attempt and never mutates the prior attempt record;
 - `INFRASTRUCTURE_UNAVAILABLE` and `INCONCLUSIVE` cannot satisfy required proof;
 - no controller transition updates repository completion authority automatically;
+- an enabled intent interview cannot reach architecture without an explicit
+  human confirm or skip action;
+- interview replies create completed turns on one interview thread; architecture
+  and plan review receive only the confirmed brief, not the raw transcript;
 - push/PR/merge cannot occur without their explicit human gate; merge is absent in v1.
 
 Generate random legal/illegal action sequences and verify the database plus emitted domain events.
@@ -76,6 +80,8 @@ Required scenarios:
 Maintain sanitized traces per pinned Codex version:
 
 - one-turn read-only architect;
+- optional intent interview question, same-thread reply, brief confirmation,
+  skip, and failed-turn retry;
 - independent plan-review accept and changes-requested verdicts;
 - automatic architect revision followed by a fresh plan review;
 - multi-turn mutable worker;

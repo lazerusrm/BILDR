@@ -1,6 +1,7 @@
 export type RunState =
   | "CREATED"
   | "PREPARING"
+  | "INTERVIEWING"
   | "READY_FOR_ARCHITECTURE"
   | "ARCHITECTING"
   | "PLAN_ADVERSARIAL_REVIEW"
@@ -163,6 +164,47 @@ export interface Run {
   scheduler_paused: boolean;
   run_token_budget?: number;
   version: number;
+}
+
+export interface IntentBrief {
+  refined_objective: string;
+  intended_final_shape: string[];
+  hard_constraints: string[];
+  preferences: string[];
+  non_goals: string[];
+  acceptance_examples: string[];
+  planner_may_decide: string[];
+  assumptions_to_validate: string[];
+}
+
+export interface IntentInterviewSnapshot {
+  schema: string;
+  status:
+    | "not_started"
+    | "running"
+    | "waiting_for_human"
+    | "ready_for_confirmation"
+    | "confirmed"
+    | "skipped"
+    | "failed";
+  agent_id?: string | null;
+  turn_count: number;
+  messages: Array<{
+    role: "human" | "interviewer" | string;
+    kind: "question" | "answer" | "direction" | "brief_ready" | string;
+    text: string;
+    why_it_matters?: string | null;
+    recorded_at: string;
+  }>;
+  draft_brief?: IntentBrief | null;
+  draft_digest?: string | null;
+  confirmed_brief?: IntentBrief | null;
+  confirmed_digest?: string | null;
+  started_at?: string | null;
+  updated_at: string;
+  confirmed_at?: string | null;
+  skipped_at?: string | null;
+  last_error?: string | null;
 }
 
 export interface Task {
@@ -373,6 +415,7 @@ export interface PlanCertificate {
   base_sha: string;
   profile_digest: string;
   authority_digest: string;
+  intent_brief_digest?: string;
   reviewer_agent_id: string;
   reviewer: {
     architect_model: string;
@@ -423,6 +466,8 @@ export interface SignoffPacket {
   packet_digest: string;
   run_id: string;
   objective: string;
+  intent_brief?: IntentBrief | null;
+  intent_brief_digest?: string | null;
   plan_digest: string;
   plan_revision: number;
   plan_review_history: PlanReviewRecord[];
@@ -493,6 +538,7 @@ export interface GovernorCheckpoint {
 
 export interface RunDetail {
   run: Run;
+  intent_interview?: IntentInterviewSnapshot | null;
   tasks: Task[];
   agents: Agent[];
   worktrees: Worktree[];

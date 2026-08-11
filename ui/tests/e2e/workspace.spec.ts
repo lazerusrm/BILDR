@@ -111,4 +111,10 @@ test("makes a prepared task's idle architecture state explicit", async ({
     page.getByRole("slider", { name: "Total run ceiling token budget" }),
   ).toBeVisible();
   await expect(page.getByText("5.0m tokens", { exact: true })).toBeVisible();
+  const deepInterview = page.getByRole("checkbox", {
+    name: /Deep interview before planning/,
+  });
+  await expect(deepInterview).not.toBeChecked();
+  await deepInterview.check();
+  await expect(deepInterview).toBeChecked();
 });

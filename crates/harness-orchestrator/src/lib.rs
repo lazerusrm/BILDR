@@ -52,6 +52,8 @@ const RUN_PLAN_SCHEMA: &str =
     include_str!("../../../schemas/harness.orchestration.plan.v1.schema.json");
 const GOVERNOR_CHECKPOINT_SCHEMA: &str =
     include_str!("../../../schemas/harness.governor-checkpoint.v1.schema.json");
+const INTENT_INTERVIEW_TURN_SCHEMA: &str =
+    include_str!("../../../schemas/harness.intent-interview-turn.v1.schema.json");
 const SETTING_REASONING_SUMMARIES: &str = "settings.store_reasoning_summaries";
 const SETTING_RAW_REASONING: &str = "settings.store_raw_reasoning";
 const SETTING_YOLO_MODE: &str = "settings.yolo_mode";
@@ -90,6 +92,13 @@ Use `blocking` only for a concrete defect likely to prevent success or cause mat
 
 const GOVERNOR_REPLAN_CONTRACT: &str = r#"The plan and milestone order are a mutable execution strategy. If following them literally would defeat the objective, revise the remaining strategy and record why. In particular, do not deadlock on a plan-created assumption, mutable inventory, provisional test shape, or metadata check. Prefer evidence from working code in the authoritative pipeline. Preserve the objective, current certified behavior, path custody, explicit external-write approvals, and the run budget. Keep tests that protect certified behavior; change stale or provisional tests that encode a rejected shape."#;
 
+const INTENT_INTERVIEW_CONTRACT: &str = r#"Clarify the human's intended final shape before implementation planning begins.
+- Ask one highest-leverage question at a time, and ask it only when the answer could materially change the result or its acceptance. When enough information exists, stop interviewing and return a ready brief.
+- Use bounded read-only repository inspection to resolve readily discoverable facts. Ask the human about intent, preferences, tradeoffs, decision boundaries, and examples that repository inspection cannot answer.
+- Preserve the original objective. Record hard constraints only when they are explicit, distinguish preferences from requirements, and leave implementation choices to the planner unless the human made them part of the desired result.
+- Do not design the implementation plan, prescribe speculative internals, demand exhaustive detail, repeat answered questions, or turn uncertainty into arbitrary constraints.
+- Keep the brief concise, concrete, and outcome-oriented. It is the durable handoff; the raw conversation is not planner input."#;
+
 #[derive(Debug)]
 struct AgentPromptLayers {
     developer_instructions: String,
@@ -117,6 +126,9 @@ fn agent_developer_instructions(role: AgentRole, sandbox: SandboxMode) -> String
         }
     };
     let purpose = match role {
+        AgentRole::Interviewer => {
+            "Clarify the intended final result with the human and produce a concise planning brief; do not plan or implement it."
+        }
         AgentRole::Architect => {
             "Produce the shortest executable plan that can deliver the objective; do not implement it."
         }
@@ -288,6 +300,8 @@ pub struct CreateRunRequest {
     pub governor_reasoning_effort: Option<String>,
     pub automatic_plan_approval: Option<bool>,
     pub codex_account_id: Option<String>,
+    #[serde(default)]
+    pub deep_interview: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -324,9 +338,81 @@ struct GovernorRouteOverride {
     reasoning_effort: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntentBrief {
+    pub refined_objective: String,
+    pub intended_final_shape: Vec<String>,
+    pub hard_constraints: Vec<String>,
+    pub preferences: Vec<String>,
+    pub non_goals: Vec<String>,
+    pub acceptance_examples: Vec<String>,
+    pub planner_may_decide: Vec<String>,
+    pub assumptions_to_validate: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentInterviewStatus {
+    NotStarted,
+    Running,
+    WaitingForHuman,
+    ReadyForConfirmation,
+    Confirmed,
+    Skipped,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntentInterviewMessage {
+    pub role: String,
+    pub kind: String,
+    pub text: String,
+    pub why_it_matters: Option<String>,
+    pub recorded_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntentInterviewSnapshot {
+    pub schema: String,
+    pub status: IntentInterviewStatus,
+    pub agent_id: Option<AgentSessionId>,
+    pub turn_count: u64,
+    pub messages: Vec<IntentInterviewMessage>,
+    pub draft_brief: Option<IntentBrief>,
+    pub draft_digest: Option<String>,
+    pub confirmed_brief: Option<IntentBrief>,
+    pub confirmed_digest: Option<String>,
+    pub started_at: Option<String>,
+    pub updated_at: String,
+    pub confirmed_at: Option<String>,
+    pub skipped_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum IntentInterviewTurnStatus {
+    Question,
+    Ready,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntentInterviewTurn {
+    schema: String,
+    status: IntentInterviewTurnStatus,
+    question: Option<String>,
+    why_it_matters: Option<String>,
+    brief: IntentBrief,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct RunDetail {
     pub run: RunSummary,
+    pub intent_interview: Option<IntentInterviewSnapshot>,
     pub tasks: Vec<TaskSummary>,
     pub agents: Vec<harness_domain::AgentSummary>,
     pub worktrees: Vec<harness_domain::WorktreeSummary>,
@@ -367,6 +453,8 @@ pub struct SignoffPacket {
     pub packet_digest: String,
     pub run_id: RunId,
     pub objective: String,
+    pub intent_brief: Option<IntentBrief>,
+    pub intent_brief_digest: Option<String>,
     pub plan_digest: String,
     pub plan_revision: u64,
     pub plan_review_history: Vec<PlanReviewRecord>,
@@ -468,6 +556,8 @@ pub struct PlanCertificate {
     pub base_sha: String,
     pub profile_digest: String,
     pub authority_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_brief_digest: Option<String>,
     pub reviewer_agent_id: AgentSessionId,
     pub reviewer: PlanReviewerIdentity,
     pub summary: String,
@@ -1987,6 +2077,7 @@ impl Orchestrator {
         &self,
         request: CreateRunRequest,
     ) -> Result<RunSummary, OrchestratorError> {
+        let deep_interview = request.deep_interview;
         if request.objective.trim().is_empty() {
             return Err(OrchestratorError::Validation(
                 "run objective must not be empty".to_owned(),
@@ -2177,6 +2268,12 @@ impl Orchestrator {
                 &json!(account_id),
             )?;
         }
+        if deep_interview {
+            self.store.put_runtime_metadata(
+                &intent_interview_metadata_key(&run_id),
+                &serde_json::to_value(new_intent_interview_snapshot())?,
+            )?;
+        }
         self.store
             .transition_run(&run_id, RunState::Preparing, "preparing", None, None)?;
         self.store.create_worktree(&NewWorktree {
@@ -2190,19 +2287,25 @@ impl Orchestrator {
             head_sha: Some(inspection_worktree.head_sha),
             state: "READY".to_owned(),
         })?;
-        let run = self.store.transition_run(
-            &run_id,
-            RunState::ReadyForArchitecture,
-            "ready_for_architecture",
-            None,
-            None,
+        let (next_state, phase) = if deep_interview {
+            (RunState::Interviewing, "interviewing")
+        } else {
+            (RunState::ReadyForArchitecture, "ready_for_architecture")
+        };
+        let run = self
+            .store
+            .transition_run(&run_id, next_state, phase, None, None)?;
+        self.emit_run_event(
+            &run,
+            "run.prepared",
+            json!({"base_sha": run.base_sha, "deep_interview": deep_interview}),
         )?;
-        self.emit_run_event(&run, "run.prepared", json!({"base_sha": run.base_sha}))?;
         Ok(run)
     }
 
     pub fn run_detail(&self, run_id: &RunId) -> Result<RunDetail, OrchestratorError> {
         let run = self.store.run(run_id)?;
+        let intent_interview = self.intent_interview_snapshot(run_id)?;
         let latest_plan = self.store.latest_plan(run_id)?;
         let plan = latest_plan.as_ref().map(|(_, plan, _, _)| plan.clone());
         let plan_digest = plan.as_ref().map(packet_digest).transpose()?;
@@ -2266,6 +2369,7 @@ impl Orchestrator {
             .runtime_metadata(&format!("draft-pr-ci:{run_id}"))?;
         Ok(RunDetail {
             run,
+            intent_interview,
             tasks: self.store.list_tasks(run_id)?,
             agents,
             worktrees: self.store.list_worktrees(Some(run_id))?,
@@ -2281,6 +2385,57 @@ impl Orchestrator {
             preferred_codex_account_id,
             governor_progress,
         })
+    }
+
+    fn intent_interview_snapshot(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<IntentInterviewSnapshot>, OrchestratorError> {
+        self.store
+            .runtime_metadata(&intent_interview_metadata_key(run_id))?
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    fn store_intent_interview_snapshot(
+        &self,
+        run_id: &RunId,
+        snapshot: &IntentInterviewSnapshot,
+    ) -> Result<(), OrchestratorError> {
+        self.store.put_runtime_metadata(
+            &intent_interview_metadata_key(run_id),
+            &serde_json::to_value(snapshot)?,
+        )?;
+        Ok(())
+    }
+
+    fn confirmed_intent_brief(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<(IntentBrief, String)>, OrchestratorError> {
+        let Some(snapshot) = self.intent_interview_snapshot(run_id)? else {
+            return Ok(None);
+        };
+        if snapshot.status != IntentInterviewStatus::Confirmed {
+            return Ok(None);
+        }
+        let brief = snapshot.confirmed_brief.ok_or_else(|| {
+            OrchestratorError::Protocol(
+                "confirmed intent interview is missing its planning brief".to_owned(),
+            )
+        })?;
+        let digest = snapshot.confirmed_digest.ok_or_else(|| {
+            OrchestratorError::Protocol(
+                "confirmed intent interview is missing its brief digest".to_owned(),
+            )
+        })?;
+        if packet_digest(&brief)? != digest {
+            return Err(OrchestratorError::Protocol(
+                "confirmed intent brief no longer matches its digest".to_owned(),
+            ));
+        }
+        Ok(Some((brief, digest)))
     }
 
     fn assemble_signoff_packet(
@@ -2406,11 +2561,17 @@ impl Orchestrator {
                 })
             })
             .collect::<Result<Vec<_>, OrchestratorError>>()?;
+        let intent_binding = self.confirmed_intent_brief(&run.id)?;
+        let (intent_brief, intent_brief_digest) = intent_binding
+            .map(|(brief, digest)| (Some(brief), Some(digest)))
+            .unwrap_or((None, None));
         let mut packet = SignoffPacket {
             schema: "harness-signoff-packet/v1".to_owned(),
             packet_digest: String::new(),
             run_id: run.id.clone(),
             objective: run.objective.clone(),
+            intent_brief,
+            intent_brief_digest,
             plan_digest: packet_digest(&plan)?,
             plan_revision,
             plan_review_history: self.plan_review_history(&run.id)?,
@@ -2661,16 +2822,35 @@ impl Orchestrator {
         Ok(archived)
     }
 
-    pub async fn start_architecture(
+    pub async fn start_intent_interview(
         &self,
         run_id: &RunId,
     ) -> Result<OperationAccepted, OrchestratorError> {
         let _guard = self.operation_lock.lock().await;
         let run = self.store.run(run_id)?;
-        if run.state != RunState::ReadyForArchitecture {
+        if run.state != RunState::Interviewing {
             return Err(OrchestratorError::Conflict(format!(
-                "run {} is {}, not READY_FOR_ARCHITECTURE",
+                "run {} is {}, not INTERVIEWING",
                 run.id, run.state
+            )));
+        }
+        if self.enforce_run_budget(&run)? {
+            return Err(OrchestratorError::Blocked(
+                "run token budget is exhausted before the intent interview turn".to_owned(),
+            ));
+        }
+        let mut snapshot = self.intent_interview_snapshot(run_id)?.ok_or_else(|| {
+            OrchestratorError::Protocol(
+                "interviewing run is missing its durable interview state".to_owned(),
+            )
+        })?;
+        if !matches!(
+            snapshot.status,
+            IntentInterviewStatus::NotStarted | IntentInterviewStatus::Failed
+        ) {
+            return Err(OrchestratorError::Conflict(format!(
+                "intent interview is {:?}, not startable",
+                snapshot.status
             )));
         }
         self.require_runtime_ready().await?;
@@ -2690,7 +2870,443 @@ impl Orchestrator {
             .ok_or_else(|| {
                 OrchestratorError::Blocked("inspection worktree is unavailable".to_owned())
             })?;
+        let route = self.governor_route(&run)?;
+        let agent_id = AgentSessionId::new();
+        self.store.create_agent_session(&NewAgentSession {
+            id: agent_id.clone(),
+            run_id: run_id.clone(),
+            task_attempt_id: None,
+            parent_agent_session_id: None,
+            runtime_kind: "codex_controller".to_owned(),
+            codex_account_id: self.selected_codex_account_id(),
+            role: AgentRole::Interviewer,
+            nickname: Some("intent-interviewer".to_owned()),
+            requested_model: route.model.clone(),
+            requested_reasoning_effort: route.reasoning_effort.clone(),
+            sandbox_mode: SandboxMode::ReadOnly,
+            approval_policy: "never".to_owned(),
+            cwd: PathBuf::from(&inspection.path),
+            state: "STARTING".to_owned(),
+            current_goal: Some(run.objective.clone()),
+            token_budget: Some(self.config.orchestration.default_task_token_budget),
+        })?;
+        let recovery_context = if snapshot.messages.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nDurable prior interview state (continue without repeating answered questions):\nMessages:\n{}\nCurrent draft brief:\n{}",
+                serde_json::to_string_pretty(&snapshot.messages)?,
+                snapshot
+                    .draft_brief
+                    .as_ref()
+                    .map(serde_json::to_string_pretty)
+                    .transpose()?
+                    .unwrap_or_else(|| "No draft brief is available.".to_owned()),
+            )
+        };
+        let timestamp = format_timestamp(now_ms());
+        snapshot.status = IntentInterviewStatus::Running;
+        snapshot.agent_id = Some(agent_id.clone());
+        snapshot.turn_count = snapshot.turn_count.saturating_add(1);
+        snapshot.started_at.get_or_insert_with(|| timestamp.clone());
+        snapshot.updated_at = timestamp;
+        snapshot.last_error = None;
+        self.store_intent_interview_snapshot(run_id, &snapshot)?;
+        let prompt = format!(
+            "Intent interview for this run.\n\nOriginal request:\n{}\n\nPinned repository base: {}{}\n\n{INTENT_INTERVIEW_CONTRACT}\n\nInspect only repository facts needed to choose the next question. Return a question when a material intent decision remains; otherwise return the ready brief. Return only JSON matching the supplied output schema.",
+            run.objective, run.base_sha, recovery_context,
+        );
+        if let Err(error) = self
+            .start_agent(
+                &agent_id,
+                run_id,
+                None,
+                Path::new(&inspection.path),
+                &route,
+                SandboxMode::ReadOnly,
+                text_requires_github(&run.objective),
+                &run.objective,
+                Some(self.config.orchestration.default_task_token_budget),
+                prompt,
+                Some(serde_json::from_str(INTENT_INTERVIEW_TURN_SCHEMA)?),
+            )
+            .await
+        {
+            snapshot.status = IntentInterviewStatus::Failed;
+            snapshot.updated_at = format_timestamp(now_ms());
+            snapshot.last_error = Some(error.to_string());
+            self.store_intent_interview_snapshot(run_id, &snapshot)?;
+            self.emit_run_event(
+                &run,
+                "run.intent_interview.failed",
+                json!({"agent_id": agent_id, "reason": error.to_string()}),
+            )?;
+            return Err(error);
+        }
+        self.emit_agent_event(
+            run_id,
+            &agent_id,
+            "agent.intent_interviewer.started",
+            json!({"model": route.model, "reasoning_effort": route.reasoning_effort}),
+        )?;
+        Ok(operation("start_intent_interview", run_id.as_str()))
+    }
+
+    pub async fn respond_to_intent_interview(
+        &self,
+        run_id: &RunId,
+        message: &str,
+        actor: &str,
+    ) -> Result<OperationAccepted, OrchestratorError> {
+        let message = message.trim();
+        if message.is_empty() || message.chars().count() > 12_000 {
+            return Err(OrchestratorError::Validation(
+                "interview response must contain between 1 and 12,000 characters".to_owned(),
+            ));
+        }
+        let _guard = self.operation_lock.lock().await;
+        let run = self.store.run(run_id)?;
+        if run.state != RunState::Interviewing {
+            return Err(OrchestratorError::Conflict(format!(
+                "run {} is {}, not INTERVIEWING",
+                run.id, run.state
+            )));
+        }
+        if self.enforce_run_budget(&run)? {
+            return Err(OrchestratorError::Blocked(
+                "run token budget is exhausted before the intent interview response".to_owned(),
+            ));
+        }
+        let mut snapshot = self.intent_interview_snapshot(run_id)?.ok_or_else(|| {
+            OrchestratorError::Protocol(
+                "interviewing run is missing its durable interview state".to_owned(),
+            )
+        })?;
+        let response_kind = match snapshot.status {
+            IntentInterviewStatus::WaitingForHuman => "answer",
+            IntentInterviewStatus::ReadyForConfirmation => "direction",
+            _ => {
+                return Err(OrchestratorError::Conflict(format!(
+                    "intent interview is {:?}, not awaiting a human response",
+                    snapshot.status
+                )));
+            }
+        };
+        let agent_id = snapshot.agent_id.clone().ok_or_else(|| {
+            OrchestratorError::Protocol("intent interview has no interviewer session".to_owned())
+        })?;
+        let agent = self.store.agent(&agent_id)?;
+        if agent.active_turn_id.is_some() {
+            return Err(OrchestratorError::Conflict(
+                "the interviewer is still working on the current turn".to_owned(),
+            ));
+        }
+        let thread_id = agent.thread_id.clone().ok_or_else(|| {
+            OrchestratorError::Blocked("interviewer thread is unavailable".to_owned())
+        })?;
+        self.require_runtime_ready().await?;
+        self.select_preferred_codex_account_for_run(run_id).await?;
+        let model = agent
+            .effective_model
+            .clone()
+            .unwrap_or(agent.requested_model.clone());
+        let effort = agent
+            .effective_reasoning_effort
+            .clone()
+            .unwrap_or(agent.requested_reasoning_effort.clone());
+        let cwd = PathBuf::from(&agent.cwd);
+        let runtime = self.runtime().await?;
+        let prior_snapshot = snapshot.clone();
+        let timestamp = format_timestamp(now_ms());
+        snapshot.status = IntentInterviewStatus::Running;
+        snapshot.turn_count = snapshot.turn_count.saturating_add(1);
+        snapshot.updated_at = timestamp.clone();
+        snapshot.last_error = None;
+        snapshot.messages.push(IntentInterviewMessage {
+            role: "human".to_owned(),
+            kind: response_kind.to_owned(),
+            text: message.to_owned(),
+            why_it_matters: None,
+            recorded_at: timestamp,
+        });
+        self.store.prepare_agent_continuation(
+            &agent_id,
+            self.config.orchestration.default_task_token_budget,
+            "Incorporating the human's intent response",
+        )?;
+        self.store_intent_interview_snapshot(run_id, &snapshot)?;
+        let prompt = format!(
+            "Human response:\n{message}\n\nUpdate the complete brief from the established conversation. Do not revisit resolved decisions. Ask the single next highest-leverage question only if its answer could materially change the intended result or acceptance; otherwise return the ready brief. Return only JSON matching the supplied output schema."
+        );
+        let turn_result: Result<Value, OrchestratorError> = async {
+            runtime
+                .set_goal(
+                    &thread_id,
+                    &run.objective,
+                    Some(self.config.orchestration.default_task_token_budget),
+                )
+                .await?;
+            runtime
+                .start_turn(StartTurn {
+                    thread_id: thread_id.clone(),
+                    input: prompt,
+                    model: model.clone(),
+                    effort: effort.clone(),
+                    cwd: cwd.clone(),
+                    sandbox_policy: sandbox_policy(
+                        SandboxMode::ReadOnly,
+                        &cwd,
+                        text_requires_github(&run.objective),
+                    ),
+                    approval_policy: "never".to_owned(),
+                    output_schema: Some(serde_json::from_str(INTENT_INTERVIEW_TURN_SCHEMA)?),
+                    reasoning_summary: self.config.codex.reasoning_summary.clone(),
+                })
+                .await
+                .map_err(Into::into)
+        }
+        .await;
+        let turn = match turn_result {
+            Ok(turn) => turn,
+            Err(error) => {
+                self.store_intent_interview_snapshot(run_id, &prior_snapshot)?;
+                self.store.clear_agent_active_turn(&agent_id)?;
+                self.store.update_agent_state(
+                    &agent_id,
+                    "TURN_COMPLETE",
+                    Some("Waiting for the human to retry the interview response"),
+                    None,
+                    None,
+                    None,
+                )?;
+                return Err(error);
+            }
+        };
+        let Some(turn_id) = value_text(&turn, &[&["turn", "id"], &["turnId"], &["id"]]) else {
+            self.store_intent_interview_snapshot(run_id, &prior_snapshot)?;
+            self.store.clear_agent_active_turn(&agent_id)?;
+            self.store.update_agent_state(
+                &agent_id,
+                "TURN_COMPLETE",
+                Some("Waiting for the human to retry the interview response"),
+                None,
+                None,
+                None,
+            )?;
+            return Err(OrchestratorError::Protocol(
+                "interviewer turn/start response lacks turn id".to_owned(),
+            ));
+        };
+        self.store.attach_codex_turn(
+            &agent_id,
+            &thread_id,
+            turn_id,
+            Some(&model),
+            Some(&effort),
+            false,
+        )?;
+        self.store.record_human_action(
+            Some(run_id),
+            None,
+            actor,
+            "respond_to_intent_interview",
+            "intent_interview",
+            run_id.as_str(),
+            &json!({"message": message, "turn_count": snapshot.turn_count}),
+        )?;
+        self.emit_agent_event(
+            run_id,
+            &agent_id,
+            "agent.intent_interviewer.response_started",
+            json!({"turn_count": snapshot.turn_count}),
+        )?;
+        Ok(operation("respond_to_intent_interview", run_id.as_str()))
+    }
+
+    pub async fn confirm_intent_interview(
+        &self,
+        run_id: &RunId,
+        expected_digest: &str,
+        actor: &str,
+    ) -> Result<OperationAccepted, OrchestratorError> {
+        let guard = self.operation_lock.lock().await;
+        let run = self.store.run(run_id)?;
+        if run.state != RunState::Interviewing {
+            return Err(OrchestratorError::Conflict(format!(
+                "run {} is {}, not INTERVIEWING",
+                run.id, run.state
+            )));
+        }
+        let mut snapshot = self.intent_interview_snapshot(run_id)?.ok_or_else(|| {
+            OrchestratorError::Protocol(
+                "interviewing run is missing its durable interview state".to_owned(),
+            )
+        })?;
+        if snapshot.status != IntentInterviewStatus::ReadyForConfirmation {
+            return Err(OrchestratorError::Conflict(format!(
+                "intent interview is {:?}, not ready for confirmation",
+                snapshot.status
+            )));
+        }
+        let brief = snapshot.draft_brief.clone().ok_or_else(|| {
+            OrchestratorError::Protocol("intent interview has no draft brief".to_owned())
+        })?;
+        let digest = snapshot.draft_digest.clone().ok_or_else(|| {
+            OrchestratorError::Protocol("intent interview has no draft digest".to_owned())
+        })?;
+        if expected_digest != digest || packet_digest(&brief)? != digest {
+            return Err(OrchestratorError::Conflict(
+                "intent brief changed before confirmation".to_owned(),
+            ));
+        }
+        let timestamp = format_timestamp(now_ms());
+        snapshot.status = IntentInterviewStatus::Confirmed;
+        snapshot.confirmed_brief = Some(brief);
+        snapshot.confirmed_digest = Some(digest.clone());
+        snapshot.confirmed_at = Some(timestamp.clone());
+        snapshot.updated_at = timestamp;
+        snapshot.last_error = None;
+        self.store_intent_interview_snapshot(run_id, &snapshot)?;
+        if let Some(agent_id) = snapshot.agent_id.as_ref() {
+            self.store.clear_agent_active_turn(agent_id)?;
+            self.store.update_agent_state(
+                agent_id,
+                "COMPLETED",
+                Some("Intent brief confirmed by the human"),
+                None,
+                None,
+                None,
+            )?;
+        }
+        self.store.record_human_action(
+            Some(run_id),
+            None,
+            actor,
+            "confirm_intent_interview",
+            "intent_brief",
+            &digest,
+            &json!({"brief_digest": digest}),
+        )?;
+        let ready = self.store.transition_run(
+            run_id,
+            RunState::ReadyForArchitecture,
+            "intent_confirmed",
+            Some(run.version),
+            None,
+        )?;
+        self.emit_run_event(
+            &ready,
+            "run.intent_interview.confirmed",
+            json!({"brief_digest": digest}),
+        )?;
+        drop(guard);
+        self.start_architecture(run_id).await?;
+        Ok(operation("confirm_intent_interview", run_id.as_str()))
+    }
+
+    pub async fn skip_intent_interview(
+        &self,
+        run_id: &RunId,
+        actor: &str,
+    ) -> Result<OperationAccepted, OrchestratorError> {
+        let guard = self.operation_lock.lock().await;
+        let run = self.store.run(run_id)?;
+        if run.state != RunState::Interviewing {
+            return Err(OrchestratorError::Conflict(format!(
+                "run {} is {}, not INTERVIEWING",
+                run.id, run.state
+            )));
+        }
+        let mut snapshot = self.intent_interview_snapshot(run_id)?.ok_or_else(|| {
+            OrchestratorError::Protocol(
+                "interviewing run is missing its durable interview state".to_owned(),
+            )
+        })?;
+        if let Some(agent_id) = snapshot.agent_id.as_ref() {
+            let agent = self.store.agent(agent_id)?;
+            if let (Some(thread_id), Some(turn_id)) =
+                (agent.thread_id.as_deref(), agent.active_turn_id.as_deref())
+                && let Ok(runtime) = self.runtime().await
+                && let Err(error) = runtime.interrupt_turn(thread_id, turn_id).await
+            {
+                warn!(%error, %agent_id, "could not interrupt skipped intent interview turn");
+            }
+            self.store.clear_agent_active_turn(agent_id)?;
+            self.store.update_agent_state(
+                agent_id,
+                "CANCELED",
+                Some("Intent interview skipped by the human"),
+                None,
+                None,
+                None,
+            )?;
+        }
+        let timestamp = format_timestamp(now_ms());
+        snapshot.status = IntentInterviewStatus::Skipped;
+        snapshot.skipped_at = Some(timestamp.clone());
+        snapshot.updated_at = timestamp;
+        snapshot.last_error = None;
+        self.store_intent_interview_snapshot(run_id, &snapshot)?;
+        self.store.record_human_action(
+            Some(run_id),
+            None,
+            actor,
+            "skip_intent_interview",
+            "intent_interview",
+            run_id.as_str(),
+            &json!({"turn_count": snapshot.turn_count}),
+        )?;
+        let ready = self.store.transition_run(
+            run_id,
+            RunState::ReadyForArchitecture,
+            "intent_skipped",
+            Some(run.version),
+            None,
+        )?;
+        self.emit_run_event(&ready, "run.intent_interview.skipped", json!({}))?;
+        drop(guard);
+        self.start_architecture(run_id).await?;
+        Ok(operation("skip_intent_interview", run_id.as_str()))
+    }
+
+    pub async fn start_architecture(
+        &self,
+        run_id: &RunId,
+    ) -> Result<OperationAccepted, OrchestratorError> {
+        let _guard = self.operation_lock.lock().await;
+        let run = self.store.run(run_id)?;
+        if run.state != RunState::ReadyForArchitecture {
+            return Err(OrchestratorError::Conflict(format!(
+                "run {} is {}, not READY_FOR_ARCHITECTURE",
+                run.id, run.state
+            )));
+        }
+        if self.enforce_run_budget(&run)? {
+            return Err(OrchestratorError::Blocked(
+                "run token budget is exhausted before architecture".to_owned(),
+            ));
+        }
+        self.require_runtime_ready().await?;
+        self.select_preferred_codex_account_for_run(run_id).await?;
+        let (active_total, _, _) = self.active_agent_counts()?;
+        if active_total >= self.config.orchestration.max_total_agent_threads {
+            return Err(OrchestratorError::Blocked(format!(
+                "all {} Codex thread slots are active",
+                self.config.orchestration.max_total_agent_threads
+            )));
+        }
+        let inspection = self
+            .store
+            .list_worktrees(Some(run_id))?
+            .into_iter()
+            .find(|worktree| worktree.kind == "inspection" && worktree.state == "READY")
+            .ok_or_else(|| {
+                OrchestratorError::Blocked("inspection worktree is unavailable".to_owned())
+            })?;
         let profile = self.profile_for_run(&run)?;
+        let intent_binding = self.confirmed_intent_brief(run_id)?;
+        let intent_section =
+            intent_brief_prompt_section(intent_binding.as_ref().map(|(brief, _)| brief))?;
         for architect in self
             .store
             .list_agents(run_id)?
@@ -2779,9 +3395,10 @@ impl Orchestrator {
             "Create the smallest safe dependency-ordered task graph. Give each governor-owned task 3-12 concrete outcome milestones inside its custody."
         };
         let prompt = format!(
-            "{}\n\nObjective:\n{}\n\nPlanning posture:\n{planning_posture}\n\n{PLAN_QUALITY_CONTRACT}\n\nController facts and output contract:\n- Use exact base SHA {} for every task.\n- Cite active authorities and define disjoint owned paths, realistic budgets, success evidence, and proof limits. An empty early-stage regression list is better than speculative coverage.\n- Path fields contain normalized repository-relative globs. Use `directory/**` for a subtree; do not put external resources in path fields.\n- A reserved serial path must appear verbatim in both the profile serial-path list and that task's owned paths. Allowed serial paths: {}.\n\nReturn only JSON matching the supplied output schema.",
+            "{}\n\nObjective:\n{}{}\n\nPlanning posture:\n{planning_posture}\n\n{PLAN_QUALITY_CONTRACT}\n\nController facts and output contract:\n- Use exact base SHA {} for every task.\n- Cite active authorities and define disjoint owned paths, realistic budgets, success evidence, and proof limits. An empty early-stage regression list is better than speculative coverage.\n- Path fields contain normalized repository-relative globs. Use `directory/**` for a subtree; do not put external resources in path fields.\n- A reserved serial path must appear verbatim in both the profile serial-path list and that task's owned paths. Allowed serial paths: {}.\n\nReturn only JSON matching the supplied output schema.",
             context.prompt_prefix(),
             run.objective,
+            intent_section,
             run.base_sha,
             serde_json::to_string(&profile.profile.serial_paths)?,
         );
@@ -2941,6 +3558,7 @@ impl Orchestrator {
         let planning_tokens_used = self.store.run_usage(run_id)?.total_tokens;
         let budget = plan_budget_assessment(&run, &plan, &self.config, planning_tokens_used);
         let risk = plan_risk_assessment(&plan, &self.config);
+        let intent_binding = self.confirmed_intent_brief(run_id)?;
         // Plan review deliberately uses the integrator family rather than the
         // architect/verifier family. The session remains read-only.
         let route = &profile.profile.models.integrator;
@@ -2965,7 +3583,17 @@ impl Orchestrator {
             )),
             token_budget: Some(self.config.orchestration.default_task_token_budget),
         })?;
-        let prompt = plan_review_prompt(&context, &run, &plan, &digest, revision, &budget, &risk)?;
+        let intent_section =
+            intent_brief_prompt_section(intent_binding.as_ref().map(|(brief, _)| brief))?;
+        let prompt = format!(
+            "{}\n\nObjective:\n{}{}\n\nPlan revision {revision}, digest {digest}:\n{}\n\nController budget assessment:\n{}\n\nController risk assessment:\n{}\n\n{PLAN_REVIEW_CONTRACT}\n\nThe controller has already checked schema, path custody, the dependency graph, base SHA, and static risk flags; do not re-derive them. Inspect implementation and authority files that bear on success. Name files actually inspected, trace the critical path by task id to behavioral proof, and identify one to three material failure modes with mitigations. Return only JSON matching the supplied output schema.",
+            context.prompt_prefix(),
+            run.objective,
+            intent_section,
+            serde_json::to_string_pretty(&plan)?,
+            serde_json::to_string_pretty(&budget)?,
+            serde_json::to_string_pretty(&risk)?,
+        );
         if let Err(error) = self
             .start_agent(
                 &agent_id,
@@ -3146,6 +3774,9 @@ impl Orchestrator {
                 automatic_approval_blockers
                     .push("architect and reviewer used the same model family".to_owned());
             }
+            let intent_brief_digest = self
+                .confirmed_intent_brief(run_id)?
+                .map(|(_, digest)| digest);
             let certificate = PlanCertificate {
                 schema: "harness.plan-certificate.v2".to_owned(),
                 run_id: run_id.clone(),
@@ -3154,6 +3785,7 @@ impl Orchestrator {
                 base_sha: run.base_sha.clone(),
                 profile_digest: profile.digest,
                 authority_digest: current_authority_digest,
+                intent_brief_digest,
                 reviewer_agent_id: agent_id.clone(),
                 reviewer: PlanReviewerIdentity {
                     architect_model,
@@ -3377,6 +4009,9 @@ impl Orchestrator {
                 OrchestratorError::Blocked("inspection worktree is unavailable".to_owned())
             })?;
         let profile = self.profile_for_run(&run)?;
+        let intent_binding = self.confirmed_intent_brief(run_id)?;
+        let intent_section =
+            intent_brief_prompt_section(intent_binding.as_ref().map(|(brief, _)| brief))?;
         let packet = architecture_packet(&run, &profile.profile, &self.config);
         let context = self.context.compile(
             Path::new(&inspection.path),
@@ -3416,9 +4051,10 @@ impl Orchestrator {
             None,
         )?;
         let prompt = format!(
-            "{}\n\nObjective:\n{}\n\nPrior plan revision {revision}:\n{}\n\nBlocking review or operator findings:\n{}\n\n{PLAN_QUALITY_CONTRACT}\n\nReturn a complete replacement plan that resolves every blocking finding while preserving correct work. Improve the path to working behavior; do not answer a finding by adding speculative process, inventory, constraints, or tests. Return only JSON matching the supplied output schema.",
+            "{}\n\nObjective:\n{}{}\n\nPrior plan revision {revision}:\n{}\n\nBlocking review or operator findings:\n{}\n\n{PLAN_QUALITY_CONTRACT}\n\nReturn a complete replacement plan that resolves every blocking finding while preserving correct work. Improve the path to working behavior; do not answer a finding by adding speculative process, inventory, constraints, or tests. Return only JSON matching the supplied output schema.",
             context.prompt_prefix(),
             run.objective,
+            intent_section,
             serde_json::to_string_pretty(&prior_plan)?,
             serde_json::to_string_pretty(&review)?,
         );
@@ -3661,6 +4297,12 @@ impl Orchestrator {
         }
         if certificate.authority_digest != current_authority_digest {
             stale_bindings.push("authority set".to_owned());
+        }
+        let current_intent_brief_digest = self
+            .confirmed_intent_brief(run_id)?
+            .map(|(_, digest)| digest);
+        if certificate.intent_brief_digest != current_intent_brief_digest {
+            stale_bindings.push("confirmed intent brief".to_owned());
         }
         if !stale_bindings.is_empty() {
             self.store.reopen_latest_plan_for_review(run_id)?;
@@ -4854,6 +5496,28 @@ impl Orchestrator {
         let agent = self.store.agent(agent_id)?;
         let (run_id, attempt_id) = self.store.agent_context(agent_id)?;
         match agent.role {
+            AgentRole::Interviewer => {
+                if self.store.run(&run_id)?.state == RunState::Interviewing {
+                    let result = parse_json_text::<IntentInterviewTurn>(text).and_then(|turn| {
+                        validate_intent_interview_turn(&turn)?;
+                        Ok(turn)
+                    });
+                    match result {
+                        Ok(turn) => {
+                            self.apply_intent_interview_turn(&run_id, agent_id, turn)
+                                .await?;
+                        }
+                        Err(error) => {
+                            self.fail_intent_interview_turn(
+                                &run_id,
+                                agent_id,
+                                "protocol_error",
+                                &error.to_string(),
+                            )?;
+                        }
+                    }
+                }
+            }
             AgentRole::Architect => {
                 if self.store.run(&run_id)?.state == RunState::Architecting {
                     let result = parse_json_text::<RunPlan>(text)
@@ -4923,6 +5587,122 @@ impl Orchestrator {
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    async fn apply_intent_interview_turn(
+        &self,
+        run_id: &RunId,
+        agent_id: &AgentSessionId,
+        turn: IntentInterviewTurn,
+    ) -> Result<(), OrchestratorError> {
+        let _guard = self.operation_lock.lock().await;
+        let run = self.store.run(run_id)?;
+        if run.state != RunState::Interviewing {
+            return Ok(());
+        }
+        let mut snapshot = self.intent_interview_snapshot(run_id)?.ok_or_else(|| {
+            OrchestratorError::Protocol(
+                "interviewing run is missing its durable interview state".to_owned(),
+            )
+        })?;
+        if snapshot.status != IntentInterviewStatus::Running
+            || snapshot.agent_id.as_ref() != Some(agent_id)
+        {
+            return Ok(());
+        }
+        let digest = packet_digest(&turn.brief)?;
+        let timestamp = format_timestamp(now_ms());
+        let (status, kind, text) = match turn.status {
+            IntentInterviewTurnStatus::Question => (
+                IntentInterviewStatus::WaitingForHuman,
+                "question",
+                turn.question.clone().expect("validated interview question"),
+            ),
+            IntentInterviewTurnStatus::Ready => (
+                IntentInterviewStatus::ReadyForConfirmation,
+                "brief_ready",
+                "The intent brief is ready for confirmation.".to_owned(),
+            ),
+        };
+        snapshot.status = status;
+        snapshot.draft_brief = Some(turn.brief);
+        snapshot.draft_digest = Some(digest.clone());
+        snapshot.updated_at = timestamp.clone();
+        snapshot.last_error = None;
+        snapshot.messages.push(IntentInterviewMessage {
+            role: "interviewer".to_owned(),
+            kind: kind.to_owned(),
+            text,
+            why_it_matters: turn.why_it_matters,
+            recorded_at: timestamp,
+        });
+        self.store_intent_interview_snapshot(run_id, &snapshot)?;
+        self.store.clear_agent_active_turn(agent_id)?;
+        self.store.update_agent_state(
+            agent_id,
+            "TURN_COMPLETE",
+            Some(match status {
+                IntentInterviewStatus::WaitingForHuman => "Waiting for the human's response",
+                IntentInterviewStatus::ReadyForConfirmation => {
+                    "Waiting for the human to confirm the intent brief"
+                }
+                _ => unreachable!("interview turn has a waiting state"),
+            }),
+            None,
+            None,
+            None,
+        )?;
+        self.emit_run_event(
+            &run,
+            "run.intent_interview.updated",
+            json!({
+                "status": status,
+                "turn_count": snapshot.turn_count,
+                "draft_digest": digest,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn fail_intent_interview_turn(
+        &self,
+        run_id: &RunId,
+        agent_id: &AgentSessionId,
+        failure_class: &str,
+        reason: &str,
+    ) -> Result<(), OrchestratorError> {
+        let run = self.store.run(run_id)?;
+        if run.state != RunState::Interviewing {
+            return Ok(());
+        }
+        let Some(mut snapshot) = self.intent_interview_snapshot(run_id)? else {
+            return Ok(());
+        };
+        if snapshot.agent_id.as_ref() != Some(agent_id)
+            || snapshot.status != IntentInterviewStatus::Running
+        {
+            return Ok(());
+        }
+        let detail = reason.chars().take(2_000).collect::<String>();
+        snapshot.status = IntentInterviewStatus::Failed;
+        snapshot.updated_at = format_timestamp(now_ms());
+        snapshot.last_error = Some(detail.clone());
+        self.store_intent_interview_snapshot(run_id, &snapshot)?;
+        self.store.clear_agent_active_turn(agent_id)?;
+        self.store.update_agent_state(
+            agent_id,
+            "FAILED",
+            Some("Intent interview turn failed"),
+            None,
+            None,
+            Some((failure_class, &detail)),
+        )?;
+        self.emit_run_event(
+            &run,
+            "run.intent_interview.failed",
+            json!({"agent_id": agent_id, "reason": detail}),
+        )?;
         Ok(())
     }
 
@@ -5183,6 +5963,87 @@ impl Orchestrator {
                 None,
             )?;
             self.finish_stopping_run_if_idle(&run_id)?;
+            return Ok(());
+        }
+        if agent.role == AgentRole::Interviewer {
+            let snapshot = self.intent_interview_snapshot(&run_id)?;
+            match snapshot.as_ref().map(|snapshot| snapshot.status) {
+                Some(IntentInterviewStatus::Skipped) => {
+                    self.store.clear_agent_active_turn(agent_id)?;
+                    self.store.update_agent_state(
+                        agent_id,
+                        "CANCELED",
+                        Some("Intent interview skipped by the human"),
+                        None,
+                        None,
+                        None,
+                    )?;
+                }
+                Some(IntentInterviewStatus::Confirmed) => {
+                    self.store.clear_agent_active_turn(agent_id)?;
+                    self.store.update_agent_state(
+                        agent_id,
+                        "COMPLETED",
+                        Some("Intent brief confirmed by the human"),
+                        None,
+                        None,
+                        None,
+                    )?;
+                }
+                Some(IntentInterviewStatus::Failed) => {
+                    let reason = snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.last_error.as_deref())
+                        .unwrap_or("interviewer turn failed");
+                    self.store.clear_agent_active_turn(agent_id)?;
+                    self.store.update_agent_state(
+                        agent_id,
+                        "FAILED",
+                        Some("Intent interview turn failed"),
+                        None,
+                        None,
+                        Some((
+                            if status == "completed" {
+                                "protocol_error"
+                            } else {
+                                "infrastructure_unavailable"
+                            },
+                            reason,
+                        )),
+                    )?;
+                }
+                Some(IntentInterviewStatus::Running) if status == "completed" => {
+                    self.fail_intent_interview_turn(
+                        &run_id,
+                        agent_id,
+                        "protocol_error",
+                        "interviewer returned no schema-valid turn",
+                    )?;
+                }
+                Some(IntentInterviewStatus::Running) => {
+                    self.fail_intent_interview_turn(
+                        &run_id,
+                        agent_id,
+                        "infrastructure_unavailable",
+                        &format!("interviewer turn ended with status {status}"),
+                    )?;
+                }
+                Some(
+                    IntentInterviewStatus::WaitingForHuman
+                    | IntentInterviewStatus::ReadyForConfirmation,
+                ) => {
+                    self.store.clear_agent_active_turn(agent_id)?;
+                    self.store.update_agent_state(
+                        agent_id,
+                        "TURN_COMPLETE",
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?;
+                }
+                Some(IntentInterviewStatus::NotStarted) | None => {}
+            }
             return Ok(());
         }
         if status != "completed" {
@@ -5514,6 +6375,7 @@ impl Orchestrator {
     fn reconcile_orphaned_sessions(&self, reason: &str) -> Result<(), OrchestratorError> {
         for run in self.store.list_runs(None, false)? {
             let mut affected = 0_u32;
+            let mut interviewer_affected = false;
             let agents = self.store.list_agents(&run.id)?;
             let active_governor_tasks = agents
                 .iter()
@@ -5565,6 +6427,7 @@ impl Orchestrator {
                 )
             }) {
                 affected = affected.saturating_add(1);
+                interviewer_affected |= agent.role == AgentRole::Interviewer;
                 self.store.clear_agent_active_turn(&agent.id)?;
                 self.store.update_agent_state(
                     &agent.id,
@@ -5690,6 +6553,21 @@ impl Orchestrator {
             }
             self.store.expire_pending_approvals(&run.id, reason)?;
             let current = self.store.run(&run.id)?;
+            if current.state == RunState::Interviewing
+                && interviewer_affected
+                && let Some(mut snapshot) = self.intent_interview_snapshot(&run.id)?
+                && snapshot.status == IntentInterviewStatus::Running
+            {
+                snapshot.status = IntentInterviewStatus::Failed;
+                snapshot.updated_at = format_timestamp(now_ms());
+                snapshot.last_error = Some(reason.to_owned());
+                self.store_intent_interview_snapshot(&run.id, &snapshot)?;
+                self.emit_run_event(
+                    &current,
+                    "run.intent_interview.failed",
+                    json!({"reason": reason, "retryable": true}),
+                )?;
+            }
             let reconciled = if current.state == RunState::Architecting {
                 let retry_state = self.architecture_retry_state(&run.id)?;
                 self.store.transition_run(
@@ -9747,6 +10625,112 @@ fn plan_review_metadata_key(run_id: &RunId, revision: u64) -> String {
     format!("plan-review:{run_id}:{revision}")
 }
 
+fn intent_interview_metadata_key(run_id: &RunId) -> String {
+    format!("intent-interview:{run_id}")
+}
+
+fn new_intent_interview_snapshot() -> IntentInterviewSnapshot {
+    IntentInterviewSnapshot {
+        schema: "harness.intent-interview.v1".to_owned(),
+        status: IntentInterviewStatus::NotStarted,
+        agent_id: None,
+        turn_count: 0,
+        messages: Vec::new(),
+        draft_brief: None,
+        draft_digest: None,
+        confirmed_brief: None,
+        confirmed_digest: None,
+        started_at: None,
+        updated_at: format_timestamp(now_ms()),
+        confirmed_at: None,
+        skipped_at: None,
+        last_error: None,
+    }
+}
+
+fn validate_intent_interview_turn(turn: &IntentInterviewTurn) -> Result<(), OrchestratorError> {
+    if turn.schema != "harness.intent-interview-turn.v1" {
+        return Err(OrchestratorError::Validation(
+            "intent interview turn has an unknown schema".to_owned(),
+        ));
+    }
+    let objective = turn.brief.refined_objective.trim();
+    if objective.is_empty() || objective.chars().count() > 12_000 {
+        return Err(OrchestratorError::Validation(
+            "intent brief needs a bounded refined objective".to_owned(),
+        ));
+    }
+    for (field, values) in [
+        ("intended_final_shape", &turn.brief.intended_final_shape),
+        ("hard_constraints", &turn.brief.hard_constraints),
+        ("preferences", &turn.brief.preferences),
+        ("non_goals", &turn.brief.non_goals),
+        ("acceptance_examples", &turn.brief.acceptance_examples),
+        ("planner_may_decide", &turn.brief.planner_may_decide),
+        (
+            "assumptions_to_validate",
+            &turn.brief.assumptions_to_validate,
+        ),
+    ] {
+        if values.len() > 32
+            || values
+                .iter()
+                .any(|value| value.trim().is_empty() || value.chars().count() > 4_000)
+        {
+            return Err(OrchestratorError::Validation(format!(
+                "intent brief field {field} contains an invalid item"
+            )));
+        }
+    }
+    match turn.status {
+        IntentInterviewTurnStatus::Question => {
+            if turn.question.as_ref().is_none_or(|question| {
+                question.trim().is_empty() || question.chars().count() > 4_000
+            }) {
+                return Err(OrchestratorError::Validation(
+                    "question interview turn needs one bounded question".to_owned(),
+                ));
+            }
+        }
+        IntentInterviewTurnStatus::Ready => {
+            if turn.question.is_some() {
+                return Err(OrchestratorError::Validation(
+                    "ready interview turn must not include another question".to_owned(),
+                ));
+            }
+            if turn.brief.intended_final_shape.is_empty()
+                || turn.brief.acceptance_examples.is_empty()
+            {
+                return Err(OrchestratorError::Validation(
+                    "ready intent brief needs a final shape and at least one acceptance example"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    if turn
+        .why_it_matters
+        .as_ref()
+        .is_some_and(|reason| reason.trim().is_empty() || reason.chars().count() > 2_000)
+    {
+        return Err(OrchestratorError::Validation(
+            "interview question rationale must be non-empty and bounded when present".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn intent_brief_prompt_section(brief: Option<&IntentBrief>) -> Result<String, OrchestratorError> {
+    brief
+        .map(|brief| {
+            serde_json::to_string_pretty(brief)
+                .map(|brief| format!("\n\nHuman-confirmed intent brief:\n{brief}"))
+                .map_err(Into::into)
+        })
+        .transpose()
+        .map(|section| section.unwrap_or_default())
+}
+
 fn plan_certificate_metadata_key(run_id: &RunId, revision: u64) -> String {
     format!("plan-certificate:{run_id}:{revision}")
 }
@@ -9757,25 +10741,6 @@ fn plan_revision_input_metadata_key(run_id: &RunId, revision: u64) -> String {
 
 fn plan_review_history_metadata_key(run_id: &RunId) -> String {
     format!("plan-review-history:{run_id}")
-}
-
-fn plan_review_prompt(
-    context: &ContextPacket,
-    run: &RunSummary,
-    plan: &RunPlan,
-    digest: &str,
-    revision: u64,
-    budget: &PlanBudgetAssessment,
-    risk: &PlanRiskAssessment,
-) -> Result<String, OrchestratorError> {
-    Ok(format!(
-        "{}\n\nObjective:\n{}\n\nPlan revision {revision}, digest {digest}:\n{}\n\nController budget assessment:\n{}\n\nController risk assessment:\n{}\n\n{PLAN_REVIEW_CONTRACT}\n\nThe controller has already checked schema, path custody, the dependency graph, base SHA, and static risk flags; do not re-derive them. Inspect implementation and authority files that bear on success. Name files actually inspected, trace the critical path by task id to behavioral proof, and identify one to three material failure modes with mitigations. Return only JSON matching the supplied output schema.",
-        context.prompt_prefix(),
-        run.objective,
-        serde_json::to_string_pretty(plan)?,
-        serde_json::to_string_pretty(budget)?,
-        serde_json::to_string_pretty(risk)?,
-    ))
 }
 
 fn validate_plan_review_verdict(
@@ -11867,6 +12832,55 @@ mod tests {
                 .developer_instructions
                 .contains("This is a read-only assignment")
         );
+    }
+
+    #[test]
+    fn intent_interview_accepts_questions_but_certifies_only_an_observable_brief() {
+        let brief = IntentBrief {
+            refined_objective: "Ship the requested behavior".to_owned(),
+            intended_final_shape: vec![],
+            hard_constraints: vec![],
+            preferences: vec![],
+            non_goals: vec![],
+            acceptance_examples: vec![],
+            planner_may_decide: vec!["Internal code shape".to_owned()],
+            assumptions_to_validate: vec![],
+        };
+        let question = IntentInterviewTurn {
+            schema: "harness.intent-interview-turn.v1".to_owned(),
+            status: IntentInterviewTurnStatus::Question,
+            question: Some("Which observable result matters most?".to_owned()),
+            why_it_matters: Some("It determines acceptance.".to_owned()),
+            brief: brief.clone(),
+        };
+        assert!(validate_intent_interview_turn(&question).is_ok());
+
+        let incomplete = IntentInterviewTurn {
+            status: IntentInterviewTurnStatus::Ready,
+            question: None,
+            ..question.clone()
+        };
+        assert!(validate_intent_interview_turn(&incomplete).is_err());
+
+        let ready = IntentInterviewTurn {
+            brief: IntentBrief {
+                intended_final_shape: vec!["The behavior works on the primary path".to_owned()],
+                acceptance_examples: vec!["The authoritative pipeline exercises it".to_owned()],
+                ..brief
+            },
+            ..incomplete
+        };
+        assert!(validate_intent_interview_turn(&ready).is_ok());
+    }
+
+    #[test]
+    fn interviewer_prompt_keeps_human_intent_separate_from_implementation_planning() {
+        let instructions =
+            agent_developer_instructions(AgentRole::Interviewer, SandboxMode::ReadOnly);
+        assert!(instructions.contains("produce a concise planning brief"));
+        assert!(instructions.contains("do not plan or implement"));
+        assert!(INTENT_INTERVIEW_CONTRACT.contains("one highest-leverage question at a time"));
+        assert!(INTENT_INTERVIEW_CONTRACT.contains("raw conversation is not planner input"));
     }
 
     #[test]

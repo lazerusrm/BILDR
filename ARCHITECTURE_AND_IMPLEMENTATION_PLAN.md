@@ -387,6 +387,7 @@ Every item retains raw event linkage and start/complete timestamps. The UI can s
 Repository
   └─ Run
       ├─ Worktree (inspection, task, verifier, integration)
+      ├─ IntentInterview (questions, human responses, draft/confirmed brief)
       ├─ Task
       │   └─ Attempt
       │       ├─ PathLease
@@ -410,7 +411,9 @@ The supplied migration is the starting relational design. Add optimistic `versio
 ```text
 CREATED
   -> PREPARING
-  -> READY_FOR_ARCHITECTURE
+  -> INTERVIEWING (optional)
+       -> READY_FOR_ARCHITECTURE (human confirms or skips)
+  -> READY_FOR_ARCHITECTURE (when the optional interview is off)
   -> ARCHITECTING
   -> PLAN_ADVERSARIAL_REVIEW
        -> PLAN_REVISION_REQUIRED -> ARCHITECTING (review/revision loop)
@@ -443,6 +446,14 @@ ARCHIVED
 ```
 
 No state is inferred from UI counts. The controller executes an explicit transition command in a transaction, validates preconditions, and emits a domain event.
+
+`INTERVIEWING` is a real human gate, not an automatic planning loop. The
+selected governor model asks at most one material intent question per completed
+turn in a read-only inspection worktree. Each human response starts a new turn
+on the same thread. Planning cannot start until the human confirms a concise
+brief or explicitly skips the interview. A fresh architect thread receives the
+original objective and confirmed brief, never the raw transcript. Automatic
+plan approval cannot confirm or skip an interview.
 
 `PLAN_REVIEW_REQUIRED` means the current plan digest and its base/profile/authority
 bindings have already passed a fresh, read-only adversarial review with zero
@@ -614,7 +625,9 @@ review verdict also carries non-empty inspected-file evidence, a task-id
 critical-path trace to behavioral proof, and one to three material failure modes
 with mitigations. The controller—not reviewer prose—attaches budget arithmetic,
 risk routing, planning spend, reviewer identity, and the plan/base/profile/
-authority binding tuple to the certificate.
+authority binding tuple to the certificate. When a human confirms an intent
+brief, the certificate also binds its digest. Approval reopens review if that
+binding changes.
 
 A `changes_requested` verdict must contain concrete blocking findings; the
 architect receives the prior plan and only those blockers and returns a full

@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bildr.local/schemas/harness.intent-interview-turn.v1.schema.json",
+  "title": "Intent interview turn",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "status", "question", "why_it_matters", "brief"],
+  "properties": {
+    "schema": {
+      "const": "harness.intent-interview-turn.v1"
+    },
+    "status": {
+      "enum": ["question", "ready"]
+    },
+    "question": {
+      "type": ["string", "null"],
+      "maxLength": 4000
+    },
+    "why_it_matters": {
+      "type": ["string", "null"],
+      "maxLength": 2000
+    },
+    "brief": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "refined_objective",
+        "intended_final_shape",
+        "hard_constraints",
+        "preferences",
+        "non_goals",
+        "acceptance_examples",
+        "planner_may_decide",
+        "assumptions_to_validate"
+      ],
+      "properties": {
+        "refined_objective": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 12000
+        },
+        "intended_final_shape": {
+          "$ref": "#/$defs/briefItems"
+        },
+        "hard_constraints": {
+          "$ref": "#/$defs/briefItems"
+        },
+        "preferences": {
+          "$ref": "#/$defs/briefItems"
+        },
+        "non_goals": {
+          "$ref": "#/$defs/briefItems"
+        },
+        "acceptance_examples": {
+          "$ref": "#/$defs/briefItems"
+        },
+        "planner_may_decide": {
+          "$ref": "#/$defs/briefItems"
+        },
+        "assumptions_to_validate": {
+          "$ref": "#/$defs/briefItems"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "briefItems": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4000
+      }
+    }
+  }
+}

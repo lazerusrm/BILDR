@@ -95,6 +95,22 @@ pub fn router(orchestrator: Arc<Orchestrator>) -> Router {
             "/api/v1/runs/{run_id}/start-architecture",
             post(start_architecture),
         )
+        .route(
+            "/api/v1/runs/{run_id}/interview/start",
+            post(start_intent_interview),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/interview/respond",
+            post(respond_to_intent_interview),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/interview/confirm",
+            post(confirm_intent_interview),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/interview/skip",
+            post(skip_intent_interview),
+        )
         .route("/api/v1/runs/{run_id}/plan/approve", post(approve_plan))
         .route(
             "/api/v1/runs/{run_id}/plan/request_changes",
@@ -465,6 +481,88 @@ async fn start_architecture(
             state
                 .orchestrator
                 .start_architecture(&RunId::from(run_id))
+                .await?,
+        ),
+    ))
+}
+
+async fn start_intent_interview(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            state
+                .orchestrator
+                .start_intent_interview(&RunId::from(run_id))
+                .await?,
+        ),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntentInterviewResponseBody {
+    message: String,
+}
+
+async fn respond_to_intent_interview(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Json(body): Json<IntentInterviewResponseBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            state
+                .orchestrator
+                .respond_to_intent_interview(&RunId::from(run_id), &body.message, "local-user")
+                .await?,
+        ),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmIntentInterviewBody {
+    brief_digest: String,
+}
+
+async fn confirm_intent_interview(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Json(body): Json<ConfirmIntentInterviewBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            state
+                .orchestrator
+                .confirm_intent_interview(&RunId::from(run_id), &body.brief_digest, "local-user")
+                .await?,
+        ),
+    ))
+}
+
+async fn skip_intent_interview(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            state
+                .orchestrator
+                .skip_intent_interview(&RunId::from(run_id), "local-user")
                 .await?,
         ),
     ))
