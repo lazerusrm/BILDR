@@ -250,10 +250,22 @@ export interface Agent {
   heartbeat_at?: string;
   thread_id?: string;
   active_turn_id?: string;
+  active_turn_started_at?: string | null;
+  active_turn_usage?: TokenUsageSnapshot | null;
   context_strategy?: string;
   context_source_attempt_id?: string;
   context_reuse_reason?: string;
   version: number;
+}
+
+export interface TokenUsageSnapshot {
+  input_tokens: number;
+  cached_input_tokens: number;
+  cache_write_input_tokens?: number | null;
+  output_tokens: number;
+  reasoning_output_tokens: number;
+  total_tokens: number;
+  model_context_window?: number | null;
 }
 
 export interface Worktree {

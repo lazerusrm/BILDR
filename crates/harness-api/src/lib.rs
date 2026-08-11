@@ -25,13 +25,15 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
-use tokio::time::{Instant, interval};
+use tokio::time::{Instant, MissedTickBehavior, interval};
 use tracing::warn;
 use uuid::Uuid;
 
 const SESSION_COOKIE: &str = "harness_session";
 const CSRF_HEADER: &str = "x-harness-csrf";
 const SESSION_TTL_SECONDS: u64 = 12 * 60 * 60;
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const EVENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -1211,7 +1213,10 @@ async fn events(
     let store = state.orchestrator.store().clone();
     let replay_limit = state.event_replay_limit;
     let stream = stream! {
-        let mut heartbeat = interval(Duration::from_secs(15));
+        let mut poll = interval(EVENT_POLL_INTERVAL);
+        poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        poll.tick().await;
+        let mut last_heartbeat = Instant::now();
         loop {
             match store.list_domain_events(cursor, run_id.as_ref(), replay_limit) {
                 Ok(events) if !events.is_empty() => {
@@ -1226,8 +1231,11 @@ async fn events(
                     }
                 }
                 Ok(_) => {
-                    heartbeat.tick().await;
-                    yield Ok(Event::default().event("heartbeat").data(cursor.to_string()));
+                    poll.tick().await;
+                    if last_heartbeat.elapsed() >= EVENT_HEARTBEAT_INTERVAL {
+                        last_heartbeat = Instant::now();
+                        yield Ok(Event::default().event("heartbeat").data(cursor.to_string()));
+                    }
                 }
                 Err(error) => {
                     yield Ok(Event::default().event("stream_error").data(error.to_string()));

@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import {
+  LiveTurnTelemetry,
   agentEffort,
   agentModel,
   delegatedThreadDisplayState,
   effectiveRunPosture,
   formatCost,
+  formatTurnElapsed,
   formatTokens,
   humanTaskState,
   primaryTaskAgent,
@@ -41,6 +45,42 @@ describe("workspace presentation helpers", () => {
     expect(roleLabel("governor")).toBe("Governor");
     expect(formatTokens(12_400)).toBe("12.4k");
     expect(formatCost(6_125_000)).toBe("$6.13");
+    expect(
+      formatTurnElapsed("2026-08-11T12:00:00Z", Date.parse("2026-08-11T12:01:05Z")),
+    ).toBe("1m 5s");
+  });
+
+  it("renders authoritative active-turn token categories without double counting", () => {
+    const agent = {
+      id: "agent-live",
+      role: "interviewer",
+      state: "RUNNING",
+      requested_model: "gpt-5.6-sol",
+      requested_reasoning_effort: "xhigh",
+      active_turn_id: "turn-live",
+      active_turn_started_at: "2026-08-11T12:00:00Z",
+      active_turn_usage: {
+        input_tokens: 12_400,
+        cached_input_tokens: 10_000,
+        cache_write_input_tokens: 0,
+        output_tokens: 640,
+        reasoning_output_tokens: 220,
+        total_tokens: 13_040,
+      },
+      current_action: "Finding the highest-leverage question",
+    } as Agent;
+    const markup = renderToStaticMarkup(
+      createElement(LiveTurnTelemetry, {
+        agent,
+        fallbackAction: "Starting the interview",
+      }),
+    );
+    expect(markup).toContain("Live turn telemetry");
+    expect(markup).toContain("Cached input");
+    expect(markup).toContain("Reasoning in output");
+    expect(markup).toContain("12.4k");
+    expect(markup).toContain("10.0k");
+    expect(markup).toContain("13.0k");
   });
 
   it("keeps the governor as the task control surface", () => {
