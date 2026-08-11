@@ -7791,6 +7791,9 @@ impl Orchestrator {
         ) else {
             return Ok(());
         };
+        let Some(checkpoint_percent) = session_budget_checkpoint_percent(agent.role) else {
+            return Ok(());
+        };
         let metadata_key = format!("session-budget-checkpoint:{agent_id}:{turn_id}");
         if self.store.runtime_metadata(&metadata_key)?.is_some() {
             return Ok(());
@@ -7806,7 +7809,7 @@ impl Orchestrator {
                 self.store.put_runtime_metadata(
                     &metadata_key,
                     &json!({
-                        "checkpoint_percent": 75,
+                        "checkpoint_percent": checkpoint_percent,
                         "tokens_used": agent.tokens_used,
                         "token_budget": budget,
                         "turn_id": turn_id,
@@ -7826,7 +7829,7 @@ impl Orchestrator {
                     agent_id,
                     "agent.session_budget.checkpoint",
                     json!({
-                        "checkpoint_percent": 75,
+                        "checkpoint_percent": checkpoint_percent,
                         "tokens_used": agent.tokens_used,
                         "token_budget": budget,
                         "turn_id": turn_id,
@@ -12754,15 +12757,32 @@ fn session_budget_checkpoint_needed(
     active_turn_id: Option<&str>,
     observed_turn_id: Option<&str>,
 ) -> bool {
-    role != AgentRole::Governor
-        && matches!(agent_state, "RUNNING" | "STEERED")
+    matches!(agent_state, "RUNNING" | "STEERED")
         && token_budget.is_some_and(|budget| {
-            budget > 0
-                && tokens_used < budget
-                && tokens_used.saturating_mul(100) >= budget.saturating_mul(75)
+            session_budget_checkpoint_percent(role).is_some_and(|checkpoint_percent| {
+                budget > 0
+                    && tokens_used < budget
+                    && tokens_used.saturating_mul(100) >= budget.saturating_mul(checkpoint_percent)
+            })
         })
         && active_turn_id.is_some()
         && active_turn_id == observed_turn_id
+}
+
+fn session_budget_checkpoint_percent(role: AgentRole) -> Option<u64> {
+    match role {
+        AgentRole::Governor => None,
+        // Structured planning and review turns need enough remaining budget to
+        // read the checkpoint and perform one more full-context inference.
+        // Total-token accounting includes that repeated input, so a late
+        // checkpoint can be impossible to act on even when output is short.
+        AgentRole::Interviewer
+        | AgentRole::Architect
+        | AgentRole::PlanReviewer
+        | AgentRole::Verifier
+        | AgentRole::FinalAuditor => Some(40),
+        _ => Some(75),
+    }
 }
 
 fn session_budget_checkpoint_message(role: AgentRole) -> &'static str {
@@ -15051,7 +15071,7 @@ mod tests {
             AgentRole::Architect,
             "RUNNING",
             Some(120_000),
-            90_000,
+            48_000,
             Some("turn-current"),
             Some("turn-current"),
         ));
@@ -15059,7 +15079,7 @@ mod tests {
             AgentRole::Architect,
             "RUNNING",
             Some(120_000),
-            89_999,
+            47_999,
             Some("turn-current"),
             Some("turn-current"),
         ));
@@ -15068,6 +15088,22 @@ mod tests {
             "RUNNING",
             Some(120_000),
             120_000,
+            Some("turn-current"),
+            Some("turn-current"),
+        ));
+        assert!(session_budget_checkpoint_needed(
+            AgentRole::Worker,
+            "RUNNING",
+            Some(120_000),
+            90_000,
+            Some("turn-current"),
+            Some("turn-current"),
+        ));
+        assert!(!session_budget_checkpoint_needed(
+            AgentRole::Worker,
+            "RUNNING",
+            Some(120_000),
+            89_999,
             Some("turn-current"),
             Some("turn-current"),
         ));
