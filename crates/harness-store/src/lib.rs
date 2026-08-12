@@ -32,6 +32,8 @@ const SELF_IMPROVEMENT_MIGRATION: &str =
     include_str!("../../../migrations/0006_self_improvement.sql");
 const FAILURE_OBSERVATION_MIGRATION: &str =
     include_str!("../../../migrations/0007_failure_observation.sql");
+const EVALUATION_CUSTODY_MIGRATION: &str =
+    include_str!("../../../migrations/0008_evaluation_custody.sql");
 
 #[derive(Clone)]
 pub struct Store {
@@ -259,8 +261,18 @@ fn apply_runtime_migrations(connection: &mut Connection) -> Result<(), StoreErro
         transaction.execute_batch(FAILURE_OBSERVATION_MIGRATION)?;
         transaction.commit()?;
     }
+    let has_evaluation_runs: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='evaluation_runs')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_evaluation_runs {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(EVALUATION_CUSTODY_MIGRATION)?;
+        transaction.commit()?;
+    }
     connection.execute(
-        "INSERT INTO schema_migrations_meta(key, value) VALUES('runtime_schema_version', '7') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        "INSERT INTO schema_migrations_meta(key, value) VALUES('runtime_schema_version', '8') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         [],
     )?;
     Ok(())
@@ -309,7 +321,7 @@ mod tests {
         assert!(store.check().unwrap().ready);
         drop(store);
         let reopened = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(reopened.migration_version().unwrap(), "7");
+        assert_eq!(reopened.migration_version().unwrap(), "8");
         let has_worktree_fingerprint: bool = reopened
             .connection()
             .unwrap()
@@ -476,7 +488,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let store = Store::open(&database, &temp.path().join("artifacts")).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "7");
+        assert_eq!(store.migration_version().unwrap(), "8");
         for name in [
             "improvement_revisions",
             "improvement_events",
@@ -546,7 +558,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "7");
+        assert_eq!(store.migration_version().unwrap(), "8");
         for name in [
             "failure_occurrences",
             "failure_clusters",
@@ -555,6 +567,15 @@ mod tests {
             "failure_cluster_edits",
             "failure_occurrences_no_update",
             "failure_cluster_membership_revisions_no_delete",
+            "taskset_revision_memberships",
+            "evaluation_runs",
+            "evaluation_run_status_revisions",
+            "evaluation_samples",
+            "evaluation_stat_verdicts",
+            "holdout_access_log",
+            "evaluation_invalidations",
+            "evaluation_runs_no_update",
+            "evaluation_invalidations_no_delete",
         ] {
             let exists: bool = store
                 .connection()
@@ -597,11 +618,260 @@ mod tests {
         );
         drop(store);
         let reopened = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(reopened.migration_version().unwrap(), "7");
+        assert_eq!(reopened.migration_version().unwrap(), "8");
         assert!(
             reopened
                 .backup(&temp.path().join("v6-backup.sqlite3"))
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn v7_upgrade_installs_evaluation_custody_schema_reopens_and_backups() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("v7.sqlite3");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.execute_batch(INITIAL_MIGRATION).unwrap();
+        connection.execute_batch(RUNTIME_MIGRATION).unwrap();
+        connection
+            .execute_batch(APPROVAL_WORKTREE_BINDING_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(ATTEMPT_CONTINUITY_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(ACCOUNT_ATTRIBUTION_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(SELF_IMPROVEMENT_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(FAILURE_OBSERVATION_MIGRATION)
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE schema_migrations_meta SET value='7' WHERE key='runtime_schema_version'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let artifacts = temp.path().join("artifacts");
+        let store = Store::open(&database, &artifacts).unwrap();
+        assert_eq!(store.migration_version().unwrap(), "8");
+        for name in [
+            "taskset_revision_memberships",
+            "evaluation_runs",
+            "evaluation_run_status_revisions",
+            "evaluation_samples",
+            "evaluation_stat_verdicts",
+            "holdout_access_log",
+            "evaluation_invalidations",
+            "evaluation_sample_membership",
+            "evaluation_invalidation_target_exists",
+        ] {
+            let exists: bool = store
+                .connection()
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "missing v8 object {name}");
+        }
+        assert!(store.connection().unwrap().execute(
+            "INSERT INTO evaluation_invalidations(id,target_kind,target_id,reason,idempotency_key,created_at) VALUES('bad','evaluation_run','missing','fixture_drift','bad',1)", []
+        ).is_err());
+        let backup = temp.path().join("v8-backup.sqlite3");
+        store.backup(&backup).unwrap();
+        drop(store);
+        assert_eq!(
+            Store::open(&database, &artifacts)
+                .unwrap()
+                .migration_version()
+                .unwrap(),
+            "8"
+        );
+        assert!(
+            Store::open(&backup, &temp.path().join("backup-artifacts"))
+                .unwrap()
+                .check()
+                .unwrap()
+                .ready
+        );
+    }
+
+    #[test]
+    fn evaluation_custody_replays_exactly_and_fails_closed() {
+        use harness_domain::{
+            ImprovementEventId, ImprovementRecordKind as K, ImprovementSchema as S,
+            ImprovementState as St, RetentionClass as R, SensitivityClass as C,
+        };
+        let temp = TempDir::new().unwrap();
+        let store = Store::in_memory(&temp.path().join("artifacts")).unwrap();
+        let mut case: harness_eval::EvalCaseV1 = serde_json::from_str(include_str!(
+            "../../../examples/self-improvement/eval-case.example.json"
+        ))
+        .unwrap();
+        case.case_id = "case-1".into();
+        case.sha256 = harness_eval::canonical_digest_without_self(&case).unwrap();
+        let mut taskset: harness_eval::TasksetV1 = serde_json::from_str(include_str!(
+            "../../../examples/self-improvement/taskset.example.json"
+        ))
+        .unwrap();
+        taskset.taskset_id = "taskset-1".into();
+        taskset.cases[0].case_id = case.case_id.clone();
+        taskset.cases[0].case_digest = case.sha256.clone();
+        taskset.sha256 = harness_eval::canonical_digest_without_self(&taskset).unwrap();
+        let grader: harness_eval::GraderBundleV1 = serde_json::from_str(include_str!(
+            "../../../examples/self-improvement/grader-bundle.example.json"
+        ))
+        .unwrap();
+        let append = |id: &str, kind: K, schema: S, value: serde_json::Value| {
+            let digest = crate::queries::sha256(serde_json::to_string(&value).unwrap().as_bytes());
+            store
+                .append_improvement_revision(&NewImprovementRevision {
+                    id: id.into(),
+                    aggregate_kind: kind,
+                    aggregate_id: id.into(),
+                    schema,
+                    state: St::Proposed,
+                    payload: value,
+                    payload_sha256: digest,
+                    sensitivity: C::Internal,
+                    retention_class: R::Evaluation,
+                    export_allowed: false,
+                    idempotency_key: format!("key-{id}"),
+                    event_id: ImprovementEventId::from(format!("event-{id}")),
+                    source_raw_event_id: None,
+                    source_domain_event_id: None,
+                })
+                .unwrap()
+        };
+        let (case_record, _) = append(
+            "case-rev",
+            K::EvalCase,
+            S::EvalCaseV1,
+            serde_json::to_value(&case).unwrap(),
+        );
+        let (taskset_record, _) = append(
+            "taskset-rev",
+            K::Taskset,
+            S::TasksetV1,
+            serde_json::to_value(&taskset).unwrap(),
+        );
+        let (grader_record, _) = append(
+            "grader-rev",
+            K::GraderBundle,
+            S::GraderBundleV1,
+            serde_json::to_value(&grader).unwrap(),
+        );
+        store
+            .append_taskset_membership(&NewTasksetMembership {
+                taskset_revision_id: taskset_record.id.clone(),
+                eval_case_revision_id: case_record.id.clone(),
+                ordinal: 0,
+            })
+            .unwrap();
+        assert!(
+            store
+                .append_taskset_membership(&NewTasksetMembership {
+                    taskset_revision_id: taskset_record.id.clone(),
+                    eval_case_revision_id: grader_record.id.clone(),
+                    ordinal: 1
+                })
+                .is_err()
+        );
+        let run = NewEvaluationRun {
+            id: "eval-1".into(),
+            taskset_revision_id: taskset_record.id.clone(),
+            grader_bundle_revision_id: grader_record.id.clone(),
+            base_sha: "1".repeat(40),
+            fixture_digest: "a".repeat(64),
+            runtime_digest: "b".repeat(64),
+            seed_policy_digest: "c".repeat(64),
+            champion_policy_digest: "d".repeat(64),
+            challenger_policy_digest: Some("e".repeat(64)),
+            idempotency_key: "eval-key".into(),
+        };
+        assert_eq!(
+            store.start_evaluation_run(&run).unwrap().split,
+            harness_eval::Split::Development
+        );
+        assert_eq!(store.start_evaluation_run(&run).unwrap().id, "eval-1");
+        let mut changed = run.clone();
+        changed.runtime_digest = "f".repeat(64);
+        assert!(matches!(
+            store.start_evaluation_run(&changed),
+            Err(StoreError::Conflict(_))
+        ));
+        let mut holdout_case = case.clone();
+        holdout_case.case_id = "case-holdout".into();
+        holdout_case.split = harness_eval::Split::Holdout;
+        holdout_case.sha256 = harness_eval::canonical_digest_without_self(&holdout_case).unwrap();
+        let mut holdout_taskset = taskset.clone();
+        holdout_taskset.taskset_id = "taskset-holdout".into();
+        holdout_taskset.cases[0].case_id = holdout_case.case_id.clone();
+        holdout_taskset.cases[0].case_digest = holdout_case.sha256.clone();
+        holdout_taskset.sha256 =
+            harness_eval::canonical_digest_without_self(&holdout_taskset).unwrap();
+        let (holdout_case_record, _) = append(
+            "case-holdout-rev",
+            K::EvalCase,
+            S::EvalCaseV1,
+            serde_json::to_value(&holdout_case).unwrap(),
+        );
+        let (holdout_taskset_record, _) = append(
+            "taskset-holdout-rev",
+            K::Taskset,
+            S::TasksetV1,
+            serde_json::to_value(&holdout_taskset).unwrap(),
+        );
+        store
+            .append_taskset_membership(&NewTasksetMembership {
+                taskset_revision_id: holdout_taskset_record.id.clone(),
+                eval_case_revision_id: holdout_case_record.id,
+                ordinal: 0,
+            })
+            .unwrap();
+        let denied = store
+            .record_holdout_access(&NewHoldoutAccess {
+                id: "holdout-1".into(),
+                taskset_revision_id: Some(holdout_taskset_record.id),
+                eval_case_revision_id: None,
+                principal: harness_eval::Principal::Optimizer,
+                action: harness_eval::HoldoutAction::ReadAnswer,
+                custody_digest: "a".repeat(64),
+                idempotency_key: "holdout-key".into(),
+            })
+            .unwrap();
+        assert!(!denied.granted);
+        assert!(
+            store
+                .invalidate_evaluation(&NewEvaluationInvalidation {
+                    id: "invalid-1".into(),
+                    target: EvaluationInvalidationTarget::EvaluationRun,
+                    target_id: "eval-1".into(),
+                    reason: EvaluationInvalidationReason::HoldoutLeakage,
+                    holdout_access_log_id: Some(denied.id),
+                    idempotency_key: "invalid-key".into()
+                })
+                .is_ok()
+        );
+        assert!(matches!(
+            store.evaluation_run("eval-1"),
+            Ok(EvaluationRunReceipt {
+                invalidated: true,
+                ..
+            })
+        ));
+        assert!(
+            store
+                .connection()
+                .unwrap()
+                .execute("UPDATE evaluation_runs SET base_sha='0'", [])
+                .is_err()
         );
     }
 

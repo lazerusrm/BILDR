@@ -1077,6 +1077,7 @@ name = "harness-store"
 version = "0.1.0"
 dependencies = [
  "harness-domain",
+ "harness-eval",
  "harness-learning",
  "harness-usage",
  "hex",

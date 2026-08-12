@@ -501,3 +501,135 @@ pub struct AuthoritativeOutcomeInput {
     pub source_domain_event_id: Option<i64>,
     pub observed_at: i64,
 }
+
+// SI-008–SI-012 custody inputs. Content is always an immutable harness-eval
+// wire value or a digest; no fixture/answer/output text crosses this boundary.
+#[derive(Clone, Debug)]
+pub struct NewTasksetMembership {
+    pub taskset_revision_id: String,
+    pub eval_case_revision_id: String,
+    pub ordinal: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewEvaluationRun {
+    pub id: String,
+    pub taskset_revision_id: String,
+    pub grader_bundle_revision_id: String,
+    pub base_sha: String,
+    pub fixture_digest: String,
+    pub runtime_digest: String,
+    pub seed_policy_digest: String,
+    pub champion_policy_digest: String,
+    pub challenger_policy_digest: Option<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvaluationRunReceipt {
+    pub id: String,
+    pub taskset_revision_id: String,
+    pub grader_bundle_revision_id: String,
+    pub split: harness_eval::Split,
+    pub invalidated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvaluationRunStatus {
+    Recording,
+    Completed,
+    InfrastructureUnavailable,
+    Invalidated,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewEvaluationRunStatus {
+    pub id: String,
+    pub evaluation_run_id: String,
+    pub status: EvaluationRunStatus,
+    pub receipt_digest: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvaluationArm {
+    Champion,
+    Challenger,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewEvaluationSample {
+    pub id: String,
+    pub evaluation_run_id: String,
+    pub eval_case_revision_id: String,
+    pub arm: EvaluationArm,
+    pub sample: harness_eval::EvalSampleV1,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvaluationSampleReceipt {
+    pub id: String,
+    pub evaluation_run_id: String,
+    pub eval_case_revision_id: String,
+    pub arm: EvaluationArm,
+    pub seed: u64,
+    pub invalidated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewPairedStatVerdict {
+    pub id: String,
+    pub champion_evaluation_run_id: String,
+    pub challenger_evaluation_run_id: String,
+    pub statistics: harness_eval::Statistics,
+    pub critical_regression: bool,
+    pub reward_integrity_pass: bool,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PairedStatVerdictReceipt {
+    pub id: String,
+    pub invalidated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewHoldoutAccess {
+    pub id: String,
+    pub taskset_revision_id: Option<String>,
+    pub eval_case_revision_id: Option<String>,
+    pub principal: harness_eval::Principal,
+    pub action: harness_eval::HoldoutAction,
+    pub custody_digest: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HoldoutAccessReceipt {
+    pub id: String,
+    pub granted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvaluationInvalidationTarget {
+    EvaluationRun,
+    EvaluationSample,
+    StatVerdict,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvaluationInvalidationReason {
+    HoldoutLeakage,
+    GraderDrift,
+    FixtureDrift,
+    CustodyViolation,
+}
+#[derive(Clone, Debug)]
+pub struct NewEvaluationInvalidation {
+    pub id: String,
+    pub target: EvaluationInvalidationTarget,
+    pub target_id: String,
+    pub reason: EvaluationInvalidationReason,
+    pub holdout_access_log_id: Option<String>,
+    pub idempotency_key: String,
+}

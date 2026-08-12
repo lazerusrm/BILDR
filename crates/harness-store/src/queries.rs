@@ -23,14 +23,18 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ArtifactRecord, AuthoritativeOutcomeInput, FailureClusterOverview, FailureProjectionReceipt,
-    FailureSplitMove, FailureTraceComposition, FailureTraceSummary, ImprovementEventRecord,
+    ArtifactRecord, AuthoritativeOutcomeInput, EvaluationArm, EvaluationInvalidationReason,
+    EvaluationInvalidationTarget, EvaluationRunReceipt, EvaluationRunStatus,
+    EvaluationSampleReceipt, FailureClusterOverview, FailureProjectionReceipt, FailureSplitMove,
+    FailureTraceComposition, FailureTraceSummary, HoldoutAccessReceipt, ImprovementEventRecord,
     ImprovementRevisionRecord, NativeSubagentActivityRecord, NewAgentSession, NewApproval,
-    NewArtifact, NewCommandRecord, NewContextPacket, NewEvidenceRecord, NewImprovementRevision,
-    NewOperatorOutcome, NewRepository, NewRun, NewTaskAttempt, NewValidationRecord, NewWorktree,
-    PriorAttemptContext, RawEventInput, RepositoryHealthInput, Store, StoreError, StoredSession,
-    TraceProjectionDomainReceipt, TraceProjectionRawReceipt, TraceProjectionSnapshot,
-    TraceProjectionStructuralReceipt, TraceProjectionWatermark,
+    NewArtifact, NewCommandRecord, NewContextPacket, NewEvaluationInvalidation, NewEvaluationRun,
+    NewEvaluationRunStatus, NewEvaluationSample, NewEvidenceRecord, NewHoldoutAccess,
+    NewImprovementRevision, NewOperatorOutcome, NewPairedStatVerdict, NewRepository, NewRun,
+    NewTaskAttempt, NewTasksetMembership, NewValidationRecord, NewWorktree,
+    PairedStatVerdictReceipt, PriorAttemptContext, RawEventInput, RepositoryHealthInput, Store,
+    StoreError, StoredSession, TraceProjectionDomainReceipt, TraceProjectionRawReceipt,
+    TraceProjectionSnapshot, TraceProjectionStructuralReceipt, TraceProjectionWatermark,
 };
 
 const TRACE_SNAPSHOT_MAX_RAW_RECEIPTS: i64 = 10_000;
@@ -38,6 +42,343 @@ const TRACE_SNAPSHOT_MAX_DOMAIN_RECEIPTS: i64 = 10_000;
 const TRACE_SNAPSHOT_MAX_PAYLOAD_BYTES: i64 = 32 * 1024 * 1024;
 
 impl Store {
+    pub fn append_taskset_membership(
+        &self,
+        input: &NewTasksetMembership,
+    ) -> Result<(), StoreError> {
+        safe_eval_id(&input.taskset_revision_id, 128)?;
+        safe_eval_id(&input.eval_case_revision_id, 128)?;
+        let mut c = self.connection()?;
+        let tx = c.transaction()?;
+        require_eval_revision(
+            &tx,
+            &input.taskset_revision_id,
+            ImprovementRecordKind::Taskset,
+        )?;
+        require_eval_revision(
+            &tx,
+            &input.eval_case_revision_id,
+            ImprovementRecordKind::EvalCase,
+        )?;
+        let taskset: harness_eval::TasksetV1 = serde_json::from_value(
+            read_improvement_revision(&tx, &input.taskset_revision_id)?.payload,
+        )?;
+        let case: harness_eval::EvalCaseV1 = serde_json::from_value(
+            read_improvement_revision(&tx, &input.eval_case_revision_id)?.payload,
+        )?;
+        if !taskset.cases.iter().any(|pin| {
+            pin.case_id == case.case_id
+                && pin.revision == case.revision
+                && pin.case_digest == case.sha256
+        }) {
+            return Err(StoreError::Conflict(
+                "taskset manifest does not pin eval-case revision/digest".into(),
+            ));
+        }
+        tx.execute("INSERT INTO taskset_revision_memberships(taskset_revision_id,eval_case_revision_id,ordinal,created_at) VALUES(?1,?2,?3,?4)", params![input.taskset_revision_id,input.eval_case_revision_id,sqlite_u64(input.ordinal,"taskset ordinal")?,now_ms()])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn start_evaluation_run(
+        &self,
+        input: &NewEvaluationRun,
+    ) -> Result<EvaluationRunReceipt, StoreError> {
+        validate_new_evaluation_run(input)?;
+        let mut c = self.connection()?;
+        let tx = c.transaction()?;
+        require_eval_revision(
+            &tx,
+            &input.taskset_revision_id,
+            ImprovementRecordKind::Taskset,
+        )?;
+        require_eval_revision(
+            &tx,
+            &input.grader_bundle_revision_id,
+            ImprovementRecordKind::GraderBundle,
+        )?;
+        if let Some(id) = tx
+            .query_row(
+                "SELECT id FROM evaluation_runs WHERE idempotency_key=?1",
+                [&input.idempotency_key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let receipt = read_evaluation_run(&tx, &id)?;
+            if receipt.taskset_revision_id == input.taskset_revision_id
+                && receipt.grader_bundle_revision_id == input.grader_bundle_revision_id
+                && tx.query_row("SELECT id=?2 AND base_sha=?3 AND fixture_digest=?4 AND runtime_digest=?5 AND seed_policy_digest=?6 AND champion_policy_digest=?7 AND challenger_policy_digest IS ?8 FROM evaluation_runs WHERE id=?1",params![id,input.id,input.base_sha,input.fixture_digest,input.runtime_digest,input.seed_policy_digest,input.champion_policy_digest,input.challenger_policy_digest],|r|r.get::<_,bool>(0))?
+            {
+                tx.commit()?;
+                return Ok(receipt);
+            }
+            return Err(StoreError::Conflict(
+                "evaluation run idempotency collision".into(),
+            ));
+        }
+        let split = taskset_split(&tx, &input.taskset_revision_id)?;
+        tx.execute("INSERT INTO evaluation_runs(id,taskset_revision_id,grader_bundle_revision_id,split,base_sha,fixture_digest,runtime_digest,seed_policy_digest,champion_policy_digest,challenger_policy_digest,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![input.id,input.taskset_revision_id,input.grader_bundle_revision_id,split_text(split),input.base_sha,input.fixture_digest,input.runtime_digest,input.seed_policy_digest,input.champion_policy_digest,input.challenger_policy_digest,input.idempotency_key,now_ms()])?;
+        tx.execute("INSERT INTO evaluation_run_status_revisions(id,evaluation_run_id,sequence,status,receipt_digest,idempotency_key,created_at) VALUES(?1,?2,1,'recording',?3,?4,?5)",params![format!("{}-recording",input.id),input.id,input.runtime_digest,format!("{}-recording",input.idempotency_key),now_ms()])?;
+        let receipt = read_evaluation_run(&tx, &input.id)?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    pub fn append_evaluation_run_status(
+        &self,
+        input: &NewEvaluationRunStatus,
+    ) -> Result<(), StoreError> {
+        safe_eval_id(&input.id, 128)?;
+        safe_eval_id(&input.evaluation_run_id, 128)?;
+        safe_eval_id(&input.idempotency_key, 200)?;
+        valid_digest(&input.receipt_digest)?;
+        let mut c = self.connection()?;
+        let tx = c.transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM evaluation_runs WHERE id=?1)",
+            [&input.evaluation_run_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::NotFound(input.evaluation_run_id.clone()));
+        }
+        if let Some(matches)=tx.query_row("SELECT id=?2 AND evaluation_run_id=?3 AND status=?4 AND receipt_digest=?5 FROM evaluation_run_status_revisions WHERE idempotency_key=?1",params![input.idempotency_key,input.id,input.evaluation_run_id,status_text(input.status),input.receipt_digest],|r|r.get::<_,bool>(0)).optional()? { if matches {tx.commit()?;return Ok(());}return Err(StoreError::Conflict("evaluation status idempotency collision".into())); }
+        let sequence:i64=tx.query_row("SELECT coalesce(max(sequence),0)+1 FROM evaluation_run_status_revisions WHERE evaluation_run_id=?1",[&input.evaluation_run_id],|r|r.get(0))?;
+        tx.execute("INSERT INTO evaluation_run_status_revisions(id,evaluation_run_id,sequence,status,receipt_digest,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![input.id,input.evaluation_run_id,sequence,status_text(input.status),input.receipt_digest,input.idempotency_key,now_ms()])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn record_evaluation_sample(
+        &self,
+        input: &NewEvaluationSample,
+    ) -> Result<EvaluationSampleReceipt, StoreError> {
+        harness_eval::verify_sample(&input.sample)
+            .map_err(|e| StoreError::Validation(e.to_string()))?;
+        safe_eval_id(&input.id, 128)?;
+        safe_eval_id(&input.evaluation_run_id, 128)?;
+        safe_eval_id(&input.eval_case_revision_id, 128)?;
+        safe_eval_id(&input.idempotency_key, 200)?;
+        let mut c = self.connection()?;
+        let tx = c.transaction()?;
+        let run = read_evaluation_run(&tx, &input.evaluation_run_id)?;
+        if run.invalidated {
+            return Err(StoreError::Conflict("evaluation run is invalidated".into()));
+        }
+        require_eval_revision(
+            &tx,
+            &input.eval_case_revision_id,
+            ImprovementRecordKind::EvalCase,
+        )?;
+        let member:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM taskset_revision_memberships WHERE taskset_revision_id=?1 AND eval_case_revision_id=?2)",params![run.taskset_revision_id,input.eval_case_revision_id],|r|r.get(0))?;
+        if !member {
+            return Err(StoreError::Conflict(
+                "sample case is not in taskset membership".into(),
+            ));
+        }
+        if input.sample.taskset_digest != improvement_payload_digest(&tx, &run.taskset_revision_id)?
+            || input.sample.grader_bundle_digest
+                != improvement_payload_digest(&tx, &run.grader_bundle_revision_id)?
+            || !tx.query_row("SELECT base_sha=?2 AND fixture_digest=?3 AND runtime_digest=?4 FROM evaluation_runs WHERE id=?1",params![input.evaluation_run_id,input.sample.base_sha,input.sample.fixture_digest,input.sample.runtime_digest],|r|r.get::<_,bool>(0))?
+        {
+            return Err(StoreError::Conflict(
+                "sample digest does not bind run taskset/grader".into(),
+            ));
+        }
+        if let Some(id) = tx
+            .query_row(
+                "SELECT id FROM evaluation_samples WHERE idempotency_key=?1",
+                [&input.idempotency_key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let receipt = read_evaluation_sample(&tx, &id)?;
+            if receipt.evaluation_run_id == input.evaluation_run_id
+                && receipt.eval_case_revision_id == input.eval_case_revision_id
+                && receipt.arm == input.arm
+                && receipt.seed == input.sample.seed
+                && tx.query_row(
+                    "SELECT id=?2 AND sample_digest=?3 FROM evaluation_samples WHERE id=?1",
+                    params![id, input.id, input.sample.sha256],
+                    |r| r.get::<_, bool>(0),
+                )?
+            {
+                tx.commit()?;
+                return Ok(receipt);
+            }
+            return Err(StoreError::Conflict(
+                "evaluation sample idempotency collision".into(),
+            ));
+        }
+        tx.execute("INSERT INTO evaluation_samples(id,evaluation_run_id,eval_case_revision_id,arm,seed,classification,sample_digest,trace_digest,evidence_digest,artifact_digest,cost_receipt_digest,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![input.id,input.evaluation_run_id,input.eval_case_revision_id,arm_text(input.arm),sqlite_u64(input.sample.seed,"sample seed")?,sample_class_text(input.sample.classification),input.sample.sha256,input.sample.trace_digest.0,input.sample.evidence_digest.0,input.sample.artifact_digest.0,input.sample.cost_receipt_digest.0,input.idempotency_key,now_ms()])?;
+        let receipt = read_evaluation_sample(&tx, &input.id)?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    pub fn record_paired_stat_verdict(
+        &self,
+        input: &NewPairedStatVerdict,
+    ) -> Result<PairedStatVerdictReceipt, StoreError> {
+        safe_eval_id(&input.id, 128)?;
+        safe_eval_id(&input.idempotency_key, 200)?;
+        valid_digest(&input.statistics.input_digest)?;
+        let mut c = self.connection()?;
+        let tx = c.transaction()?;
+        let champion = read_evaluation_run(&tx, &input.champion_evaluation_run_id)?;
+        let challenger = read_evaluation_run(&tx, &input.challenger_evaluation_run_id)?;
+        if champion.invalidated
+            || challenger.invalidated
+            || champion.split != challenger.split
+            || champion.taskset_revision_id != challenger.taskset_revision_id
+            || champion.grader_bundle_revision_id != challenger.grader_bundle_revision_id
+        {
+            return Err(StoreError::Conflict(
+                "paired verdict runs are incompatible or invalidated".into(),
+            ));
+        }
+        if let Some((id,matches)) = tx.query_row("SELECT id,id=?2 AND champion_evaluation_run_id=?3 AND challenger_evaluation_run_id=?4 AND input_digest=?5 AND successful_pairs=?6 AND win_pairs=?7 AND loss_pairs=?8 AND delta_milli=?9 AND critical_regression=?10 AND reward_integrity_pass=?11 AND decision=?12 FROM evaluation_stat_verdicts WHERE idempotency_key=?1",params![input.idempotency_key,input.id,input.champion_evaluation_run_id,input.challenger_evaluation_run_id,input.statistics.input_digest,sqlite_u64(input.statistics.successful_pairs,"successful pairs")?,sqlite_u64(input.statistics.win_pairs,"winning pairs")?,sqlite_u64(input.statistics.loss_pairs,"losing pairs")?,input.statistics.delta_milli,input.critical_regression,input.reward_integrity_pass,decision_text(input.statistics.decision)],|r|Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?))).optional()? {
+            if !matches { return Err(StoreError::Conflict("paired verdict idempotency collision".into())); }
+            tx.commit()?;
+            return Ok(PairedStatVerdictReceipt {
+                id,
+                invalidated: false,
+            });
+        }
+        tx.execute("INSERT INTO evaluation_stat_verdicts(id,champion_evaluation_run_id,challenger_evaluation_run_id,method,decision,input_digest,successful_pairs,win_pairs,loss_pairs,delta_milli,critical_regression,reward_integrity_pass,idempotency_key,created_at) VALUES(?1,?2,?3,'paired_exact_v1',?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![input.id,input.champion_evaluation_run_id,input.challenger_evaluation_run_id,decision_text(input.statistics.decision),input.statistics.input_digest,sqlite_u64(input.statistics.successful_pairs,"successful pairs")?,sqlite_u64(input.statistics.win_pairs,"winning pairs")?,sqlite_u64(input.statistics.loss_pairs,"losing pairs")?,input.statistics.delta_milli,input.critical_regression,input.reward_integrity_pass,input.idempotency_key,now_ms()])?;
+        tx.commit()?;
+        Ok(PairedStatVerdictReceipt {
+            id: input.id.clone(),
+            invalidated: false,
+        })
+    }
+
+    pub fn record_holdout_access(
+        &self,
+        input: &NewHoldoutAccess,
+    ) -> Result<HoldoutAccessReceipt, StoreError> {
+        safe_eval_id(&input.id, 128)?;
+        safe_eval_id(&input.idempotency_key, 200)?;
+        valid_digest(&input.custody_digest)?;
+        if input.taskset_revision_id.is_some() == input.eval_case_revision_id.is_some() {
+            return Err(StoreError::Validation(
+                "holdout access requires exactly one revision target".into(),
+            ));
+        }
+        let mut c = self.connection()?;
+        let tx = c.transaction()?;
+        let split;
+        if let Some(id) = &input.taskset_revision_id {
+            safe_eval_id(id, 128)?;
+            require_eval_revision(&tx, id, ImprovementRecordKind::Taskset)?;
+            split = taskset_split(&tx, id)?;
+        } else if let Some(id) = &input.eval_case_revision_id {
+            safe_eval_id(id, 128)?;
+            require_eval_revision(&tx, id, ImprovementRecordKind::EvalCase)?;
+            let record = read_improvement_revision(&tx, id)?;
+            split = serde_json::from_value::<harness_eval::EvalCaseV1>(record.payload)?.split;
+        } else {
+            return Err(StoreError::Validation(
+                "holdout access requires revision target".into(),
+            ));
+        }
+        let granted = !(split == harness_eval::Split::Holdout
+            && matches!(
+                input.principal,
+                harness_eval::Principal::Optimizer | harness_eval::Principal::CandidateRuntime
+            ));
+        if let Some((id, matches)) = tx
+            .query_row("SELECT id,id=?2 AND taskset_revision_id IS ?3 AND eval_case_revision_id IS ?4 AND principal=?5 AND split=?6 AND action=?7 AND decision=?8 AND custody_digest=?9 FROM holdout_access_log WHERE idempotency_key=?1",params![input.idempotency_key,input.id,input.taskset_revision_id,input.eval_case_revision_id,principal_text(input.principal),split_text(split),holdout_action_text(input.action),if granted{"granted"}else{"denied"},input.custody_digest],|r|Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?)))
+            .optional()?
+        {
+            if matches {
+                tx.commit()?;
+                return Ok(HoldoutAccessReceipt { id, granted });
+            }
+            return Err(StoreError::Conflict(
+                "holdout access idempotency collision".into(),
+            ));
+        }
+        tx.execute("INSERT INTO holdout_access_log(id,taskset_revision_id,eval_case_revision_id,principal,split,action,decision,custody_digest,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![input.id,input.taskset_revision_id,input.eval_case_revision_id,principal_text(input.principal),split_text(split),holdout_action_text(input.action),if granted{"granted"}else{"denied"},input.custody_digest,input.idempotency_key,now_ms()])?;
+        tx.commit()?;
+        Ok(HoldoutAccessReceipt {
+            id: input.id.clone(),
+            granted,
+        })
+    }
+
+    pub fn invalidate_evaluation(
+        &self,
+        input: &NewEvaluationInvalidation,
+    ) -> Result<(), StoreError> {
+        safe_eval_id(&input.id, 128)?;
+        safe_eval_id(&input.target_id, 128)?;
+        safe_eval_id(&input.idempotency_key, 200)?;
+        let mut c = self.connection()?;
+        let tx = c.transaction()?;
+        let exists: bool = match input.target {
+            EvaluationInvalidationTarget::EvaluationRun => tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM evaluation_runs WHERE id=?1)",
+                [&input.target_id],
+                |r| r.get(0),
+            )?,
+            EvaluationInvalidationTarget::EvaluationSample => tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM evaluation_samples WHERE id=?1)",
+                [&input.target_id],
+                |r| r.get(0),
+            )?,
+            EvaluationInvalidationTarget::StatVerdict => tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM evaluation_stat_verdicts WHERE id=?1)",
+                [&input.target_id],
+                |r| r.get(0),
+            )?,
+        };
+        if !exists {
+            return Err(StoreError::NotFound(input.target_id.clone()));
+        }
+        if input.reason == EvaluationInvalidationReason::HoldoutLeakage {
+            let id = input.holdout_access_log_id.as_deref().ok_or_else(|| {
+                StoreError::Validation("holdout leakage requires access receipt".into())
+            })?;
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM holdout_access_log WHERE id=?1)",
+                [id],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Err(StoreError::NotFound(id.into()));
+            }
+        }
+        if let Some(matches)=tx.query_row("SELECT id=?2 AND target_kind=?3 AND target_id=?4 AND reason=?5 AND holdout_access_log_id IS ?6 FROM evaluation_invalidations WHERE idempotency_key=?1",params![input.idempotency_key,input.id,invalidation_target_text(input.target),input.target_id,invalidation_reason_text(input.reason),input.holdout_access_log_id],|r|r.get::<_,bool>(0)).optional()? {if matches {tx.commit()?;return Ok(());}return Err(StoreError::Conflict("evaluation invalidation idempotency collision".into()));}
+        tx.execute("INSERT INTO evaluation_invalidations(id,target_kind,target_id,reason,holdout_access_log_id,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![input.id,invalidation_target_text(input.target),input.target_id,invalidation_reason_text(input.reason),input.holdout_access_log_id,input.idempotency_key,now_ms()])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn evaluation_run(&self, id: &str) -> Result<EvaluationRunReceipt, StoreError> {
+        safe_eval_id(id, 128)?;
+        let mut c = self.connection()?;
+        let tx = c.transaction()?;
+        let receipt = read_evaluation_run(&tx, id)?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    pub fn evaluation_sample(&self, id: &str) -> Result<EvaluationSampleReceipt, StoreError> {
+        safe_eval_id(id, 128)?;
+        let mut c = self.connection()?;
+        let tx = c.transaction()?;
+        let receipt = read_evaluation_sample(&tx, id)?;
+        if receipt.invalidated {
+            return Err(StoreError::Conflict(
+                "evaluation sample is invalidated".into(),
+            ));
+        }
+        tx.commit()?;
+        Ok(receipt)
+    }
     // SI-007: project only Store-owned, typed terminal and outcome receipts.
     // Neither failure reasons nor outcome notes are read or persisted here.
     pub fn project_failures_for_run(
@@ -3974,6 +4315,7 @@ fn parse_improvement_schema(value: &str) -> rusqlite::Result<ImprovementSchema> 
         "harness.trace.v1" => ImprovementSchema::TraceV1,
         "harness.trace.v2" => ImprovementSchema::TraceV2,
         "harness.outcome.v1" => ImprovementSchema::OutcomeV1,
+        "harness.taskset.v1" => ImprovementSchema::TasksetV1,
         "harness.eval-case.v1" => ImprovementSchema::EvalCaseV1,
         "harness.grader-bundle.v1" => ImprovementSchema::GraderBundleV1,
         "harness.improvement-candidate.v1" => ImprovementSchema::ImprovementCandidateV1,
@@ -3989,6 +4331,225 @@ fn parse_improvement_schema(value: &str) -> rusqlite::Result<ImprovementSchema> 
         }
     };
     Ok(schema)
+}
+
+fn safe_eval_id(value: &str, maximum: usize) -> Result<(), StoreError> {
+    if !value.is_empty()
+        && value.len() <= maximum
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+    {
+        Ok(())
+    } else {
+        Err(StoreError::Validation(
+            "invalid bounded evaluation identifier".into(),
+        ))
+    }
+}
+fn valid_digest(value: &str) -> Result<(), StoreError> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b.is_ascii_hexdigit()))
+    {
+        Ok(())
+    } else {
+        Err(StoreError::Validation("invalid evaluation digest".into()))
+    }
+}
+fn sqlite_u64(value: u64, field: &str) -> Result<i64, StoreError> {
+    i64::try_from(value)
+        .map_err(|_| StoreError::Validation(format!("{field} exceeds SQLite range")))
+}
+fn split_text(value: harness_eval::Split) -> &'static str {
+    match value {
+        harness_eval::Split::Training => "training",
+        harness_eval::Split::Development => "development",
+        harness_eval::Split::Holdout => "holdout",
+        harness_eval::Split::Canary => "canary",
+        harness_eval::Split::Quarantine => "quarantine",
+    }
+}
+fn parse_split(value: String) -> Result<harness_eval::Split, StoreError> {
+    serde_json::from_value(Value::String(value)).map_err(|e| StoreError::Validation(e.to_string()))
+}
+fn arm_text(value: EvaluationArm) -> &'static str {
+    match value {
+        EvaluationArm::Champion => "champion",
+        EvaluationArm::Challenger => "challenger",
+    }
+}
+fn parse_arm(value: String) -> Result<EvaluationArm, StoreError> {
+    match value.as_str() {
+        "champion" => Ok(EvaluationArm::Champion),
+        "challenger" => Ok(EvaluationArm::Challenger),
+        _ => Err(StoreError::Validation("unknown evaluation arm".into())),
+    }
+}
+fn status_text(value: EvaluationRunStatus) -> &'static str {
+    match value {
+        EvaluationRunStatus::Recording => "recording",
+        EvaluationRunStatus::Completed => "completed",
+        EvaluationRunStatus::InfrastructureUnavailable => "infrastructure_unavailable",
+        EvaluationRunStatus::Invalidated => "invalidated",
+    }
+}
+fn sample_class_text(value: harness_eval::SampleClassification) -> &'static str {
+    match value {
+        harness_eval::SampleClassification::Pass => "pass",
+        harness_eval::SampleClassification::Fail => "fail",
+        harness_eval::SampleClassification::InfrastructureUnavailable => {
+            "infrastructure_unavailable"
+        }
+        harness_eval::SampleClassification::Invalidated => "invalidated",
+    }
+}
+fn decision_text(value: harness_eval::Decision) -> &'static str {
+    match value {
+        harness_eval::Decision::Better => "better",
+        harness_eval::Decision::Worse => "worse",
+        harness_eval::Decision::Inconclusive => "inconclusive",
+        harness_eval::Decision::RefusedCriticalRegression => "refused_critical_regression",
+        harness_eval::Decision::RefusedSmallSample => "refused_small_sample",
+        harness_eval::Decision::InvalidRewardIntegrity => "invalid_reward_integrity",
+    }
+}
+fn principal_text(value: harness_eval::Principal) -> &'static str {
+    match value {
+        harness_eval::Principal::Optimizer => "optimizer",
+        harness_eval::Principal::CandidateRuntime => "candidate_runtime",
+        harness_eval::Principal::Evaluator => "evaluator",
+        harness_eval::Principal::Operator => "operator",
+    }
+}
+fn holdout_action_text(value: harness_eval::HoldoutAction) -> &'static str {
+    match value {
+        harness_eval::HoldoutAction::ReadMetadata => "read_metadata",
+        harness_eval::HoldoutAction::ReadAnswer => "read_answer",
+        harness_eval::HoldoutAction::Execute => "execute",
+    }
+}
+fn invalidation_target_text(value: EvaluationInvalidationTarget) -> &'static str {
+    match value {
+        EvaluationInvalidationTarget::EvaluationRun => "evaluation_run",
+        EvaluationInvalidationTarget::EvaluationSample => "evaluation_sample",
+        EvaluationInvalidationTarget::StatVerdict => "stat_verdict",
+    }
+}
+fn invalidation_reason_text(value: EvaluationInvalidationReason) -> &'static str {
+    match value {
+        EvaluationInvalidationReason::HoldoutLeakage => "holdout_leakage",
+        EvaluationInvalidationReason::GraderDrift => "grader_drift",
+        EvaluationInvalidationReason::FixtureDrift => "fixture_drift",
+        EvaluationInvalidationReason::CustodyViolation => "custody_violation",
+    }
+}
+
+fn validate_new_evaluation_run(input: &NewEvaluationRun) -> Result<(), StoreError> {
+    for value in [
+        &input.id,
+        &input.taskset_revision_id,
+        &input.grader_bundle_revision_id,
+        &input.idempotency_key,
+    ] {
+        safe_eval_id(value, 200)?;
+    }
+    for value in [
+        &input.fixture_digest,
+        &input.runtime_digest,
+        &input.seed_policy_digest,
+        &input.champion_policy_digest,
+    ] {
+        valid_digest(value)?;
+    }
+    if let Some(value) = &input.challenger_policy_digest {
+        valid_digest(value)?;
+    }
+    if input.base_sha.len() != 40
+        || !input
+            .base_sha
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b.is_ascii_hexdigit()))
+    {
+        return Err(StoreError::Validation("invalid evaluation base SHA".into()));
+    }
+    Ok(())
+}
+
+fn require_eval_revision(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    kind: ImprovementRecordKind,
+) -> Result<(), StoreError> {
+    let record = read_improvement_revision(tx, id)?;
+    if record.aggregate_kind != kind {
+        return Err(StoreError::Conflict(
+            "evaluation revision kind mismatch".into(),
+        ));
+    }
+    match kind {
+        ImprovementRecordKind::EvalCase => {
+            let wire: harness_eval::EvalCaseV1 = serde_json::from_value(record.payload)?;
+            harness_eval::verify_case_v1(&wire)
+                .map_err(|e| StoreError::Validation(e.to_string()))?;
+        }
+        ImprovementRecordKind::GraderBundle => {
+            let wire: harness_eval::GraderBundleV1 = serde_json::from_value(record.payload)?;
+            harness_eval::verify_grader_contract(&wire)
+                .map_err(|e| StoreError::Validation(e.to_string()))?;
+        }
+        ImprovementRecordKind::Taskset => {
+            let wire: harness_eval::TasksetV1 = serde_json::from_value(record.payload)?;
+            harness_eval::verify_taskset_v1(&wire)
+                .map_err(|e| StoreError::Validation(e.to_string()))?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+fn improvement_payload_digest(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+) -> Result<String, StoreError> {
+    Ok(read_improvement_revision(tx, id)?.payload_sha256)
+}
+fn taskset_split(
+    tx: &rusqlite::Transaction<'_>,
+    taskset: &str,
+) -> Result<harness_eval::Split, StoreError> {
+    let mut s=tx.prepare("SELECT eval_case_revision_id FROM taskset_revision_memberships WHERE taskset_revision_id=?1 ORDER BY ordinal")?;
+    let ids = s
+        .query_map([taskset], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut split = None;
+    for id in ids {
+        let record = read_improvement_revision(tx, &id)?;
+        let case: harness_eval::EvalCaseV1 = serde_json::from_value(record.payload)?;
+        harness_eval::verify_case_v1(&case).map_err(|e| StoreError::Validation(e.to_string()))?;
+        if let Some(prior) = split {
+            if prior != case.split {
+                return Err(StoreError::Conflict(
+                    "taskset contains multiple case splits".into(),
+                ));
+            }
+        } else {
+            split = Some(case.split);
+        }
+    }
+    split.ok_or_else(|| StoreError::Validation("taskset has no immutable memberships".into()))
+}
+fn read_evaluation_run(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+) -> Result<EvaluationRunReceipt, StoreError> {
+    tx.query_row("SELECT taskset_revision_id,grader_bundle_revision_id,split,EXISTS(SELECT 1 FROM evaluation_invalidations i WHERE i.target_kind='evaluation_run' AND i.target_id=evaluation_runs.id) FROM evaluation_runs WHERE id=?1",[id],|r|Ok(EvaluationRunReceipt{id:id.into(),taskset_revision_id:r.get(0)?,grader_bundle_revision_id:r.get(1)?,split:parse_split(r.get(2)?).map_err(|e|rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,invalidated:r.get(3)?})).optional()?.ok_or_else(||StoreError::NotFound(id.into()))
+}
+fn read_evaluation_sample(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+) -> Result<EvaluationSampleReceipt, StoreError> {
+    tx.query_row("SELECT evaluation_run_id,eval_case_revision_id,arm,seed,EXISTS(SELECT 1 FROM evaluation_invalidations i WHERE i.target_kind='evaluation_sample' AND i.target_id=evaluation_samples.id) FROM evaluation_samples WHERE id=?1",[id],|r|{let seed:i64=r.get(3)?;Ok(EvaluationSampleReceipt{id:id.into(),evaluation_run_id:r.get(0)?,eval_case_revision_id:r.get(1)?,arm:parse_arm(r.get(2)?).map_err(|e|rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,seed:positive_database_u64(seed,"sample seed")?,invalidated:r.get(4)?})}).optional()?.ok_or_else(||StoreError::NotFound(id.into()))
 }
 
 fn validate_improvement_input(input: &NewImprovementRevision) -> Result<(), StoreError> {
@@ -4012,6 +4573,25 @@ fn validate_improvement_input(input: &NewImprovementRevision) -> Result<(), Stor
         return Err(StoreError::Validation(
             "improvement payload schema discriminator mismatch".to_owned(),
         ));
+    }
+    match input.schema {
+        ImprovementSchema::TasksetV1 => {
+            let value: harness_eval::TasksetV1 = serde_json::from_value(input.payload.clone())?;
+            harness_eval::verify_taskset_v1(&value)
+                .map_err(|error| StoreError::Validation(error.to_string()))?;
+        }
+        ImprovementSchema::EvalCaseV1 => {
+            let value: harness_eval::EvalCaseV1 = serde_json::from_value(input.payload.clone())?;
+            harness_eval::verify_case_v1(&value)
+                .map_err(|error| StoreError::Validation(error.to_string()))?;
+        }
+        ImprovementSchema::GraderBundleV1 => {
+            let value: harness_eval::GraderBundleV1 =
+                serde_json::from_value(input.payload.clone())?;
+            harness_eval::verify_grader_contract(&value)
+                .map_err(|error| StoreError::Validation(error.to_string()))?;
+        }
+        _ => {}
     }
     let serialized = serde_json::to_string(&input.payload)?;
     if input.payload_sha256.len() != 64
@@ -4176,6 +4756,60 @@ fn map_improvement_revision(row: &Row<'_>) -> rusqlite::Result<ImprovementRevisi
                 Box::new(error),
             )
         })?;
+    }
+    match record.schema {
+        ImprovementSchema::TasksetV1 => {
+            let value: harness_eval::TasksetV1 = serde_json::from_value(record.payload.clone())
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            harness_eval::verify_taskset_v1(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        }
+        ImprovementSchema::EvalCaseV1 => {
+            let value: harness_eval::EvalCaseV1 = serde_json::from_value(record.payload.clone())
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            harness_eval::verify_case_v1(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        }
+        ImprovementSchema::GraderBundleV1 => {
+            let value: harness_eval::GraderBundleV1 =
+                serde_json::from_value(record.payload.clone()).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            harness_eval::verify_grader_contract(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        }
+        _ => {}
     }
     Ok(record)
 }
