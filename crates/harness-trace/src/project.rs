@@ -12,6 +12,10 @@ use crate::{
     redaction::redact,
 };
 
+const BRANCH_PATH_LIMIT: usize = 256;
+const BRANCH_DEPTH_LIMIT: usize = 4_096;
+const BRANCH_NODE_REFERENCE_LIMIT: usize = 65_536;
+
 #[derive(Clone)]
 struct Candidate {
     key: String,
@@ -580,7 +584,11 @@ fn validate_edges(
     edges: &[TraceEdge],
 ) -> Result<(), ProjectionError> {
     let ids = keys.values().cloned().collect::<BTreeSet<_>>();
-    let mut adjacent = BTreeMap::<String, Vec<String>>::new();
+    let mut adjacent = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut inbound = ids
+        .iter()
+        .map(|id| (id.clone(), 0_u64))
+        .collect::<BTreeMap<_, _>>();
     for edge in edges {
         if !ids.contains(&edge.from) {
             return Err(ProjectionError::UnknownRelationReceipt(edge.from.clone()));
@@ -588,43 +596,43 @@ fn validate_edges(
         if !ids.contains(&edge.to) {
             return Err(ProjectionError::UnknownRelationReceipt(edge.to.clone()));
         }
-        adjacent
+        if adjacent
             .entry(edge.from.clone())
             .or_default()
-            .push(edge.to.clone());
-    }
-    for node in &ids {
-        let mut visiting = BTreeSet::new();
-        if reaches(node, node, &adjacent, &mut visiting, true) {
-            return Err(ProjectionError::Cycle {
-                from: node.clone(),
-                to: node.clone(),
-            });
+            .insert(edge.to.clone())
+        {
+            *inbound.get_mut(&edge.to).expect("validated destination") += 1;
         }
     }
-    Ok(())
-}
-
-fn reaches(
-    origin: &str,
-    current: &str,
-    adjacent: &BTreeMap<String, Vec<String>>,
-    visiting: &mut BTreeSet<String>,
-    first: bool,
-) -> bool {
-    if !first && current == origin {
-        return true;
+    let mut ready = inbound
+        .iter()
+        .filter_map(|(id, count)| (*count == 0).then_some(id.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut visited = 0_usize;
+    while let Some(node) = ready.pop_first() {
+        visited += 1;
+        if let Some(next) = adjacent.get(&node) {
+            for destination in next {
+                let count = inbound.get_mut(destination).expect("validated destination");
+                *count -= 1;
+                if *count == 0 {
+                    ready.insert(destination.clone());
+                }
+            }
+        }
     }
-    if !visiting.insert(current.to_owned()) {
-        return false;
+    if visited == ids.len() {
+        Ok(())
+    } else {
+        let node = inbound
+            .into_iter()
+            .find_map(|(id, count)| (count > 0).then_some(id))
+            .expect("a cycle leaves inbound nodes");
+        Err(ProjectionError::Cycle {
+            from: node.clone(),
+            to: node,
+        })
     }
-    let result = adjacent
-        .get(current)
-        .into_iter()
-        .flatten()
-        .any(|next| reaches(origin, next, adjacent, visiting, false));
-    visiting.remove(current);
-    result
 }
 
 fn branches(
@@ -640,71 +648,116 @@ fn branches(
         .iter()
         .map(|edge| edge.to.as_str())
         .collect::<BTreeSet<_>>();
-    let mut branches = ids
+    let mut adjacent = BTreeMap::<String, Vec<String>>::new();
+    for edge in edges {
+        adjacent
+            .entry(edge.from.clone())
+            .or_default()
+            .push(edge.to.clone());
+    }
+    for next in adjacent.values_mut() {
+        next.sort_unstable();
+        next.dedup();
+    }
+    let roots = ids
         .iter()
         .filter(|id| !inbound.contains(**id))
-        .flat_map(|root| {
-            let (paths, truncated) = enumerate_paths(root, edges, 256);
-            if truncated {
-                diagnostics.push(ProjectionDiagnostic {
-                    code: "branch_path_bound_reached".to_owned(),
-                    detail: "path_limit_reached".to_owned(),
-                    source_receipts: Vec::new(),
-                });
-            }
-            paths.into_iter().map(move |node_ids| {
-                let leaf = node_ids
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| (*root).to_owned());
-                TraceBranch {
-                    id: format!(
-                        "b_{}",
-                        digest(&["harness.trace.branch.v2", root, &node_ids.join(",")])
-                    ),
-                    root_node_id: (*root).to_owned(),
-                    leaf_node_id: leaf,
-                    node_ids,
-                    metadata: BTreeMap::from([("path_bound".to_owned(), json!(256))]),
-                }
-            })
-        })
+        .copied()
         .collect::<Vec<_>>();
+    let mut branches = Vec::new();
+    let mut node_references = 0_usize;
+    let mut truncated = false;
+    for root in roots {
+        let remaining_paths = BRANCH_PATH_LIMIT.saturating_sub(branches.len());
+        let remaining_references = BRANCH_NODE_REFERENCE_LIMIT.saturating_sub(node_references);
+        if remaining_paths == 0 || remaining_references == 0 {
+            truncated = true;
+            break;
+        }
+        let (paths, root_truncated) = enumerate_paths(
+            root,
+            &adjacent,
+            remaining_paths,
+            BRANCH_DEPTH_LIMIT,
+            remaining_references,
+        );
+        truncated |= root_truncated;
+        for node_ids in paths {
+            node_references += node_ids.len();
+            let leaf = node_ids.last().cloned().unwrap_or_else(|| root.to_owned());
+            branches.push(TraceBranch {
+                id: format!(
+                    "b_{}",
+                    digest(&["harness.trace.branch.v2", root, &node_ids.join(",")])
+                ),
+                root_node_id: root.to_owned(),
+                leaf_node_id: leaf,
+                node_ids,
+                metadata: BTreeMap::from([("path_bound".to_owned(), json!(BRANCH_PATH_LIMIT))]),
+            });
+        }
+    }
+    if truncated {
+        diagnostics.push(ProjectionDiagnostic {
+            code: "branch_path_bound_reached".to_owned(),
+            detail: "path_limit_reached".to_owned(),
+            source_receipts: Vec::new(),
+        });
+    }
     branches.sort_by(|left, right| left.id.cmp(&right.id));
     branches
 }
 
-fn enumerate_paths(root: &str, edges: &[TraceEdge], bound: usize) -> (Vec<Vec<String>>, bool) {
-    fn walk(
-        current: &str,
-        edges: &[TraceEdge],
-        path: &mut Vec<String>,
-        paths: &mut Vec<Vec<String>>,
-        bound: usize,
-    ) {
-        if paths.len() >= bound {
-            return;
+fn enumerate_paths(
+    root: &str,
+    adjacent: &BTreeMap<String, Vec<String>>,
+    path_bound: usize,
+    depth_bound: usize,
+    node_reference_bound: usize,
+) -> (Vec<Vec<String>>, bool) {
+    assert!(path_bound > 0 && depth_bound > 0 && node_reference_bound > 0);
+    let mut paths = Vec::new();
+    let mut node_references = 0_usize;
+    let mut path = vec![root.to_owned()];
+    let mut stack = vec![(root.to_owned(), 0_usize)];
+    let mut truncated = false;
+    while !stack.is_empty() {
+        if paths.len() >= path_bound {
+            truncated = true;
+            break;
         }
-        let mut next = edges
-            .iter()
-            .filter(|edge| edge.from == current)
-            .map(|edge| edge.to.as_str())
-            .collect::<Vec<_>>();
-        next.sort_unstable();
-        next.dedup();
-        if next.is_empty() {
+        let (node, offset) = stack.last_mut().expect("non-empty traversal stack");
+        let next = adjacent.get(node).map(Vec::as_slice).unwrap_or_default();
+        if node_references + path.len() > node_reference_bound
+            || (node_references + path.len() == node_reference_bound && !next.is_empty())
+        {
+            let remaining = node_reference_bound - node_references;
+            if remaining > 0 {
+                paths.push(path[..remaining.min(path.len())].to_vec());
+            }
+            truncated = true;
+            break;
+        } else if next.is_empty() {
+            node_references += path.len();
             paths.push(path.clone());
-            return;
-        }
-        for value in next {
-            path.push(value.to_owned());
-            walk(value, edges, path, paths, bound);
+            stack.pop();
             path.pop();
+        } else if path.len() >= depth_bound {
+            node_references += path.len();
+            paths.push(path.clone());
+            truncated = true;
+            stack.pop();
+            path.pop();
+        } else if *offset >= next.len() {
+            stack.pop();
+            path.pop();
+        } else {
+            let destination = next[*offset].clone();
+            *offset += 1;
+            path.push(destination.clone());
+            stack.push((destination, 0));
         }
     }
-    let mut paths = Vec::new();
-    walk(root, edges, &mut vec![root.to_owned()], &mut paths, bound);
-    let truncated = paths.len() >= bound;
     (paths, truncated)
 }
 
@@ -718,4 +771,107 @@ fn source_key(receipt: &SourceReceipt) -> String {
 
 fn manifest_value(manifest: &TraceManifest) -> Value {
     serde_json::to_value(manifest).expect("trace manifest serializes")
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+
+    #[test]
+    fn long_linear_graph_validation_and_branching_are_iterative() {
+        let count = 50_000;
+        let keys = (0..count)
+            .map(|index| (format!("source:{index}"), format!("node:{index}")))
+            .collect::<BTreeMap<_, _>>();
+        let edges = (1..count)
+            .map(|index| TraceEdge {
+                from: format!("node:{}", index - 1),
+                to: format!("node:{index}"),
+                kind: TraceRelationKind::Next,
+            })
+            .collect::<Vec<_>>();
+        validate_edges(&keys, &edges).unwrap();
+
+        let adjacent = edges.iter().fold(BTreeMap::new(), |mut map, edge| {
+            map.entry(edge.from.clone())
+                .or_insert_with(Vec::new)
+                .push(edge.to.clone());
+            map
+        });
+        let (paths, truncated) = enumerate_paths(
+            "node:0",
+            &adjacent,
+            BRANCH_PATH_LIMIT,
+            BRANCH_DEPTH_LIMIT,
+            BRANCH_NODE_REFERENCE_LIMIT,
+        );
+        assert!(truncated);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].len(), BRANCH_DEPTH_LIMIT);
+
+        let mut cyclic = edges;
+        cyclic.push(TraceEdge {
+            from: format!("node:{}", count - 1),
+            to: "node:0".to_owned(),
+            kind: TraceRelationKind::Next,
+        });
+        assert!(matches!(
+            validate_edges(&keys, &cyclic),
+            Err(ProjectionError::Cycle { .. })
+        ));
+    }
+
+    #[test]
+    fn branch_references_are_bounded_globally_across_many_roots() {
+        let root_count = 500;
+        let tail_count = 1_000;
+        let mut nodes = (0..root_count)
+            .map(|index| test_node(format!("root:{index}")))
+            .collect::<Vec<_>>();
+        nodes.extend((0..tail_count).map(|index| test_node(format!("tail:{index}"))));
+        let mut edges = (0..root_count)
+            .map(|index| TraceEdge {
+                from: format!("root:{index}"),
+                to: "tail:0".to_owned(),
+                kind: TraceRelationKind::Next,
+            })
+            .collect::<Vec<_>>();
+        edges.extend((1..tail_count).map(|index| TraceEdge {
+            from: format!("tail:{}", index - 1),
+            to: format!("tail:{index}"),
+            kind: TraceRelationKind::Next,
+        }));
+        let mut diagnostics = Vec::new();
+
+        let projected = branches(&nodes, &edges, &mut diagnostics);
+
+        assert!(projected.len() <= BRANCH_PATH_LIMIT);
+        assert!(
+            projected
+                .iter()
+                .map(|branch| branch.node_ids.len())
+                .sum::<usize>()
+                <= BRANCH_NODE_REFERENCE_LIMIT
+        );
+        assert!(projected.len() < root_count);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "branch_path_bound_reached")
+                .count(),
+            1
+        );
+    }
+
+    fn test_node(id: String) -> TraceNode {
+        TraceNode {
+            id,
+            kind: "unknown_protocol".to_owned(),
+            content_sha256: "0".repeat(64),
+            source_receipts: Vec::new(),
+            redaction_class: "content_withheld".to_owned(),
+            timestamp_ms: None,
+            metadata: BTreeMap::new(),
+        }
+    }
 }

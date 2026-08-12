@@ -33,6 +33,10 @@ use crate::{
     TraceProjectionStructuralReceipt,
 };
 
+const TRACE_SNAPSHOT_MAX_RAW_RECEIPTS: i64 = 10_000;
+const TRACE_SNAPSHOT_MAX_DOMAIN_RECEIPTS: i64 = 10_000;
+const TRACE_SNAPSHOT_MAX_PAYLOAD_BYTES: i64 = 32 * 1024 * 1024;
+
 impl Store {
     // SI-007: project only Store-owned, typed terminal and outcome receipts.
     // Neither failure reasons nor outcome notes are read or persisted here.
@@ -1066,7 +1070,8 @@ impl Store {
     }
     pub fn trace_projection_candidate_runs(&self) -> Result<Vec<RunId>, StoreError> {
         let connection = self.connection()?;
-        let mut statement = connection.prepare("SELECT id FROM runs ORDER BY created_at,id")?;
+        let mut statement =
+            connection.prepare("SELECT id FROM runs ORDER BY created_at DESC,id DESC")?;
         statement
             .query_map([], |row| Ok(RunId::from(row.get::<_, String>(0)?)))?
             .collect::<Result<Vec<_>, _>>()
@@ -1087,6 +1092,7 @@ impl Store {
                 [run_id.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
+        enforce_trace_snapshot_limits(&transaction, run_id)?;
         let mut raw_statement = transaction.prepare("SELECT re.id,re.agent_session_id,re.thread_id,re.turn_id,re.direction,re.method,re.request_id,re.received_at,re.payload_json,re.payload_sha256,re.source_sequence,re.redaction_class FROM raw_events re LEFT JOIN agent_sessions a ON a.id=re.agent_session_id WHERE re.run_id=?1 OR (re.run_id IS NULL AND a.run_id=?1) ORDER BY re.id")?;
         let raw_events = raw_statement
             .query_map([run_id.as_str()], |row| {
@@ -4221,6 +4227,86 @@ fn validate_failure_actor(value: &str) -> Result<(), StoreError> {
     validate_failure_identifier(value)
 }
 
+fn enforce_trace_snapshot_limits(
+    transaction: &rusqlite::Transaction<'_>,
+    run_id: &RunId,
+) -> Result<(), StoreError> {
+    let direct_raw: i64 = transaction.query_row(
+        "SELECT count(*) FROM raw_events WHERE run_id=?1",
+        [run_id.as_str()],
+        |row| row.get(0),
+    )?;
+    let domain: i64 = transaction.query_row(
+        "SELECT count(*) FROM domain_events WHERE run_id=?1",
+        [run_id.as_str()],
+        |row| row.get(0),
+    )?;
+    validate_trace_snapshot_counts(direct_raw, domain)?;
+
+    let (legacy_raw, legacy_bytes): (i64, i64) = transaction.query_row(
+        "SELECT count(*),coalesce(sum(length(re.payload_json)),0) FROM raw_events re JOIN agent_sessions a ON a.id=re.agent_session_id WHERE re.run_id IS NULL AND a.run_id=?1",
+        [run_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let raw = direct_raw
+        .checked_add(legacy_raw)
+        .ok_or_else(|| StoreError::Validation("trace receipt count overflow".to_owned()))?;
+    validate_trace_snapshot_counts(raw, domain)?;
+
+    let direct_bytes: i64 = transaction.query_row(
+        "SELECT coalesce(sum(length(payload_json)),0) FROM raw_events WHERE run_id=?1",
+        [run_id.as_str()],
+        |row| row.get(0),
+    )?;
+    let domain_bytes: i64 = transaction.query_row(
+        "SELECT coalesce(sum(length(payload_json)),0) FROM domain_events WHERE run_id=?1",
+        [run_id.as_str()],
+        |row| row.get(0),
+    )?;
+    let other_bytes = legacy_bytes
+        .checked_add(domain_bytes)
+        .ok_or_else(|| StoreError::Validation("trace payload byte count overflow".to_owned()))?;
+    validate_trace_snapshot_bytes(raw, domain, direct_bytes, other_bytes)
+}
+
+fn validate_trace_snapshot_counts(
+    raw_receipts: i64,
+    domain_receipts: i64,
+) -> Result<(), StoreError> {
+    if raw_receipts < 0
+        || domain_receipts < 0
+        || raw_receipts > TRACE_SNAPSHOT_MAX_RAW_RECEIPTS
+        || domain_receipts > TRACE_SNAPSHOT_MAX_DOMAIN_RECEIPTS
+    {
+        return Err(StoreError::TraceProjectionBound {
+            raw_receipts,
+            domain_receipts,
+            payload_bytes: None,
+        });
+    }
+    Ok(())
+}
+
+fn validate_trace_snapshot_bytes(
+    raw_receipts: i64,
+    domain_receipts: i64,
+    raw_bytes: i64,
+    other_bytes: i64,
+) -> Result<(), StoreError> {
+    validate_trace_snapshot_counts(raw_receipts, domain_receipts)?;
+    let bytes = raw_bytes
+        .checked_add(other_bytes)
+        .ok_or_else(|| StoreError::Validation("trace payload byte count overflow".to_owned()))?;
+    if raw_bytes < 0 || other_bytes < 0 || bytes > TRACE_SNAPSHOT_MAX_PAYLOAD_BYTES {
+        return Err(StoreError::TraceProjectionBound {
+            raw_receipts,
+            domain_receipts,
+            payload_bytes: Some(bytes),
+        });
+    }
+    Ok(())
+}
+
 type FailureCostColumns = (Option<String>, Option<i64>, Option<i64>);
 
 fn failure_cost_columns(cost: FailureWireCost) -> Result<FailureCostColumns, StoreError> {
@@ -4893,6 +4979,59 @@ mod tests {
             columns,
             (Some("run:priced-run".to_owned()), Some(10), Some(15))
         );
+    }
+
+    #[test]
+    fn trace_snapshot_limits_fail_before_unbounded_history_is_materialized() {
+        assert!(
+            validate_trace_snapshot_bytes(
+                TRACE_SNAPSHOT_MAX_RAW_RECEIPTS,
+                TRACE_SNAPSHOT_MAX_DOMAIN_RECEIPTS,
+                TRACE_SNAPSHOT_MAX_PAYLOAD_BYTES,
+                0,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_trace_snapshot_counts(TRACE_SNAPSHOT_MAX_RAW_RECEIPTS + 1, 0),
+            Err(StoreError::TraceProjectionBound { .. })
+        ));
+        assert!(matches!(
+            validate_trace_snapshot_bytes(1, 1, TRACE_SNAPSHOT_MAX_PAYLOAD_BYTES, 1,),
+            Err(StoreError::TraceProjectionBound {
+                payload_bytes: Some(_),
+                ..
+            })
+        ));
+
+        let (store, run_id) = store_with_created_run();
+        let mut connection = store.connection().unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT INTO raw_events(run_id,direction,method,received_at,payload_json,payload_sha256,redaction_class) VALUES(?1,'inbound','invalid',1,'not-json','invalid','none')",
+                [run_id.as_str()],
+            )
+            .unwrap();
+        {
+            let mut insert = transaction
+                .prepare("INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json) VALUES(?1,'run',?1,'test.receipt',?2,'{}')")
+                .unwrap();
+            for index in 0..=TRACE_SNAPSHOT_MAX_DOMAIN_RECEIPTS {
+                insert.execute(params![run_id.as_str(), index]).unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            store.trace_projection_snapshot(&run_id),
+            Err(StoreError::TraceProjectionBound {
+                raw_receipts: 1,
+                domain_receipts,
+                ..
+            }) if domain_receipts == TRACE_SNAPSHOT_MAX_DOMAIN_RECEIPTS + 1
+        ));
     }
 
     #[test]

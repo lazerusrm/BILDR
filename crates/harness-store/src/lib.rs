@@ -282,6 +282,14 @@ pub enum StoreError {
     Conflict(String),
     #[error("validation failed: {0}")]
     Validation(String),
+    #[error(
+        "trace snapshot exceeds projection bounds ({raw_receipts} raw receipts, {domain_receipts} domain receipts, {payload_bytes:?} payload bytes)"
+    )]
+    TraceProjectionBound {
+        raw_receipts: i64,
+        domain_receipts: i64,
+        payload_bytes: Option<i64>,
+    },
     #[error("artifact integrity failure: {0}")]
     ArtifactIntegrity(String),
 }

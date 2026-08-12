@@ -1133,6 +1133,7 @@ dependencies = [
  "rust-embed",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
  "tower-http 0.7.0",
  "tracing",
