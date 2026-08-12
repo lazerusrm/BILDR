@@ -12836,6 +12836,10 @@ fn session_budget_checkpoint_needed(
 fn session_budget_checkpoint_percent(role: AgentRole) -> Option<u64> {
     match role {
         AgentRole::Governor => None,
+        // Mutable workers must pivot before repeated repository reads consume
+        // the calls needed to edit, check, and hand off. The launch preflight
+        // already proves that their initial context fits the session.
+        AgentRole::Worker | AgentRole::HighRiskWorker => Some(20),
         // Every bounded session needs enough remaining budget to read the
         // checkpoint and perform another full-context inference. Total-token
         // accounting includes that repeated input, so a late checkpoint can
@@ -12863,7 +12867,7 @@ fn session_budget_checkpoint_message(role: AgentRole) -> &'static str {
             "Controller token-budget checkpoint: stop tools and return your best complete schema-valid interview turn now. Do not ask additional questions unless required by the response contract."
         }
         AgentRole::Worker | AgentRole::HighRiskWorker => {
-            "Controller token-budget checkpoint: broad exploration is over. Continue using tools to implement the smallest complete task-owned change now, run the narrowest useful check, and then return a concise handoff. Do not return an empty handoff unless a concrete authority or environment blocker prevents edits."
+            "Controller token-budget checkpoint: broad exploration is over. Your next tool call must create the smallest task-owned diff unless one narrowly targeted source read is strictly necessary; after that read, edit immediately. Do not issue another broad search, status, or discovery command. Run the narrowest useful check, then return a concise handoff. Do not return an empty handoff unless a concrete authority or environment blocker prevents edits."
         }
         AgentRole::Integrator | AgentRole::CiTriage => {
             "Controller token-budget checkpoint: broad exploration is over. Continue using tools to complete the smallest task-owned correction now, run the narrowest useful check, and then return a concise handoff. Do not return an empty handoff unless a concrete authority or environment blocker prevents edits."
@@ -15205,7 +15209,7 @@ mod tests {
             AgentRole::Worker,
             "RUNNING",
             Some(120_000),
-            48_000,
+            24_000,
             Some("turn-current"),
             Some("turn-current"),
         ));
@@ -15213,7 +15217,7 @@ mod tests {
             AgentRole::Worker,
             "RUNNING",
             Some(120_000),
-            47_999,
+            23_999,
             Some("turn-current"),
             Some("turn-current"),
         ));
@@ -15265,11 +15269,16 @@ mod tests {
             AgentRole::CiTriage,
         ] {
             let message = session_budget_checkpoint_message(role);
-            assert!(message.contains("Continue using tools"));
             assert!(message.contains("smallest"));
             assert!(message.contains("Do not return an empty handoff"));
             assert!(!message.contains("stop tools"));
             assert!(!message.contains("schema-valid"));
+        }
+        for role in [AgentRole::Worker, AgentRole::HighRiskWorker] {
+            let worker_message = session_budget_checkpoint_message(role);
+            assert!(worker_message.contains("next tool call must create"));
+            assert!(worker_message.contains("one narrowly targeted source read"));
+            assert!(worker_message.contains("edit immediately"));
         }
     }
 
