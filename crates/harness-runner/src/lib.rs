@@ -367,6 +367,93 @@ pub struct EvaluationIsolationRunner {
     trusted_holdout_root: Arc<PathBuf>,
     trusted_artifact_root: Arc<PathBuf>,
     staging_root: Arc<PathBuf>,
+    cargo_build_cache: Option<Arc<AdmittedCargoBuildCache>>,
+}
+
+/// Controller-approved offline Cargo inputs.  The registry and git directories
+/// are immutable cache snapshots; the target directory is a controller-owned
+/// disposable build output root.  They are deliberately configured on the
+/// isolation runner rather than supplied by an evaluated command.
+#[derive(Clone, Debug)]
+pub struct CargoBuildCacheAdmission {
+    pub trusted_registry_root: PathBuf,
+    pub registry_cache: PathBuf,
+    pub registry_receipt_digest: String,
+    pub trusted_git_root: PathBuf,
+    pub git_cache: PathBuf,
+    pub git_receipt_digest: String,
+    pub trusted_target_root: PathBuf,
+    pub target_dir: PathBuf,
+    pub target_receipt_digest: String,
+    pub trusted_toolchain_root: PathBuf,
+    pub toolchain_dir: PathBuf,
+    pub toolchain_receipt_digest: String,
+}
+
+#[derive(Clone, Debug)]
+struct AdmittedCargoBuildCache {
+    registry_cache: PathBuf,
+    registry_receipt_digest: String,
+    git_cache: PathBuf,
+    git_receipt_digest: String,
+    target_dir: PathBuf,
+    target_receipt_digest: String,
+    toolchain_dir: PathBuf,
+    toolchain_receipt_digest: String,
+}
+
+impl CargoBuildCacheAdmission {
+    fn admit(self) -> Result<AdmittedCargoBuildCache, RunnerError> {
+        let registry_root = canonical_directory(
+            &self.trusted_registry_root,
+            "trusted Cargo registry cache root",
+        )?;
+        let registry_cache =
+            strict_trusted_directory(&self.registry_cache, &registry_root, "Cargo registry cache")?;
+        let git_root = canonical_directory(&self.trusted_git_root, "trusted Cargo git cache root")?;
+        let git_cache = strict_trusted_directory(&self.git_cache, &git_root, "Cargo git cache")?;
+        let target_root =
+            canonical_directory(&self.trusted_target_root, "trusted Cargo target root")?;
+        let target_dir =
+            strict_trusted_directory(&self.target_dir, &target_root, "Cargo target directory")?;
+        let toolchain_root =
+            canonical_directory(&self.trusted_toolchain_root, "trusted Rust toolchain root")?;
+        let toolchain_dir = strict_trusted_directory(
+            &self.toolchain_dir,
+            &toolchain_root,
+            "Rust toolchain directory",
+        )?;
+        validate_cargo_cache_layout(&registry_cache, &["index", "cache", "src"], "registry")?;
+        validate_cargo_cache_layout(&git_cache, &["db", "checkouts"], "git")?;
+        reject_cargo_credentials_or_config(&registry_cache)?;
+        reject_cargo_credentials_or_config(&git_cache)?;
+        validate_rust_toolchain_layout(&toolchain_dir)?;
+        reject_cargo_credentials_or_config(&toolchain_dir)?;
+        for (digest, label) in [
+            (
+                &self.registry_receipt_digest,
+                "Cargo registry receipt digest",
+            ),
+            (&self.git_receipt_digest, "Cargo git receipt digest"),
+            (&self.target_receipt_digest, "Cargo target receipt digest"),
+            (
+                &self.toolchain_receipt_digest,
+                "Rust toolchain receipt digest",
+            ),
+        ] {
+            validate_sha256(digest, label)?;
+        }
+        Ok(AdmittedCargoBuildCache {
+            registry_cache,
+            registry_receipt_digest: self.registry_receipt_digest,
+            git_cache,
+            git_receipt_digest: self.git_receipt_digest,
+            target_dir,
+            target_receipt_digest: self.target_receipt_digest,
+            toolchain_dir,
+            toolchain_receipt_digest: self.toolchain_receipt_digest,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -380,6 +467,33 @@ pub struct EvaluationIsolationReceipt {
     pub available: bool,
     pub policy_digest: String,
     pub digest: String,
+}
+
+/// Canonical digest for the closed isolation receipt fields.  Policy binding
+/// may change while an evaluation is assembled, so callers must recompute the
+/// digest after setting `policy_digest`; the digest never chains through a
+/// caller-supplied prior digest.
+#[must_use]
+pub fn evaluation_isolation_receipt_digest(receipt: &EvaluationIsolationReceipt) -> String {
+    let serialized = format!(
+        "harness.eval.isolation.receipt.v2\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        receipt.backend,
+        receipt.backend_version,
+        receipt.namespaces.join(","),
+        receipt.candidate_access,
+        receipt.grader_access,
+        receipt.artifact_access,
+        receipt.available,
+        receipt.policy_digest,
+    );
+    hex::encode(Sha256::digest(serialized.as_bytes()))
+}
+
+#[must_use]
+pub fn verify_evaluation_isolation_receipt(receipt: &EvaluationIsolationReceipt) -> bool {
+    validate_sha256(&receipt.policy_digest, "evaluation isolation policy digest").is_ok()
+        && validate_sha256(&receipt.digest, "evaluation isolation receipt digest").is_ok()
+        && evaluation_isolation_receipt_digest(receipt) == receipt.digest
 }
 
 #[derive(Clone, Debug)]
@@ -463,7 +577,52 @@ impl EvaluationIsolationRunner {
             trusted_holdout_root: Arc::new(trusted_holdout_root),
             trusted_artifact_root: Arc::new(trusted_artifact_root),
             staging_root: Arc::new(staging_root),
+            cargo_build_cache: None,
         })
+    }
+
+    /// Admit only controller-configured offline Cargo cache snapshots.  This
+    /// does not alter generic command execution or enable an unisolated path.
+    pub fn with_cargo_build_cache(
+        mut self,
+        admission: CargoBuildCacheAdmission,
+    ) -> Result<Self, RunnerError> {
+        let cache = admission.admit()?;
+        if paths_overlap(&cache.registry_cache, &cache.git_cache)
+            || paths_overlap(&cache.registry_cache, &cache.target_dir)
+            || paths_overlap(&cache.git_cache, &cache.target_dir)
+        {
+            return Err(RunnerError::Invalid(
+                "Cargo registry, git, and target custody must not overlap".to_owned(),
+            ));
+        }
+        if paths_overlap(&cache.toolchain_dir, &cache.registry_cache)
+            || paths_overlap(&cache.toolchain_dir, &cache.git_cache)
+            || paths_overlap(&cache.toolchain_dir, &cache.target_dir)
+        {
+            return Err(RunnerError::Invalid(
+                "Rust toolchain custody must not overlap Cargo cache or target custody".to_owned(),
+            ));
+        }
+        for path in [
+            &cache.registry_cache,
+            &cache.git_cache,
+            &cache.target_dir,
+            &cache.toolchain_dir,
+        ] {
+            if path.starts_with(self.trusted_worktree_root.as_ref())
+                || path.starts_with(self.trusted_grader_root.as_ref())
+                || path.starts_with(self.trusted_holdout_root.as_ref())
+                || path.starts_with(self.trusted_artifact_root.as_ref())
+                || path.starts_with(self.staging_root.as_ref())
+            {
+                return Err(RunnerError::Invalid(
+                    "Cargo cache custody must not overlap evaluation custody roots".to_owned(),
+                ));
+            }
+        }
+        self.cargo_build_cache = Some(Arc::new(cache));
+        Ok(self)
     }
 
     /// Discard an isolated command spool only after the caller has retained
@@ -529,7 +688,7 @@ impl EvaluationIsolationRunner {
         spec: CandidateIsolationSpec,
     ) -> Result<EvaluationIsolationOutcome, RunnerError> {
         let candidate = self.trusted_candidate_cwd(&spec.command.cwd)?;
-        validate_isolated_command(&spec.command)?;
+        validate_candidate_isolated_command(&spec.command, self.cargo_build_cache.as_deref())?;
         let hidden = canonical_paths(
             spec.grader_paths
                 .iter()
@@ -556,10 +715,12 @@ impl EvaluationIsolationRunner {
                     .map(|path| path.to_string_lossy().into_owned()),
             ),
         );
+        let receipt = bind_cargo_cache_policy(receipt, self.cargo_build_cache.as_deref());
         if !receipt.available {
             return Ok(unavailable_outcome(receipt));
         }
-        let args = candidate_arguments(&candidate, &spec.command);
+        let args =
+            candidate_arguments(&candidate, &spec.command, self.cargo_build_cache.as_deref());
         let command = self
             .commands
             .run(wrapped_command(
@@ -760,11 +921,7 @@ fn isolation_receipt(
         "uts".to_owned(),
         "cgroup".to_owned(),
     ];
-    let serialized = format!(
-        "harness.eval.isolation.v1\0bubblewrap\0{version}\0{}\0{candidate_access}\0{grader_access}\0{artifact_access}\0{available}",
-        namespaces.join(",")
-    );
-    EvaluationIsolationReceipt {
+    let mut receipt = EvaluationIsolationReceipt {
         backend: "bubblewrap".to_owned(),
         backend_version: version.to_owned(),
         namespaces,
@@ -773,8 +930,10 @@ fn isolation_receipt(
         artifact_access: artifact_access.to_owned(),
         available,
         policy_digest: hex::encode(Sha256::digest(b"harness.eval.isolation.policy.v1\0")),
-        digest: hex::encode(Sha256::digest(serialized.as_bytes())),
-    }
+        digest: String::new(),
+    };
+    receipt.digest = evaluation_isolation_receipt_digest(&receipt);
+    receipt
 }
 
 fn bind_isolation_policy(
@@ -790,14 +949,43 @@ fn bind_isolation_policy(
         bindings.join("\0")
     );
     receipt.policy_digest = hex::encode(Sha256::digest(policy.as_bytes()));
-    receipt.digest = hex::encode(Sha256::digest(
-        format!(
-            "harness.eval.isolation.receipt.v1\0{}\0{}",
-            receipt.digest, receipt.policy_digest
-        )
-        .as_bytes(),
-    ));
+    receipt.digest = evaluation_isolation_receipt_digest(&receipt);
     receipt
+}
+
+fn bind_cargo_cache_policy(
+    receipt: EvaluationIsolationReceipt,
+    cache: Option<&AdmittedCargoBuildCache>,
+) -> EvaluationIsolationReceipt {
+    let Some(cache) = cache else {
+        return receipt;
+    };
+    bind_isolation_policy(
+        receipt,
+        "candidate-offline-cargo-cache",
+        [
+            format!(
+                "registry:{}:{}",
+                cache.registry_cache.display(),
+                cache.registry_receipt_digest
+            ),
+            format!(
+                "git:{}:{}",
+                cache.git_cache.display(),
+                cache.git_receipt_digest
+            ),
+            format!(
+                "target:{}:{}",
+                cache.target_dir.display(),
+                cache.target_receipt_digest
+            ),
+            format!(
+                "toolchain:{}:{}",
+                cache.toolchain_dir.display(),
+                cache.toolchain_receipt_digest
+            ),
+        ],
+    )
 }
 
 fn bwrap_base_arguments() -> Vec<String> {
@@ -850,7 +1038,11 @@ fn runtime_ro_binds() -> Vec<String> {
         .collect()
 }
 
-fn candidate_arguments(candidate: &Path, command: &CommandSpec) -> Vec<String> {
+fn candidate_arguments(
+    candidate: &Path,
+    command: &CommandSpec,
+    cargo_cache: Option<&AdmittedCargoBuildCache>,
+) -> Vec<String> {
     let mut args = bwrap_base_arguments();
     args.extend(runtime_ro_binds());
     args.extend([
@@ -866,6 +1058,42 @@ fn candidate_arguments(candidate: &Path, command: &CommandSpec) -> Vec<String> {
         "--chdir".to_owned(),
         "/work/candidate".to_owned(),
     ]);
+    if let Some(cache) = cargo_cache {
+        // Cargo's mutable metadata and locks live only in the sandbox tmpfs;
+        // controller-admitted registry/git snapshots remain read-only.
+        args.extend([
+            "--tmpfs".to_owned(),
+            "/cargo-home".to_owned(),
+            "--dir".to_owned(),
+            "/cargo-home/registry".to_owned(),
+            "--dir".to_owned(),
+            "/cargo-home/git".to_owned(),
+            "--ro-bind".to_owned(),
+            cache.registry_cache.to_string_lossy().into_owned(),
+            "/cargo-home/registry".to_owned(),
+            "--ro-bind".to_owned(),
+            cache.git_cache.to_string_lossy().into_owned(),
+            "/cargo-home/git".to_owned(),
+            "--bind".to_owned(),
+            cache.target_dir.to_string_lossy().into_owned(),
+            "/work/cargo-target".to_owned(),
+            "--ro-bind".to_owned(),
+            cache.toolchain_dir.to_string_lossy().into_owned(),
+            "/cargo-toolchain".to_owned(),
+            "--setenv".to_owned(),
+            "CARGO_HOME".to_owned(),
+            "/cargo-home".to_owned(),
+            "--setenv".to_owned(),
+            "CARGO_TARGET_DIR".to_owned(),
+            "/work/cargo-target".to_owned(),
+            "--setenv".to_owned(),
+            "CARGO_NET_OFFLINE".to_owned(),
+            "true".to_owned(),
+            "--setenv".to_owned(),
+            "RUSTC".to_owned(),
+            "/cargo-toolchain/bin/rustc".to_owned(),
+        ]);
+    }
     append_environment(&mut args, &command.environment);
     args.push("--".to_owned());
     args.push(command.program.clone());
@@ -939,7 +1167,23 @@ fn append_environment(args: &mut Vec<String>, environment: &BTreeMap<String, Str
     }
 }
 
+fn validate_candidate_isolated_command(
+    command: &CommandSpec,
+    cargo_cache: Option<&AdmittedCargoBuildCache>,
+) -> Result<(), RunnerError> {
+    validate_isolated_command_common(command)?;
+    if command.program == "/cargo-toolchain/bin/cargo" && cargo_cache.is_some() {
+        return Ok(());
+    }
+    validate_runtime_executable(&command.program)
+}
+
 fn validate_isolated_command(command: &CommandSpec) -> Result<(), RunnerError> {
+    validate_isolated_command_common(command)?;
+    validate_runtime_executable(&command.program)
+}
+
+fn validate_isolated_command_common(command: &CommandSpec) -> Result<(), RunnerError> {
     command.validate()?;
     if !command.inherited_environment.is_empty() {
         return Err(RunnerError::Invalid(
@@ -961,14 +1205,18 @@ fn validate_isolated_command(command: &CommandSpec) -> Result<(), RunnerError> {
             "governed isolation requires an absolute executable path".to_owned(),
         ));
     }
-    if !Path::new(&command.program).is_file() {
+    Ok(())
+}
+
+fn validate_runtime_executable(program: &str) -> Result<(), RunnerError> {
+    if !Path::new(program).is_file() {
         return Err(RunnerError::Invalid(
             "governed isolation executable does not exist".to_owned(),
         ));
     }
     if !["/usr/", "/bin/"]
         .iter()
-        .any(|prefix| command.program.starts_with(prefix))
+        .any(|prefix| program.starts_with(prefix))
     {
         return Err(RunnerError::Invalid(
             "governed isolation executable must be under the read-only runtime".to_owned(),
@@ -993,6 +1241,58 @@ fn canonical_file(path: &Path, label: &str) -> Result<PathBuf, RunnerError> {
     } else {
         Err(RunnerError::Invalid(format!("{label} is not a file")))
     }
+}
+
+fn validate_cargo_cache_layout(
+    cache: &Path,
+    required_children: &[&str],
+    label: &str,
+) -> Result<(), RunnerError> {
+    if required_children
+        .iter()
+        .any(|child| !cache.join(child).is_dir())
+    {
+        return Err(RunnerError::Invalid(format!(
+            "Cargo {label} cache must contain its standard {} layout",
+            required_children.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+fn validate_rust_toolchain_layout(toolchain: &Path) -> Result<(), RunnerError> {
+    for path in [
+        toolchain.join("bin/cargo"),
+        toolchain.join("bin/rustc"),
+        toolchain.join("lib/rustlib"),
+    ] {
+        if !(path.is_file() || path.is_dir()) {
+            return Err(RunnerError::Invalid(
+                "Rust toolchain must contain bin/cargo, bin/rustc, and lib/rustlib".to_owned(),
+            ));
+        }
+    }
+    if !toolchain.join("bin/cargo").is_file()
+        || !toolchain.join("bin/rustc").is_file()
+        || !toolchain.join("lib/rustlib").is_dir()
+    {
+        return Err(RunnerError::Invalid(
+            "Rust toolchain must contain bin/cargo, bin/rustc, and lib/rustlib".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_cargo_credentials_or_config(cache: &Path) -> Result<(), RunnerError> {
+    for name in ["credentials", "credentials.toml", "config", "config.toml"] {
+        if cache.join(name).exists() {
+            return Err(RunnerError::Invalid(
+                "Cargo cache admission must not expose credentials or Cargo configuration"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn strict_trusted_directory(path: &Path, root: &Path, label: &str) -> Result<PathBuf, RunnerError> {
@@ -1021,6 +1321,10 @@ fn ensure_strict_descendant(path: &Path, root: &Path, label: &str) -> Result<(),
             "{label} must be a strict child of its controller-trusted root"
         )))
     }
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
 }
 
 fn canonical_paths<'a>(
@@ -1355,7 +1659,7 @@ mod tests {
         let command = isolated_spec(&candidate);
         let candidate = std::fs::canonicalize(&candidate).unwrap();
         let candidate_text = candidate.to_string_lossy().into_owned();
-        let args = candidate_arguments(&candidate, &command);
+        let args = candidate_arguments(&candidate, &command, None);
 
         for flag in [
             "--unshare-net",
@@ -1374,11 +1678,211 @@ mod tests {
         let rendered = args.join("\0");
         assert!(!rendered.contains(grader.to_string_lossy().as_ref()));
         assert!(!rendered.contains(ground_truth.to_string_lossy().as_ref()));
+        assert!(!rendered.contains("CARGO_HOME"));
+        assert!(!rendered.contains("CARGO_TARGET_DIR"));
         assert!(
             !args
                 .windows(2)
                 .any(|values| values[0] == "--ro-bind" && values[1] == "/work/candidate")
         );
+    }
+
+    #[test]
+    fn cargo_cache_admission_is_canonical_receipt_bound_and_offline_only() {
+        let temp = TempDir::new().unwrap();
+        let registry_root = temp.path().join("registry-root");
+        let git_root = temp.path().join("git-root");
+        let target_root = temp.path().join("target-root");
+        let toolchain_root = temp.path().join("toolchain-root");
+        let registry = registry_root.join("snapshot");
+        let git = git_root.join("snapshot");
+        let target = target_root.join("lease-target");
+        let toolchain = toolchain_root.join("rust-1.97");
+        for path in [
+            &registry.join("index"),
+            &registry.join("cache"),
+            &registry.join("src"),
+            &git.join("db"),
+            &git.join("checkouts"),
+            &target,
+            &toolchain.join("lib/rustlib"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::create_dir_all(toolchain.join("bin")).unwrap();
+        std::fs::write(toolchain.join("bin/cargo"), "toolchain cargo").unwrap();
+        std::fs::write(toolchain.join("bin/rustc"), "toolchain rustc").unwrap();
+        let cache = CargoBuildCacheAdmission {
+            trusted_registry_root: registry_root,
+            registry_cache: registry.clone(),
+            registry_receipt_digest: "a".repeat(64),
+            trusted_git_root: git_root,
+            git_cache: git.clone(),
+            git_receipt_digest: "b".repeat(64),
+            trusted_target_root: target_root,
+            target_dir: target.clone(),
+            target_receipt_digest: "c".repeat(64),
+            trusted_toolchain_root: toolchain_root,
+            toolchain_dir: toolchain.clone(),
+            toolchain_receipt_digest: "d".repeat(64),
+        }
+        .admit()
+        .unwrap();
+        let candidate = temp.path().join("candidate");
+        std::fs::create_dir_all(&candidate).unwrap();
+        let args = candidate_arguments(&candidate, &isolated_spec(&candidate), Some(&cache));
+        let registry_dir = args
+            .windows(2)
+            .position(|values| values[0] == "--dir" && values[1] == "/cargo-home/registry")
+            .unwrap();
+        let registry_bind = args
+            .windows(3)
+            .position(|values| values[0] == "--ro-bind" && values[2] == "/cargo-home/registry")
+            .unwrap();
+        let git_dir = args
+            .windows(2)
+            .position(|values| values[0] == "--dir" && values[1] == "/cargo-home/git")
+            .unwrap();
+        let git_bind = args
+            .windows(3)
+            .position(|values| values[0] == "--ro-bind" && values[2] == "/cargo-home/git")
+            .unwrap();
+        assert!(registry_dir < registry_bind);
+        assert!(git_dir < git_bind);
+        assert!(args.windows(3).any(|values| {
+            values[0] == "--ro-bind"
+                && values[1] == registry.to_string_lossy().as_ref()
+                && values[2] == "/cargo-home/registry"
+        }));
+        assert!(args.windows(3).any(|values| {
+            values[0] == "--ro-bind"
+                && values[1] == toolchain.to_string_lossy().as_ref()
+                && values[2] == "/cargo-toolchain"
+        }));
+        assert!(args.windows(3).any(|values| {
+            values[0] == "--ro-bind"
+                && values[1] == git.to_string_lossy().as_ref()
+                && values[2] == "/cargo-home/git"
+        }));
+        assert!(args.windows(3).any(|values| {
+            values[0] == "--bind"
+                && values[1] == target.to_string_lossy().as_ref()
+                && values[2] == "/work/cargo-target"
+        }));
+        assert!(args.windows(3).any(|values| {
+            values[0] == "--setenv" && values[1] == "CARGO_HOME" && values[2] == "/cargo-home"
+        }));
+        assert!(args.windows(3).any(|values| {
+            values[0] == "--setenv"
+                && values[1] == "CARGO_TARGET_DIR"
+                && values[2] == "/work/cargo-target"
+        }));
+        assert!(args.windows(3).any(|values| {
+            values[0] == "--setenv" && values[1] == "CARGO_NET_OFFLINE" && values[2] == "true"
+        }));
+        assert!(args.windows(3).any(|values| {
+            values[0] == "--setenv"
+                && values[1] == "RUSTC"
+                && values[2] == "/cargo-toolchain/bin/rustc"
+        }));
+        let virtual_cargo = CommandSpec {
+            program: "/cargo-toolchain/bin/cargo".into(),
+            ..isolated_spec(&candidate)
+        };
+        assert!(validate_candidate_isolated_command(&virtual_cargo, Some(&cache)).is_ok());
+        assert!(validate_candidate_isolated_command(&virtual_cargo, None).is_err());
+        let receipt = bind_cargo_cache_policy(
+            isolation_receipt("bubblewrap 0.11.0", true, "read_write", "none", "none"),
+            Some(&cache),
+        );
+        assert!(verify_evaluation_isolation_receipt(&receipt));
+        let mut forged = receipt.clone();
+        forged.digest = "e".repeat(64);
+        assert!(!verify_evaluation_isolation_receipt(&forged));
+        assert_ne!(
+            receipt.policy_digest,
+            isolation_receipt("bubblewrap 0.11.0", true, "read_write", "none", "none")
+                .policy_digest
+        );
+    }
+
+    #[test]
+    fn cargo_cache_admission_rejects_outside_roots_and_invalid_digests() {
+        let temp = TempDir::new().unwrap();
+        let registry_root = temp.path().join("registry-root");
+        let git_root = temp.path().join("git-root");
+        let target_root = temp.path().join("target-root");
+        let toolchain_root = temp.path().join("toolchain-root");
+        let outside = temp.path().join("outside");
+        for path in [&registry_root, &git_root, &target_root, &outside] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let admission = CargoBuildCacheAdmission {
+            trusted_registry_root: registry_root.clone(),
+            registry_cache: outside.clone(),
+            registry_receipt_digest: "a".repeat(64),
+            trusted_git_root: git_root.clone(),
+            git_cache: outside.clone(),
+            git_receipt_digest: "b".repeat(64),
+            trusted_target_root: target_root.clone(),
+            target_dir: outside,
+            target_receipt_digest: "c".repeat(64),
+            trusted_toolchain_root: toolchain_root.clone(),
+            toolchain_dir: toolchain_root.join("outside"),
+            toolchain_receipt_digest: "d".repeat(64),
+        };
+        assert!(admission.admit().is_err());
+
+        let registry = registry_root.join("registry");
+        let git = git_root.join("git");
+        let target = target_root.join("target");
+        let toolchain = toolchain_root.join("rust-1.97");
+        for path in [
+            &registry.join("index"),
+            &registry.join("cache"),
+            &registry.join("src"),
+            &git.join("db"),
+            &git.join("checkouts"),
+            &target,
+            &toolchain.join("lib/rustlib"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::create_dir_all(toolchain.join("bin")).unwrap();
+        std::fs::write(toolchain.join("bin/cargo"), "toolchain cargo").unwrap();
+        std::fs::write(toolchain.join("bin/rustc"), "toolchain rustc").unwrap();
+        let invalid_digest = CargoBuildCacheAdmission {
+            trusted_registry_root: registry_root,
+            registry_cache: registry.clone(),
+            registry_receipt_digest: "not-a-digest".into(),
+            trusted_git_root: git_root,
+            git_cache: git.clone(),
+            git_receipt_digest: "b".repeat(64),
+            trusted_target_root: target_root,
+            target_dir: target.clone(),
+            target_receipt_digest: "c".repeat(64),
+            trusted_toolchain_root: toolchain_root.clone(),
+            toolchain_dir: toolchain.clone(),
+            toolchain_receipt_digest: "d".repeat(64),
+        };
+        assert!(invalid_digest.admit().is_err());
+
+        std::fs::write(registry.join("credentials.toml"), "token = 'secret'").unwrap();
+        let credentials = CargoBuildCacheAdmission {
+            trusted_registry_root: temp.path().join("registry-root"),
+            registry_cache: registry,
+            registry_receipt_digest: "a".repeat(64),
+            trusted_git_root: temp.path().join("git-root"),
+            git_cache: git,
+            git_receipt_digest: "b".repeat(64),
+            trusted_target_root: temp.path().join("target-root"),
+            target_dir: target,
+            target_receipt_digest: "c".repeat(64),
+            trusted_toolchain_root: toolchain_root,
+            toolchain_dir: toolchain,
+            toolchain_receipt_digest: "d".repeat(64),
+        };
+        assert!(credentials.admit().is_err());
     }
 
     #[test]

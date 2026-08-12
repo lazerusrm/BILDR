@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod learning_contracts;
+pub use learning_contracts::*;
+
 pub const FAILURE_TAXONOMY_VERSION: &str = "harness.failure-taxonomy.v1";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

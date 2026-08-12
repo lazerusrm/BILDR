@@ -118,10 +118,12 @@ pub enum ImprovementSchema {
     TasksetV1,
     EvalCaseV1,
     GraderBundleV1,
+    PolicyBundleV1,
     ImprovementCandidateV1,
     ExperimentV1,
     KnowledgeItemV1,
     PromotionDecisionV1,
+    RollbackV1,
 }
 
 impl ImprovementSchema {
@@ -134,10 +136,12 @@ impl ImprovementSchema {
             Self::TasksetV1 => "harness.taskset.v1",
             Self::EvalCaseV1 => "harness.eval-case.v1",
             Self::GraderBundleV1 => "harness.grader-bundle.v1",
+            Self::PolicyBundleV1 => "harness.policy-bundle.v1",
             Self::ImprovementCandidateV1 => "harness.improvement-candidate.v1",
             Self::ExperimentV1 => "harness.experiment.v1",
             Self::KnowledgeItemV1 => "harness.knowledge-item.v1",
             Self::PromotionDecisionV1 => "harness.promotion-decision.v1",
+            Self::RollbackV1 => "harness.rollback.v1",
         }
     }
     #[must_use]
@@ -149,10 +153,12 @@ impl ImprovementSchema {
             Self::TasksetV1 => ImprovementRecordKind::Taskset,
             Self::EvalCaseV1 => ImprovementRecordKind::EvalCase,
             Self::GraderBundleV1 => ImprovementRecordKind::GraderBundle,
+            Self::PolicyBundleV1 => ImprovementRecordKind::PolicyBundle,
             Self::ImprovementCandidateV1 => ImprovementRecordKind::Candidate,
             Self::ExperimentV1 => ImprovementRecordKind::Experiment,
             Self::KnowledgeItemV1 => ImprovementRecordKind::Knowledge,
             Self::PromotionDecisionV1 => ImprovementRecordKind::Promotion,
+            Self::RollbackV1 => ImprovementRecordKind::Rollback,
         }
     }
 }
@@ -212,9 +218,13 @@ impl ImprovementState {
         match kind {
             K::Trace => matches!(self, S::Captured),
             K::Outcome | K::Failure => matches!(self, S::Observed | S::Superseded),
-            K::Taskset | K::EvalCase | K::GraderBundle | K::PolicyBundle => matches!(
+            K::Taskset | K::EvalCase | K::GraderBundle => matches!(
                 self,
                 S::Proposed | S::Active | S::Quarantined | S::Retired | S::Superseded | S::Revoked
+            ),
+            K::PolicyBundle => matches!(
+                self,
+                S::Proposed | S::Quarantined | S::Retired | S::Superseded | S::Revoked
             ),
             K::Candidate => matches!(
                 self,
@@ -1732,6 +1742,21 @@ mod tests {
         );
         assert!(ImprovementState::Active.allowed_for(ImprovementRecordKind::Taskset));
         assert!(!ImprovementState::Running.allowed_for(ImprovementRecordKind::Taskset));
+    }
+
+    #[test]
+    fn rollback_schema_is_closed_to_requested_or_completed_records() {
+        assert_eq!(
+            ImprovementSchema::RollbackV1.as_str(),
+            "harness.rollback.v1"
+        );
+        assert_eq!(
+            ImprovementSchema::RollbackV1.kind(),
+            ImprovementRecordKind::Rollback
+        );
+        assert!(ImprovementState::Requested.allowed_for(ImprovementRecordKind::Rollback));
+        assert!(ImprovementState::Completed.allowed_for(ImprovementRecordKind::Rollback));
+        assert!(!ImprovementState::Active.allowed_for(ImprovementRecordKind::Rollback));
     }
 
     #[test]

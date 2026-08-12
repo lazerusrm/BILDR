@@ -1,91 +1,25 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:harness:improvement-candidate.v1",
-  "title": "Harness improvement candidate",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "candidate_id", "parent_bundle_id", "target_scope", "target_failure_classes", "hypothesis", "edits", "predictions", "risk_class", "required_tasksets", "required_ablations", "budget", "rollback_bundle_id", "state", "sha256"],
+  "required": ["schema", "candidate_id", "scope", "parent_bundle", "target_failure", "development_case", "no_change_control", "taskset", "grader_bundle", "runtime", "hypothesis", "edit", "predictions", "evidence", "rollback_bundle", "state", "sha256"],
   "properties": {
-    "schema": {"const": "harness.improvement-candidate.v1"},
-    "candidate_id": {"type": "string", "minLength": 1},
-    "parent_bundle_id": {"type": "string", "minLength": 1},
-    "target_scope": {"type": "object"},
-    "target_failure_classes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
-    "hypothesis": {"type": "string", "minLength": 1},
-    "edits": {
-      "type": "array",
-      "minItems": 1,
-      "maxItems": 8,
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["component_id", "operation", "before_digest", "after_digest", "risk_class", "rationale"],
-        "properties": {
-          "component_id": {"enum": ["context_source_ordering", "token_budget", "read_only_probe_parameters", "retry_timing", "cache_summary_policy", "role_prompts", "planning_contracts", "skills", "procedural_memory", "model_effort_routing", "delegation_strategy", "validator_selection", "validator_thresholds", "knowledge_retrieval", "compaction_handoff"]},
-          "operation": {"enum": ["add", "delete", "replace"]},
-          "before_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
-          "after_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
-          "risk_class": {"enum": ["green", "amber"]},
-          "rationale": {"type": "string", "minLength": 1}
-        },
-        "oneOf": [
-          {
-            "properties": {
-              "component_id": {"enum": ["context_source_ordering", "token_budget", "read_only_probe_parameters", "retry_timing", "cache_summary_policy"]},
-              "risk_class": {"const": "green"}
-            }
-          },
-          {
-            "properties": {
-              "component_id": {"enum": ["role_prompts", "planning_contracts", "skills", "procedural_memory", "model_effort_routing", "delegation_strategy", "validator_selection", "validator_thresholds", "knowledge_retrieval", "compaction_handoff"]},
-              "risk_class": {"const": "amber"}
-            }
-          }
-        ]
-      }
-    },
-    "predictions": {
-      "type": "array",
-      "minItems": 1,
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["signal_id", "direction", "minimum_delta", "reason"],
-        "properties": {
-          "signal_id": {"type": "string", "minLength": 1},
-          "direction": {"enum": ["increase", "decrease", "unchanged"]},
-          "minimum_delta": {"type": "number"},
-          "reason": {"type": "string", "minLength": 1}
-        }
-      }
-    },
-    "risk_class": {"enum": ["green", "amber"]},
-    "required_tasksets": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
-    "required_ablations": {"type": "array", "items": {"type": "string", "minLength": 1}},
-    "budget": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["max_eval_tokens", "max_cost_microusd", "max_wall_seconds"],
-      "properties": {
-        "max_eval_tokens": {"type": "integer", "minimum": 1},
-        "max_cost_microusd": {"type": "integer", "minimum": 0},
-        "max_wall_seconds": {"type": "integer", "minimum": 1}
-      }
-    },
-    "rollback_bundle_id": {"type": "string", "minLength": 1},
-    "state": {"enum": ["proposed", "validated", "rejected", "experiment_ready", "superseded"]},
-    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    "schema": {"const": "harness.improvement-candidate.v1"}, "candidate_id": {"$ref": "#/$defs/id"},
+    "scope": {"$ref": "#/$defs/scope"}, "parent_bundle": {"$ref": "#/$defs/policy_bundle"}, "target_failure": {"$ref": "#/$defs/failure"},
+    "development_case": {"$ref": "#/$defs/development"}, "no_change_control": {"$ref": "#/$defs/development"},
+    "taskset": {"$ref": "#/$defs/taskset"}, "grader_bundle": {"$ref": "#/$defs/grader"}, "runtime": {"$ref": "#/$defs/runtime"},
+    "hypothesis": {"type": "string", "minLength": 1}, "edit": {"$ref": "#/$defs/edit"},
+    "predictions": {"$comment": "CandidateV1::verify enforces unique signal_id; JSON Schema can only enforce whole-object uniqueItems.", "type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "object", "additionalProperties": false, "required": ["signal_id", "direction", "minimum_delta_milli"], "properties": {"signal_id": {"$ref": "#/$defs/id"}, "direction": {"enum": ["increase", "decrease", "unchanged"]}, "minimum_delta_milli": {"type": "integer"}}}},
+    "evidence": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/receipt"}}, "rollback_bundle": {"$ref": "#/$defs/policy_bundle"},
+    "state": {"enum": ["proposed", "rejected", "superseded"]}, "sha256": {"$ref": "#/$defs/digest"}
   },
-  "allOf": [
-    {
-      "if": {"properties": {"risk_class": {"const": "green"}}},
-      "then": {
-        "properties": {
-          "edits": {
-            "items": {"properties": {"risk_class": {"const": "green"}}}
-          }
-        }
-      }
-    }
-  ]
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"}, "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "scope": {"type":"object","additionalProperties":false,"required":["repository_id","task_family","model_family","runtime_class","base_sha"],"properties":{"repository_id":{"$ref":"#/$defs/id"},"task_family":{"$ref":"#/$defs/id"},"model_family":{"type":["string","null"],"pattern":"^[A-Za-z0-9_.:-]{1,128}$"},"runtime_class":{"type":["string","null"],"pattern":"^[A-Za-z0-9_.:-]{1,128}$"},"base_sha":{"type":"string","pattern":"^[0-9a-f]{40}$"}}},
+    "receipt": {"type": "object", "additionalProperties": false, "required": ["kind", "revision_id", "digest", "split", "custody"], "properties": {"kind": {"enum": ["trace", "outcome", "failure", "eval_case", "taskset", "grader_bundle", "runtime", "policy_bundle", "human_review"]}, "revision_id": {"$ref": "#/$defs/id"}, "digest": {"$ref": "#/$defs/digest"}, "split": {"type": ["string", "null"], "enum": ["training", "development", "holdout", "canary", "quarantine", null]}, "custody": {"type": ["string", "null"], "enum": ["clean", "invalidated", "restricted", null]}}},
+    "policy_bundle": {"allOf": [{"$ref": "#/$defs/receipt"}, {"properties": {"kind": {"const": "policy_bundle"}}}]}, "failure": {"allOf": [{"$ref": "#/$defs/receipt"}, {"properties": {"kind": {"const": "failure"}}}]},
+    "taskset": {"allOf": [{"$ref": "#/$defs/receipt"}, {"properties": {"kind": {"const": "taskset"}}}]}, "grader": {"allOf": [{"$ref": "#/$defs/receipt"}, {"properties": {"kind": {"const": "grader_bundle"}}}]}, "runtime": {"allOf": [{"$ref": "#/$defs/receipt"}, {"properties": {"kind": {"const": "runtime"}}}]},
+    "development": {"allOf": [{"$ref": "#/$defs/receipt"}, {"properties": {"kind": {"const": "eval_case"}, "split": {"const": "development"}, "custody": {"const": "clean"}}}]},
+    "edit": {"type": "object", "additionalProperties": false, "required": ["dimension", "risk_class", "operation", "before_digest", "after_digest"], "properties": {"dimension": {"enum": ["context_source_ordering", "token_budget", "read_only_probe_parameters", "retry_timing", "cache_summary_policy", "role_prompts", "planning_contracts", "skills", "procedural_memory", "model_effort_routing", "delegation_strategy", "validator_selection", "validator_thresholds", "knowledge_retrieval", "compaction_handoff"]}, "risk_class": {"enum": ["green", "amber"]}, "operation": {"const": "replace"}, "before_digest": {"$ref": "#/$defs/digest"}, "after_digest": {"$ref": "#/$defs/digest"}}, "oneOf": [{"properties": {"dimension": {"enum": ["context_source_ordering", "token_budget", "read_only_probe_parameters", "retry_timing", "cache_summary_policy"]}, "risk_class": {"const": "green"}}}, {"properties": {"dimension": {"enum": ["role_prompts", "planning_contracts", "skills", "procedural_memory", "model_effort_routing", "delegation_strategy", "validator_selection", "validator_thresholds", "knowledge_retrieval", "compaction_handoff"]}, "risk_class": {"const": "amber"}}}]}
+  }
 }

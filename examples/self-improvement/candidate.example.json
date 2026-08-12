@@ -1,27 +1,93 @@
 {
   "schema": "harness.improvement-candidate.v1",
-  "candidate_id": "candidate_context_order_v1",
-  "parent_bundle_id": "bundle_champion_v1",
-  "target_scope": {"task_family": "context_compilation"},
-  "target_failure_classes": ["context_budget_exhaustion"],
-  "hypothesis": "Ordering task authority before large supporting sources will reduce truncation without losing required authority.",
-  "edits": [{
-    "component_id": "context_source_ordering",
+  "candidate_id": "candidate-1",
+  "scope": {
+    "repository_id": "repository_example",
+    "task_family": "context_compilation",
+    "model_family": null,
+    "runtime_class": null,
+    "base_sha": "1111111111111111111111111111111111111111"
+  },
+  "parent_bundle": {
+    "kind": "policy_bundle",
+    "revision_id": "bundle-1",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "split": null,
+    "custody": null
+  },
+  "target_failure": {
+    "kind": "failure",
+    "revision_id": "failure-1",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "split": null,
+    "custody": null
+  },
+  "development_case": {
+    "kind": "eval_case",
+    "revision_id": "case-dev-1",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "split": "development",
+    "custody": "clean"
+  },
+  "no_change_control": {
+    "kind": "eval_case",
+    "revision_id": "case-control-1",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "split": "development",
+    "custody": "clean"
+  },
+  "taskset": {
+    "kind": "taskset",
+    "revision_id": "set-dev-1",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "split": null,
+    "custody": null
+  },
+  "grader_bundle": {
+    "kind": "grader_bundle",
+    "revision_id": "grader-1",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "split": null,
+    "custody": null
+  },
+  "runtime": {
+    "kind": "runtime",
+    "revision_id": "runtime-1",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "split": null,
+    "custody": null
+  },
+  "hypothesis": "Narrowly reduce known context pressure.",
+  "edit": {
+    "dimension": "token_budget",
+    "risk_class": "green",
     "operation": "replace",
     "before_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "after_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "risk_class": "green",
-    "rationale": "Prioritize mandatory evidence before optional support."
-  }],
+    "after_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
   "predictions": [
-    {"signal_id": "required_authority_present", "direction": "unchanged", "minimum_delta": 0, "reason": "Required sources remain pinned."},
-    {"signal_id": "context_tokens", "direction": "decrease", "minimum_delta": -0.05, "reason": "Optional sources are admitted after mandatory sources."}
+    {
+      "signal_id": "quality",
+      "direction": "unchanged",
+      "minimum_delta_milli": 0
+    }
   ],
-  "risk_class": "green",
-  "required_tasksets": ["taskset_context_v1"],
-  "required_ablations": ["no_change_control"],
-  "budget": {"max_eval_tokens": 1000000, "max_cost_microusd": 10000000, "max_wall_seconds": 3600},
-  "rollback_bundle_id": "bundle_champion_v1",
+  "evidence": [
+    {
+      "kind": "trace",
+      "revision_id": "trace-1",
+      "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "split": null,
+      "custody": null
+    }
+  ],
+  "rollback_bundle": {
+    "kind": "policy_bundle",
+    "revision_id": "bundle-1",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "split": null,
+    "custody": null
+  },
   "state": "proposed",
-  "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  "sha256": "a9b2fcf1c817999c7d9848e5ddffb4b7717076c163262af40c03c0d168fc3aff"
 }

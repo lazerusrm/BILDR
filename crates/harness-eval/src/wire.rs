@@ -43,6 +43,7 @@ pub enum CaseSourceKind {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaseRuntime {
+    pub repository_id: String,
     pub repository_fixture: String,
     pub base_sha: String,
     pub setup_digest: String,
@@ -305,6 +306,7 @@ pub fn verify_case_v1(v: &EvalCaseV1) -> Result<(), DigestError> {
         && hash(&v.grader_bundle_digest)
         && !v.source.locator.is_empty()
         && hash(&v.source.digest)
+        && token(&v.runtime.repository_id)
         && !v.runtime.repository_fixture.is_empty()
         && sha40(&v.runtime.base_sha)
         && hash(&v.runtime.setup_digest)

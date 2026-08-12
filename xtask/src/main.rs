@@ -998,20 +998,104 @@ mod tests {
         .unwrap();
         assert!(validator.is_valid(&example));
 
-        let mut role_prompts_green = example.clone();
-        role_prompts_green["edits"][0]["component_id"] = json!("role_prompts");
-        assert!(!validator.is_valid(&role_prompts_green));
-
         let mut underclassified = example.clone();
-        underclassified["edits"][0]["component_id"] = json!("role_prompts");
-        underclassified["edits"][0]["risk_class"] = json!("amber");
+        underclassified["edit"]["dimension"] = json!("validator_selection");
+        underclassified["edit"]["risk_class"] = json!("green");
         assert!(!validator.is_valid(&underclassified));
+
+        let mut valid_amber = example.clone();
+        valid_amber["edit"]["dimension"] = json!("validator_selection");
+        valid_amber["edit"]["risk_class"] = json!("amber");
+        assert!(validator.is_valid(&valid_amber));
+
+        let mut duplicate_prediction = example.clone();
+        let first_prediction = duplicate_prediction["predictions"][0].clone();
+        duplicate_prediction["predictions"]
+            .as_array_mut()
+            .unwrap()
+            .push(first_prediction);
+        assert!(!validator.is_valid(&duplicate_prediction));
 
         for component_id in ["frozen_safety_anchor", "unknown_component"] {
             let mut forbidden = example.clone();
-            forbidden["edits"][0]["component_id"] = json!(component_id);
+            forbidden["edit"]["dimension"] = json!(component_id);
             assert!(!validator.is_valid(&forbidden));
         }
+    }
+
+    #[test]
+    fn experiment_schema_requires_evidence_for_passed_stages() {
+        let registry = jsonschema::Registry::new().prepare().unwrap();
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../schemas/harness.experiment.v1.schema.json"
+        ))
+        .unwrap();
+        let validator =
+            compile_schema(Path::new("experiment.schema.json"), &schema, &registry).unwrap();
+        let example: Value = serde_json::from_str(include_str!(
+            "../../examples/self-improvement/experiment.example.json"
+        ))
+        .unwrap();
+        assert!(validator.is_valid(&example));
+
+        let mut missing_passed_evidence = example;
+        let passed_stage = missing_passed_evidence["stages"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|stage| stage["state"] == "passed")
+            .expect("example contains a passed stage");
+        passed_stage["evidence"] = Value::Null;
+        assert!(!validator.is_valid(&missing_passed_evidence));
+    }
+
+    #[test]
+    fn trace_v2_schema_preserves_projection_branch_bounds() {
+        let registry = jsonschema::Registry::new().prepare().unwrap();
+        let schema: Value =
+            serde_json::from_str(include_str!("../../schemas/harness.trace.v2.schema.json"))
+                .unwrap();
+        let validator =
+            compile_schema(Path::new("trace-v2.schema.json"), &schema, &registry).unwrap();
+        let example: Value = serde_json::from_str(include_str!(
+            "../../examples/self-improvement/trace.v2.example.json"
+        ))
+        .unwrap();
+        assert!(validator.is_valid(&example));
+
+        let mut wrong_bound = example;
+        wrong_bound["branches"][0]["metadata"]["path_bound"] = json!(1);
+        assert!(!validator.is_valid(&wrong_bound));
+    }
+
+    #[test]
+    fn knowledge_schema_requires_active_human_review_and_safe_optional_scope_ids() {
+        let registry = jsonschema::Registry::new().prepare().unwrap();
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../schemas/harness.knowledge-item.v1.schema.json"
+        ))
+        .unwrap();
+        let validator =
+            compile_schema(Path::new("knowledge.schema.json"), &schema, &registry).unwrap();
+        let example: Value = serde_json::from_str(include_str!(
+            "../../examples/self-improvement/knowledge-item.example.json"
+        ))
+        .unwrap();
+        assert!(validator.is_valid(&example));
+
+        let mut unreviewed_active = example.clone();
+        unreviewed_active["review"]["state"] = json!("unreviewed");
+        unreviewed_active["review"]["reviewer_id"] = Value::Null;
+        unreviewed_active["review"]["reviewed_at"] = Value::Null;
+        unreviewed_active["review"]["receipt"] = Value::Null;
+        assert!(!validator.is_valid(&unreviewed_active));
+
+        let mut free_text_scope = example.clone();
+        free_text_scope["scope"]["model_family"] = json!("model family with spaces");
+        assert!(!validator.is_valid(&free_text_scope));
+        let mut free_text_reviewer = example;
+        free_text_reviewer["review"]["reviewer_id"] = json!("operator name");
+        assert!(!validator.is_valid(&free_text_reviewer));
     }
 
     #[test]

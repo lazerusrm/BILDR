@@ -89,6 +89,23 @@ harnessctl runtime
 harnessctl runtime codex
 ```
 
+## Explicit observer regression evaluation
+
+The first development evaluation is an operator-invoked, controller-owned
+regression for the historical trace-snapshot bound. It is available only when
+self-improvement is effectively `observe_only` and the configured frozen
+safety anchor matches:
+
+```bash
+harnessd evaluate-observer-snapshot --repository /path/to/registered/bildr
+```
+
+The command checks out the two pinned historical SHAs in managed worktrees,
+uses a lockfile-filtered offline Cargo snapshot and isolated deterministic
+grader, persists only receipt-bearing evaluation evidence, and prints the
+evaluation/sample IDs. It does not accept candidate code, commands, fixtures,
+grader inputs, or holdout data, and it cannot activate or promote a policy.
+
 ## Register a checkout
 
 ```bash

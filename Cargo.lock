@@ -885,6 +885,7 @@ dependencies = [
  "axum",
  "futures",
  "harness-domain",
+ "harness-eval",
  "harness-orchestrator",
  "harness-store",
  "hex",
@@ -1055,6 +1056,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-promotion"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "harness-runner"
 version = "0.1.0"
 dependencies = [
@@ -1079,6 +1091,8 @@ dependencies = [
  "harness-domain",
  "harness-eval",
  "harness-learning",
+ "harness-promotion",
+ "harness-trace",
  "harness-usage",
  "hex",
  "rusqlite",
@@ -1137,19 +1151,25 @@ dependencies = [
  "harness-api",
  "harness-codex",
  "harness-domain",
+ "harness-eval",
+ "harness-git",
  "harness-orchestrator",
  "harness-profile",
+ "harness-runner",
  "harness-store",
  "harness-trace",
+ "hex",
  "mime_guess",
  "rust-embed",
  "serde_json",
  "sha2",
  "tempfile",
  "tokio",
+ "toml",
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
+ "ulid",
 ]
 
 [[package]]

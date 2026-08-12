@@ -195,6 +195,22 @@ pub fn router(orchestrator: Arc<Orchestrator>) -> Router {
             get(get_failure_trace),
         )
         .route(
+            "/api/v1/improvement/evaluations/runs/{evaluation_run_id}",
+            get(get_evaluation_run),
+        )
+        .route(
+            "/api/v1/improvement/evaluations/samples/{sample_id}",
+            get(get_evaluation_sample),
+        )
+        .route(
+            "/api/v1/improvement/evaluations/cases/{case_revision_id}",
+            get(get_evaluation_case),
+        )
+        .route(
+            "/api/v1/improvement/evaluations/occurrences/{occurrence_id}",
+            get(get_evaluation_occurrence_source),
+        )
+        .route(
             "/api/v1/runs/{run_id}/evidence/export",
             post(export_evidence),
         )
@@ -1340,6 +1356,263 @@ async fn get_failure_trace(
     }))
 }
 
+/// Receipt-only M2 read models.  These intentionally omit fixture locators,
+/// commands, evidence bodies, artifacts, and any executor controls.
+#[derive(Serialize)]
+struct EvaluationRunResponse {
+    id: String,
+    controller_run_id: String,
+    taskset_revision_id: String,
+    grader_bundle_revision_id: String,
+    split: String,
+    status: String,
+    invalidated: bool,
+}
+
+#[derive(Serialize)]
+struct EvaluationSampleResponse {
+    id: String,
+    evaluation_run_id: String,
+    eval_case_revision_id: String,
+    arm: String,
+    seed: u64,
+    classification: String,
+    sample_digest: String,
+    invalidated: bool,
+}
+
+#[derive(Serialize)]
+struct EvaluationCaseResponse {
+    revision_id: String,
+    case_id: String,
+    revision: u64,
+    payload_sha256: String,
+    case_sha256: String,
+    split: String,
+    task_family: String,
+    base_sha: String,
+    setup_digest: String,
+    grader_bundle_id: String,
+    grader_bundle_revision: u64,
+    grader_bundle_digest: String,
+}
+
+#[derive(Serialize)]
+struct EvaluationOccurrenceSourceResponse {
+    occurrence_id: String,
+    repository_id: String,
+    run_id: String,
+    base_sha: String,
+    source_receipt_sha256: String,
+    source_kind: String,
+    trace_revision_id: Option<String>,
+    trace_digest: Option<String>,
+    outcome_revision_id: Option<String>,
+    outcome_digest: Option<String>,
+}
+
+async fn get_evaluation_run(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(evaluation_run_id): Path<String>,
+) -> Result<Json<EvaluationRunResponse>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    validate_failure_read_identifier(&evaluation_run_id, "run id")?;
+    let value = state
+        .orchestrator
+        .store()
+        .evaluation_run(&evaluation_run_id)?;
+    Ok(Json(EvaluationRunResponse {
+        id: checked_failure_identifier(value.id, "evaluation run id")?,
+        controller_run_id: checked_failure_identifier(
+            value.controller_run_id.to_string(),
+            "controller run id",
+        )?,
+        taskset_revision_id: checked_failure_identifier(
+            value.taskset_revision_id,
+            "taskset revision id",
+        )?,
+        grader_bundle_revision_id: checked_failure_identifier(
+            value.grader_bundle_revision_id,
+            "grader revision id",
+        )?,
+        split: closed_eval_split(value.split)?,
+        status: closed_evaluation_run_status(value.status)?,
+        invalidated: value.invalidated,
+    }))
+}
+
+async fn get_evaluation_sample(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(sample_id): Path<String>,
+) -> Result<Json<EvaluationSampleResponse>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    validate_failure_read_identifier(&sample_id, "sample id")?;
+    let value = state.orchestrator.store().evaluation_sample(&sample_id)?;
+    Ok(Json(EvaluationSampleResponse {
+        id: checked_failure_identifier(value.id, "sample id")?,
+        evaluation_run_id: checked_failure_identifier(
+            value.evaluation_run_id,
+            "evaluation run id",
+        )?,
+        eval_case_revision_id: checked_failure_identifier(
+            value.eval_case_revision_id,
+            "case revision id",
+        )?,
+        arm: closed_evaluation_arm(value.arm)?,
+        seed: value.seed,
+        classification: closed_sample_classification(value.classification)?,
+        sample_digest: checked_digest(value.sample_digest, "sample digest")?,
+        invalidated: value.invalidated,
+    }))
+}
+
+async fn get_evaluation_case(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(case_revision_id): Path<String>,
+) -> Result<Json<EvaluationCaseResponse>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    validate_failure_read_identifier(&case_revision_id, "case revision id")?;
+    let value = state
+        .orchestrator
+        .store()
+        .immutable_eval_case_revision(&case_revision_id)?;
+    let wire = value.wire;
+    Ok(Json(EvaluationCaseResponse {
+        revision_id: checked_failure_identifier(value.id, "case revision id")?,
+        case_id: checked_failure_identifier(wire.case_id, "case id")?,
+        revision: wire.revision,
+        payload_sha256: checked_digest(value.payload_sha256, "case payload digest")?,
+        case_sha256: checked_digest(wire.sha256, "case digest")?,
+        split: closed_eval_split(wire.split)?,
+        task_family: checked_failure_identifier(wire.task_family, "task family")?,
+        base_sha: checked_base_sha(wire.runtime.base_sha)?,
+        setup_digest: checked_digest(wire.runtime.setup_digest, "setup digest")?,
+        grader_bundle_id: checked_failure_identifier(wire.grader_bundle_id, "grader bundle id")?,
+        grader_bundle_revision: wire.grader_bundle_revision,
+        grader_bundle_digest: checked_digest(wire.grader_bundle_digest, "grader bundle digest")?,
+    }))
+}
+
+async fn get_evaluation_occurrence_source(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(occurrence_id): Path<String>,
+) -> Result<Json<EvaluationOccurrenceSourceResponse>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    validate_failure_read_identifier(&occurrence_id, "occurrence id")?;
+    let value = state
+        .orchestrator
+        .store()
+        .failure_development_case_source(&occurrence_id)?;
+    Ok(Json(EvaluationOccurrenceSourceResponse {
+        occurrence_id: checked_failure_identifier(value.occurrence_id, "occurrence id")?,
+        repository_id: checked_failure_identifier(
+            value.repository_id.to_string(),
+            "repository id",
+        )?,
+        run_id: checked_failure_identifier(value.run_id.to_string(), "run id")?,
+        base_sha: checked_base_sha(value.base_sha)?,
+        source_receipt_sha256: checked_digest(
+            value.source_receipt_sha256,
+            "source receipt digest",
+        )?,
+        source_kind: closed_failure_source_kind(value.source_kind)?,
+        trace_revision_id: value
+            .trace_revision_id
+            .map(|id| checked_failure_identifier(id, "trace revision id"))
+            .transpose()?,
+        trace_digest: value
+            .trace_digest
+            .map(|digest| checked_digest(digest, "trace digest"))
+            .transpose()?,
+        outcome_revision_id: value
+            .outcome_revision_id
+            .map(|id| checked_failure_identifier(id, "outcome revision id"))
+            .transpose()?,
+        outcome_digest: value
+            .outcome_digest
+            .map(|digest| checked_digest(digest, "outcome digest"))
+            .transpose()?,
+    }))
+}
+
+fn closed_eval_split(value: harness_eval::Split) -> Result<String, ApiError> {
+    Ok(match value {
+        harness_eval::Split::Training => "training",
+        harness_eval::Split::Development => "development",
+        harness_eval::Split::Holdout => "holdout",
+        harness_eval::Split::Canary => "canary",
+        harness_eval::Split::Quarantine => "quarantine",
+    }
+    .to_owned())
+}
+
+fn closed_evaluation_arm(value: harness_store::EvaluationArm) -> Result<String, ApiError> {
+    Ok(match value {
+        harness_store::EvaluationArm::Champion => "champion",
+        harness_store::EvaluationArm::Challenger => "challenger",
+    }
+    .to_owned())
+}
+
+fn closed_evaluation_run_status(
+    value: harness_store::EvaluationRunStatus,
+) -> Result<String, ApiError> {
+    Ok(match value {
+        harness_store::EvaluationRunStatus::Recording => "recording",
+        harness_store::EvaluationRunStatus::Completed => "completed",
+        harness_store::EvaluationRunStatus::InfrastructureUnavailable => {
+            "infrastructure_unavailable"
+        }
+        harness_store::EvaluationRunStatus::Invalidated => "invalidated",
+    }
+    .to_owned())
+}
+
+fn closed_sample_classification(
+    value: harness_eval::SampleClassification,
+) -> Result<String, ApiError> {
+    Ok(match value {
+        harness_eval::SampleClassification::Pass => "pass",
+        harness_eval::SampleClassification::Fail => "fail",
+        harness_eval::SampleClassification::InfrastructureUnavailable => {
+            "infrastructure_unavailable"
+        }
+        harness_eval::SampleClassification::Invalidated => "invalidated",
+    }
+    .to_owned())
+}
+
+fn closed_failure_source_kind(value: String) -> Result<String, ApiError> {
+    matches!(
+        value.as_str(),
+        "attempt_terminal" | "run_terminal" | "typed_outcome"
+    )
+    .then_some(value)
+    .ok_or_else(|| ApiError::internal("persisted failure source kind is invalid"))
+}
+
+fn checked_digest(value: String, field: &str) -> Result<String, ApiError> {
+    (value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+    .then_some(value)
+    .ok_or_else(|| ApiError::internal(&format!("persisted {field} is invalid")))
+}
+
+fn checked_base_sha(value: String) -> Result<String, ApiError> {
+    (value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+    .then_some(value)
+    .ok_or_else(|| ApiError::internal("persisted base SHA is invalid"))
+}
+
 fn closed_trace_rows(manifest: &Value) -> Result<Vec<FailureTraceRowResponse>, ApiError> {
     let nodes = manifest
         .get("nodes")
@@ -1990,5 +2263,83 @@ mod tests {
         .is_err());
         assert!(validate_failure_read_identifier("trace:01J", "trace_id").is_ok());
         assert!(validate_failure_read_identifier("trace/01J", "trace_id").is_err());
+    }
+
+    #[test]
+    fn evaluation_read_models_are_receipt_only_and_closed() {
+        let run = serde_json::to_value(EvaluationRunResponse {
+            id: "evaluation-run-1".into(),
+            controller_run_id: "run-1".into(),
+            taskset_revision_id: "taskset-revision-1".into(),
+            grader_bundle_revision_id: "grader-revision-1".into(),
+            split: "development".into(),
+            status: "completed".into(),
+            invalidated: false,
+        })
+        .unwrap();
+        assert_eq!(run["status"], "completed");
+        assert_eq!(run.as_object().unwrap().len(), 7);
+        let sample = serde_json::to_value(EvaluationSampleResponse {
+            id: "sample-1".into(),
+            evaluation_run_id: "evaluation-run-1".into(),
+            eval_case_revision_id: "case-revision-1".into(),
+            arm: "challenger".into(),
+            seed: 7,
+            classification: "pass".into(),
+            sample_digest: "f".repeat(64),
+            invalidated: false,
+        })
+        .unwrap();
+        assert_eq!(sample["classification"], "pass");
+        assert_eq!(sample.as_object().unwrap().len(), 8);
+        let response = EvaluationCaseResponse {
+            revision_id: "case-revision-1".into(),
+            case_id: "case-1".into(),
+            revision: 1,
+            payload_sha256: "a".repeat(64),
+            case_sha256: "b".repeat(64),
+            split: "development".into(),
+            task_family: "context".into(),
+            base_sha: "c".repeat(40),
+            setup_digest: "d".repeat(64),
+            grader_bundle_id: "grader-1".into(),
+            grader_bundle_revision: 1,
+            grader_bundle_digest: "e".repeat(64),
+        };
+        let value = serde_json::to_value(response).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 12);
+        for forbidden in ["fixture", "command", "evidence", "artifact", "objective"] {
+            assert!(!object.contains_key(forbidden));
+        }
+        let occurrence = serde_json::to_value(EvaluationOccurrenceSourceResponse {
+            occurrence_id: "occurrence-1".into(),
+            repository_id: "repository-1".into(),
+            run_id: "run-1".into(),
+            base_sha: "f".repeat(40),
+            source_receipt_sha256: "a".repeat(64),
+            source_kind: "run_terminal".into(),
+            trace_revision_id: Some("trace-1".into()),
+            trace_digest: Some("b".repeat(64)),
+            outcome_revision_id: None,
+            outcome_digest: None,
+        })
+        .unwrap();
+        let occurrence = occurrence.as_object().unwrap();
+        assert_eq!(occurrence.len(), 10);
+        assert!(!occurrence.contains_key("source_domain_event_id"));
+        assert!(checked_digest("A".repeat(64), "digest").is_err());
+        assert!(checked_base_sha("a".repeat(39)).is_err());
+        assert_eq!(
+            closed_evaluation_run_status(
+                harness_store::EvaluationRunStatus::InfrastructureUnavailable
+            )
+            .unwrap(),
+            "infrastructure_unavailable"
+        );
+        assert_eq!(
+            closed_sample_classification(harness_eval::SampleClassification::Fail).unwrap(),
+            "fail"
+        );
     }
 }

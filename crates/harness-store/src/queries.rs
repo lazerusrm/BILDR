@@ -24,17 +24,19 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ArtifactRecord, AuthoritativeOutcomeInput, EvaluationArm, EvaluationInvalidationReason,
-    EvaluationInvalidationTarget, EvaluationRunReceipt, EvaluationRunStatus,
-    EvaluationSampleReceipt, FailureClusterOverview, FailureProjectionReceipt, FailureSplitMove,
-    FailureTraceComposition, FailureTraceSummary, HoldoutAccessReceipt, ImprovementEventRecord,
-    ImprovementRevisionRecord, NativeSubagentActivityRecord, NewAgentSession, NewApproval,
-    NewArtifact, NewCommandRecord, NewContextPacket, NewEvaluationInvalidation, NewEvaluationRun,
-    NewEvaluationRunStatus, NewEvaluationSample, NewEvidenceRecord, NewHoldoutAccess,
-    NewImprovementRevision, NewOperatorOutcome, NewPairedStatVerdict, NewRepository, NewRun,
+    EvaluationInvalidationTarget, EvaluationLaunchPins, EvaluationRunReceipt, EvaluationRunStatus,
+    EvaluationSampleReceipt, FailureClusterOverview, FailureDevelopmentCaseSource,
+    FailureProjectionReceipt, FailureSplitMove, FailureTraceComposition, FailureTraceSummary,
+    HoldoutAccessReceipt, ImmutableRevision, ImprovementEventRecord, ImprovementRevisionRecord,
+    NativeSubagentActivityRecord, NewAgentSession, NewApproval, NewArtifact, NewCommandRecord,
+    NewContextPacket, NewEvaluationInvalidation, NewEvaluationRun, NewEvaluationRunStatus,
+    NewEvaluationSample, NewEvidenceRecord, NewHoldoutAccess, NewImprovementRevision,
+    NewOperatorOutcome, NewPairedStatVerdict, NewPolicyChampionBinding, NewRepository, NewRun,
     NewTaskAttempt, NewTasksetMembership, NewValidationRecord, NewWorktree,
-    PairedStatVerdictReceipt, PriorAttemptContext, RawEventInput, RepositoryHealthInput, Store,
-    StoreError, StoredSession, TraceProjectionDomainReceipt, TraceProjectionRawReceipt,
-    TraceProjectionSnapshot, TraceProjectionStructuralReceipt, TraceProjectionWatermark,
+    PairedStatVerdictReceipt, PolicyChampionBinding, PriorAttemptContext, RawEventInput,
+    RepositoryHealthInput, Store, StoreError, StoredSession, TraceProjectionDomainReceipt,
+    TraceProjectionRawReceipt, TraceProjectionSnapshot, TraceProjectionStructuralReceipt,
+    TraceProjectionWatermark,
 };
 
 const TRACE_SNAPSHOT_MAX_RAW_RECEIPTS: i64 = 10_000;
@@ -42,6 +44,239 @@ const TRACE_SNAPSHOT_MAX_DOMAIN_RECEIPTS: i64 = 10_000;
 const TRACE_SNAPSHOT_MAX_PAYLOAD_BYTES: i64 = 32 * 1024 * 1024;
 
 impl Store {
+    pub fn bind_champion_policy(
+        &self,
+        input: &NewPolicyChampionBinding,
+    ) -> Result<PolicyChampionBinding, StoreError> {
+        safe_eval_id(&input.id, 128)?;
+        safe_eval_id(&input.task_family, 128)?;
+        safe_eval_id(&input.policy_bundle_revision_id, 128)?;
+        safe_eval_id(&input.idempotency_key, 200)?;
+        valid_digest(&input.expected_safety_anchor_digest)?;
+        let mut connection = self.connection()?;
+        let tx = connection.transaction()?;
+        let bundle: ImmutableRevision<harness_learning::PolicyBundleV1> =
+            immutable_revision_wire_tx(
+                &tx,
+                &input.policy_bundle_revision_id,
+                ImprovementRecordKind::PolicyBundle,
+            )?;
+        if bundle.wire.repository_id != input.repository_id.as_str()
+            || bundle.wire.task_family != input.task_family
+            || bundle.wire.safety_anchor_digest != input.expected_safety_anchor_digest
+        {
+            return Err(StoreError::Conflict("policy bundle scope mismatch".into()));
+        }
+        let lifecycle: String = tx.query_row(
+            "SELECT lifecycle_state FROM improvement_revisions WHERE id=?1",
+            [&input.policy_bundle_revision_id],
+            |r| r.get(0),
+        )?;
+        if lifecycle != "proposed" {
+            return Err(StoreError::Conflict(
+                "champion bundle lifecycle is not admissible".into(),
+            ));
+        }
+        let model = input.model_family.as_deref().unwrap_or("");
+        let runtime = input.runtime_class.as_deref().unwrap_or("");
+        if input
+            .model_family
+            .as_deref()
+            .is_some_and(|value| safe_eval_id(value, 128).is_err())
+            || input
+                .runtime_class
+                .as_deref()
+                .is_some_and(|value| safe_eval_id(value, 128).is_err())
+        {
+            return Err(StoreError::Validation(
+                "invalid champion binding scope".into(),
+            ));
+        }
+        if let Some(existing) = tx
+            .query_row(
+                "SELECT id FROM policy_champion_bindings WHERE idempotency_key=?1",
+                [&input.idempotency_key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let out = read_policy_binding(&tx, &existing)?;
+            if existing == input.id
+                && out.repository_id == input.repository_id
+                && out.task_family == input.task_family
+                && out.model_family.as_deref().unwrap_or("") == model
+                && out.runtime_class.as_deref().unwrap_or("") == runtime
+                && out.policy_bundle_revision_id == input.policy_bundle_revision_id
+                && out.bundle_sha256 == bundle.wire.sha256
+                && out.previous_binding_id == input.expected_previous_binding_id
+            {
+                tx.commit()?;
+                return Ok(out);
+            }
+            return Err(StoreError::Conflict(
+                "policy binding idempotency collision".into(),
+            ));
+        }
+        let prior = tx.query_row("SELECT id FROM policy_current_champions WHERE repository_id=?1 AND task_family=?2 AND model_family=?3 AND runtime_class=?4",params![input.repository_id.as_str(),input.task_family,model,runtime],|r|r.get::<_,String>(0)).optional()?;
+        if prior.as_deref() != input.expected_previous_binding_id.as_deref() {
+            return Err(StoreError::Conflict("stale policy champion binding".into()));
+        }
+        let sequence:i64=tx.query_row("SELECT coalesce(max(sequence),0)+1 FROM policy_champion_bindings WHERE repository_id=?1 AND task_family=?2 AND model_family=?3 AND runtime_class=?4",params![input.repository_id.as_str(),input.task_family,model,runtime],|r|r.get(0))?;
+        tx.execute("INSERT INTO policy_champion_bindings(id,repository_id,task_family,model_family,runtime_class,sequence,policy_bundle_revision_id,bundle_sha256,previous_binding_id,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![input.id,input.repository_id.as_str(),input.task_family,model,runtime,sequence,input.policy_bundle_revision_id,bundle.wire.sha256,prior,input.idempotency_key,now_ms()])?;
+        let out = read_policy_binding(&tx, &input.id)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    pub fn current_champion_policy(
+        &self,
+        repository_id: &RepositoryId,
+        task_family: &str,
+    ) -> Result<Option<ImmutableRevision<harness_learning::PolicyBundleV1>>, StoreError> {
+        self.current_champion_policy_scoped(repository_id, task_family, None, None)
+    }
+
+    pub fn current_champion_policy_scoped(
+        &self,
+        repository_id: &RepositoryId,
+        task_family: &str,
+        model_family: Option<&str>,
+        runtime_class: Option<&str>,
+    ) -> Result<Option<ImmutableRevision<harness_learning::PolicyBundleV1>>, StoreError> {
+        safe_eval_id(task_family, 128)?;
+        let model = model_family.unwrap_or("");
+        let runtime = runtime_class.unwrap_or("");
+        if model_family.is_some_and(|value| safe_eval_id(value, 128).is_err())
+            || runtime_class.is_some_and(|value| safe_eval_id(value, 128).is_err())
+        {
+            return Err(StoreError::Validation("invalid champion scope".into()));
+        }
+        let connection = self.connection()?;
+        let id: Option<String> = connection.query_row(
+            "SELECT policy_bundle_revision_id FROM policy_current_champions WHERE repository_id=?1 AND task_family=?2 AND model_family=?3 AND runtime_class=?4",
+            params![repository_id.as_str(), task_family, model, runtime],
+            |r| r.get(0),
+        ).optional()?;
+        id.map(|id| {
+            immutable_revision_wire_conn(&connection, &id, ImprovementRecordKind::PolicyBundle)
+        })
+        .transpose()
+    }
+
+    pub fn rejected_candidate_suppressions(
+        &self,
+    ) -> Result<Vec<harness_learning::RejectedSuggestion>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare("SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_current_revisions WHERE aggregate_kind='candidate' ORDER BY aggregate_id")?;
+        let rows = statement.query_map([], map_improvement_revision)?;
+        let mut output = Vec::new();
+        for row in rows {
+            let record = row?;
+            let candidate: harness_learning::CandidateV1 = serde_json::from_value(record.payload)?;
+            if candidate.state == harness_learning::CandidateState::Rejected {
+                output.push(harness_learning::RejectedSuggestion {
+                    failure_revision_id: candidate.target_failure.revision_id,
+                    dimension: candidate.edit.dimension,
+                });
+            }
+        }
+        Ok(output)
+    }
+
+    pub fn resolved_active_knowledge(
+        &self,
+        repository_id: &RepositoryId,
+        task_family: &str,
+        now: u64,
+    ) -> Result<Vec<harness_learning::DisplayKnowledge>, StoreError> {
+        self.resolved_active_knowledge_scoped(repository_id, task_family, None, None, now)
+    }
+
+    pub fn resolved_active_knowledge_scoped(
+        &self,
+        repository_id: &RepositoryId,
+        task_family: &str,
+        model_family: Option<&str>,
+        runtime_class: Option<&str>,
+        now: u64,
+    ) -> Result<Vec<harness_learning::DisplayKnowledge>, StoreError> {
+        safe_eval_id(task_family, 128)?;
+        if model_family.is_some_and(|value| safe_eval_id(value, 128).is_err())
+            || runtime_class.is_some_and(|value| safe_eval_id(value, 128).is_err())
+        {
+            return Err(StoreError::Validation("invalid knowledge scope".into()));
+        }
+        let mut connection = self.connection()?;
+        let tx = connection.transaction()?;
+        let mut statement = tx.prepare("SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_current_revisions WHERE aggregate_kind='knowledge' ORDER BY aggregate_id")?;
+        let rows = statement.query_map([], map_improvement_revision)?;
+        let items = rows
+            .map(|row| {
+                let record = row?;
+                let item =
+                    serde_json::from_value::<harness_learning::KnowledgeItemV1>(record.payload)
+                        .map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
+                Ok::<_, rusqlite::Error>((record.id, item))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut output = Vec::new();
+        for (revision_id, item) in &items {
+            if item.scope.repository_id != repository_id.as_str()
+                || item.scope.task_family != task_family
+                || item.scope.model_family.as_deref() != model_family
+                || item.scope.runtime_class.as_deref() != runtime_class
+                || !item.displayable(now)
+            {
+                continue;
+            }
+            if items.iter().any(|(other_revision_id, other)| {
+                other_revision_id != revision_id
+                    && other.scope == item.scope
+                    && (other.contradicts.iter().any(|id| id == &item.knowledge_id)
+                        || other.supersedes.iter().any(|id| id == &item.knowledge_id))
+            }) {
+                continue;
+            }
+            let review = item
+                .review
+                .receipt
+                .clone()
+                .ok_or_else(|| StoreError::Conflict("active knowledge lacks review".into()))?;
+            let action_id: i64 = review
+                .revision_id
+                .parse()
+                .map_err(|_| StoreError::Validation("human review ID invalid".into()))?;
+            let reviewer_id = item.review.reviewer_id.as_deref().ok_or_else(|| {
+                StoreError::Conflict("active knowledge lacks reviewer identity".into())
+            })?;
+            let trusted: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM human_actions WHERE id=?1 AND payload_sha256=?2 AND action_type='knowledge_review_accepted' AND target_type='knowledge' AND target_id=?3 AND actor=?4 AND json_extract(payload_json,'$.knowledge_revision_id')=?5 AND json_extract(payload_json,'$.knowledge_wire_sha256')=?6)",
+                params![action_id, review.digest, item.knowledge_id, reviewer_id, revision_id, item.sha256],
+                |r| r.get(0),
+            )?;
+            if !trusted {
+                return Err(StoreError::Conflict(
+                    "knowledge review is not trusted".into(),
+                ));
+            }
+            let evidence_clean = item.evidence.iter().try_fold(true, |clean, receipt| {
+                learning_receipt_clean_tx(&tx, receipt).map(|value| clean && value)
+            })?;
+            let resolution = harness_learning::TrustedKnowledgeResolution {
+                human_action: review,
+                evidence_clean,
+            };
+            if let Some(display) = harness_learning::resolve_trusted_display(item, &resolution, now)
+            {
+                output.push(display);
+            }
+        }
+        tx.commit()?;
+        Ok(output)
+    }
     pub fn append_taskset_membership(
         &self,
         input: &NewTasksetMembership,
@@ -70,9 +305,27 @@ impl Store {
             pin.case_id == case.case_id
                 && pin.revision == case.revision
                 && pin.case_digest == case.sha256
+                && pin.split == case.split
         }) {
             return Err(StoreError::Conflict(
                 "taskset manifest does not pin eval-case revision/digest".into(),
+            ));
+        }
+        if let Some(existing_ordinal)=tx.query_row("SELECT ordinal FROM taskset_revision_memberships WHERE taskset_revision_id=?1 AND eval_case_revision_id=?2",params![input.taskset_revision_id,input.eval_case_revision_id],|r|r.get::<_,i64>(0)).optional()? { if existing_ordinal==sqlite_u64(input.ordinal,"taskset ordinal")? { tx.commit()?; return Ok(()); } return Err(StoreError::Conflict("taskset membership replay has different ordinal".into())); }
+        let ordinal_taken: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM taskset_revision_memberships WHERE taskset_revision_id=?1 AND ordinal=?2)",params![input.taskset_revision_id,sqlite_u64(input.ordinal,"taskset ordinal")?],|r|r.get(0))?;
+        if ordinal_taken {
+            return Err(StoreError::Conflict(
+                "taskset membership ordinal is already occupied".into(),
+            ));
+        }
+        let launched: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM evaluation_runs WHERE taskset_revision_id=?1)",
+            [&input.taskset_revision_id],
+            |r| r.get(0),
+        )?;
+        if launched {
+            return Err(StoreError::Conflict(
+                "taskset membership is frozen after evaluation launch".into(),
             ));
         }
         tx.execute("INSERT INTO taskset_revision_memberships(taskset_revision_id,eval_case_revision_id,ordinal,created_at) VALUES(?1,?2,?3,?4)", params![input.taskset_revision_id,input.eval_case_revision_id,sqlite_u64(input.ordinal,"taskset ordinal")?,now_ms()])?;
@@ -87,6 +340,18 @@ impl Store {
         validate_new_evaluation_run(input)?;
         let mut c = self.connection()?;
         let tx = c.transaction()?;
+        let controller_repository: Option<String> = tx
+            .query_row(
+                "SELECT repository_id FROM runs WHERE id=?1 AND base_sha=?2",
+                params![input.controller_run_id.as_str(), input.base_sha],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(controller_repository) = controller_repository else {
+            return Err(StoreError::Conflict(
+                "evaluation base SHA does not match controller run".into(),
+            ));
+        };
         require_eval_revision(
             &tx,
             &input.taskset_revision_id,
@@ -97,6 +362,19 @@ impl Store {
             &input.grader_bundle_revision_id,
             ImprovementRecordKind::GraderBundle,
         )?;
+        let pins = evaluation_launch_pins_tx(
+            &tx,
+            &input.taskset_revision_id,
+            &input.grader_bundle_revision_id,
+        )?;
+        if pins.eval_cases.iter().any(|case| {
+            case.wire.runtime.repository_id != controller_repository
+                || case.wire.runtime.base_sha != input.base_sha
+        }) {
+            return Err(StoreError::Conflict(
+                "evaluation case repository/base does not match controller run".into(),
+            ));
+        }
         if let Some(id) = tx
             .query_row(
                 "SELECT id FROM evaluation_runs WHERE idempotency_key=?1",
@@ -108,7 +386,7 @@ impl Store {
             let receipt = read_evaluation_run(&tx, &id)?;
             if receipt.taskset_revision_id == input.taskset_revision_id
                 && receipt.grader_bundle_revision_id == input.grader_bundle_revision_id
-                && tx.query_row("SELECT id=?2 AND base_sha=?3 AND fixture_digest=?4 AND runtime_digest=?5 AND seed_policy_digest=?6 AND champion_policy_digest=?7 AND challenger_policy_digest IS ?8 FROM evaluation_runs WHERE id=?1",params![id,input.id,input.base_sha,input.fixture_digest,input.runtime_digest,input.seed_policy_digest,input.champion_policy_digest,input.challenger_policy_digest],|r|r.get::<_,bool>(0))?
+                && tx.query_row("SELECT id=?2 AND controller_run_id=?3 AND base_sha=?4 AND fixture_digest=?5 AND runtime_digest=?6 AND seed_policy_digest=?7 AND champion_policy_digest=?8 AND challenger_policy_digest IS ?9 FROM evaluation_runs WHERE id=?1",params![id,input.id,input.controller_run_id.as_str(),input.base_sha,input.fixture_digest,input.runtime_digest,input.seed_policy_digest,input.champion_policy_digest,input.challenger_policy_digest],|r|r.get::<_,bool>(0))?
             {
                 tx.commit()?;
                 return Ok(receipt);
@@ -117,8 +395,8 @@ impl Store {
                 "evaluation run idempotency collision".into(),
             ));
         }
-        let split = taskset_split(&tx, &input.taskset_revision_id)?;
-        tx.execute("INSERT INTO evaluation_runs(id,taskset_revision_id,grader_bundle_revision_id,split,base_sha,fixture_digest,runtime_digest,seed_policy_digest,champion_policy_digest,challenger_policy_digest,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![input.id,input.taskset_revision_id,input.grader_bundle_revision_id,split_text(split),input.base_sha,input.fixture_digest,input.runtime_digest,input.seed_policy_digest,input.champion_policy_digest,input.challenger_policy_digest,input.idempotency_key,now_ms()])?;
+        let split = pins.split;
+        tx.execute("INSERT INTO evaluation_runs(id,controller_run_id,taskset_revision_id,grader_bundle_revision_id,split,base_sha,fixture_digest,runtime_digest,seed_policy_digest,champion_policy_digest,challenger_policy_digest,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![input.id,input.controller_run_id.as_str(),input.taskset_revision_id,input.grader_bundle_revision_id,split_text(split),input.base_sha,input.fixture_digest,input.runtime_digest,input.seed_policy_digest,input.champion_policy_digest,input.challenger_policy_digest,input.idempotency_key,now_ms()])?;
         tx.execute("INSERT INTO evaluation_run_status_revisions(id,evaluation_run_id,sequence,status,receipt_digest,idempotency_key,created_at) VALUES(?1,?2,1,'recording',?3,?4,?5)",params![format!("{}-recording",input.id),input.id,input.runtime_digest,format!("{}-recording",input.idempotency_key),now_ms()])?;
         let receipt = read_evaluation_run(&tx, &input.id)?;
         tx.commit()?;
@@ -143,7 +421,32 @@ impl Store {
         if !exists {
             return Err(StoreError::NotFound(input.evaluation_run_id.clone()));
         }
+        let already_invalidated: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM evaluation_invalidations WHERE target_kind='evaluation_run' AND target_id=?1)", [&input.evaluation_run_id], |r| r.get(0))?;
+        if already_invalidated && input.status != EvaluationRunStatus::Invalidated {
+            return Err(StoreError::Conflict(
+                "invalidated evaluation run is terminal".into(),
+            ));
+        }
         if let Some(matches)=tx.query_row("SELECT id=?2 AND evaluation_run_id=?3 AND status=?4 AND receipt_digest=?5 FROM evaluation_run_status_revisions WHERE idempotency_key=?1",params![input.idempotency_key,input.id,input.evaluation_run_id,status_text(input.status),input.receipt_digest],|r|r.get::<_,bool>(0)).optional()? { if matches {tx.commit()?;return Ok(());}return Err(StoreError::Conflict("evaluation status idempotency collision".into())); }
+        let prior: String = tx.query_row("SELECT status FROM evaluation_run_status_revisions WHERE evaluation_run_id=?1 ORDER BY sequence DESC LIMIT 1", [&input.evaluation_run_id], |r| r.get(0))?;
+        if prior == "invalidated" {
+            return Err(StoreError::Conflict(
+                "invalidated evaluation run is terminal".into(),
+            ));
+        }
+        if input.status == EvaluationRunStatus::Invalidated {
+            let receipt: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM evaluation_invalidations WHERE target_kind='evaluation_run' AND target_id=?1)", [&input.evaluation_run_id], |r| r.get(0))?;
+            if !receipt {
+                return Err(StoreError::Conflict(
+                    "invalidated status requires immutable invalidation receipt".into(),
+                ));
+            }
+        }
+        if !evaluation_status_transition_allowed(&prior, input.status) {
+            return Err(StoreError::Conflict(
+                "illegal evaluation run status transition".into(),
+            ));
+        }
         let sequence:i64=tx.query_row("SELECT coalesce(max(sequence),0)+1 FROM evaluation_run_status_revisions WHERE evaluation_run_id=?1",[&input.evaluation_run_id],|r|r.get(0))?;
         tx.execute("INSERT INTO evaluation_run_status_revisions(id,evaluation_run_id,sequence,status,receipt_digest,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![input.id,input.evaluation_run_id,sequence,status_text(input.status),input.receipt_digest,input.idempotency_key,now_ms()])?;
         tx.commit()?;
@@ -156,6 +459,15 @@ impl Store {
     ) -> Result<EvaluationSampleReceipt, StoreError> {
         harness_eval::verify_sample(&input.sample)
             .map_err(|e| StoreError::Validation(e.to_string()))?;
+        let artifact_length = match input.sample.classification {
+            harness_eval::SampleClassification::Pass | harness_eval::SampleClassification::Fail => {
+                let digest = input.sample.artifact_digest.0.as_deref().ok_or_else(|| {
+                    StoreError::Conflict("pass/fail sample requires artifact digest".into())
+                })?;
+                Some(self.artifacts.verify(digest)?)
+            }
+            _ => None,
+        };
         safe_eval_id(&input.id, 128)?;
         safe_eval_id(&input.evaluation_run_id, 128)?;
         safe_eval_id(&input.eval_case_revision_id, 128)?;
@@ -166,11 +478,28 @@ impl Store {
         if run.invalidated {
             return Err(StoreError::Conflict("evaluation run is invalidated".into()));
         }
+        if evaluation_run_status_tx(&tx, &input.evaluation_run_id)? != "recording" {
+            return Err(StoreError::Conflict(
+                "evaluation samples are accepted only while recording".into(),
+            ));
+        }
         require_eval_revision(
             &tx,
             &input.eval_case_revision_id,
             ImprovementRecordKind::EvalCase,
         )?;
+        let case: harness_eval::EvalCaseV1 = serde_json::from_value(
+            read_improvement_revision(&tx, &input.eval_case_revision_id)?.payload,
+        )?;
+        if input.sample.case_id != case.case_id
+            || input.sample.case_revision != case.revision
+            || input.sample.case_digest != case.sha256
+            || input.sample.setup_digest != case.runtime.setup_digest
+        {
+            return Err(StoreError::Conflict(
+                "sample does not exactly bind immutable eval case".into(),
+            ));
+        }
         let member:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM taskset_revision_memberships WHERE taskset_revision_id=?1 AND eval_case_revision_id=?2)",params![run.taskset_revision_id,input.eval_case_revision_id],|r|r.get(0))?;
         if !member {
             return Err(StoreError::Conflict(
@@ -186,6 +515,13 @@ impl Store {
                 "sample digest does not bind run taskset/grader".into(),
             ));
         }
+        let policy_digest: String = tx.query_row("SELECT CASE ?2 WHEN 'champion' THEN champion_policy_digest ELSE challenger_policy_digest END FROM evaluation_runs WHERE id=?1",params![input.evaluation_run_id,arm_text(input.arm)],|r|r.get(0))?;
+        if input.sample.policy_digest != policy_digest {
+            return Err(StoreError::Conflict(
+                "sample policy digest does not bind arm".into(),
+            ));
+        }
+        validate_evaluation_sample_evidence(&tx, input, &run.controller_run_id, artifact_length)?;
         if let Some(id) = tx
             .query_row(
                 "SELECT id FROM evaluation_samples WHERE idempotency_key=?1",
@@ -200,8 +536,8 @@ impl Store {
                 && receipt.arm == input.arm
                 && receipt.seed == input.sample.seed
                 && tx.query_row(
-                    "SELECT id=?2 AND sample_digest=?3 FROM evaluation_samples WHERE id=?1",
-                    params![id, input.id, input.sample.sha256],
+                    "SELECT id=?2 AND controller_evidence_id=?3 AND grader_evidence_id=?4 AND sample_digest=?5 FROM evaluation_samples WHERE id=?1",
+                    params![id, input.id, input.controller_evidence_id.as_str(), input.grader_evidence_id.as_str(), input.sample.sha256],
                     |r| r.get::<_, bool>(0),
                 )?
             {
@@ -212,7 +548,7 @@ impl Store {
                 "evaluation sample idempotency collision".into(),
             ));
         }
-        tx.execute("INSERT INTO evaluation_samples(id,evaluation_run_id,eval_case_revision_id,arm,seed,classification,sample_digest,trace_digest,evidence_digest,artifact_digest,cost_receipt_digest,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![input.id,input.evaluation_run_id,input.eval_case_revision_id,arm_text(input.arm),sqlite_u64(input.sample.seed,"sample seed")?,sample_class_text(input.sample.classification),input.sample.sha256,input.sample.trace_digest.0,input.sample.evidence_digest.0,input.sample.artifact_digest.0,input.sample.cost_receipt_digest.0,input.idempotency_key,now_ms()])?;
+        tx.execute("INSERT INTO evaluation_samples(id,evaluation_run_id,controller_evidence_id,grader_evidence_id,eval_case_revision_id,arm,seed,classification,sample_digest,trace_digest,evidence_digest,artifact_digest,cost_receipt_digest,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",params![input.id,input.evaluation_run_id,input.controller_evidence_id.as_str(),input.grader_evidence_id.as_str(),input.eval_case_revision_id,arm_text(input.arm),sqlite_u64(input.sample.seed,"sample seed")?,sample_class_text(input.sample.classification),input.sample.sha256,input.sample.trace_digest.0,input.sample.evidence_digest.0,input.sample.artifact_digest.0,input.sample.cost_receipt_digest.0,input.idempotency_key,now_ms()])?;
         let receipt = read_evaluation_sample(&tx, &input.id)?;
         tx.commit()?;
         Ok(receipt)
@@ -239,7 +575,42 @@ impl Store {
                 "paired verdict runs are incompatible or invalidated".into(),
             ));
         }
-        if let Some((id,matches)) = tx.query_row("SELECT id,id=?2 AND champion_evaluation_run_id=?3 AND challenger_evaluation_run_id=?4 AND input_digest=?5 AND successful_pairs=?6 AND win_pairs=?7 AND loss_pairs=?8 AND delta_milli=?9 AND critical_regression=?10 AND reward_integrity_pass=?11 AND decision=?12 FROM evaluation_stat_verdicts WHERE idempotency_key=?1",params![input.idempotency_key,input.id,input.champion_evaluation_run_id,input.challenger_evaluation_run_id,input.statistics.input_digest,sqlite_u64(input.statistics.successful_pairs,"successful pairs")?,sqlite_u64(input.statistics.win_pairs,"winning pairs")?,sqlite_u64(input.statistics.loss_pairs,"losing pairs")?,input.statistics.delta_milli,input.critical_regression,input.reward_integrity_pass,decision_text(input.statistics.decision)],|r|Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?))).optional()? {
+        if evaluation_run_status_tx(&tx, &input.champion_evaluation_run_id)? != "completed"
+            || evaluation_run_status_tx(&tx, &input.challenger_evaluation_run_id)? != "completed"
+        {
+            return Err(StoreError::Conflict(
+                "paired verdict requires completed evaluation runs".into(),
+            ));
+        }
+        for (run_id, arm) in [
+            (&input.champion_evaluation_run_id, "champion"),
+            (&input.challenger_evaluation_run_id, "challenger"),
+        ] {
+            let count:i64=tx.query_row("SELECT count(*) FROM evaluation_samples WHERE evaluation_run_id=?1 AND arm=?2 AND classification IN ('pass','fail')",params![run_id,arm],|r|r.get(0))?;
+            if count == 0 {
+                return Err(StoreError::Conflict(
+                    "paired verdict requires successful arm samples".into(),
+                ));
+            }
+        }
+        if !matches!(
+            input.statistics.decision,
+            harness_eval::Decision::Inconclusive | harness_eval::Decision::RefusedSmallSample
+        ) {
+            return Err(StoreError::Validation(
+                "Store cannot authorize better/worse statistics without persisted paired wires"
+                    .into(),
+            ));
+        }
+        let derived_input_digest = sha256(
+            format!(
+                "harness.eval.store.verdict.v1\0{}\0{}",
+                input.champion_evaluation_run_id, input.challenger_evaluation_run_id
+            )
+            .as_bytes(),
+        );
+        let derived_decision = harness_eval::Decision::RefusedSmallSample;
+        if let Some((id,matches)) = tx.query_row("SELECT id,id=?2 AND champion_evaluation_run_id=?3 AND challenger_evaluation_run_id=?4 AND input_digest=?5 AND successful_pairs=0 AND win_pairs=0 AND loss_pairs=0 AND delta_milli=0 AND critical_regression=0 AND reward_integrity_pass=0 AND decision=?6 FROM evaluation_stat_verdicts WHERE idempotency_key=?1",params![input.idempotency_key,input.id,input.champion_evaluation_run_id,input.challenger_evaluation_run_id,derived_input_digest,decision_text(derived_decision)],|r|Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?))).optional()? {
             if !matches { return Err(StoreError::Conflict("paired verdict idempotency collision".into())); }
             tx.commit()?;
             return Ok(PairedStatVerdictReceipt {
@@ -247,7 +618,7 @@ impl Store {
                 invalidated: false,
             });
         }
-        tx.execute("INSERT INTO evaluation_stat_verdicts(id,champion_evaluation_run_id,challenger_evaluation_run_id,method,decision,input_digest,successful_pairs,win_pairs,loss_pairs,delta_milli,critical_regression,reward_integrity_pass,idempotency_key,created_at) VALUES(?1,?2,?3,'paired_exact_v1',?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![input.id,input.champion_evaluation_run_id,input.challenger_evaluation_run_id,decision_text(input.statistics.decision),input.statistics.input_digest,sqlite_u64(input.statistics.successful_pairs,"successful pairs")?,sqlite_u64(input.statistics.win_pairs,"winning pairs")?,sqlite_u64(input.statistics.loss_pairs,"losing pairs")?,input.statistics.delta_milli,input.critical_regression,input.reward_integrity_pass,input.idempotency_key,now_ms()])?;
+        tx.execute("INSERT INTO evaluation_stat_verdicts(id,champion_evaluation_run_id,challenger_evaluation_run_id,method,decision,input_digest,successful_pairs,win_pairs,loss_pairs,delta_milli,critical_regression,reward_integrity_pass,idempotency_key,created_at) VALUES(?1,?2,?3,'paired_exact_v1',?4,?5,0,0,0,0,0,0,?6,?7)",params![input.id,input.champion_evaluation_run_id,input.challenger_evaluation_run_id,decision_text(derived_decision),derived_input_digest,input.idempotency_key,now_ms()])?;
         tx.commit()?;
         Ok(PairedStatVerdictReceipt {
             id: input.id.clone(),
@@ -366,6 +737,167 @@ impl Store {
         Ok(receipt)
     }
 
+    pub fn evaluation_launch_pins(
+        &self,
+        taskset_revision_id: &str,
+        grader_bundle_revision_id: &str,
+    ) -> Result<EvaluationLaunchPins, StoreError> {
+        safe_eval_id(taskset_revision_id, 128)?;
+        safe_eval_id(grader_bundle_revision_id, 128)?;
+        let mut c = self.connection()?;
+        let tx = c.transaction()?;
+        let pins = evaluation_launch_pins_tx(&tx, taskset_revision_id, grader_bundle_revision_id)?;
+        tx.commit()?;
+        Ok(pins)
+    }
+
+    pub fn immutable_eval_case_revision(
+        &self,
+        id: &str,
+    ) -> Result<ImmutableRevision<harness_eval::EvalCaseV1>, StoreError> {
+        self.immutable_revision_wire(id, ImprovementRecordKind::EvalCase)
+    }
+    pub fn immutable_taskset_revision(
+        &self,
+        id: &str,
+    ) -> Result<ImmutableRevision<harness_eval::TasksetV1>, StoreError> {
+        self.immutable_revision_wire(id, ImprovementRecordKind::Taskset)
+    }
+    pub fn immutable_grader_bundle_revision(
+        &self,
+        id: &str,
+    ) -> Result<ImmutableRevision<harness_eval::GraderBundleV1>, StoreError> {
+        self.immutable_revision_wire(id, ImprovementRecordKind::GraderBundle)
+    }
+    pub fn immutable_policy_bundle_revision(
+        &self,
+        id: &str,
+    ) -> Result<ImmutableRevision<harness_learning::PolicyBundleV1>, StoreError> {
+        self.immutable_revision_wire(id, ImprovementRecordKind::PolicyBundle)
+    }
+    pub fn immutable_candidate_revision(
+        &self,
+        id: &str,
+    ) -> Result<ImmutableRevision<harness_learning::CandidateV1>, StoreError> {
+        self.immutable_revision_wire(id, ImprovementRecordKind::Candidate)
+    }
+    pub fn immutable_knowledge_revision(
+        &self,
+        id: &str,
+    ) -> Result<ImmutableRevision<harness_learning::KnowledgeItemV1>, StoreError> {
+        self.immutable_revision_wire(id, ImprovementRecordKind::Knowledge)
+    }
+    fn immutable_revision_wire<T: serde::de::DeserializeOwned>(
+        &self,
+        id: &str,
+        kind: ImprovementRecordKind,
+    ) -> Result<ImmutableRevision<T>, StoreError> {
+        safe_eval_id(id, 128)?;
+        let c = self.connection()?;
+        immutable_revision_wire_conn(&c, id, kind)
+    }
+
+    pub fn failure_development_case_source(
+        &self,
+        occurrence_id: &str,
+    ) -> Result<FailureDevelopmentCaseSource, StoreError> {
+        safe_eval_id(occurrence_id, 128)?;
+        let c = self.connection()?;
+        let (repository_id, source_kind, source_id, source_domain_event_id): (String, String, String, Option<i64>) = c
+            .query_row(
+                "SELECT repository_id,source_kind,source_id,source_domain_event_id FROM failure_occurrences WHERE id=?1",
+                [occurrence_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(occurrence_id.into()))?;
+        let outcome = if source_kind == "typed_outcome" {
+            let record = c
+                .query_row(
+                    "SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_revisions WHERE id=?1",
+                    [&source_id],
+                    map_improvement_revision,
+                )
+                .optional()?
+                .filter(|record| record.aggregate_kind == ImprovementRecordKind::Outcome)
+                .ok_or_else(|| StoreError::Conflict("failure outcome source is not immutable OutcomeV1".into()))?;
+            let wire: OutcomeWireV1 = serde_json::from_value(record.payload.clone())?;
+            wire.validate()
+                .map_err(|error| StoreError::Validation(error.to_string()))?;
+            Some((record.id, wire.run_id.to_string(), record.payload_sha256))
+        } else {
+            None
+        };
+        let run_id = match source_kind.as_str() {
+            "attempt_terminal" => c.query_row("SELECT t.run_id FROM task_attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=?1",[&source_id],|r|r.get::<_,String>(0)).optional()?,
+            "run_terminal" => {
+                let event_id = source_domain_event_id.ok_or_else(|| {
+                    StoreError::Conflict("run-terminal failure lacks source domain event".into())
+                })?;
+                if source_id != format!("domain-event-{event_id}") {
+                    return Err(StoreError::Conflict(
+                        "run-terminal failure source ID disagrees with domain event".into(),
+                    ));
+                }
+                c.query_row(
+                    "SELECT run_id FROM domain_events WHERE id=?1 AND event_type='run.lifecycle.transitioned'",
+                    [event_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            }
+            "typed_outcome" => outcome.as_ref().map(|value| value.1.clone()),
+            _ => None,
+        }.ok_or_else(||StoreError::Conflict("failure occurrence lacks durable run source".into()))?;
+        let (base_sha, run_repository_id): (String, String) = c.query_row(
+            "SELECT base_sha,repository_id FROM runs WHERE id=?1",
+            [&run_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if run_repository_id != repository_id
+            || base_sha.len() != 40
+            || !base_sha
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b.is_ascii_hexdigit()))
+        {
+            return Err(StoreError::Conflict(
+                "failure occurrence run provenance is invalid".into(),
+            ));
+        }
+        let trace = c.query_row("SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_revisions WHERE aggregate_kind='trace' AND json_extract(payload_json,'$.run_id')=?1 ORDER BY revision DESC LIMIT 1",[&run_id],map_improvement_revision).optional()?.map(|record| {
+            if record.schema != ImprovementSchema::TraceV2 || record.sensitivity == SensitivityClass::Restricted {
+                return Err(StoreError::Conflict("failure trace is not an export-safe TraceV2".into()));
+            }
+            let manifest: harness_trace::TraceManifest = serde_json::from_value(record.payload)?;
+            if manifest.schema != "harness.trace.v2" || manifest.run_id != run_id || !is_lower_hex_digest(&manifest.sha256) {
+                return Err(StoreError::Conflict("failure trace manifest provenance is invalid".into()));
+            }
+            harness_trace::validate_manifest(&manifest)
+                .map_err(|error| StoreError::Conflict(format!("invalid trace manifest: {error}")))?;
+            Ok((record.id, record.payload_sha256))
+        }).transpose()?;
+        let receipt = sha256(
+            format!(
+                "failure-source.v2\0{source_kind}\0{source_id}\0{}",
+                source_domain_event_id.map_or_else(String::new, |id| id.to_string())
+            )
+            .as_bytes(),
+        );
+        Ok(FailureDevelopmentCaseSource {
+            occurrence_id: occurrence_id.into(),
+            repository_id: RepositoryId::from(repository_id),
+            run_id: RunId::from(run_id),
+            base_sha: base_sha.clone(),
+            source_receipt_sha256: receipt,
+            source_kind,
+            source_domain_event_id,
+            trace_revision_id: trace.as_ref().map(|value| value.0.clone()),
+            trace_digest: trace.map(|value| value.1),
+            outcome_revision_id: outcome.as_ref().map(|value| value.0.clone()),
+            outcome_digest: outcome.map(|value| value.2.clone()),
+        })
+    }
+
     pub fn evaluation_sample(&self, id: &str) -> Result<EvaluationSampleReceipt, StoreError> {
         safe_eval_id(id, 128)?;
         let mut c = self.connection()?;
@@ -378,6 +910,19 @@ impl Store {
         }
         tx.commit()?;
         Ok(receipt)
+    }
+
+    pub fn paired_stat_verdict(&self, id: &str) -> Result<PairedStatVerdictReceipt, StoreError> {
+        safe_eval_id(id, 128)?;
+        let c = self.connection()?;
+        let invalidated: bool=c.query_row("SELECT EXISTS(SELECT 1 FROM evaluation_invalidations i WHERE (i.target_kind='stat_verdict' AND i.target_id=v.id) OR (i.target_kind='evaluation_run' AND i.target_id IN (v.champion_evaluation_run_id,v.challenger_evaluation_run_id))) FROM evaluation_stat_verdicts v WHERE v.id=?1",[id],|r|r.get(0)).optional()?.ok_or_else(||StoreError::NotFound(id.into()))?;
+        if invalidated {
+            return Err(StoreError::Conflict("paired verdict is invalidated".into()));
+        }
+        Ok(PairedStatVerdictReceipt {
+            id: id.into(),
+            invalidated: false,
+        })
     }
     // SI-007: project only Store-owned, typed terminal and outcome receipts.
     // Neither failure reasons nor outcome notes are read or persisted here.
@@ -1689,6 +2234,7 @@ impl Store {
                 return Err(StoreError::Conflict("illegal improvement revision transition or classification downgrade".to_owned()));
             }
         }
+        validate_learning_references_tx(&transaction, input)?;
         let next: i64 = transaction.query_row(
             "SELECT coalesce(max(revision),0)+1 FROM improvement_revisions WHERE aggregate_kind=?1 AND aggregate_id=?2",
             params![enum_text(&input.aggregate_kind)?, input.aggregate_id], |row| row.get(0),
@@ -2205,6 +2751,49 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn create_or_validate_evaluation_worktree(
+        &self,
+        input: &NewWorktree,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection()?;
+        let state: Option<String> = connection
+            .query_row(
+                "SELECT state FROM worktrees WHERE id=?1 AND run_id=?2 AND task_attempt_id IS ?3 AND kind=?4 AND path=?5 AND branch IS ?6 AND base_sha=?7 AND head_sha IS ?8",
+                params![input.id.as_str(),input.run_id.as_str(),input.task_attempt_id.as_ref().map(AttemptId::as_str),input.kind,input.path.to_string_lossy(),input.branch,input.base_sha,input.head_sha],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match state.as_deref() {
+            Some(state) if state == input.state => Ok(()),
+            Some("REMOVED") if input.state == "ACTIVE" && input.kind == "evaluation_controller" => {
+                let changed = connection.execute(
+                    "UPDATE worktrees SET state='ACTIVE',reconciled_at=?2,version=version+1 WHERE id=?1 AND run_id=?3 AND task_attempt_id IS ?4 AND kind='evaluation_controller' AND path=?5 AND branch IS ?6 AND base_sha=?7 AND head_sha IS ?8 AND state='REMOVED'",
+                    params![input.id.as_str(), now_ms(), input.run_id.as_str(), input.task_attempt_id.as_ref().map(AttemptId::as_str), input.path.to_string_lossy(), input.branch, input.base_sha, input.head_sha],
+                )?;
+                if changed == 1 {
+                    Ok(())
+                } else {
+                    Err(StoreError::Conflict(
+                        "evaluation worktree removal replay raced or differed".into(),
+                    ))
+                }
+            }
+            Some(_) => Err(StoreError::Conflict(
+                "evaluation worktree replay differs".into(),
+            )),
+            None => {
+                // Do the insert through this guarded connection.  Calling the
+                // public create_worktree here would attempt to lock Store a
+                // second time and deadlock on a first-run replay.
+                connection.execute(
+                    "INSERT INTO worktrees(id,run_id,task_attempt_id,kind,path,branch,base_sha,head_sha,state,created_at,version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1)",
+                    params![input.id.as_str(), input.run_id.as_str(), input.task_attempt_id.as_ref().map(AttemptId::as_str), input.kind, input.path.to_string_lossy(), input.branch, input.base_sha, input.head_sha, input.state, now_ms()],
+                )?;
+                Ok(())
+            }
+        }
     }
 
     pub fn update_worktree(
@@ -3662,6 +4251,82 @@ impl Store {
         Ok(input.id.clone())
     }
 
+    /// Evaluation artifacts use deterministic IDs.  Replay validates both the
+    /// complete DB envelope and the bytes already held by ArtifactStore.
+    pub fn register_or_validate_evaluation_artifact(
+        &self,
+        input: &NewArtifact,
+    ) -> Result<ArtifactId, StoreError> {
+        let observed_length = self.artifacts().verify(&input.sha256)?;
+        if observed_length != input.byte_length {
+            return Err(StoreError::ArtifactIntegrity(
+                "evaluation artifact byte length differs from artifact custody".into(),
+            ));
+        }
+        let byte_length = i64::try_from(input.byte_length)
+            .map_err(|_| StoreError::Validation("artifact length exceeds SQLite range".into()))?;
+        let mut connection = self.connection()?;
+        let tx = connection.transaction()?;
+        // Artifact identity is content-addressed.  `run_id`, task attempt,
+        // kind, and logical name describe a caller's use and must not be
+        // treated as immutable properties of shared bytes.
+        let common_matches = |id: &str| -> Result<Option<bool>, StoreError> {
+            tx.query_row(
+                "SELECT storage_path=?2 AND sha256=?3 AND media_type=?4 AND compression IS ?5 AND sensitivity=?6 AND byte_length=?7 AND retention_class=?8 AND pinned=?9 AND verified_at IS NOT NULL FROM artifacts WHERE id=?1",
+                params![id, input.storage_path.to_string_lossy(), input.sha256, input.media_type, input.compression, input.sensitivity, byte_length, input.retention_class, input.pinned],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        };
+        let requested_matches = tx
+            .query_row(
+                "SELECT run_id IS ?2 AND task_attempt_id IS ?3 AND kind=?4 AND logical_name=?5 AND storage_path=?6 AND sha256=?7 AND media_type=?8 AND compression IS ?9 AND sensitivity=?10 AND byte_length=?11 AND retention_class=?12 AND pinned=?13 AND verified_at IS NOT NULL FROM artifacts WHERE id=?1",
+                params![input.id.as_str(), input.run_id.as_ref().map(RunId::as_str), input.task_attempt_id.as_ref().map(AttemptId::as_str), input.kind, input.logical_name, input.storage_path.to_string_lossy(), input.sha256, input.media_type, input.compression, input.sensitivity, byte_length, input.retention_class, input.pinned],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let canonical_id = match requested_matches {
+            Some(true) => input.id.clone(),
+            Some(false) => {
+                return Err(StoreError::Conflict(
+                    "evaluation artifact replay differs".into(),
+                ));
+            }
+            None => {
+                let by_digest: Option<String> = tx
+                    .query_row(
+                        "SELECT id FROM artifacts WHERE sha256=?1",
+                        [&input.sha256],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(existing) = by_digest {
+                    if common_matches(&existing)? != Some(true) {
+                        return Err(StoreError::Conflict(
+                            "content-addressed artifact envelope differs".into(),
+                        ));
+                    }
+                    ArtifactId::from(existing)
+                } else {
+                    tx.execute(
+                        "INSERT INTO artifacts(id,run_id,task_attempt_id,kind,logical_name,storage_path,sha256,media_type,compression,sensitivity,byte_length,retention_class,pinned,created_at,verified_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14)",
+                        params![input.id.as_str(), input.run_id.as_ref().map(RunId::as_str), input.task_attempt_id.as_ref().map(AttemptId::as_str), input.kind, input.logical_name, input.storage_path.to_string_lossy(), input.sha256, input.media_type, input.compression, input.sensitivity, byte_length, input.retention_class, input.pinned, now_ms()],
+                    )?;
+                    input.id.clone()
+                }
+            }
+        };
+        if let Some(run_id) = &input.run_id {
+            tx.execute(
+                "INSERT OR IGNORE INTO artifact_run_bindings(artifact_id,run_id,created_at) VALUES(?1,?2,?3)",
+                params![canonical_id.as_str(), run_id.as_str(), now_ms()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(canonical_id)
+    }
+
     pub fn artifact(&self, id: &ArtifactId) -> Result<ArtifactRecord, StoreError> {
         self.connection()?
             .query_row(
@@ -3717,6 +4382,35 @@ impl Store {
         Ok(())
     }
 
+    pub fn record_or_validate_evaluation_command(
+        &self,
+        input: &NewCommandRecord,
+    ) -> Result<(), StoreError> {
+        let raw = serde_json::to_string(&input.command)?;
+        let digest = sha256(raw.as_bytes());
+        let c = self.connection()?;
+        let error_json = input
+            .error
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let result_class = enum_text(&input.result_class)?;
+        let matches:Option<bool>=c.query_row("SELECT run_id=?2 AND task_attempt_id IS ?3 AND agent_session_id IS ?4 AND worktree_id IS ?5 AND command_json=?6 AND command_sha256=?7 AND cwd=?8 AND source_sha_before IS ?9 AND source_sha_after IS ?10 AND resource_class=?11 AND host_identity IS ?12 AND target_profile IS ?13 AND started_at=?14 AND completed_at=?15 AND exit_code IS ?16 AND signal IS ?17 AND timed_out=?18 AND result_class=?19 AND stdout_artifact_id IS ?20 AND stderr_artifact_id IS ?21 AND error_json IS ?22 FROM command_runs WHERE id=?1",params![input.id.as_str(),input.run_id.as_str(),input.task_attempt_id.as_ref().map(AttemptId::as_str),input.agent_session_id.as_ref().map(AgentSessionId::as_str),input.worktree_id.as_ref().map(harness_domain::WorktreeId::as_str),raw,digest,input.cwd.to_string_lossy(),input.source_sha_before,input.source_sha_after,input.resource_class,input.host_identity,input.target_profile,input.started_at,input.completed_at,input.exit_code,input.signal,input.timed_out,result_class,input.stdout_artifact_id.as_ref().map(ArtifactId::as_str),input.stderr_artifact_id.as_ref().map(ArtifactId::as_str),error_json],|r|r.get(0)).optional()?;
+        match matches {
+            Some(true) => Ok(()),
+            Some(false) => Err(StoreError::Conflict(
+                "evaluation command replay differs".into(),
+            )),
+            None => {
+                c.execute(
+                    "INSERT INTO command_runs(id,run_id,task_attempt_id,agent_session_id,worktree_id,command_json,command_sha256,cwd,source_sha_before,source_sha_after,resource_class,host_identity,target_profile,started_at,completed_at,exit_code,signal,timed_out,result_class,stdout_artifact_id,stderr_artifact_id,error_json,version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,1)",
+                    params![input.id.as_str(),input.run_id.as_str(),input.task_attempt_id.as_ref().map(AttemptId::as_str),input.agent_session_id.as_ref().map(AgentSessionId::as_str),input.worktree_id.as_ref().map(harness_domain::WorktreeId::as_str),raw,digest,input.cwd.to_string_lossy(),input.source_sha_before,input.source_sha_after,input.resource_class,input.host_identity,input.target_profile,input.started_at,input.completed_at,input.exit_code,input.signal,input.timed_out,result_class,input.stdout_artifact_id.as_ref().map(ArtifactId::as_str),input.stderr_artifact_id.as_ref().map(ArtifactId::as_str),error_json],
+                )?;
+                Ok(())
+            }
+        }
+    }
+
     pub fn record_validation(&self, input: &NewValidationRecord) -> Result<(), StoreError> {
         self.connection()?.execute(
             "INSERT INTO validations(id,run_id,task_attempt_id,worktree_id,validator_id,proof_tier,source_sha,selector_reason,state,result_class,command_run_id,started_at,completed_at,version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'completed',?9,?10,?11,?12,1)",
@@ -3736,6 +4430,38 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Create a completed controller validation once, or prove that a replay
+    /// is byte-for-byte the same authority.  This intentionally has no broad
+    /// upsert semantics: a reused ID with one changed field is a conflict.
+    pub fn record_or_validate_evaluation_validation(
+        &self,
+        input: &NewValidationRecord,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection()?;
+        let proof_tier = enum_text(&input.proof_tier)?;
+        let result_class = enum_text(&input.result_class)?;
+        let matches: Option<bool> = connection
+            .query_row(
+                "SELECT run_id=?2 AND task_attempt_id IS ?3 AND worktree_id=?4 AND validator_id=?5 AND proof_tier=?6 AND source_sha=?7 AND selector_reason=?8 AND state='completed' AND result_class=?9 AND command_run_id IS ?10 AND started_at=?11 AND completed_at=?12 FROM validations WHERE id=?1",
+                params![input.id.as_str(), input.run_id.as_str(), input.task_attempt_id.as_ref().map(AttemptId::as_str), input.worktree_id.as_str(), input.validator_id, proof_tier, input.source_sha, input.selector_reason, result_class, input.command_run_id.as_ref().map(harness_domain::CommandRunId::as_str), input.started_at, input.completed_at],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match matches {
+            Some(true) => Ok(()),
+            Some(false) => Err(StoreError::Conflict(
+                "evaluation validation replay differs".into(),
+            )),
+            None => {
+                connection.execute(
+                    "INSERT INTO validations(id,run_id,task_attempt_id,worktree_id,validator_id,proof_tier,source_sha,selector_reason,state,result_class,command_run_id,started_at,completed_at,version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'completed',?9,?10,?11,?12,1)",
+                    params![input.id.as_str(), input.run_id.as_str(), input.task_attempt_id.as_ref().map(AttemptId::as_str), input.worktree_id.as_str(), input.validator_id, proof_tier, input.source_sha, input.selector_reason, result_class, input.command_run_id.as_ref().map(harness_domain::CommandRunId::as_str), input.started_at, input.completed_at],
+                )?;
+                Ok(())
+            }
+        }
     }
 
     pub fn record_evidence(&self, input: &NewEvidenceRecord) -> Result<(), StoreError> {
@@ -3760,6 +4486,82 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Exact replay boundary for evaluator evidence and its artifact-purpose
+    /// links.  Artifact links are part of the authority: a replay cannot
+    /// silently retain a stale artifact or add a new purpose.
+    pub fn record_or_validate_evaluation_evidence(
+        &self,
+        input: &NewEvidenceRecord,
+        artifact_links: &[(ArtifactId, String)],
+    ) -> Result<(), StoreError> {
+        let mut expected_links = artifact_links
+            .iter()
+            .map(|(artifact, purpose)| (artifact.as_str().to_owned(), purpose.clone()))
+            .collect::<Vec<_>>();
+        expected_links.sort();
+        if expected_links.is_empty()
+            || expected_links.windows(2).any(|pair| pair[0] == pair[1])
+            || expected_links.windows(2).any(|pair| pair[0].0 == pair[1].0)
+            || expected_links.iter().any(|(_, purpose)| purpose.is_empty())
+        {
+            return Err(StoreError::Validation(
+                "evaluation evidence artifact links are invalid".into(),
+            ));
+        }
+        let evidence_json = serde_json::to_string(&input.evidence)?;
+        let evidence_sha = sha256(evidence_json.as_bytes());
+        let checklist_json = serde_json::to_string(&input.checklist_rows)?;
+        let unproved_json = serde_json::to_string(&input.unproved_claims)?;
+        let proof_tier = enum_text(&input.proof_tier)?;
+        let result_class = enum_text(&input.result_class)?;
+        let mut connection = self.connection()?;
+        let tx = connection.transaction()?;
+        let matches: Option<bool> = tx.query_row(
+            "SELECT run_id=?2 AND task_attempt_id IS ?3 AND validation_id IS ?4 AND claim_id=?5 AND checklist_rows_json=?6 AND source_sha=?7 AND proof_tier=?8 AND result_class=?9 AND evidence_json=?10 AND evidence_sha256=?11 AND unproved_claims_json=?12 FROM evidence_records WHERE id=?1",
+            params![input.id.as_str(), input.run_id.as_str(), input.task_attempt_id.as_ref().map(AttemptId::as_str), input.validation_id.as_ref().map(harness_domain::ValidationId::as_str), input.claim_id, checklist_json, input.source_sha, proof_tier, result_class, evidence_json, evidence_sha, unproved_json],
+            |row| row.get(0),
+        ).optional()?;
+        match matches {
+            Some(false) => Err(StoreError::Conflict(
+                "evaluation evidence replay differs".into(),
+            )),
+            Some(true) => {
+                let actual = evidence_artifact_links_tx(&tx, input.id.as_str())?;
+                if actual != expected_links {
+                    return Err(StoreError::Conflict(
+                        "evaluation evidence artifact links differ".into(),
+                    ));
+                }
+                tx.commit()?;
+                Ok(())
+            }
+            None => {
+                for (artifact, _) in &expected_links {
+                    let exists: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM artifacts a WHERE a.id=?1 AND (a.run_id=?2 OR EXISTS(SELECT 1 FROM artifact_run_bindings b WHERE b.artifact_id=a.id AND b.run_id=?2)))",
+                        params![artifact, input.run_id.as_str()],
+                        |row| row.get(0),
+                    )?;
+                    if !exists {
+                        return Err(StoreError::NotFound(format!("artifact {artifact}")));
+                    }
+                }
+                tx.execute(
+                    "INSERT INTO evidence_records(id,run_id,task_attempt_id,validation_id,claim_id,checklist_rows_json,source_sha,proof_tier,result_class,evidence_json,evidence_sha256,unproved_claims_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                    params![input.id.as_str(), input.run_id.as_str(), input.task_attempt_id.as_ref().map(AttemptId::as_str), input.validation_id.as_ref().map(harness_domain::ValidationId::as_str), input.claim_id, checklist_json, input.source_sha, proof_tier, result_class, evidence_json, evidence_sha, unproved_json, now_ms()],
+                )?;
+                for (artifact, purpose) in &expected_links {
+                    tx.execute(
+                        "INSERT INTO evidence_artifacts(evidence_id,artifact_id,purpose) VALUES(?1,?2,?3)",
+                        params![input.id.as_str(), artifact, purpose],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            }
+        }
     }
 
     pub fn link_evidence_artifact(
@@ -4318,10 +5120,12 @@ fn parse_improvement_schema(value: &str) -> rusqlite::Result<ImprovementSchema> 
         "harness.taskset.v1" => ImprovementSchema::TasksetV1,
         "harness.eval-case.v1" => ImprovementSchema::EvalCaseV1,
         "harness.grader-bundle.v1" => ImprovementSchema::GraderBundleV1,
+        "harness.policy-bundle.v1" => ImprovementSchema::PolicyBundleV1,
         "harness.improvement-candidate.v1" => ImprovementSchema::ImprovementCandidateV1,
         "harness.experiment.v1" => ImprovementSchema::ExperimentV1,
         "harness.knowledge-item.v1" => ImprovementSchema::KnowledgeItemV1,
         "harness.promotion-decision.v1" => ImprovementSchema::PromotionDecisionV1,
+        "harness.rollback.v1" => ImprovementSchema::RollbackV1,
         _ => {
             return Err(rusqlite::Error::FromSqlConversionFailure(
                 4,
@@ -4357,6 +5161,13 @@ fn valid_digest(value: &str) -> Result<(), StoreError> {
     } else {
         Err(StoreError::Validation("invalid evaluation digest".into()))
     }
+}
+
+fn is_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b.is_ascii_hexdigit()))
 }
 fn sqlite_u64(value: u64, field: &str) -> Result<i64, StoreError> {
     i64::try_from(value)
@@ -4395,6 +5206,17 @@ fn status_text(value: EvaluationRunStatus) -> &'static str {
         EvaluationRunStatus::Invalidated => "invalidated",
     }
 }
+fn parse_evaluation_status(value: String) -> Result<EvaluationRunStatus, StoreError> {
+    match value.as_str() {
+        "recording" => Ok(EvaluationRunStatus::Recording),
+        "completed" => Ok(EvaluationRunStatus::Completed),
+        "infrastructure_unavailable" => Ok(EvaluationRunStatus::InfrastructureUnavailable),
+        "invalidated" => Ok(EvaluationRunStatus::Invalidated),
+        _ => Err(StoreError::Validation(
+            "unknown evaluation run status".into(),
+        )),
+    }
+}
 fn sample_class_text(value: harness_eval::SampleClassification) -> &'static str {
     match value {
         harness_eval::SampleClassification::Pass => "pass",
@@ -4403,6 +5225,19 @@ fn sample_class_text(value: harness_eval::SampleClassification) -> &'static str 
             "infrastructure_unavailable"
         }
         harness_eval::SampleClassification::Invalidated => "invalidated",
+    }
+}
+fn parse_sample_class(value: String) -> Result<harness_eval::SampleClassification, StoreError> {
+    match value.as_str() {
+        "pass" => Ok(harness_eval::SampleClassification::Pass),
+        "fail" => Ok(harness_eval::SampleClassification::Fail),
+        "infrastructure_unavailable" => {
+            Ok(harness_eval::SampleClassification::InfrastructureUnavailable)
+        }
+        "invalidated" => Ok(harness_eval::SampleClassification::Invalidated),
+        _ => Err(StoreError::Validation(
+            "unknown evaluation sample classification".into(),
+        )),
     }
 }
 fn decision_text(value: harness_eval::Decision) -> &'static str {
@@ -4539,17 +5374,758 @@ fn taskset_split(
     }
     split.ok_or_else(|| StoreError::Validation("taskset has no immutable memberships".into()))
 }
+fn evaluation_launch_pins_tx(
+    tx: &rusqlite::Transaction<'_>,
+    taskset_id: &str,
+    grader_id: &str,
+) -> Result<EvaluationLaunchPins, StoreError> {
+    let taskset: ImmutableRevision<harness_eval::TasksetV1> =
+        immutable_revision_wire_tx(tx, taskset_id, ImprovementRecordKind::Taskset)?;
+    let grader: ImmutableRevision<harness_eval::GraderBundleV1> =
+        immutable_revision_wire_tx(tx, grader_id, ImprovementRecordKind::GraderBundle)?;
+    let mut statement=tx.prepare("SELECT eval_case_revision_id FROM taskset_revision_memberships WHERE taskset_revision_id=?1 ORDER BY ordinal")?;
+    let ids = statement
+        .query_map([taskset_id], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if ids.len() != taskset.wire.cases.len() {
+        return Err(StoreError::Conflict(
+            "taskset membership count disagrees with immutable manifest".into(),
+        ));
+    }
+    let mut split = None;
+    let mut eval_cases = Vec::with_capacity(ids.len());
+    for (ordinal, id) in ids.iter().enumerate() {
+        let case: ImmutableRevision<harness_eval::EvalCaseV1> =
+            immutable_revision_wire_tx(tx, id, ImprovementRecordKind::EvalCase)?;
+        let pin = &taskset.wire.cases[ordinal];
+        if pin.case_id != case.wire.case_id
+            || pin.revision != case.wire.revision
+            || pin.case_digest != case.wire.sha256
+            || pin.split != case.wire.split
+        {
+            return Err(StoreError::Conflict(
+                "taskset membership pin disagrees with immutable manifest".into(),
+            ));
+        }
+        if case.wire.grader_bundle_id != grader.wire.grader_bundle_id
+            || case.wire.grader_bundle_revision != grader.wire.revision
+            || case.wire.grader_bundle_digest != grader.wire.sha256
+        {
+            return Err(StoreError::Conflict(
+                "eval case grader pin disagrees with immutable grader bundle".into(),
+            ));
+        }
+        if let Some(old) = split {
+            if old != case.wire.split {
+                return Err(StoreError::Conflict(
+                    "taskset contains multiple case splits".into(),
+                ));
+            }
+        } else {
+            split = Some(case.wire.split);
+        }
+        eval_cases.push(case);
+    }
+    Ok(EvaluationLaunchPins {
+        taskset_revision_id: taskset_id.into(),
+        grader_bundle_revision_id: grader_id.into(),
+        split: split
+            .ok_or_else(|| StoreError::Validation("taskset has no immutable memberships".into()))?,
+        taskset,
+        grader_bundle: grader,
+        eval_cases,
+    })
+}
+
+fn immutable_revision_wire_conn<T: serde::de::DeserializeOwned>(
+    connection: &rusqlite::Connection,
+    id: &str,
+    kind: ImprovementRecordKind,
+) -> Result<ImmutableRevision<T>, StoreError> {
+    let record = connection.query_row(
+        "SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_revisions WHERE id=?1",
+        [id],
+        map_improvement_revision,
+    )?;
+    immutable_revision_from_record(record, kind)
+}
+
+fn immutable_revision_wire_tx<T: serde::de::DeserializeOwned>(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    kind: ImprovementRecordKind,
+) -> Result<ImmutableRevision<T>, StoreError> {
+    immutable_revision_from_record(read_improvement_revision(tx, id)?, kind)
+}
+
+fn immutable_revision_from_record<T: serde::de::DeserializeOwned>(
+    record: ImprovementRevisionRecord,
+    kind: ImprovementRecordKind,
+) -> Result<ImmutableRevision<T>, StoreError> {
+    if record.aggregate_kind != kind || record.schema.kind() != kind {
+        return Err(StoreError::Conflict(
+            "immutable revision kind mismatch".into(),
+        ));
+    }
+    Ok(ImmutableRevision {
+        id: record.id,
+        aggregate_id: record.aggregate_id,
+        revision: record.revision,
+        payload_sha256: record.payload_sha256,
+        wire: serde_json::from_value(record.payload)?,
+    })
+}
+
+/// Resolve a learning receipt from controller-owned state before using it as
+/// evidence.  A wire's `custody` bit is merely a claim; this rechecks the
+/// referenced immutable record and rejects sources which cannot be cleanly
+/// resolved by the Store.
+fn learning_receipt_clean_tx(
+    tx: &rusqlite::Transaction<'_>,
+    receipt: &harness_learning::SourceReceipt,
+) -> Result<bool, StoreError> {
+    use harness_learning::{CustodyState, ReceiptKind};
+
+    if receipt.custody != Some(CustodyState::Clean) {
+        return Ok(false);
+    }
+    match receipt.kind {
+        ReceiptKind::Failure => {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM failure_occurrences WHERE id=?1 AND fingerprint_sha256=?2)",
+                params![receipt.revision_id, receipt.digest],
+                |row| row.get(0),
+            )?;
+            Ok(exists)
+        }
+        ReceiptKind::Runtime => {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE id=?1 AND authority_digest=?2)",
+                params![receipt.revision_id, receipt.digest],
+                |row| row.get(0),
+            )?;
+            Ok(exists)
+        }
+        ReceiptKind::HumanReview => Ok(false),
+        kind => {
+            let expected = match kind {
+                ReceiptKind::Trace => ImprovementRecordKind::Trace,
+                ReceiptKind::Outcome => ImprovementRecordKind::Outcome,
+                ReceiptKind::EvalCase => ImprovementRecordKind::EvalCase,
+                ReceiptKind::Taskset => ImprovementRecordKind::Taskset,
+                ReceiptKind::GraderBundle => ImprovementRecordKind::GraderBundle,
+                ReceiptKind::PolicyBundle => ImprovementRecordKind::PolicyBundle,
+                ReceiptKind::Failure | ReceiptKind::Runtime | ReceiptKind::HumanReview => {
+                    unreachable!("handled above")
+                }
+            };
+            let record = read_improvement_revision(tx, &receipt.revision_id)?;
+            Ok(record.aggregate_kind == expected
+                && record.payload.get("sha256").and_then(Value::as_str)
+                    == Some(receipt.digest.as_str())
+                && record.sensitivity != SensitivityClass::Restricted)
+        }
+    }
+}
+
+fn validate_learning_references_tx(
+    tx: &rusqlite::Transaction<'_>,
+    input: &NewImprovementRevision,
+) -> Result<(), StoreError> {
+    use harness_learning::{CandidateV1, KnowledgeItemV1, ReceiptKind, SourceReceipt};
+    let resolve = |receipt: &SourceReceipt| -> Result<(), StoreError> {
+        let kind = match receipt.kind {
+            ReceiptKind::Trace => ImprovementRecordKind::Trace,
+            ReceiptKind::Outcome => ImprovementRecordKind::Outcome,
+            ReceiptKind::EvalCase => ImprovementRecordKind::EvalCase,
+            ReceiptKind::Taskset => ImprovementRecordKind::Taskset,
+            ReceiptKind::GraderBundle => ImprovementRecordKind::GraderBundle,
+            ReceiptKind::PolicyBundle => ImprovementRecordKind::PolicyBundle,
+            ReceiptKind::Failure => {
+                let matches: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM failure_occurrences WHERE id=?1 AND fingerprint_sha256=?2)",
+                    params![&receipt.revision_id, &receipt.digest],
+                    |r| r.get(0),
+                )?;
+                if !matches {
+                    return Err(StoreError::NotFound(receipt.revision_id.clone()));
+                }
+                return Ok(());
+            }
+            ReceiptKind::Runtime => {
+                let matches: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM runs WHERE id=?1 AND authority_digest=?2)",
+                    params![receipt.revision_id, receipt.digest],
+                    |r| r.get(0),
+                )?;
+                if !matches {
+                    return Err(StoreError::Conflict(
+                        "runtime receipt does not resolve to controller run authority".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            ReceiptKind::HumanReview => {
+                return Err(StoreError::Conflict(
+                    "human review receipt is only valid for knowledge review".into(),
+                ));
+            }
+        };
+        let record = read_improvement_revision(tx, &receipt.revision_id)?;
+        if record.aggregate_kind != kind
+            || record.payload.get("sha256").and_then(Value::as_str) != Some(receipt.digest.as_str())
+        {
+            return Err(StoreError::Conflict(
+                "learning receipt does not resolve exactly".into(),
+            ));
+        }
+        Ok(())
+    };
+    let resolve_promotion_record = |kind: ImprovementRecordKind,
+                                    aggregate_id: &str,
+                                    digest: &str|
+     -> Result<ImprovementRevisionRecord, StoreError> {
+        let kind = match kind {
+            ImprovementRecordKind::Candidate => "candidate",
+            ImprovementRecordKind::Experiment => "experiment",
+            ImprovementRecordKind::PolicyBundle => "policy_bundle",
+            ImprovementRecordKind::Promotion => "promotion",
+            _ => {
+                return Err(StoreError::Validation(
+                    "unsupported promotion receipt kind".into(),
+                ));
+            }
+        };
+        tx.query_row(
+            "SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_revisions WHERE aggregate_kind=?1 AND aggregate_id=?2 AND json_extract(payload_json,'$.sha256')=?3",
+            params![kind, aggregate_id, digest],
+            map_improvement_revision,
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::Conflict("promotion receipt does not resolve exactly".into()))
+    };
+    match input.schema {
+        ImprovementSchema::PolicyBundleV1 => {
+            let bundle: harness_learning::PolicyBundleV1 =
+                serde_json::from_value(input.payload.clone())?;
+            if bundle.bundle_id != input.aggregate_id {
+                return Err(StoreError::Conflict(
+                    "policy bundle aggregate ID does not match immutable wire".into(),
+                ));
+            }
+            let mut next = bundle.parent_bundle_id.clone();
+            let mut seen = BTreeSet::from([bundle.bundle_id.clone()]);
+            while let Some(parent_id) = next {
+                if !seen.insert(parent_id.clone()) {
+                    return Err(StoreError::Conflict(
+                        "policy bundle parent lineage contains a cycle".into(),
+                    ));
+                }
+                let parent: ImprovementRevisionRecord = tx
+                    .query_row(
+                        "SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_revisions WHERE aggregate_kind='policy_bundle' AND aggregate_id=?1 ORDER BY revision ASC LIMIT 1",
+                        [&parent_id],
+                        map_improvement_revision,
+                    )
+                    .optional()?
+                    .ok_or_else(|| StoreError::NotFound(parent_id.clone()))?;
+                let parent_wire: harness_learning::PolicyBundleV1 =
+                    serde_json::from_value(parent.payload)?;
+                parent_wire
+                    .verify()
+                    .map_err(|error| StoreError::Conflict(error.to_string()))?;
+                if parent_wire.repository_id != bundle.repository_id
+                    || parent_wire.task_family != bundle.task_family
+                    || parent_wire.safety_anchor_digest != bundle.safety_anchor_digest
+                {
+                    return Err(StoreError::Conflict(
+                        "policy bundle parent crosses repository, task family, or safety anchor"
+                            .into(),
+                    ));
+                }
+                next = parent_wire.parent_bundle_id;
+            }
+        }
+        ImprovementSchema::ImprovementCandidateV1 => {
+            let candidate: CandidateV1 = serde_json::from_value(input.payload.clone())?;
+            for receipt in [
+                &candidate.parent_bundle,
+                &candidate.target_failure,
+                &candidate.development_case,
+                &candidate.no_change_control,
+                &candidate.taskset,
+                &candidate.grader_bundle,
+                &candidate.runtime,
+                &candidate.rollback_bundle,
+            ] {
+                resolve(receipt)?;
+            }
+            for receipt in &candidate.evidence {
+                resolve(receipt)?;
+            }
+            let parent: ImmutableRevision<harness_learning::PolicyBundleV1> =
+                immutable_revision_wire_tx(
+                    tx,
+                    &candidate.parent_bundle.revision_id,
+                    ImprovementRecordKind::PolicyBundle,
+                )?;
+            if parent.wire.repository_id != candidate.scope.repository_id
+                || parent.wire.task_family != candidate.scope.task_family
+            {
+                return Err(StoreError::Conflict(
+                    "candidate scope disagrees with parent policy bundle".into(),
+                ));
+            }
+            let development: ImmutableRevision<harness_eval::EvalCaseV1> =
+                immutable_revision_wire_tx(
+                    tx,
+                    &candidate.development_case.revision_id,
+                    ImprovementRecordKind::EvalCase,
+                )?;
+            let control: ImmutableRevision<harness_eval::EvalCaseV1> = immutable_revision_wire_tx(
+                tx,
+                &candidate.no_change_control.revision_id,
+                ImprovementRecordKind::EvalCase,
+            )?;
+            if development.wire.split != harness_eval::Split::Development
+                || control.wire.split != harness_eval::Split::Development
+                || development.id == control.id
+            {
+                return Err(StoreError::Conflict(
+                    "candidate development/control custody is invalid".into(),
+                ));
+            }
+            if development.wire.task_family != parent.wire.task_family
+                || control.wire.task_family != parent.wire.task_family
+            {
+                return Err(StoreError::Conflict(
+                    "candidate case task-family is cross-scope".into(),
+                ));
+            }
+            let taskset: ImmutableRevision<harness_eval::TasksetV1> = immutable_revision_wire_tx(
+                tx,
+                &candidate.taskset.revision_id,
+                ImprovementRecordKind::Taskset,
+            )?;
+            let grader: ImmutableRevision<harness_eval::GraderBundleV1> =
+                immutable_revision_wire_tx(
+                    tx,
+                    &candidate.grader_bundle.revision_id,
+                    ImprovementRecordKind::GraderBundle,
+                )?;
+            let mut member_statement = tx.prepare(
+                "SELECT eval_case_revision_id FROM taskset_revision_memberships WHERE taskset_revision_id=?1 ORDER BY ordinal",
+            )?;
+            let member_ids = member_statement
+                .query_map([&taskset.id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            if member_ids.len() != taskset.wire.cases.len() {
+                return Err(StoreError::Conflict(
+                    "candidate taskset has incomplete immutable memberships".into(),
+                ));
+            }
+            for (pin, member_id) in taskset.wire.cases.iter().zip(&member_ids) {
+                let member: ImmutableRevision<harness_eval::EvalCaseV1> =
+                    immutable_revision_wire_tx(tx, member_id, ImprovementRecordKind::EvalCase)?;
+                if member.wire.case_id != pin.case_id
+                    || member.wire.revision != pin.revision
+                    || member.wire.sha256 != pin.case_digest
+                    || member.wire.split != harness_eval::Split::Development
+                    || member.wire.task_family != parent.wire.task_family
+                    || member.wire.runtime.repository_id != candidate.scope.repository_id
+                    || member.wire.runtime.base_sha != candidate.scope.base_sha
+                    || !matches!(
+                        member.wire.leakage_status,
+                        Some(harness_eval::LeakageStatus::Clean)
+                            | Some(harness_eval::LeakageStatus::NotApplicable)
+                    )
+                    || matches!(
+                        member.wire.privacy.classification,
+                        harness_eval::PrivacyClass::Restricted
+                    )
+                    || member.wire.grader_bundle_id != grader.wire.grader_bundle_id
+                    || member.wire.grader_bundle_revision != grader.wire.revision
+                    || member.wire.grader_bundle_digest != grader.wire.sha256
+                {
+                    return Err(StoreError::Conflict(
+                        "candidate taskset contains a cross-scope or unclean case".into(),
+                    ));
+                }
+            }
+            for case in [&development, &control] {
+                if !taskset.wire.cases.iter().any(|pin| {
+                    pin.case_id == case.wire.case_id
+                        && pin.revision == case.wire.revision
+                        && pin.case_digest == case.wire.sha256
+                        && pin.split == harness_eval::Split::Development
+                }) || case.wire.grader_bundle_id != grader.wire.grader_bundle_id
+                    || case.wire.grader_bundle_revision != grader.wire.revision
+                    || case.wire.grader_bundle_digest != grader.wire.sha256
+                    || case.wire.runtime.repository_id != candidate.scope.repository_id
+                    || case.wire.runtime.base_sha != candidate.scope.base_sha
+                {
+                    return Err(StoreError::Conflict(
+                        "candidate case/taskset/grader pins are incompatible".into(),
+                    ));
+                }
+            }
+            let runtime_repo: Option<String> = tx
+                .query_row(
+                    "SELECT repository_id FROM runs WHERE id=?1 AND authority_digest=?2",
+                    params![candidate.runtime.revision_id, candidate.runtime.digest],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let runtime_base: Option<String> = tx
+                .query_row(
+                    "SELECT base_sha FROM runs WHERE id=?1 AND authority_digest=?2",
+                    params![candidate.runtime.revision_id, candidate.runtime.digest],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let failure_repo: Option<String> = tx.query_row("SELECT repository_id FROM failure_occurrences WHERE id=?1 AND fingerprint_sha256=?2",params![candidate.target_failure.revision_id,candidate.target_failure.digest],|r|r.get(0)).optional()?;
+            if runtime_repo.as_deref() != Some(candidate.scope.repository_id.as_str())
+                || failure_repo.as_deref() != Some(candidate.scope.repository_id.as_str())
+            {
+                return Err(StoreError::Conflict(
+                    "candidate runtime or failure is cross-repository".into(),
+                ));
+            }
+            if runtime_base.as_deref() != Some(candidate.scope.base_sha.as_str()) {
+                return Err(StoreError::Conflict(
+                    "candidate development/control case base SHA is not controller-bound".into(),
+                ));
+            }
+            if parent.wire.sha256 != candidate.parent_bundle.digest
+                || parent
+                    .wire
+                    .components
+                    .iter()
+                    .find(|component| component.dimension == candidate.edit.dimension)
+                    .map(|component| component.manifest_digest.as_str())
+                    != Some(candidate.edit.before_digest.as_str())
+            {
+                return Err(StoreError::Conflict(
+                    "candidate parent component before-digest is stale".into(),
+                ));
+            }
+            let current: Option<String> = tx.query_row("SELECT policy_bundle_revision_id FROM policy_current_champions WHERE repository_id=?1 AND task_family=?2 AND model_family=?3 AND runtime_class=?4",params![candidate.scope.repository_id,candidate.scope.task_family,candidate.scope.model_family.as_deref().unwrap_or(""),candidate.scope.runtime_class.as_deref().unwrap_or("")],|r|r.get(0)).optional()?;
+            if current.as_deref() != Some(candidate.parent_bundle.revision_id.as_str()) {
+                return Err(StoreError::Conflict(
+                    "candidate parent is not current champion".into(),
+                ));
+            }
+            let rollback: ImmutableRevision<harness_learning::PolicyBundleV1> =
+                immutable_revision_wire_tx(
+                    tx,
+                    &candidate.rollback_bundle.revision_id,
+                    ImprovementRecordKind::PolicyBundle,
+                )?;
+            if rollback.wire.repository_id != parent.wire.repository_id
+                || rollback.wire.task_family != parent.wire.task_family
+                || rollback.wire.safety_anchor_digest != parent.wire.safety_anchor_digest
+            {
+                return Err(StoreError::Conflict(
+                    "candidate rollback bundle is scope or safety-anchor incompatible".into(),
+                ));
+            }
+            let mut ancestor = Some(parent.wire.bundle_id.clone());
+            let mut compatible = false;
+            let mut seen = BTreeSet::new();
+            for _ in 0..64 {
+                let Some(bundle_id) = ancestor else {
+                    break;
+                };
+                if !seen.insert(bundle_id.clone()) {
+                    return Err(StoreError::Conflict(
+                        "policy bundle rollback lineage contains a cycle".into(),
+                    ));
+                }
+                if bundle_id == rollback.wire.bundle_id {
+                    compatible = true;
+                    break;
+                }
+                let record: Option<ImprovementRevisionRecord> = tx.query_row("SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_revisions WHERE aggregate_kind='policy_bundle' AND aggregate_id=?1 ORDER BY revision ASC LIMIT 1",[&bundle_id],map_improvement_revision).optional()?;
+                let Some(record) = record else {
+                    return Err(StoreError::Conflict(
+                        "policy bundle rollback lineage is not immutable".into(),
+                    ));
+                };
+                let bundle: harness_learning::PolicyBundleV1 =
+                    serde_json::from_value(record.payload)?;
+                bundle
+                    .verify()
+                    .map_err(|error| StoreError::Conflict(error.to_string()))?;
+                if bundle.repository_id != parent.wire.repository_id
+                    || bundle.task_family != parent.wire.task_family
+                    || bundle.safety_anchor_digest != parent.wire.safety_anchor_digest
+                {
+                    return Err(StoreError::Conflict(
+                        "policy bundle rollback lineage crosses scope or anchor".into(),
+                    ));
+                }
+                ancestor = bundle.parent_bundle_id;
+            }
+            if !compatible {
+                return Err(StoreError::Conflict(
+                    "candidate rollback bundle is not parent-compatible".into(),
+                ));
+            }
+        }
+        ImprovementSchema::KnowledgeItemV1 => {
+            let item: KnowledgeItemV1 = serde_json::from_value(input.payload.clone())?;
+            for receipt in &item.evidence {
+                resolve(receipt)?;
+            }
+            if item.state == harness_learning::KnowledgeState::Active {
+                let review = item.review.receipt.as_ref().ok_or_else(|| {
+                    StoreError::Conflict("active knowledge lacks review receipt".into())
+                })?;
+                let action_id: i64 = review.revision_id.parse().map_err(|_| {
+                    StoreError::Validation("human review receipt ID is invalid".into())
+                })?;
+                let reviewer_id = item.review.reviewer_id.as_deref().ok_or_else(|| {
+                    StoreError::Conflict("active knowledge lacks reviewer identity".into())
+                })?;
+                let matches: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM human_actions WHERE id=?1 AND payload_sha256=?2 AND action_type='knowledge_review_accepted' AND target_type='knowledge' AND target_id=?3 AND actor=?4 AND json_extract(payload_json,'$.knowledge_revision_id')=?5 AND json_extract(payload_json,'$.knowledge_wire_sha256')=?6)",
+                    params![action_id, review.digest, item.knowledge_id, reviewer_id, input.id, item.sha256],
+                    |r| r.get(0),
+                )?;
+                if !matches {
+                    return Err(StoreError::Conflict(
+                        "knowledge review is not a trusted human action".into(),
+                    ));
+                }
+                if !item.evidence.iter().try_fold(true, |clean, receipt| {
+                    learning_receipt_clean_tx(tx, receipt).map(|value| clean && value)
+                })? {
+                    return Err(StoreError::Conflict(
+                        "active knowledge evidence is not controller-clean".into(),
+                    ));
+                }
+            }
+        }
+        ImprovementSchema::ExperimentV1 => {
+            let experiment: harness_promotion::ExperimentV1 =
+                serde_json::from_value(input.payload.clone())?;
+            let candidate = resolve_promotion_record(
+                ImprovementRecordKind::Candidate,
+                &experiment.candidate_id,
+                &experiment.candidate_receipt.digest,
+            )?;
+            let champion = resolve_promotion_record(
+                ImprovementRecordKind::PolicyBundle,
+                &experiment.champion_bundle_id,
+                &experiment.champion_bundle_receipt.digest,
+            )?;
+            let challenger = resolve_promotion_record(
+                ImprovementRecordKind::PolicyBundle,
+                &experiment.challenger_bundle_id,
+                &experiment.challenger_bundle_receipt.digest,
+            )?;
+            if candidate.payload.get("sha256").and_then(Value::as_str)
+                != Some(experiment.candidate_receipt.digest.as_str())
+                || champion.payload.get("sha256").and_then(Value::as_str)
+                    != Some(experiment.champion_bundle_receipt.digest.as_str())
+                || challenger.payload.get("sha256").and_then(Value::as_str)
+                    != Some(experiment.challenger_bundle_receipt.digest.as_str())
+            {
+                return Err(StoreError::Conflict(
+                    "experiment receipt digest does not match immutable authority".into(),
+                ));
+            }
+        }
+        ImprovementSchema::PromotionDecisionV1 => {
+            let promotion: harness_promotion::PromotionDecisionV1 =
+                serde_json::from_value(input.payload.clone())?;
+            let experiment = resolve_promotion_record(
+                ImprovementRecordKind::Experiment,
+                &promotion.experiment_id,
+                &promotion.experiment_digest,
+            )?;
+            let experiment: harness_promotion::ExperimentV1 =
+                serde_json::from_value(experiment.payload)?;
+            harness_promotion::verify_promotion_against_experiment(&promotion, &experiment)
+                .map_err(|error| StoreError::Conflict(error.to_string()))?;
+        }
+        ImprovementSchema::RollbackV1 => {
+            let rollback: harness_promotion::RollbackContract =
+                serde_json::from_value(input.payload.clone())?;
+            let promotion = resolve_promotion_record(
+                ImprovementRecordKind::Promotion,
+                &rollback.promotion_id,
+                &rollback.promotion_receipt.digest,
+            )?;
+            if promotion.payload.get("sha256").and_then(Value::as_str)
+                != Some(rollback.promotion_receipt.digest.as_str())
+            {
+                return Err(StoreError::Conflict(
+                    "rollback promotion receipt does not resolve exactly".into(),
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn read_policy_binding(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+) -> Result<PolicyChampionBinding, StoreError> {
+    tx.query_row(
+        "SELECT repository_id,task_family,model_family,runtime_class,policy_bundle_revision_id,bundle_sha256,previous_binding_id FROM policy_champion_bindings WHERE id=?1",
+        [id],
+        |r| Ok(PolicyChampionBinding { id:id.into(), repository_id:RepositoryId::from(r.get::<_,String>(0)?), task_family:r.get(1)?, model_family:{let s:String=r.get(2)?;(!s.is_empty()).then_some(s)}, runtime_class:{let s:String=r.get(3)?;(!s.is_empty()).then_some(s)}, policy_bundle_revision_id:r.get(4)?, bundle_sha256:r.get(5)?, previous_binding_id:r.get(6)? }),
+    ).optional()?.ok_or_else(|| StoreError::NotFound(id.into()))
+}
+fn evaluation_run_status_tx(
+    tx: &rusqlite::Transaction<'_>,
+    run_id: &str,
+) -> Result<String, StoreError> {
+    tx.query_row("SELECT status FROM evaluation_run_status_revisions WHERE evaluation_run_id=?1 ORDER BY sequence DESC LIMIT 1",[run_id],|r|r.get(0)).optional()?.ok_or_else(||StoreError::NotFound(run_id.into()))
+}
+fn evaluation_status_transition_allowed(from: &str, to: EvaluationRunStatus) -> bool {
+    matches!(
+        (from, status_text(to)),
+        (
+            "recording",
+            "completed" | "infrastructure_unavailable" | "invalidated"
+        )
+    )
+}
 fn read_evaluation_run(
     tx: &rusqlite::Transaction<'_>,
     id: &str,
 ) -> Result<EvaluationRunReceipt, StoreError> {
-    tx.query_row("SELECT taskset_revision_id,grader_bundle_revision_id,split,EXISTS(SELECT 1 FROM evaluation_invalidations i WHERE i.target_kind='evaluation_run' AND i.target_id=evaluation_runs.id) FROM evaluation_runs WHERE id=?1",[id],|r|Ok(EvaluationRunReceipt{id:id.into(),taskset_revision_id:r.get(0)?,grader_bundle_revision_id:r.get(1)?,split:parse_split(r.get(2)?).map_err(|e|rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,invalidated:r.get(3)?})).optional()?.ok_or_else(||StoreError::NotFound(id.into()))
+    tx.query_row("SELECT controller_run_id,taskset_revision_id,grader_bundle_revision_id,split,(SELECT status FROM evaluation_run_status_revisions s WHERE s.evaluation_run_id=evaluation_runs.id ORDER BY sequence DESC LIMIT 1),EXISTS(SELECT 1 FROM evaluation_invalidations i WHERE i.target_kind='evaluation_run' AND i.target_id=evaluation_runs.id) FROM evaluation_runs WHERE id=?1",[id],|r|Ok(EvaluationRunReceipt{id:id.into(),controller_run_id:RunId::from(r.get::<_,String>(0)?),taskset_revision_id:r.get(1)?,grader_bundle_revision_id:r.get(2)?,split:parse_split(r.get(3)?).map_err(|e|rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,status:parse_evaluation_status(r.get(4)?).map_err(|e|rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,invalidated:r.get(5)?})).optional()?.ok_or_else(||StoreError::NotFound(id.into()))
+}
+
+fn validate_evaluation_sample_evidence(
+    tx: &rusqlite::Transaction<'_>,
+    input: &NewEvaluationSample,
+    controller_run_id: &RunId,
+    artifact_length: Option<u64>,
+) -> Result<(), StoreError> {
+    use harness_eval::SampleClassification;
+
+    if input.controller_evidence_id == input.grader_evidence_id {
+        return Err(StoreError::Conflict(
+            "candidate and grader evidence must be independent".into(),
+        ));
+    }
+    if matches!(
+        input.sample.classification,
+        SampleClassification::InfrastructureUnavailable
+    ) {
+        let unavailable: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM evidence_records e JOIN validations v ON v.id=e.validation_id JOIN command_runs c ON c.id=v.command_run_id WHERE e.id=?1 AND e.run_id=?2 AND v.run_id=?2 AND c.run_id=?2 AND e.source_sha=?3 AND v.source_sha=?3 AND (c.source_sha_after=?3 OR c.source_sha_before=?3) AND (c.timed_out=1 OR c.result_class='infrastructure_unavailable'))",
+            params![input.controller_evidence_id.as_str(), controller_run_id.as_str(), input.sample.base_sha],
+            |r| r.get(0),
+        )?;
+        return unavailable.then_some(()).ok_or_else(|| {
+            StoreError::Conflict(
+                "infrastructure sample lacks durable unavailable command receipt".into(),
+            )
+        });
+    }
+    if !matches!(
+        input.sample.classification,
+        SampleClassification::Pass | SampleClassification::Fail
+    ) {
+        return Err(StoreError::Conflict(
+            "invalidated samples cannot be recorded as evaluation evidence".into(),
+        ));
+    }
+    let evidence_digest =
+        input.sample.evidence_digest.0.as_deref().ok_or_else(|| {
+            StoreError::Conflict("pass/fail sample requires evidence digest".into())
+        })?;
+    let artifact_digest =
+        input.sample.artifact_digest.0.as_deref().ok_or_else(|| {
+            StoreError::Conflict("pass/fail sample requires artifact digest".into())
+        })?;
+    let candidate_valid: bool = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM evidence_records e
+            JOIN validations v ON v.id=e.validation_id
+            JOIN command_runs c ON c.id=v.command_run_id
+            WHERE e.id=?1
+              AND e.run_id=?2 AND v.run_id=?2 AND c.run_id=?2
+              AND e.invalidated_at IS NULL AND v.invalidated_at IS NULL
+              AND v.state='completed'
+              AND e.result_class='success' AND v.result_class='success' AND c.result_class='success'
+              AND e.source_sha=?3 AND v.source_sha=?3
+              AND (c.source_sha_after=?3 OR c.source_sha_before=?3)
+              AND c.command_sha256=?4
+        )",
+        params![
+            input.controller_evidence_id.as_str(),
+            controller_run_id.as_str(),
+            input.sample.base_sha,
+            input.sample.command_digest
+        ],
+        |r| r.get(0),
+    )?;
+    let grader_valid: bool = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM evidence_records e
+            JOIN validations v ON v.id=e.validation_id
+            JOIN command_runs c ON c.id=v.command_run_id
+            JOIN evidence_artifacts ea ON ea.evidence_id=e.id
+            JOIN artifacts a ON a.id=ea.artifact_id
+            WHERE e.id=?1
+              AND e.run_id=?2 AND v.run_id=?2 AND c.run_id=?2
+              AND (a.run_id=?2 OR EXISTS(SELECT 1 FROM artifact_run_bindings arb WHERE arb.artifact_id=a.id AND arb.run_id=?2))
+              AND e.invalidated_at IS NULL AND v.invalidated_at IS NULL
+              AND v.state='completed'
+              AND e.result_class='success' AND v.result_class='success' AND c.result_class='success'
+              AND e.source_sha=?3 AND v.source_sha=?3
+              AND (c.source_sha_after=?3 OR c.source_sha_before=?3)
+              AND e.evidence_sha256=?4 AND a.sha256=?5
+              AND a.verified_at IS NOT NULL
+              AND a.byte_length=?6
+        )",
+        params![
+            input.grader_evidence_id.as_str(),
+            controller_run_id.as_str(),
+            input.sample.base_sha,
+            evidence_digest,
+            artifact_digest,
+            i64::try_from(artifact_length.expect("pass/fail artifact length checked")).map_err(
+                |_| StoreError::Validation("artifact length exceeds SQLite range".into())
+            )?,
+        ],
+        |r| r.get(0),
+    )?;
+    if candidate_valid && grader_valid {
+        Ok(())
+    } else {
+        Err(StoreError::Conflict(
+            "pass/fail sample lacks independent candidate and grader evidence chains".into(),
+        ))
+    }
 }
 fn read_evaluation_sample(
     tx: &rusqlite::Transaction<'_>,
     id: &str,
 ) -> Result<EvaluationSampleReceipt, StoreError> {
-    tx.query_row("SELECT evaluation_run_id,eval_case_revision_id,arm,seed,EXISTS(SELECT 1 FROM evaluation_invalidations i WHERE i.target_kind='evaluation_sample' AND i.target_id=evaluation_samples.id) FROM evaluation_samples WHERE id=?1",[id],|r|{let seed:i64=r.get(3)?;Ok(EvaluationSampleReceipt{id:id.into(),evaluation_run_id:r.get(0)?,eval_case_revision_id:r.get(1)?,arm:parse_arm(r.get(2)?).map_err(|e|rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,seed:positive_database_u64(seed,"sample seed")?,invalidated:r.get(4)?})}).optional()?.ok_or_else(||StoreError::NotFound(id.into()))
+    tx.query_row("SELECT evaluation_run_id,controller_evidence_id,grader_evidence_id,eval_case_revision_id,arm,seed,classification,sample_digest,EXISTS(SELECT 1 FROM evaluation_invalidations i WHERE (i.target_kind='evaluation_sample' AND i.target_id=evaluation_samples.id) OR (i.target_kind='evaluation_run' AND i.target_id=evaluation_samples.evaluation_run_id)) FROM evaluation_samples WHERE id=?1",[id],|r|{let seed:i64=r.get(5)?;Ok(EvaluationSampleReceipt{id:id.into(),evaluation_run_id:r.get(0)?,controller_evidence_id:harness_domain::EvidenceId::from(r.get::<_,String>(1)?),grader_evidence_id:harness_domain::EvidenceId::from(r.get::<_,String>(2)?),eval_case_revision_id:r.get(3)?,arm:parse_arm(r.get(4)?).map_err(|e|rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,seed:positive_database_u64(seed,"sample seed")?,classification:parse_sample_class(r.get(6)?).map_err(|e|rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,sample_digest:r.get(7)?,invalidated:r.get(8)?})}).optional()?.ok_or_else(||StoreError::NotFound(id.into()))
+}
+
+fn evidence_artifact_links_tx(
+    tx: &rusqlite::Transaction<'_>,
+    evidence_id: &str,
+) -> Result<Vec<(String, String)>, StoreError> {
+    let mut statement = tx.prepare(
+        "SELECT artifact_id,purpose FROM evidence_artifacts WHERE evidence_id=?1 ORDER BY artifact_id,purpose",
+    )?;
+    Ok(statement
+        .query_map([evidence_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?)
 }
 
 fn validate_improvement_input(input: &NewImprovementRevision) -> Result<(), StoreError> {
@@ -4575,6 +6151,55 @@ fn validate_improvement_input(input: &NewImprovementRevision) -> Result<(), Stor
         ));
     }
     match input.schema {
+        ImprovementSchema::PolicyBundleV1 => {
+            let value: harness_learning::PolicyBundleV1 =
+                serde_json::from_value(input.payload.clone())?;
+            value
+                .verify()
+                .map_err(|error| StoreError::Validation(error.to_string()))?;
+        }
+        ImprovementSchema::ImprovementCandidateV1 => {
+            let value: harness_learning::CandidateV1 =
+                serde_json::from_value(input.payload.clone())?;
+            value
+                .verify()
+                .map_err(|error| StoreError::Validation(error.to_string()))?;
+        }
+        ImprovementSchema::KnowledgeItemV1 => {
+            let value: harness_learning::KnowledgeItemV1 =
+                serde_json::from_value(input.payload.clone())?;
+            value
+                .verify()
+                .map_err(|error| StoreError::Validation(error.to_string()))?;
+        }
+        ImprovementSchema::ExperimentV1 => {
+            let value: harness_promotion::ExperimentV1 =
+                serde_json::from_value(input.payload.clone())?;
+            harness_promotion::verify_experiment(&value)
+                .map_err(|error| StoreError::Validation(error.to_string()))?;
+        }
+        ImprovementSchema::PromotionDecisionV1 => {
+            let value: harness_promotion::PromotionDecisionV1 =
+                serde_json::from_value(input.payload.clone())?;
+            harness_promotion::verify_promotion(&value)
+                .map_err(|error| StoreError::Validation(error.to_string()))?;
+        }
+        ImprovementSchema::RollbackV1 => {
+            let value: harness_promotion::RollbackContract =
+                serde_json::from_value(input.payload.clone())?;
+            harness_promotion::validate_rollback(
+                &value,
+                &value.expected_active_bundle_id,
+                &value.safety_anchor_digest,
+            )
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        }
+        ImprovementSchema::TraceV2 => {
+            let value: harness_trace::TraceManifest =
+                serde_json::from_value(input.payload.clone())?;
+            harness_trace::validate_manifest(&value)
+                .map_err(|error| StoreError::Validation(error.to_string()))?;
+        }
         ImprovementSchema::TasksetV1 => {
             let value: harness_eval::TasksetV1 = serde_json::from_value(input.payload.clone())?;
             harness_eval::verify_taskset_v1(&value)
@@ -4758,6 +6383,130 @@ fn map_improvement_revision(row: &Row<'_>) -> rusqlite::Result<ImprovementRevisi
         })?;
     }
     match record.schema {
+        ImprovementSchema::PolicyBundleV1 => {
+            let value: harness_learning::PolicyBundleV1 =
+                serde_json::from_value(record.payload.clone()).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            value.verify().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        }
+        ImprovementSchema::ImprovementCandidateV1 => {
+            let value: harness_learning::CandidateV1 =
+                serde_json::from_value(record.payload.clone()).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            value.verify().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        }
+        ImprovementSchema::KnowledgeItemV1 => {
+            let value: harness_learning::KnowledgeItemV1 =
+                serde_json::from_value(record.payload.clone()).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            value.verify().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        }
+        ImprovementSchema::ExperimentV1 => {
+            let value: harness_promotion::ExperimentV1 =
+                serde_json::from_value(record.payload.clone()).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            harness_promotion::verify_experiment(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        }
+        ImprovementSchema::PromotionDecisionV1 => {
+            let value: harness_promotion::PromotionDecisionV1 =
+                serde_json::from_value(record.payload.clone()).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            harness_promotion::verify_promotion(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        }
+        ImprovementSchema::RollbackV1 => {
+            let value: harness_promotion::RollbackContract =
+                serde_json::from_value(record.payload.clone()).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            harness_promotion::validate_rollback(
+                &value,
+                &value.expected_active_bundle_id,
+                &value.safety_anchor_digest,
+            )
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        }
+        ImprovementSchema::TraceV2 => {
+            let value: harness_trace::TraceManifest =
+                serde_json::from_value(record.payload.clone()).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            harness_trace::validate_manifest(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        }
         ImprovementSchema::TasksetV1 => {
             let value: harness_eval::TasksetV1 = serde_json::from_value(record.payload.clone())
                 .map_err(|error| {
@@ -5614,7 +7363,7 @@ mod tests {
                 state: RunState::Created.to_string(),
                 phase: "created".to_owned(),
                 base_ref: "main".to_owned(),
-                base_sha: "fixture".to_owned(),
+                base_sha: "a".repeat(40),
                 authority_digest: "fixture".to_owned(),
                 profile_digest: "fixture".to_owned(),
                 codex_version: None,
@@ -5848,6 +7597,21 @@ mod tests {
         assert_eq!(
             failure_occurrence_run(&store.connection().unwrap(), &occurrence_id).unwrap(),
             Some(run_id.clone())
+        );
+        let source = store
+            .failure_development_case_source(&occurrence_id)
+            .unwrap();
+        assert_eq!(source.run_id, run_id);
+        assert_eq!(source.source_kind, "run_terminal");
+        assert_eq!(source.source_domain_event_id, Some(lifecycle_event_id));
+        assert_eq!(
+            source.source_receipt_sha256,
+            sha256(
+                format!(
+                    "failure-source.v2\0run_terminal\0domain-event-{lifecycle_event_id}\0{lifecycle_event_id}"
+                )
+                .as_bytes()
+            )
         );
 
         let mut negative = operator_outcome(&run_id, "failure-outcome", "changes_requested");
@@ -6210,7 +7974,7 @@ mod tests {
     #[test]
     fn improvement_transitions_are_kind_aware() {
         use harness_domain::{ImprovementRecordKind as K, ImprovementState as S};
-        for kind in [K::Taskset, K::EvalCase, K::GraderBundle, K::PolicyBundle] {
+        for kind in [K::Taskset, K::EvalCase, K::GraderBundle] {
             assert!(improvement_transition_allowed(kind, S::Proposed, S::Active));
         }
         assert!(improvement_transition_allowed(

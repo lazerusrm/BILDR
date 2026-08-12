@@ -10,11 +10,10 @@ use crate::{
         TraceManifest, TraceNode, TraceRelationKind,
     },
     redaction::redact,
+    validate::{
+        BRANCH_DEPTH_LIMIT, BRANCH_NODE_REFERENCE_LIMIT, BRANCH_PATH_LIMIT, validate_edges,
+    },
 };
-
-const BRANCH_PATH_LIMIT: usize = 256;
-const BRANCH_DEPTH_LIMIT: usize = 4_096;
-const BRANCH_NODE_REFERENCE_LIMIT: usize = 65_536;
 
 #[derive(Clone)]
 struct Candidate {
@@ -579,62 +578,6 @@ fn add_explicit_edges(
     Ok(())
 }
 
-fn validate_edges(
-    keys: &BTreeMap<String, String>,
-    edges: &[TraceEdge],
-) -> Result<(), ProjectionError> {
-    let ids = keys.values().cloned().collect::<BTreeSet<_>>();
-    let mut adjacent = BTreeMap::<String, BTreeSet<String>>::new();
-    let mut inbound = ids
-        .iter()
-        .map(|id| (id.clone(), 0_u64))
-        .collect::<BTreeMap<_, _>>();
-    for edge in edges {
-        if !ids.contains(&edge.from) {
-            return Err(ProjectionError::UnknownRelationReceipt(edge.from.clone()));
-        }
-        if !ids.contains(&edge.to) {
-            return Err(ProjectionError::UnknownRelationReceipt(edge.to.clone()));
-        }
-        if adjacent
-            .entry(edge.from.clone())
-            .or_default()
-            .insert(edge.to.clone())
-        {
-            *inbound.get_mut(&edge.to).expect("validated destination") += 1;
-        }
-    }
-    let mut ready = inbound
-        .iter()
-        .filter_map(|(id, count)| (*count == 0).then_some(id.clone()))
-        .collect::<BTreeSet<_>>();
-    let mut visited = 0_usize;
-    while let Some(node) = ready.pop_first() {
-        visited += 1;
-        if let Some(next) = adjacent.get(&node) {
-            for destination in next {
-                let count = inbound.get_mut(destination).expect("validated destination");
-                *count -= 1;
-                if *count == 0 {
-                    ready.insert(destination.clone());
-                }
-            }
-        }
-    }
-    if visited == ids.len() {
-        Ok(())
-    } else {
-        let node = inbound
-            .into_iter()
-            .find_map(|(id, count)| (count > 0).then_some(id))
-            .expect("a cycle leaves inbound nodes");
-        Err(ProjectionError::Cycle {
-            from: node.clone(),
-            to: node,
-        })
-    }
-}
-
 fn branches(
     nodes: &[TraceNode],
     edges: &[TraceEdge],
@@ -776,6 +719,125 @@ fn manifest_value(manifest: &TraceManifest) -> Value {
 #[cfg(test)]
 mod scale_tests {
     use super::*;
+    use crate::validate::validate_manifest;
+
+    fn resign(manifest: &mut TraceManifest) {
+        manifest.sha256.clear();
+        manifest.sha256 = digest(&[
+            "harness.trace.manifest.v2",
+            &canonical_json(&manifest_value(manifest)),
+        ]);
+    }
+
+    fn manifest_fixture() -> TraceManifest {
+        let payload = json!({"event": "fixture"});
+        project(&TraceInput {
+            trace_id: "trace-fixture".to_owned(),
+            run_id: "run-fixture".to_owned(),
+            task_attempt_id: None,
+            runtime_digest: "a".repeat(64),
+            redaction_policy_digest: "b".repeat(64),
+            sensitivity: "internal".to_owned(),
+            raw_events: vec![RawEventReceipt {
+                id: 1,
+                execution_scope_id: None,
+                lifecycle_group_id: None,
+                thread_id: None,
+                turn_id: None,
+                direction: "inbound".to_owned(),
+                method: "fixture".to_owned(),
+                request_id: None,
+                received_at: 1,
+                payload: payload.clone(),
+                payload_sha256: payload_digest(&payload),
+                source_sequence: None,
+                redaction_class: "none".to_owned(),
+            }],
+            domain_events: Vec::new(),
+            structural_receipts: Vec::new(),
+            relations: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn manifest_validator_rejects_digest_and_endpoint_mutations() {
+        let manifest = manifest_fixture();
+        validate_manifest(&manifest).unwrap();
+
+        let mut mutated_digest = manifest.clone();
+        mutated_digest.runtime_digest = "c".repeat(64);
+        assert!(validate_manifest(&mutated_digest).is_err());
+
+        let mut endpoint = manifest;
+        endpoint.nodes[0].source_receipts = vec![SourceReceipt::RawEvent { raw_event_id: 0 }];
+        resign(&mut endpoint);
+        assert!(validate_manifest(&endpoint).is_err());
+
+        let mut open_node = manifest_fixture();
+        open_node.nodes[0].kind = "customer supplied kind".to_owned();
+        resign(&mut open_node);
+        assert!(validate_manifest(&open_node).is_err());
+
+        let mut forged_node = manifest_fixture();
+        forged_node.nodes[0].id = format!("n_{}", "f".repeat(64));
+        forged_node.branches[0].root_node_id = forged_node.nodes[0].id.clone();
+        forged_node.branches[0].leaf_node_id = forged_node.nodes[0].id.clone();
+        forged_node.branches[0].node_ids[0] = forged_node.nodes[0].id.clone();
+        forged_node.branches[0].id = format!(
+            "b_{}",
+            digest(&[
+                "harness.trace.branch.v2",
+                &forged_node.branches[0].root_node_id,
+                &forged_node.branches[0].node_ids.join(","),
+            ])
+        );
+        resign(&mut forged_node);
+        assert!(validate_manifest(&forged_node).is_err());
+
+        let mut wrong_count = manifest_fixture();
+        wrong_count.nodes[0]
+            .metadata
+            .insert("receipt_count".to_owned(), json!(2));
+        resign(&mut wrong_count);
+        assert!(validate_manifest(&wrong_count).is_err());
+
+        let mut wrong_range = manifest_fixture();
+        wrong_range.source_event_range = Some(SourceEventRange {
+            first_id: 1,
+            last_id: 2,
+        });
+        resign(&mut wrong_range);
+        assert!(validate_manifest(&wrong_range).is_err());
+
+        let mut duplicate_branch = manifest_fixture();
+        duplicate_branch
+            .branches
+            .push(duplicate_branch.branches[0].clone());
+        resign(&mut duplicate_branch);
+        assert!(validate_manifest(&duplicate_branch).is_err());
+
+        let mut forged_branch = manifest_fixture();
+        forged_branch.branches[0].id = format!("b_{}", "f".repeat(64));
+        resign(&mut forged_branch);
+        assert!(validate_manifest(&forged_branch).is_err());
+
+        let mut forged_bound = manifest_fixture();
+        forged_bound.branches[0]
+            .metadata
+            .insert("path_bound".to_owned(), json!(1));
+        resign(&mut forged_bound);
+        assert!(validate_manifest(&forged_bound).is_err());
+
+        let mut open_diagnostic = manifest_fixture();
+        open_diagnostic.diagnostics.push(ProjectionDiagnostic {
+            code: "free_text".to_owned(),
+            detail: "customer supplied detail".to_owned(),
+            source_receipts: Vec::new(),
+        });
+        resign(&mut open_diagnostic);
+        assert!(validate_manifest(&open_diagnostic).is_err());
+    }
 
     #[test]
     fn long_linear_graph_validation_and_branching_are_iterative() {

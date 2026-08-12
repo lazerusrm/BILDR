@@ -1,64 +1,50 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:harness:knowledge-item.v1",
-  "title": "Harness evidence-backed knowledge item",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "knowledge_id", "kind", "statement", "scope", "evidence", "confidence", "review", "freshness", "state", "sha256"],
+  "required": ["schema", "knowledge_id", "kind", "statement", "scope", "evidence", "confidence_milli", "review", "freshness", "contradicts", "supersedes", "state", "sha256"],
   "properties": {
     "schema": {"const": "harness.knowledge-item.v1"},
-    "knowledge_id": {"type": "string", "minLength": 1},
+    "knowledge_id": {"$ref": "#/$defs/id"},
     "kind": {"enum": ["fact", "procedure", "warning", "heuristic", "anti_pattern"]},
     "statement": {"type": "string", "minLength": 1},
     "scope": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["repository", "task_families", "model_families", "runtime_classes"],
+      "type": "object", "additionalProperties": false,
+      "required": ["repository_id", "task_family", "model_family", "runtime_class"],
       "properties": {
-        "repository": {"type": ["string", "null"]},
-        "task_families": {"type": "array", "items": {"type": "string", "minLength": 1}},
-        "model_families": {"type": "array", "items": {"type": "string", "minLength": 1}},
-        "runtime_classes": {"type": "array", "items": {"type": "string", "minLength": 1}}
+        "repository_id": {"$ref": "#/$defs/id"},
+        "task_family": {"$ref": "#/$defs/id"},
+        "model_family": {"anyOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+        "runtime_class": {"anyOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]}
       }
     },
-    "evidence": {
-      "type": "array",
-      "minItems": 1,
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["kind", "id", "digest"],
-        "properties": {
-          "kind": {"enum": ["trace", "outcome", "validation", "finding", "experiment", "human_review"]},
-          "id": {"type": "string", "minLength": 1},
-          "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
-        }
-      }
-    },
-    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "evidence": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/receipt"}},
+    "confidence_milli": {"type": "integer", "minimum": 0, "maximum": 1000},
     "review": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["state", "reviewer"],
+      "type": "object", "additionalProperties": false,
+      "required": ["state", "reviewer_id", "reviewed_at", "receipt"],
       "properties": {
         "state": {"enum": ["unreviewed", "accepted", "rejected", "needs_revalidation"]},
-        "reviewer": {"type": ["string", "null"]},
-        "note": {"type": ["string", "null"]}
+        "reviewer_id": {"anyOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+        "reviewed_at": {"type": ["integer", "null"], "minimum": 0},
+        "receipt": {"anyOf": [{"$ref": "#/$defs/human_review"}, {"type": "null"}]}
       }
     },
-    "freshness": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["created_at", "revalidate_after", "expires_at"],
-      "properties": {
-        "created_at": {"type": "string", "format": "date-time"},
-        "revalidate_after": {"type": "string", "format": "date-time"},
-        "expires_at": {"type": "string", "format": "date-time"}
-      }
-    },
-    "contradicts": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
-    "supersedes": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "freshness": {"type": "object", "additionalProperties": false, "required": ["created_at", "revalidate_after", "expires_at"], "properties": {"created_at": {"type": "integer", "minimum": 0}, "revalidate_after": {"type": "integer", "minimum": 0}, "expires_at": {"type": "integer", "minimum": 0}}},
+    "contradicts": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+    "supersedes": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
     "state": {"enum": ["candidate", "active", "expired", "contradicted", "superseded", "rejected"]},
-    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    "sha256": {"$ref": "#/$defs/digest"}
+  },
+  "allOf": [{
+    "if": {"properties": {"state": {"const": "active"}}},
+    "then": {"properties": {"review": {"allOf": [{"properties": {"state": {"const": "accepted"}, "reviewer_id": {"$ref": "#/$defs/id"}, "reviewed_at": {"type": "integer", "minimum": 0}, "receipt": {"$ref": "#/$defs/human_review"}}}]}}}
+  }],
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "receipt": {"type": "object", "additionalProperties": false, "required": ["kind", "revision_id", "digest", "split", "custody"], "properties": {"kind": {"enum": ["trace", "outcome", "failure", "eval_case", "taskset", "grader_bundle", "runtime", "policy_bundle", "human_review"]}, "revision_id": {"$ref": "#/$defs/id"}, "digest": {"$ref": "#/$defs/digest"}, "split": {"type": ["string", "null"], "enum": ["training", "development", "holdout", "canary", "quarantine", null]}, "custody": {"type": ["string", "null"], "enum": ["clean", "invalidated", "restricted", null]}}},
+    "human_review": {"allOf": [{"$ref": "#/$defs/receipt"}, {"properties": {"kind": {"const": "human_review"}}}]}
   }
 }

@@ -1,17 +1,1 @@
-{
-  "schema": "harness.promotion-decision.v1",
-  "promotion_id": "promotion_context_order_v1",
-  "experiment_id": "experiment_context_order_v1",
-  "candidate_id": "candidate_context_order_v1",
-  "from_bundle_id": "bundle_champion_v1",
-  "to_bundle_id": "bundle_context_order_v1",
-  "safety_anchor_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "scope": {"task_family": "context_compilation"},
-  "required_receipts": {"offline": "evidence_offline", "holdout": "evidence_holdout", "shadow": "evidence_shadow", "canary": null, "reward_integrity": "evidence_reward", "statistics": "evidence_stats"},
-  "decision": "defer",
-  "decided_by": "operator",
-  "decided_at": "2026-08-11T19:00:00Z",
-  "activation_not_before": null,
-  "rollback": {"target_bundle_id": "bundle_champion_v1", "automatic_triggers": ["safety_violation"], "tested_evidence_id": "evidence_rollback"},
-  "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-}
+{"schema":"harness.promotion-decision.v1","promotion_id":"promotion-1","experiment_id":"experiment-1","candidate_id":"candidate-1","experiment_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","runtime_policy_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","from_bundle_id":"champion-1","to_bundle_id":"challenger-1","safety_anchor_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","required_receipts":{"offline":{"kind":"offline","id":"receipt-offline","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"holdout":{"kind":"holdout","id":"receipt-holdout","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"shadow":{"kind":"shadow","id":"receipt-shadow","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"canary":{"kind":"canary","id":"receipt-canary","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"reward_integrity":{"kind":"reward_integrity","id":"receipt-reward","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"statistics":{"kind":"statistics","id":"receipt-statistics","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"approvals":[{"role":"independent_reviewer","receipt":{"kind":"independent_review","id":"promotion-1-review","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},{"role":"operator","receipt":{"kind":"operator_approval","id":"promotion-1-operator","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}],"rollback_evidence":{"kind":"rollback","id":"receipt-rollback","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"sha256":"40b6a55b96f3c450f5631fc2872d219492eb7e39416b2e3c13a72172f85963aa"}

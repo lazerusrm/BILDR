@@ -174,6 +174,62 @@ export interface FailureTrace {
   outcomes: OutcomeVector;
 }
 
+export type EvaluationSplit = "training" | "development" | "holdout" | "canary" | "quarantine";
+export type EvaluationArm = "champion" | "challenger";
+export type EvaluationRunStatus = "recording" | "completed" | "infrastructure_unavailable" | "invalidated";
+export type EvaluationSampleClassification = "pass" | "fail" | "infrastructure_unavailable" | "invalidated";
+export type FailureSourceKind = "attempt_terminal" | "run_terminal" | "typed_outcome";
+
+/** Receipt-only M2 records; no fixture, command, evidence, or artifact payloads. */
+export interface EvaluationRunSummary {
+  id: string;
+  controller_run_id: string;
+  taskset_revision_id: string;
+  grader_bundle_revision_id: string;
+  split: EvaluationSplit;
+  status: EvaluationRunStatus;
+  invalidated: boolean;
+}
+
+export interface EvaluationSampleSummary {
+  id: string;
+  evaluation_run_id: string;
+  eval_case_revision_id: string;
+  arm: EvaluationArm;
+  seed: number;
+  classification: EvaluationSampleClassification;
+  sample_digest: string;
+  invalidated: boolean;
+}
+
+export interface EvaluationCaseSummary {
+  revision_id: string;
+  case_id: string;
+  revision: number;
+  payload_sha256: string;
+  case_sha256: string;
+  split: EvaluationSplit;
+  task_family: string;
+  base_sha: string;
+  setup_digest: string;
+  grader_bundle_id: string;
+  grader_bundle_revision: number;
+  grader_bundle_digest: string;
+}
+
+export interface EvaluationOccurrenceSource {
+  occurrence_id: string;
+  repository_id: string;
+  run_id: string;
+  base_sha: string;
+  source_receipt_sha256: string;
+  source_kind: FailureSourceKind;
+  trace_revision_id: string | null;
+  trace_digest: string | null;
+  outcome_revision_id: string | null;
+  outcome_digest: string | null;
+}
+
 export interface OutcomeRevision {
   revision_id: string;
   revision: number;

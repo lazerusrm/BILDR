@@ -8,9 +8,11 @@ mod canonical;
 mod model;
 mod project;
 mod redaction;
+mod validate;
 
 pub use model::{
     DomainEventReceipt, ProjectionDiagnostic, ProjectionError, RawEventReceipt, RelationInput,
     SourceReceipt, StructuralReceipt, TraceInput, TraceManifest, TraceNode, TraceRelationKind,
 };
 pub use project::project;
+pub use validate::validate_manifest;

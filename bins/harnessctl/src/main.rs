@@ -207,6 +207,21 @@ enum ImprovementCommand {
         #[command(subcommand)]
         command: OutcomeCommand,
     },
+    /// Receipt-only evaluation records. This command cannot start or mutate an evaluation.
+    Evaluation {
+        #[command(subcommand)]
+        command: EvaluationCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum EvaluationCommand {
+    /// Show one closed evaluation receipt by its opaque identifier.
+    Show {
+        #[arg(value_parser = ["run", "sample", "case", "occurrence"])]
+        kind: String,
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -215,28 +230,31 @@ enum OutcomeCommand {
         #[arg(long)]
         run: String,
     },
-    Record {
-        #[arg(long)]
-        run: String,
-        #[arg(long)]
-        subject: String,
-        #[arg(long, value_parser = ["operator_acceptance", "operator_correction", "review_regression", "pr_reopened", "rollback", "downstream_regression"])]
-        dimension: String,
-        #[arg(long, value_parser = ["positive", "negative", "neutral", "unknown"])]
-        classification: String,
-        #[arg(long)]
-        code: String,
-        #[arg(long)]
-        reason_code: Option<String>,
-        #[arg(long)]
-        note: Option<String>,
-        #[arg(long)]
-        correction_artifact: Option<String>,
-        #[arg(long = "supersedes")]
-        supersedes: Vec<String>,
-        #[arg(long)]
-        idempotency_key: String,
-    },
+    Record(Box<OutcomeRecordArgs>),
+}
+
+#[derive(Args)]
+struct OutcomeRecordArgs {
+    #[arg(long)]
+    run: String,
+    #[arg(long)]
+    subject: String,
+    #[arg(long, value_parser = ["operator_acceptance", "operator_correction", "review_regression", "pr_reopened", "rollback", "downstream_regression"])]
+    dimension: String,
+    #[arg(long, value_parser = ["positive", "negative", "neutral", "unknown"])]
+    classification: String,
+    #[arg(long)]
+    code: String,
+    #[arg(long)]
+    reason_code: Option<String>,
+    #[arg(long)]
+    note: Option<String>,
+    #[arg(long)]
+    correction_artifact: Option<String>,
+    #[arg(long = "supersedes")]
+    supersedes: Vec<String>,
+    #[arg(long)]
+    idempotency_key: String,
 }
 
 struct ApiClient {
@@ -564,18 +582,19 @@ async fn execute(api: &ApiClient, command: Command) -> Result<Value> {
                 OutcomeCommand::List { run } => api
                     .get(&format!("/api/v1/improvement/outcomes?run_id={run}"))
                     .await,
-                OutcomeCommand::Record {
-                    run,
-                    subject,
-                    dimension,
-                    classification,
-                    code,
-                    reason_code,
-                    note,
-                    correction_artifact,
-                    supersedes,
-                    idempotency_key,
-                } => {
+                OutcomeCommand::Record(args) => {
+                    let OutcomeRecordArgs {
+                        run,
+                        subject,
+                        dimension,
+                        classification,
+                        code,
+                        reason_code,
+                        note,
+                        correction_artifact,
+                        supersedes,
+                        idempotency_key,
+                    } = *args;
                     let (kind, id) = subject.split_once(':').context(
                         "--subject must be run:ID, task_attempt:ID, or publication:ID",
                     )?;
@@ -597,6 +616,20 @@ async fn execute(api: &ApiClient, command: Command) -> Result<Value> {
                             "idempotency_key": idempotency_key,
                         }),
                     ).await
+                }
+            },
+            ImprovementCommand::Evaluation { command } => match command {
+                EvaluationCommand::Show { kind, id } => {
+                    let collection = match kind.as_str() {
+                        "run" => "runs",
+                        "sample" => "samples",
+                        "case" => "cases",
+                        "occurrence" => "occurrences",
+                        _ => unreachable!("clap constrains evaluation kind"),
+                    };
+                    let id: String = url::form_urlencoded::byte_serialize(id.as_bytes()).collect();
+                    api.get(&format!("/api/v1/improvement/evaluations/{collection}/{id}"))
+                        .await
                 }
             },
         },

@@ -3,11 +3,13 @@
 
 mod custody;
 mod digest;
+mod observer_snapshot_bound;
 mod stats;
 mod wire;
 
 pub use custody::*;
 pub use digest::*;
+pub use observer_snapshot_bound::*;
 pub use stats::*;
 pub use wire::*;
 

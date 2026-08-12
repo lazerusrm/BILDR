@@ -19,6 +19,7 @@ CREATE INDEX IF NOT EXISTS idx_taskset_revision_memberships_case
 -- append-only status receipt below.
 CREATE TABLE IF NOT EXISTS evaluation_runs (
     id TEXT PRIMARY KEY,
+    controller_run_id TEXT NOT NULL REFERENCES runs(id),
     taskset_revision_id TEXT NOT NULL REFERENCES improvement_revisions(id),
     grader_bundle_revision_id TEXT NOT NULL REFERENCES improvement_revisions(id),
     split TEXT NOT NULL CHECK(split IN ('training','development','holdout','canary','quarantine')),
@@ -50,6 +51,8 @@ CREATE TABLE IF NOT EXISTS evaluation_run_status_revisions (
 CREATE TABLE IF NOT EXISTS evaluation_samples (
     id TEXT PRIMARY KEY,
     evaluation_run_id TEXT NOT NULL REFERENCES evaluation_runs(id),
+    controller_evidence_id TEXT NOT NULL REFERENCES evidence_records(id),
+    grader_evidence_id TEXT NOT NULL REFERENCES evidence_records(id),
     eval_case_revision_id TEXT NOT NULL REFERENCES improvement_revisions(id),
     arm TEXT NOT NULL CHECK(arm IN ('champion','challenger')),
     seed INTEGER NOT NULL CHECK(seed >= 0),
@@ -61,7 +64,8 @@ CREATE TABLE IF NOT EXISTS evaluation_samples (
     cost_receipt_digest TEXT CHECK(cost_receipt_digest IS NULL OR (length(cost_receipt_digest)=64 AND cost_receipt_digest NOT GLOB '*[^0-9a-f]*')),
     idempotency_key TEXT NOT NULL UNIQUE CHECK(length(idempotency_key) BETWEEN 1 AND 200),
     created_at INTEGER NOT NULL,
-    UNIQUE(evaluation_run_id, eval_case_revision_id, arm, seed)
+    UNIQUE(evaluation_run_id, eval_case_revision_id, arm, seed),
+    CHECK(controller_evidence_id <> grader_evidence_id)
 );
 CREATE INDEX IF NOT EXISTS idx_evaluation_samples_pair
     ON evaluation_samples(evaluation_run_id, eval_case_revision_id, seed);
@@ -133,6 +137,7 @@ END;
 CREATE TRIGGER IF NOT EXISTS evaluation_run_revision_kinds
 BEFORE INSERT ON evaluation_runs BEGIN
     SELECT CASE WHEN (SELECT aggregate_kind FROM improvement_revisions WHERE id=NEW.taskset_revision_id) <> 'taskset'
+                  OR (SELECT schema_name FROM improvement_revisions WHERE id=NEW.taskset_revision_id) <> 'harness.taskset.v1'
                   OR (SELECT aggregate_kind FROM improvement_revisions WHERE id=NEW.grader_bundle_revision_id) <> 'grader_bundle'
                   OR (SELECT schema_name FROM improvement_revisions WHERE id=NEW.grader_bundle_revision_id) <> 'harness.grader-bundle.v1'
         THEN RAISE(ABORT, 'evaluation run revision kind/schema mismatch') END;

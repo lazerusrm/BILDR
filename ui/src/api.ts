@@ -5,6 +5,10 @@ import type {
   CodexAccountLoginStatus,
   CodexAccountsSnapshot,
   EvidenceSnapshot,
+  EvaluationCaseSummary,
+  EvaluationOccurrenceSource,
+  EvaluationRunSummary,
+  EvaluationSampleSummary,
   FailureOverview,
   FailureTrace,
   OutcomeVector,
@@ -117,6 +121,14 @@ class HarnessApi {
     this.get<FailureTrace>(
       `/improvement/traces/${encodeURIComponent(traceId)}`,
     );
+  evaluationRun = (id: string) =>
+    this.get<EvaluationRunSummary>(`/improvement/evaluations/runs/${encodeURIComponent(id)}`);
+  evaluationSample = (id: string) =>
+    this.get<EvaluationSampleSummary>(`/improvement/evaluations/samples/${encodeURIComponent(id)}`);
+  evaluationCase = (id: string) =>
+    this.get<EvaluationCaseSummary>(`/improvement/evaluations/cases/${encodeURIComponent(id)}`);
+  evaluationOccurrenceSource = (id: string) =>
+    this.get<EvaluationOccurrenceSource>(`/improvement/evaluations/occurrences/${encodeURIComponent(id)}`);
   worktreeDiff = (worktreeId: string) =>
     this.get<WorktreeDiffSummary>(`/worktrees/${worktreeId}/diff`);
 

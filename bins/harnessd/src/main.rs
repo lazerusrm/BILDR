@@ -18,6 +18,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use clap::{Parser, Subcommand};
+use evaluation::EvaluationService;
 use harness_codex::{
     CodexRuntime, CodexRuntimeManager, CodexSettings, EventKind, probe_compatibility,
 };
@@ -68,6 +69,12 @@ enum Command {
         #[arg(long)]
         without_codex: bool,
     },
+    /// Run the single controller-owned observer snapshot regression evaluation.
+    EvaluateObserverSnapshot {
+        /// Repository containing the pinned historical commits.
+        #[arg(long)]
+        repository: PathBuf,
+    },
 }
 
 #[derive(RustEmbed)]
@@ -95,6 +102,25 @@ async fn main() -> Result<()> {
             json,
             without_codex,
         } => doctor(config, &cli.profile, json, without_codex).await,
+        Command::EvaluateObserverSnapshot { repository } => {
+            let improvement = config.self_improvement_runtime_status();
+            if !improvement.observation_enabled {
+                bail!(
+                    "observer snapshot evaluation requires effective observe_only mode with the frozen safety anchor"
+                );
+            }
+            let paths = config.resolve_paths()?;
+            paths.create_securely()?;
+            let receipt = EvaluationService::new(
+                Store::open(&paths.database, &paths.artifact_root)?,
+                paths.worktree_root.clone(),
+                paths.cache_dir.join("evaluation-spool"),
+            )?
+            .run_observer_snapshot_once(repository)
+            .await?;
+            println!("{receipt}");
+            Ok(())
+        }
     }
 }
 
@@ -508,4 +534,5 @@ async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
         }
     }
 }
+mod evaluation;
 mod observation;

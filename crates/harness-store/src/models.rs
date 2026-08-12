@@ -514,6 +514,7 @@ pub struct NewTasksetMembership {
 #[derive(Clone, Debug)]
 pub struct NewEvaluationRun {
     pub id: String,
+    pub controller_run_id: RunId,
     pub taskset_revision_id: String,
     pub grader_bundle_revision_id: String,
     pub base_sha: String,
@@ -528,10 +529,74 @@ pub struct NewEvaluationRun {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvaluationRunReceipt {
     pub id: String,
+    pub controller_run_id: RunId,
     pub taskset_revision_id: String,
     pub grader_bundle_revision_id: String,
     pub split: harness_eval::Split,
+    pub status: EvaluationRunStatus,
     pub invalidated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImmutableRevision<T> {
+    pub id: String,
+    pub aggregate_id: String,
+    pub revision: u64,
+    pub payload_sha256: String,
+    pub wire: T,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyChampionBinding {
+    pub id: String,
+    pub repository_id: RepositoryId,
+    pub task_family: String,
+    pub model_family: Option<String>,
+    pub runtime_class: Option<String>,
+    pub policy_bundle_revision_id: String,
+    pub bundle_sha256: String,
+    pub previous_binding_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewPolicyChampionBinding {
+    pub id: String,
+    pub repository_id: RepositoryId,
+    pub task_family: String,
+    pub model_family: Option<String>,
+    pub runtime_class: Option<String>,
+    pub policy_bundle_revision_id: String,
+    /// Controller-verified frozen anchor expected by this binding.
+    pub expected_safety_anchor_digest: String,
+    pub expected_previous_binding_id: Option<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvaluationLaunchPins {
+    pub taskset_revision_id: String,
+    pub grader_bundle_revision_id: String,
+    pub split: harness_eval::Split,
+    pub taskset: ImmutableRevision<harness_eval::TasksetV1>,
+    pub grader_bundle: ImmutableRevision<harness_eval::GraderBundleV1>,
+    pub eval_cases: Vec<ImmutableRevision<harness_eval::EvalCaseV1>>,
+}
+
+/// Read-only, server-derived materialization authority.  It contains only
+/// durable IDs/digests and deliberately has no failure text or fixture body.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailureDevelopmentCaseSource {
+    pub occurrence_id: String,
+    pub repository_id: RepositoryId,
+    pub run_id: RunId,
+    pub base_sha: String,
+    pub source_receipt_sha256: String,
+    pub source_kind: String,
+    pub source_domain_event_id: Option<i64>,
+    pub trace_revision_id: Option<String>,
+    pub trace_digest: Option<String>,
+    pub outcome_revision_id: Option<String>,
+    pub outcome_digest: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -561,6 +626,8 @@ pub enum EvaluationArm {
 pub struct NewEvaluationSample {
     pub id: String,
     pub evaluation_run_id: String,
+    pub controller_evidence_id: EvidenceId,
+    pub grader_evidence_id: EvidenceId,
     pub eval_case_revision_id: String,
     pub arm: EvaluationArm,
     pub sample: harness_eval::EvalSampleV1,
@@ -571,9 +638,13 @@ pub struct NewEvaluationSample {
 pub struct EvaluationSampleReceipt {
     pub id: String,
     pub evaluation_run_id: String,
+    pub controller_evidence_id: EvidenceId,
+    pub grader_evidence_id: EvidenceId,
     pub eval_case_revision_id: String,
     pub arm: EvaluationArm,
     pub seed: u64,
+    pub classification: harness_eval::SampleClassification,
+    pub sample_digest: String,
     pub invalidated: bool,
 }
 

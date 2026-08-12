@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
-import type { FailureClusterSummary, FailureOverview, FailureTrace } from "../types";
+import type { EvaluationOccurrenceSource, FailureClusterSummary, FailureOverview, FailureTrace } from "../types";
+import { EvaluationSourceCard } from "./EvaluationSourceCard";
 import { OutcomePanel } from "./OutcomePanel";
 import { TraceExplorer } from "./TraceExplorer";
 import { VirtualRows } from "./VirtualRows";
@@ -11,6 +12,8 @@ export function ImprovementCenter({ repositoryId }: { repositoryId?: string }) {
   const [trace, setTrace] = useState<FailureTrace>();
   const [error, setError] = useState("");
   const [traceError, setTraceError] = useState("");
+  const [evaluationSource, setEvaluationSource] = useState<EvaluationOccurrenceSource>();
+  const [evaluationSourceError, setEvaluationSourceError] = useState("");
 
   useEffect(() => {
     let active = true;
@@ -51,6 +54,19 @@ export function ImprovementCenter({ repositoryId }: { repositoryId?: string }) {
     return () => { active = false; };
   }, [traceId]);
 
+  const occurrenceId = selected?.representative_occurrence_id;
+  useEffect(() => {
+    let active = true;
+    setEvaluationSource(undefined);
+    setEvaluationSourceError("");
+    if (!occurrenceId) return () => { active = false; };
+    api.evaluationOccurrenceSource(occurrenceId).then(
+      (value) => active && setEvaluationSource(value),
+      (cause: unknown) => active && setEvaluationSourceError(displayError(cause, "Could not resolve evaluation source")),
+    );
+    return () => { active = false; };
+  }, [occurrenceId]);
+
   const clusters = useMemo(
     () => [...(overview?.clusters || [])].sort(compareClusters),
     [overview],
@@ -84,6 +100,7 @@ export function ImprovementCenter({ repositoryId }: { repositoryId?: string }) {
       </>}
       {traceError && <p role="alert" className="form-error">{traceError}</p>}
       <TraceExplorer traceId={traceId || undefined} rows={trace?.rows || []} loading={Boolean(traceId && !trace && !traceError)} />
+      <EvaluationSourceCard source={evaluationSource} loading={Boolean(occurrenceId && !evaluationSource && !evaluationSourceError)} error={evaluationSourceError} />
       {selected?.representative_run_id && <OutcomePanel runId={selected.representative_run_id} />}
     </div>
   );
