@@ -83,6 +83,7 @@ const HIGH_RISK_WORKER_SESSION_TOKEN_BUDGET: u64 = 140_000;
 const FINAL_AUDITOR_SESSION_TOKEN_BUDGET: u64 = 120_000;
 const WORKER_PROTOCOL_CONTEXT_ALLOWANCE: u64 = 20_000;
 const WORKER_COMPLETION_RESERVE: u64 = 16_000;
+const WORKER_EXECUTION_CONTRACT: &str = "Begin from the task packet and compiled context; do not batch broad discovery. After reading repository-required guidance, inspect only the narrowest change seam needed, then create a candidate diff before any further exploration. Once a diff exists, run focused checks and iterate from concrete failures. If bounded prior-attempt continuity already contains a candidate, inspect that diff first and improve or test it instead of restarting discovery. Stop only if required work is outside leased custody or conflicts with active authority.";
 const ARCHITECT_TASK_OUTPUT_FIELDS: &[&str] = &[
     "task_id",
     "title",
@@ -12491,7 +12492,7 @@ fn worker_prompt(
     let action_contract = if governing {
         "Work the next highest-leverage outcome now. Use direct repository work by default; delegate a bounded read-only investigation or review only when it materially shortens the critical path. Reconcile useful existing delegated work without repeating completed exploration. Materialize any recoverable candidate into this leased worktree before claiming progress."
     } else {
-        "Implement the packet's requested behavior and run the smallest focused checks that provide useful feedback. Stop only if required work is outside leased custody or conflicts with active authority."
+        WORKER_EXECUTION_CONTRACT
     };
     let replan_contract = if governing {
         format!("\n\n{GOVERNOR_REPLAN_CONTRACT}")
@@ -14599,6 +14600,17 @@ mod tests {
         assert!(bounded_high_risk <= HIGH_RISK_WORKER_SESSION_TOKEN_BUDGET);
         let bounded_worker = worker_launch_minimum_token_budget(AgentRole::Worker, 45_000, 1_600);
         assert!(bounded_worker <= 80_000);
+    }
+
+    #[test]
+    fn worker_execution_contract_prioritizes_candidate_feedback_over_rediscovery() {
+        assert!(WORKER_EXECUTION_CONTRACT.contains("do not batch broad discovery"));
+        assert!(
+            WORKER_EXECUTION_CONTRACT
+                .contains("create a candidate diff before any further exploration")
+        );
+        assert!(WORKER_EXECUTION_CONTRACT.contains("iterate from concrete failures"));
+        assert!(WORKER_EXECUTION_CONTRACT.contains("inspect that diff first"));
     }
 
     #[test]
