@@ -115,6 +115,7 @@ pub enum ImprovementSchema {
     TraceV1,
     TraceV2,
     OutcomeV1,
+    TasksetV1,
     EvalCaseV1,
     GraderBundleV1,
     ImprovementCandidateV1,
@@ -130,6 +131,7 @@ impl ImprovementSchema {
             Self::TraceV1 => "harness.trace.v1",
             Self::TraceV2 => "harness.trace.v2",
             Self::OutcomeV1 => "harness.outcome.v1",
+            Self::TasksetV1 => "harness.taskset.v1",
             Self::EvalCaseV1 => "harness.eval-case.v1",
             Self::GraderBundleV1 => "harness.grader-bundle.v1",
             Self::ImprovementCandidateV1 => "harness.improvement-candidate.v1",
@@ -144,6 +146,7 @@ impl ImprovementSchema {
             Self::TraceV1 => ImprovementRecordKind::Trace,
             Self::TraceV2 => ImprovementRecordKind::Trace,
             Self::OutcomeV1 => ImprovementRecordKind::Outcome,
+            Self::TasksetV1 => ImprovementRecordKind::Taskset,
             Self::EvalCaseV1 => ImprovementRecordKind::EvalCase,
             Self::GraderBundleV1 => ImprovementRecordKind::GraderBundle,
             Self::ImprovementCandidateV1 => ImprovementRecordKind::Candidate,
@@ -1718,6 +1721,17 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn taskset_schema_is_closed_and_uses_the_existing_taskset_lifecycle() {
+        assert_eq!(ImprovementSchema::TasksetV1.as_str(), "harness.taskset.v1");
+        assert_eq!(
+            ImprovementSchema::TasksetV1.kind(),
+            ImprovementRecordKind::Taskset
+        );
+        assert!(ImprovementState::Active.allowed_for(ImprovementRecordKind::Taskset));
+        assert!(!ImprovementState::Running.allowed_for(ImprovementRecordKind::Taskset));
     }
 
     #[test]
