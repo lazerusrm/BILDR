@@ -1085,8 +1085,9 @@ impl Store {
             .map_err(Into::into)
     }
     /// Return one consistent, read-only receipt snapshot for a historical run.
-    /// Raw rows without `run_id` are included only when their agent session is
-    /// durably bound to this run, which covers legacy child-agent rows.
+    /// Raw rows without `run_id` are included only when their registered thread
+    /// belongs to an agent session durably bound to this run. This is the
+    /// authoritative ownership path for legacy App Server receipts.
     pub fn trace_projection_snapshot(
         &self,
         run_id: &RunId,
@@ -1100,7 +1101,19 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
         enforce_trace_snapshot_limits(&transaction, run_id)?;
-        let mut raw_statement = transaction.prepare("SELECT re.id,re.agent_session_id,re.thread_id,re.turn_id,re.direction,re.method,re.request_id,re.received_at,re.payload_json,re.payload_sha256,re.source_sequence,re.redaction_class FROM raw_events re LEFT JOIN agent_sessions a ON a.id=re.agent_session_id WHERE re.run_id=?1 OR (re.run_id IS NULL AND a.run_id=?1) ORDER BY re.id")?;
+        let mut raw_statement = transaction.prepare(
+            "SELECT id,agent_session_id,thread_id,turn_id,direction,method,request_id,received_at,payload_json,payload_sha256,source_sequence,redaction_class FROM (
+                SELECT re.id,re.agent_session_id,re.thread_id,re.turn_id,re.direction,re.method,re.request_id,re.received_at,re.payload_json,re.payload_sha256,re.source_sequence,re.redaction_class
+                FROM raw_events re INDEXED BY idx_raw_events_run_id_id
+                WHERE re.run_id=?1
+                UNION ALL
+                SELECT re.id,a.id,re.thread_id,re.turn_id,re.direction,re.method,re.request_id,re.received_at,re.payload_json,re.payload_sha256,re.source_sequence,re.redaction_class
+                FROM agent_sessions a INDEXED BY idx_agents_run_state
+                JOIN codex_threads ct ON ct.agent_session_id=a.id
+                JOIN raw_events re INDEXED BY idx_raw_events_thread_id_id ON re.thread_id=ct.thread_id
+                WHERE a.run_id=?1 AND re.run_id IS NULL
+            ) ORDER BY id",
+        )?;
         let raw_events = raw_statement
             .query_map([run_id.as_str()], |row| {
                 let payload: Value =
@@ -4251,7 +4264,11 @@ fn enforce_trace_snapshot_limits(
     validate_trace_snapshot_counts(direct_raw, domain)?;
 
     let (legacy_raw, legacy_bytes): (i64, i64) = transaction.query_row(
-        "SELECT count(*),coalesce(sum(length(re.payload_json)),0) FROM raw_events re JOIN agent_sessions a ON a.id=re.agent_session_id WHERE re.run_id IS NULL AND a.run_id=?1",
+        "SELECT count(*),coalesce(sum(length(re.payload_json)),0)
+         FROM agent_sessions a INDEXED BY idx_agents_run_state
+         JOIN codex_threads ct ON ct.agent_session_id=a.id
+         JOIN raw_events re INDEXED BY idx_raw_events_thread_id_id ON re.thread_id=ct.thread_id
+         WHERE a.run_id=?1 AND re.run_id IS NULL",
         [run_id.as_str()],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;

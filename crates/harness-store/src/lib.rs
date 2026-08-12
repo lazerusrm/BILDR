@@ -693,10 +693,19 @@ mod tests {
             connection
                 .pragma_update(None, "foreign_keys", false)
                 .unwrap();
-            connection.execute_batch("INSERT INTO runs(id,repository_id,title,requested_objective,mode,publication_mode,state,phase,base_ref,base_sha,authority_digest,profile_digest,requested_by,created_at,updated_at) VALUES('run-trace','repo','t','o','m','p','CREATED','p','main','0000000000000000000000000000000000000000','authority','profile','test',1,1); INSERT INTO agent_sessions(id,run_id,runtime_kind,role,requested_model,requested_reasoning_effort,sandbox_mode,approval_policy,cwd,state) VALUES('child','run-trace','test','worker','model','low','read_only','never','/tmp','COMPLETED');").unwrap();
+            connection.execute_batch("INSERT INTO runs(id,repository_id,title,requested_objective,mode,publication_mode,state,phase,base_ref,base_sha,authority_digest,profile_digest,requested_by,created_at,updated_at) VALUES('run-trace','repo','t','o','m','p','CREATED','p','main','0000000000000000000000000000000000000000','authority','profile','test',1,1);
+                INSERT INTO runs(id,repository_id,title,requested_objective,mode,publication_mode,state,phase,base_ref,base_sha,authority_digest,profile_digest,requested_by,created_at,updated_at) VALUES('run-other','repo','t','o','m','p','CREATED','p','main','0000000000000000000000000000000000000000','authority','profile','test',2,2);
+                INSERT INTO agent_sessions(id,run_id,runtime_kind,role,requested_model,requested_reasoning_effort,sandbox_mode,approval_policy,cwd,state) VALUES('child','run-trace','test','worker','model','low','read_only','never','/tmp','COMPLETED');
+                INSERT INTO agent_sessions(id,run_id,runtime_kind,role,requested_model,requested_reasoning_effort,sandbox_mode,approval_policy,cwd,state) VALUES('other-child','run-other','test','worker','model','low','read_only','never','/tmp','COMPLETED');
+                INSERT INTO codex_threads(thread_id,agent_session_id,created_at,updated_at) VALUES('child-thread','child',1,1);
+                INSERT INTO codex_threads(thread_id,agent_session_id,created_at,updated_at) VALUES('other-thread','other-child',1,1);").unwrap();
         }
         let payload = serde_json::json!({"value":"child"});
-        store.connection().unwrap().execute("INSERT INTO raw_events(run_id,agent_session_id,direction,method,received_at,payload_json,payload_sha256,redaction_class) VALUES(NULL,'child','inbound','item/completed',1,?1,?2,'none')", rusqlite::params![payload.to_string(), crate::queries::sha256(payload.to_string().as_bytes())]).unwrap();
+        store.connection().unwrap().execute("INSERT INTO raw_events(run_id,agent_session_id,thread_id,direction,method,received_at,payload_json,payload_sha256,redaction_class) VALUES(NULL,NULL,'child-thread','inbound','item/completed',1,?1,?2,'none')", rusqlite::params![payload.to_string(), crate::queries::sha256(payload.to_string().as_bytes())]).unwrap();
+        let unrelated = serde_json::json!({"value":"other"});
+        store.connection().unwrap().execute("INSERT INTO raw_events(run_id,agent_session_id,thread_id,direction,method,received_at,payload_json,payload_sha256,redaction_class) VALUES(NULL,NULL,'other-thread','inbound','item/completed',1,?1,?2,'none')", rusqlite::params![unrelated.to_string(), crate::queries::sha256(unrelated.to_string().as_bytes())]).unwrap();
+        let stale_owner = serde_json::json!({"value":"stale-owner"});
+        store.connection().unwrap().execute("INSERT INTO raw_events(run_id,agent_session_id,thread_id,direction,method,received_at,payload_json,payload_sha256,redaction_class) VALUES(NULL,'other-child','child-thread','inbound','item/completed',2,?1,?2,'none')", rusqlite::params![stale_owner.to_string(), crate::queries::sha256(stale_owner.to_string().as_bytes())]).unwrap();
         store
             .emit_domain_event(
                 Some(&harness_domain::RunId::from("run-trace")),
@@ -710,7 +719,13 @@ mod tests {
         let first = store
             .trace_projection_snapshot(&harness_domain::RunId::from("run-trace"))
             .unwrap();
-        assert_eq!(first.raw_events.len(), 1);
+        assert_eq!(first.raw_events.len(), 2);
+        assert!(
+            first
+                .raw_events
+                .iter()
+                .all(|receipt| receipt.agent_session_id.as_deref() == Some("child"))
+        );
         assert_eq!(first.domain_events.len(), 1);
         assert!(
             first
@@ -739,6 +754,12 @@ mod tests {
                 .relations
                 .iter()
                 .any(|relation| relation.kind == "next")
+        );
+        assert!(
+            !first
+                .relations
+                .iter()
+                .any(|relation| relation.from == "structural:agent:other-child")
         );
         assert_eq!(
             first.structural_digest,
