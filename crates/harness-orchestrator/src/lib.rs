@@ -12862,6 +12862,12 @@ fn session_budget_checkpoint_message(role: AgentRole) -> &'static str {
         AgentRole::Interviewer => {
             "Controller token-budget checkpoint: stop tools and return your best complete schema-valid interview turn now. Do not ask additional questions unless required by the response contract."
         }
+        AgentRole::Worker | AgentRole::HighRiskWorker => {
+            "Controller token-budget checkpoint: broad exploration is over. Continue using tools to implement the smallest complete task-owned change now, run the narrowest useful check, and then return a concise handoff. Do not return an empty handoff unless a concrete authority or environment blocker prevents edits."
+        }
+        AgentRole::Integrator | AgentRole::CiTriage => {
+            "Controller token-budget checkpoint: broad exploration is over. Continue using tools to complete the smallest task-owned correction now, run the narrowest useful check, and then return a concise handoff. Do not return an empty handoff unless a concrete authority or environment blocker prevents edits."
+        }
         _ => {
             "Controller token-budget checkpoint: stop tools and return your best complete handoff now. Name changes, checks and results, residual risk, anything unproved, and the next action if incomplete."
         }
@@ -15247,13 +15253,24 @@ mod tests {
             (AgentRole::FinalAuditor, "schema-valid final-audit verdict"),
             (AgentRole::Verifier, "schema-valid verifier verdict"),
             (AgentRole::Interviewer, "schema-valid interview turn"),
-            (AgentRole::Worker, "complete handoff"),
         ] {
             let message = session_budget_checkpoint_message(role);
             assert!(message.contains("stop tools and return your best complete"));
             assert!(message.contains(expected));
         }
-        assert!(!session_budget_checkpoint_message(AgentRole::Worker).contains("schema-valid"));
+        for role in [
+            AgentRole::Worker,
+            AgentRole::HighRiskWorker,
+            AgentRole::Integrator,
+            AgentRole::CiTriage,
+        ] {
+            let message = session_budget_checkpoint_message(role);
+            assert!(message.contains("Continue using tools"));
+            assert!(message.contains("smallest"));
+            assert!(message.contains("Do not return an empty handoff"));
+            assert!(!message.contains("stop tools"));
+            assert!(!message.contains("schema-valid"));
+        }
     }
 
     #[test]
