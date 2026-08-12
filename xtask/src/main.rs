@@ -13,6 +13,16 @@ use walkdir::WalkDir;
 
 const SCHEMA_DIGEST_ENCODING: &str = "normalized-compact-json";
 const JSON_SCHEMA_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
+const IMPROVEMENT_CRATES: &[&str] = &[
+    "harness-trace",
+    "harness-eval",
+    "harness-learning",
+    "harness-promotion",
+];
+// This applies only to the new improvement surfaces.  The legacy orchestrator
+// and App are reviewed exceptions, rather than files subject to a growth cap.
+const IMPROVEMENT_RUST_FILE_LINE_BUDGET: usize = 1_200;
+const IMPROVEMENT_UI_FILE_LINE_BUDGET: usize = 1_200;
 
 #[derive(Clone, Debug)]
 struct SchemaDocument {
@@ -35,6 +45,7 @@ enum Task {
     },
     UiBuild,
     Check,
+    ArchitecturePolicyCheck,
     OpenapiCheck,
     SchemaCheck,
     AppServerBindingsCheck,
@@ -57,6 +68,7 @@ fn main() -> Result<()> {
         Task::UiInstall { locked } => ui_install(&root, locked),
         Task::UiBuild => ui_build(&root),
         Task::Check => check(&root),
+        Task::ArchitecturePolicyCheck => architecture_policy_check(&root),
         Task::OpenapiCheck => openapi_check(&root),
         Task::SchemaCheck => schema_check(&root),
         Task::AppServerBindingsCheck => app_server_bindings_check(&root),
@@ -98,6 +110,7 @@ fn check(root: &Path) -> Result<()> {
     schema_check(root)?;
     openapi_check(root)?;
     app_server_bindings_check(root)?;
+    architecture_policy_check(root)?;
     ui_build(root)?;
     run(
         Command::new("cargo")
@@ -111,6 +124,123 @@ fn check(root: &Path) -> Result<()> {
             .current_dir(root),
         "workspace tests",
     )
+}
+
+fn architecture_policy_check(root: &Path) -> Result<()> {
+    let mut violations = Vec::new();
+    let crates_root = root.join("crates");
+    for crate_name in IMPROVEMENT_CRATES {
+        let crate_root = crates_root.join(crate_name);
+        let manifest = crate_root.join("Cargo.toml");
+        if !manifest.exists() {
+            continue;
+        }
+        let value: toml::Value = toml::from_str(&fs::read_to_string(&manifest)?)
+            .with_context(|| format!("invalid manifest: {}", manifest.display()))?;
+        if manifest_depends_on_orchestrator(&value) {
+            violations.push(format!(
+                "{} must not depend on harness-orchestrator",
+                manifest.display()
+            ));
+        }
+        violations.extend(source_line_budget_violations(
+            &crate_root,
+            &["rs"],
+            IMPROVEMENT_RUST_FILE_LINE_BUDGET,
+        )?);
+    }
+    violations.extend(source_line_budget_violations(
+        &root.join("ui/src/improvement"),
+        &["ts", "tsx", "css"],
+        IMPROVEMENT_UI_FILE_LINE_BUDGET,
+    )?);
+    if !violations.is_empty() {
+        bail!(
+            "architecture policy violations:\n- {}",
+            violations.join("\n- ")
+        )
+    }
+    println!(
+        "architecture-policy-check: present improvement crates avoid harness-orchestrator; new improvement source files are within the {IMPROVEMENT_RUST_FILE_LINE_BUDGET}-line budget"
+    );
+    Ok(())
+}
+
+fn manifest_depends_on_orchestrator(manifest: &toml::Value) -> bool {
+    dependency_tables(manifest).any(|dependencies| {
+        dependencies.iter().any(|(name, specification)| {
+            name == "harness-orchestrator"
+                || specification
+                    .as_table()
+                    .and_then(|table| table.get("package"))
+                    .and_then(toml::Value::as_str)
+                    == Some("harness-orchestrator")
+        })
+    })
+}
+
+fn dependency_tables(
+    manifest: &toml::Value,
+) -> impl Iterator<Item = &toml::map::Map<String, toml::Value>> {
+    let root = manifest.as_table();
+    let direct = root.into_iter().flat_map(|table| {
+        ["dependencies", "dev-dependencies", "build-dependencies"]
+            .into_iter()
+            .filter_map(|name| table.get(name).and_then(toml::Value::as_table))
+    });
+    let target = root
+        .and_then(|table| table.get("target"))
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(|targets| targets.values())
+        .filter_map(toml::Value::as_table)
+        .flat_map(|table| {
+            ["dependencies", "dev-dependencies", "build-dependencies"]
+                .into_iter()
+                .filter_map(|name| table.get(name).and_then(toml::Value::as_table))
+        });
+    direct.chain(target)
+}
+
+fn source_line_budget_violations(
+    directory: &Path,
+    extensions: &[&str],
+    maximum_lines: usize,
+) -> Result<Vec<String>> {
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let entries = WalkDir::new(directory)
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("cannot walk source directory: {}", directory.display()))?;
+    let mut paths = entries
+        .into_iter()
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extensions.contains(&extension))
+        })
+        .map(|entry| entry.into_path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut violations = Vec::new();
+    for path in paths {
+        let lines = fs::read_to_string(&path)
+            .with_context(|| format!("cannot read source file: {}", path.display()))?
+            .lines()
+            .count();
+        if lines > maximum_lines {
+            violations.push(format!(
+                "{} has {lines} lines; the new improvement-source budget is {maximum_lines}",
+                path.display()
+            ));
+        }
+    }
+    Ok(violations)
 }
 
 fn schema_check(root: &Path) -> Result<()> {
@@ -925,5 +1055,51 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn architecture_policy_detects_direct_renamed_and_target_orchestrator_dependencies() {
+        let allowed: toml::Value =
+            toml::from_str("[dependencies]\nharness-domain = { path = \"../harness-domain\" }")
+                .unwrap();
+        assert!(!manifest_depends_on_orchestrator(&allowed));
+
+        for manifest in [
+            "[dependencies]\nharness-orchestrator = { path = \"../harness-orchestrator\" }",
+            "[dependencies]\ncontroller = { package = \"harness-orchestrator\", path = \"../harness-orchestrator\" }",
+            "[target.'cfg(unix)'.dev-dependencies]\nharness-orchestrator = { path = \"../harness-orchestrator\" }",
+        ] {
+            let value: toml::Value = toml::from_str(manifest).unwrap();
+            assert!(manifest_depends_on_orchestrator(&value), "{manifest}");
+        }
+    }
+
+    #[test]
+    fn architecture_policy_enforces_only_the_new_source_roots_line_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let trace = root.path().join("crates/harness-trace/src");
+        let improvement = root.path().join("ui/src/improvement");
+        let legacy = root.path().join("crates/harness-orchestrator/src");
+        fs::create_dir_all(&trace).unwrap();
+        fs::create_dir_all(&improvement).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(trace.join("within.rs"), "one\ntwo\n").unwrap();
+        fs::write(trace.join("over.rs"), "one\ntwo\nthree\n").unwrap();
+        fs::write(improvement.join("over.tsx"), "one\ntwo\nthree\n").unwrap();
+        fs::write(legacy.join("legacy.rs"), "one\ntwo\nthree\nfour\n").unwrap();
+
+        let rust =
+            source_line_budget_violations(&root.path().join("crates/harness-trace"), &["rs"], 2)
+                .unwrap();
+        let ui = source_line_budget_violations(
+            &root.path().join("ui/src/improvement"),
+            &["ts", "tsx", "css"],
+            2,
+        )
+        .unwrap();
+        assert_eq!(rust.len(), 1);
+        assert!(rust[0].contains("over.rs"));
+        assert_eq!(ui.len(), 1);
+        assert!(ui[0].contains("over.tsx"));
     }
 }
