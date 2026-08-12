@@ -9,6 +9,8 @@ fn receipt(id: i64, sequence: &str, method: &str, item: serde_json::Value) -> Ra
     let payload = json!({"threadId": "thread-a", "turnId": "turn-a", "item": item});
     RawEventReceipt {
         id,
+        execution_scope_id: Some("session-01JSAFE".to_owned()),
+        lifecycle_group_id: None,
         thread_id: Some("thread-a".to_owned()),
         turn_id: Some("turn-a".to_owned()),
         direction: "inbound".to_owned(),
@@ -164,12 +166,14 @@ fn item_lifecycle_deduplicates_and_private_reasoning_is_never_hashed_from_conten
         "item/started",
         json!({"id": "same", "type": "agentMessage", "text": "before"}),
     );
-    let completed = receipt(
+    let mut completed = receipt(
         2,
         "2",
         "item/completed",
         json!({"id": "same", "type": "agentMessage", "text": "after"}),
     );
+    started.lifecycle_group_id = Some("lifecycle-01JSAFE".to_owned());
+    completed.lifecycle_group_id = Some("lifecycle-01JSAFE".to_owned());
     started.received_at = 20;
     let mut trace_input = input(vec![started, completed, reasoning]);
     trace_input.relations.clear();
@@ -328,6 +332,8 @@ fn arbitrary_ingress_values_are_neither_emitted_nor_hashed() {
             sensitivity: "restricted".to_owned(),
             raw_events: vec![RawEventReceipt {
                 id: 1,
+                execution_scope_id: Some("session-01JSAFE".to_owned()),
+                lifecycle_group_id: None,
                 thread_id: Some(email.to_owned()),
                 turn_id: Some(secret.to_owned()),
                 direction: email.to_owned(),
@@ -443,7 +449,7 @@ fn rejects_invalid_ids_and_non_lowercase_receipt_digests() {
 }
 
 #[test]
-fn delimiter_containing_item_ids_do_not_collide_in_lifecycle_grouping() {
+fn untrusted_raw_item_ids_do_not_create_lifecycle_groups_or_next_edges() {
     let mut first = receipt(
         1,
         "1",
@@ -451,6 +457,7 @@ fn delimiter_containing_item_ids_do_not_collide_in_lifecycle_grouping() {
         json!({"id": "b:c", "type": "agentMessage"}),
     );
     first.thread_id = Some("a".to_owned());
+    first.execution_scope_id = None;
     let mut second = receipt(
         2,
         "2",
@@ -458,6 +465,7 @@ fn delimiter_containing_item_ids_do_not_collide_in_lifecycle_grouping() {
         json!({"id": "c", "type": "agentMessage"}),
     );
     second.thread_id = Some("a:b".to_owned());
+    second.execution_scope_id = None;
     let mut trace_input = input(vec![first, second]);
     trace_input.structural_receipts.clear();
     trace_input.relations.clear();
@@ -469,6 +477,80 @@ fn delimiter_containing_item_ids_do_not_collide_in_lifecycle_grouping() {
             .iter()
             .all(|node| node.source_receipts.len() == 1)
     );
+    assert!(manifest.edges.is_empty());
+}
+
+#[test]
+fn trusted_topology_is_invariant_to_raw_protocol_identifiers() {
+    fn event(id: i64, raw_thread: &str, raw_turn: &str, raw_item: &str) -> RawEventReceipt {
+        let payload = json!({
+            "threadId": raw_thread,
+            "turnId": raw_turn,
+            "item": {"id": raw_item, "type": "agentMessage", "text": raw_item}
+        });
+        RawEventReceipt {
+            id,
+            execution_scope_id: Some("session-01JSAFE".to_owned()),
+            lifecycle_group_id: None,
+            thread_id: Some(raw_thread.to_owned()),
+            turn_id: Some(raw_turn.to_owned()),
+            direction: raw_thread.to_owned(),
+            method: "turn/start".to_owned(),
+            request_id: Some(raw_item.to_owned()),
+            received_at: id,
+            payload_sha256: raw_digest(&payload),
+            payload,
+            source_sequence: Some(id.to_string()),
+            redaction_class: "none".to_owned(),
+        }
+    }
+    let mut first_input = input(vec![
+        event(1, "thread-one", "turn-one", "item-one"),
+        event(2, "thread-two", "turn-two", "item-two"),
+    ]);
+    first_input.structural_receipts.clear();
+    first_input.relations.clear();
+    let mut second_input = input(vec![
+        event(1, "customer@example.test", "secret-turn", "secret-item"),
+        event(2, "thread:other", "another-turn", "another-item"),
+    ]);
+    second_input.structural_receipts.clear();
+    second_input.relations.clear();
+
+    let first = project(&first_input).unwrap();
+    let second = project(&second_input).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&second).unwrap()
+    );
+    assert_eq!(first.edges.len(), 1);
+    assert_eq!(first.edges[0].kind, TraceRelationKind::Next);
+}
+
+#[test]
+fn lifecycle_group_is_scoped_to_its_trusted_execution_scope() {
+    let mut first = receipt(
+        1,
+        "1",
+        "item/completed",
+        json!({"id": "untrusted-a", "type": "agentMessage"}),
+    );
+    first.execution_scope_id = Some("session-01JONE".to_owned());
+    first.lifecycle_group_id = Some("lifecycle-reused".to_owned());
+    let mut second = receipt(
+        2,
+        "1",
+        "item/completed",
+        json!({"id": "untrusted-b", "type": "agentMessage"}),
+    );
+    second.execution_scope_id = Some("session-01JTWO".to_owned());
+    second.lifecycle_group_id = Some("lifecycle-reused".to_owned());
+    let mut trace_input = input(vec![first, second]);
+    trace_input.structural_receipts.clear();
+    trace_input.relations.clear();
+    let manifest = project(&trace_input).unwrap();
+    assert_eq!(manifest.nodes.len(), 2);
+    assert!(manifest.edges.is_empty());
 }
 
 #[test]

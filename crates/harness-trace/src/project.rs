@@ -16,8 +16,7 @@ use crate::{
 struct Candidate {
     key: String,
     node: TraceNode,
-    thread_id: String,
-    turn_id: Option<String>,
+    execution_scope_id: Option<String>,
     order: EventOrder,
 }
 
@@ -152,6 +151,23 @@ fn validate_receipts(input: &TraceInput) -> Result<(), ProjectionError> {
                 receipt: format!("raw:{}", event.id),
             });
         }
+        for (field, value) in [
+            ("execution_scope_id", event.execution_scope_id.as_deref()),
+            ("lifecycle_group_id", event.lifecycle_group_id.as_deref()),
+        ] {
+            if value.is_some_and(|value| !safe_id(value)) {
+                return Err(ProjectionError::InvalidInput {
+                    field: field.to_owned(),
+                    value: "invalid".to_owned(),
+                });
+            }
+        }
+        if event.lifecycle_group_id.is_some() && event.execution_scope_id.is_none() {
+            return Err(ProjectionError::InvalidInput {
+                field: "lifecycle_group_id".to_owned(),
+                value: "requires_execution_scope_id".to_owned(),
+            });
+        }
     }
     let mut structural = BTreeSet::new();
     for receipt in &input.structural_receipts {
@@ -204,34 +220,36 @@ fn safe_id(value: &str) -> bool {
 }
 
 fn order_events(events: &mut [RawEventReceipt], diagnostics: &mut Vec<ProjectionDiagnostic>) {
-    let mut mixed_threads = BTreeMap::new();
+    let mut mixed_scopes = BTreeMap::new();
     for event in events.iter() {
-        let thread = event.thread_id.as_deref().unwrap_or("unbound");
+        let Some(scope) = event.execution_scope_id.as_deref() else {
+            continue;
+        };
         let has_sequence =
             valid_sequence(event.source_sequence.as_deref().unwrap_or_default()).is_some();
-        mixed_threads
-            .entry(thread.to_owned())
+        mixed_scopes
+            .entry(scope.to_owned())
             .or_insert((false, false));
-        let flags = mixed_threads.get_mut(thread).expect("inserted");
+        let flags = mixed_scopes.get_mut(scope).expect("inserted");
         if has_sequence {
             flags.0 = true
         } else {
             flags.1 = true
         }
     }
-    let ambiguous = mixed_threads
+    let ambiguous = mixed_scopes
         .into_iter()
         .filter_map(|(thread, (sequenced, unsequenced))| {
             (sequenced && unsequenced).then_some(thread)
         })
         .collect::<BTreeSet<_>>();
-    for thread in &ambiguous {
+    for scope in &ambiguous {
         diagnostics.push(ProjectionDiagnostic {
             code: "ambiguous_mixed_sequence_order".to_owned(),
             detail: "receipt_order_used".to_owned(),
             source_receipts: events
                 .iter()
-                .filter(|event| event.thread_id.as_deref().unwrap_or("unbound") == thread)
+                .filter(|event| event.execution_scope_id.as_deref() == Some(scope))
                 .map(|event| SourceReceipt::RawEvent {
                     raw_event_id: event.id,
                 })
@@ -264,15 +282,17 @@ fn group_raw_events(
 ) -> Vec<Candidate> {
     let mut grouped = BTreeMap::<GroupKey, Vec<&RawEventReceipt>>::new();
     for event in events {
-        let thread = event.thread_id.as_deref().unwrap_or("unbound");
-        let item = event
-            .payload
-            .pointer("/item/id")
-            .and_then(Value::as_str)
-            .filter(|_| matches!(event.method.as_str(), "item/started" | "item/completed"));
-        let key = item.map_or_else(
+        let key = event.lifecycle_group_id.as_ref().map_or_else(
             || GroupKey::Raw(event.id),
-            |item| GroupKey::Item(thread.to_owned(), item.to_owned()),
+            |group| {
+                GroupKey::Lifecycle(
+                    event
+                        .execution_scope_id
+                        .clone()
+                        .expect("validated lifecycle scope"),
+                    group.clone(),
+                )
+            },
         );
         if event.source_sequence.is_some()
             && valid_sequence(event.source_sequence.as_deref().unwrap_or_default()).is_none()
@@ -308,18 +328,16 @@ fn group_raw_events(
 #[derive(Eq, Ord, PartialEq, PartialOrd)]
 enum GroupKey {
     Raw(i64),
-    Item(String, String),
+    Lifecycle(String, String),
 }
 
 impl GroupKey {
     fn key(&self) -> String {
         match self {
             Self::Raw(id) => format!("raw:{id}"),
-            // The key only drives internal relation lookup; digest the tuple
-            // rather than joining untrusted identifiers with delimiters.
-            Self::Item(thread, item) => format!(
-                "item:{}",
-                digest(&["harness.trace.item-group.v2", thread, item])
+            Self::Lifecycle(scope, group) => format!(
+                "lifecycle:{}",
+                digest(&["harness.trace.lifecycle-group.v2", scope, group])
             ),
         }
     }
@@ -361,11 +379,7 @@ fn raw_candidate(key: String, receipts: &[&RawEventReceipt]) -> Candidate {
             timestamp_ms: Some(latest.received_at),
             metadata,
         },
-        thread_id: latest
-            .thread_id
-            .clone()
-            .unwrap_or_else(|| "unbound".to_owned()),
-        turn_id: latest.turn_id.clone(),
+        execution_scope_id: latest.execution_scope_id.clone(),
         order: event_order(latest),
     }
 }
@@ -406,10 +420,7 @@ fn structural_candidates(receipts: &[StructuralReceipt]) -> Vec<Candidate> {
                     timestamp_ms: receipt.occurred_at,
                     metadata: BTreeMap::new(),
                 },
-                // Structural receipts have no trustworthy turn chain; their
-                // causality is represented only by explicit durable edges.
-                thread_id: "structural:opaque".to_owned(),
-                turn_id: None,
+                execution_scope_id: None,
                 order: EventOrder {
                     sequence: None,
                     received_at: receipt.occurred_at.unwrap_or_default(),
@@ -450,10 +461,7 @@ fn domain_candidates(receipts: &[DomainEventReceipt]) -> Vec<Candidate> {
                     timestamp_ms: Some(receipt.occurred_at),
                     metadata: BTreeMap::new(),
                 },
-                // Domain events likewise require an explicit relation rather
-                // than an inferred cross-aggregate sequence.
-                thread_id: format!("domain:receipt:{}", receipt.id),
-                turn_id: None,
+                execution_scope_id: None,
                 order: EventOrder {
                     sequence: None,
                     received_at: receipt.occurred_at,
@@ -515,18 +523,15 @@ fn item_state_rank(event: &RawEventReceipt) -> u8 {
 }
 
 fn sequential_edges(candidates: &[Candidate]) -> Vec<TraceEdge> {
-    let mut by_turn = BTreeMap::<(&str, Option<&str>), Vec<&Candidate>>::new();
+    let mut by_scope = BTreeMap::<&str, Vec<&Candidate>>::new();
     for candidate in candidates {
-        if candidate.thread_id.starts_with("structural:") {
+        let Some(scope) = candidate.execution_scope_id.as_deref() else {
             continue;
-        }
-        by_turn
-            .entry((&candidate.thread_id, candidate.turn_id.as_deref()))
-            .or_default()
-            .push(candidate);
+        };
+        by_scope.entry(scope).or_default().push(candidate);
     }
     let mut result = Vec::new();
-    for entries in by_turn.values_mut() {
+    for entries in by_scope.values_mut() {
         // Source sequences have ordering meaning only inside one thread/turn
         // chain. A mixed chain is deliberately receipt-ordered instead of
         // relying on `Option` ordering.

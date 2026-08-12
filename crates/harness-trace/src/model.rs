@@ -7,6 +7,14 @@ use thiserror::Error;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RawEventReceipt {
     pub id: i64,
+    /// Controller-owned execution scope (for example, a durable agent session
+    /// identity). Raw protocol thread/turn fields are never topology inputs.
+    #[serde(default)]
+    pub execution_scope_id: Option<String>,
+    /// Controller-owned lifecycle grouping identity. It is intentionally
+    /// distinct from a raw protocol item id.
+    #[serde(default)]
+    pub lifecycle_group_id: Option<String>,
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
     pub direction: String,
