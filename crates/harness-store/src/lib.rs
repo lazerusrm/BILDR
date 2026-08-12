@@ -706,6 +706,8 @@ mod tests {
         store.connection().unwrap().execute("INSERT INTO raw_events(run_id,agent_session_id,thread_id,direction,method,received_at,payload_json,payload_sha256,redaction_class) VALUES(NULL,NULL,'other-thread','inbound','item/completed',1,?1,?2,'none')", rusqlite::params![unrelated.to_string(), crate::queries::sha256(unrelated.to_string().as_bytes())]).unwrap();
         let stale_owner = serde_json::json!({"value":"stale-owner"});
         store.connection().unwrap().execute("INSERT INTO raw_events(run_id,agent_session_id,thread_id,direction,method,received_at,payload_json,payload_sha256,redaction_class) VALUES(NULL,'other-child','child-thread','inbound','item/completed',2,?1,?2,'none')", rusqlite::params![stale_owner.to_string(), crate::queries::sha256(stale_owner.to_string().as_bytes())]).unwrap();
+        let direct = serde_json::json!({"value":"direct"});
+        store.connection().unwrap().execute("INSERT INTO raw_events(run_id,agent_session_id,thread_id,direction,method,received_at,payload_json,payload_sha256,redaction_class) VALUES('run-trace','child','child-thread','inbound','item/completed',3,?1,?2,'none')", rusqlite::params![direct.to_string(), crate::queries::sha256(direct.to_string().as_bytes())]).unwrap();
         store
             .emit_domain_event(
                 Some(&harness_domain::RunId::from("run-trace")),
@@ -716,10 +718,19 @@ mod tests {
                 Some(1),
             )
             .unwrap();
+        let watermark = store
+            .trace_projection_watermark(&harness_domain::RunId::from("run-trace"))
+            .unwrap();
         let first = store
             .trace_projection_snapshot(&harness_domain::RunId::from("run-trace"))
             .unwrap();
-        assert_eq!(first.raw_events.len(), 2);
+        assert_eq!(first.raw_events.len(), 3);
+        assert_eq!(watermark.base_sha, first.base_sha);
+        assert_eq!(watermark.authority_digest, first.authority_digest);
+        assert_eq!(watermark.profile_digest, first.profile_digest);
+        assert_eq!(watermark.max_raw_event_id, first.max_raw_event_id);
+        assert_eq!(watermark.max_domain_event_id, first.max_domain_event_id);
+        assert_eq!(watermark.structural_digest, first.structural_digest);
         assert!(
             first
                 .raw_events
@@ -768,6 +779,20 @@ mod tests {
                 .unwrap()
                 .structural_digest
         );
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE agent_sessions SET state='FAILED' WHERE id='child'",
+                [],
+            )
+            .unwrap();
+        let changed = store
+            .trace_projection_watermark(&harness_domain::RunId::from("run-trace"))
+            .unwrap();
+        assert_eq!(changed.max_raw_event_id, watermark.max_raw_event_id);
+        assert_eq!(changed.max_domain_event_id, watermark.max_domain_event_id);
+        assert_ne!(changed.structural_digest, watermark.structural_digest);
     }
 
     #[test]

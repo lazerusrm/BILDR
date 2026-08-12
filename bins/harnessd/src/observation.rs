@@ -58,25 +58,37 @@ impl ObservationService {
         {
             return Ok(());
         }
+        let watermark = self.store.trace_projection_watermark(run_id)?;
+        let watermark_runtime_digest = trace_runtime_digest(
+            &watermark.base_sha,
+            &watermark.authority_digest,
+            &watermark.profile_digest,
+        );
+        let watermark_cursor_digest = trace_cursor_digest(
+            watermark.max_raw_event_id,
+            watermark.max_domain_event_id,
+            &watermark.structural_digest,
+            &watermark_runtime_digest,
+        )?;
+        let key = format!("{OBSERVER_KEY_PREFIX}{run_id}");
+        if self.store.runtime_metadata(&key)?.as_ref() == Some(&json!(watermark_cursor_digest)) {
+            return Ok(());
+        }
         let snapshot = self.store.trace_projection_snapshot(run_id)?;
         if self.store.runtime_metadata(&error_key)?.is_some() {
             self.store.delete_runtime_metadata(&error_key)?;
         }
-        let runtime_digest = digest(&[
-            "harness.trace.runtime.v1",
+        let runtime_digest = trace_runtime_digest(
             &snapshot.base_sha,
             &snapshot.authority_digest,
             &snapshot.profile_digest,
-        ]);
-        let cursor = json!({"raw":snapshot.max_raw_event_id,"domain":snapshot.max_domain_event_id,"structural":snapshot.structural_digest,"runtime":runtime_digest});
-        let cursor_digest = digest(&[
-            "harness.trace.cursor.v2",
-            &serde_json::to_string(&cursor).map_err(harness_store::StoreError::from)?,
-        ]);
-        let key = format!("{OBSERVER_KEY_PREFIX}{run_id}");
-        if self.store.runtime_metadata(&key)?.as_ref() == Some(&json!(cursor_digest)) {
-            return Ok(());
-        }
+        );
+        let cursor_digest = trace_cursor_digest(
+            snapshot.max_raw_event_id,
+            snapshot.max_domain_event_id,
+            &snapshot.structural_digest,
+            &runtime_digest,
+        )?;
         let manifest = project(&trace_input(snapshot, runtime_digest)?).map_err(|error| {
             harness_store::StoreError::Validation(format!("trace projection failed: {error}"))
         })?;
@@ -126,6 +138,33 @@ fn projection_error_marker(error: &harness_store::StoreError) -> Value {
             "reason":"projection_failed",
         }),
     }
+}
+
+fn trace_runtime_digest(base_sha: &str, authority_digest: &str, profile_digest: &str) -> String {
+    digest(&[
+        "harness.trace.runtime.v1",
+        base_sha,
+        authority_digest,
+        profile_digest,
+    ])
+}
+
+fn trace_cursor_digest(
+    max_raw_event_id: i64,
+    max_domain_event_id: i64,
+    structural_digest: &str,
+    runtime_digest: &str,
+) -> Result<String, harness_store::StoreError> {
+    let cursor = json!({
+        "raw":max_raw_event_id,
+        "domain":max_domain_event_id,
+        "structural":structural_digest,
+        "runtime":runtime_digest,
+    });
+    Ok(digest(&[
+        "harness.trace.cursor.v2",
+        &serde_json::to_string(&cursor)?,
+    ]))
 }
 
 fn trace_input(

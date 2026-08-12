@@ -348,6 +348,16 @@ pub struct TraceProjectionSnapshot {
     pub structural_digest: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceProjectionWatermark {
+    pub base_sha: String,
+    pub authority_digest: String,
+    pub profile_digest: String,
+    pub max_raw_event_id: i64,
+    pub max_domain_event_id: i64,
+    pub structural_digest: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct TraceProjectionRawReceipt {
     pub agent_session_id: Option<String>,

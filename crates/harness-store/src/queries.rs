@@ -30,7 +30,7 @@ use crate::{
     NewOperatorOutcome, NewRepository, NewRun, NewTaskAttempt, NewValidationRecord, NewWorktree,
     PriorAttemptContext, RawEventInput, RepositoryHealthInput, Store, StoreError, StoredSession,
     TraceProjectionDomainReceipt, TraceProjectionRawReceipt, TraceProjectionSnapshot,
-    TraceProjectionStructuralReceipt,
+    TraceProjectionStructuralReceipt, TraceProjectionWatermark,
 };
 
 const TRACE_SNAPSHOT_MAX_RAW_RECEIPTS: i64 = 10_000;
@@ -1084,6 +1084,57 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
+    /// Return the receipt and controller-state watermark without reading raw or
+    /// domain payloads. Callers use this to avoid rebuilding an unchanged
+    /// historical trace.
+    pub fn trace_projection_watermark(
+        &self,
+        run_id: &RunId,
+    ) -> Result<TraceProjectionWatermark, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let (base_sha, authority_digest, profile_digest): (String, String, String) = transaction
+            .query_row(
+                "SELECT base_sha,authority_digest,profile_digest FROM runs WHERE id=?1",
+                [run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        let max_raw_event_id = transaction.query_row(
+            "SELECT coalesce(max(id),0) FROM (
+                SELECT re.id FROM raw_events re INDEXED BY idx_raw_events_run_id_id WHERE re.run_id=?1
+                UNION ALL
+                SELECT re.id
+                FROM agent_sessions a INDEXED BY idx_agents_run_state
+                JOIN codex_threads ct ON ct.agent_session_id=a.id
+                JOIN raw_events re INDEXED BY idx_raw_events_thread_id_id ON re.thread_id=ct.thread_id
+                WHERE a.run_id=?1 AND re.run_id IS NULL
+            )",
+            [run_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let max_domain_event_id = transaction.query_row(
+            "SELECT coalesce(max(id),0) FROM domain_events INDEXED BY idx_domain_events_run_id WHERE run_id=?1",
+            [run_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let structural_receipts = trace_structural_receipts(
+            &transaction,
+            run_id,
+            &base_sha,
+            &authority_digest,
+            &profile_digest,
+        )?;
+        let watermark = TraceProjectionWatermark {
+            base_sha,
+            authority_digest,
+            profile_digest,
+            max_raw_event_id,
+            max_domain_event_id,
+            structural_digest: trace_structural_digest(&structural_receipts)?,
+        };
+        transaction.commit()?;
+        Ok(watermark)
+    }
     /// Return one consistent, read-only receipt snapshot for a historical run.
     /// Raw rows without `run_id` are included only when their registered thread
     /// belongs to an agent session durably bound to this run. This is the
@@ -1182,19 +1233,14 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         drop(domain_statement);
-        let mut structural = vec![TraceProjectionStructuralReceipt {
-            id: format!("run:{run_id}"),
-            kind: "run".to_owned(),
-            occurred_at: None,
-            metadata: json!({"base_sha":base_sha,"authority_digest":authority_digest,"profile_digest":profile_digest}),
-        }];
-        let mut statement = transaction.prepare("SELECT a.id,a.state,a.base_sha,a.head_sha,a.terminal_class,a.created_at,a.completed_at FROM task_attempts a JOIN tasks t ON t.id=a.task_id WHERE t.run_id=?1 ORDER BY a.created_at,a.id")?;
-        for row in statement.query_map([run_id.as_str()], |row| Ok(TraceProjectionStructuralReceipt { id: format!("attempt:{}", row.get::<_, String>(0)?), kind: "attempt".to_owned(), occurred_at: row.get(5)?, metadata: json!({"state":row.get::<_, String>(1)?,"base_sha":row.get::<_, String>(2)?,"head_sha":row.get::<_, Option<String>>(3)?,"terminal_class":row.get::<_, Option<String>>(4)?,"completed_at":row.get::<_, Option<i64>>(6)?}) }))? { structural.push(row?); }
-        drop(statement);
-        let mut statement = transaction.prepare("SELECT id,parent_agent_session_id,task_attempt_id,role,state,effective_model,requested_model,effective_reasoning_effort,requested_reasoning_effort,started_at,completed_at FROM agent_sessions WHERE run_id=?1 ORDER BY started_at,id")?;
-        for row in statement.query_map([run_id.as_str()], |row| Ok(TraceProjectionStructuralReceipt { id: format!("agent:{}", row.get::<_, String>(0)?), kind: "agent".to_owned(), occurred_at: row.get(9)?, metadata: json!({"parent_agent_session_id":row.get::<_, Option<String>>(1)?,"task_attempt_id":row.get::<_, Option<String>>(2)?,"role":row.get::<_, String>(3)?,"state":row.get::<_, String>(4)?,"model":row.get::<_, Option<String>>(5)?.or(row.get(6)?),"reasoning_effort":row.get::<_, Option<String>>(7)?.or(row.get(8)?),"completed_at":row.get::<_, Option<i64>>(10)?}) }))? { structural.push(row?); }
-        drop(statement);
-        let structural_json = serde_json::to_string(&structural)?;
+        let structural = trace_structural_receipts(
+            &transaction,
+            run_id,
+            &base_sha,
+            &authority_digest,
+            &profile_digest,
+        )?;
+        let structural_digest = trace_structural_digest(&structural)?;
         let mut relations = Vec::new();
         for raw in &raw_events {
             if let Some(agent) = &raw.agent_session_id {
@@ -1235,7 +1281,7 @@ impl Store {
             profile_digest,
             max_raw_event_id: raw_events.last().map_or(0, |row| row.id),
             max_domain_event_id: domain_events.last().map_or(0, |row| row.id),
-            structural_digest: sha256(structural_json.as_bytes()),
+            structural_digest,
             raw_events,
             domain_events,
             structural_receipts: structural,
@@ -4245,6 +4291,37 @@ fn validate_failure_identifier(value: &str) -> Result<(), StoreError> {
 
 fn validate_failure_actor(value: &str) -> Result<(), StoreError> {
     validate_failure_identifier(value)
+}
+
+fn trace_structural_receipts(
+    transaction: &rusqlite::Transaction<'_>,
+    run_id: &RunId,
+    base_sha: &str,
+    authority_digest: &str,
+    profile_digest: &str,
+) -> Result<Vec<TraceProjectionStructuralReceipt>, StoreError> {
+    let mut structural = vec![TraceProjectionStructuralReceipt {
+        id: format!("run:{run_id}"),
+        kind: "run".to_owned(),
+        occurred_at: None,
+        metadata: json!({"base_sha":base_sha,"authority_digest":authority_digest,"profile_digest":profile_digest}),
+    }];
+    let mut statement = transaction.prepare("SELECT a.id,a.state,a.base_sha,a.head_sha,a.terminal_class,a.created_at,a.completed_at FROM task_attempts a JOIN tasks t ON t.id=a.task_id WHERE t.run_id=?1 ORDER BY a.created_at,a.id")?;
+    for row in statement.query_map([run_id.as_str()], |row| Ok(TraceProjectionStructuralReceipt { id: format!("attempt:{}", row.get::<_, String>(0)?), kind: "attempt".to_owned(), occurred_at: row.get(5)?, metadata: json!({"state":row.get::<_, String>(1)?,"base_sha":row.get::<_, String>(2)?,"head_sha":row.get::<_, Option<String>>(3)?,"terminal_class":row.get::<_, Option<String>>(4)?,"completed_at":row.get::<_, Option<i64>>(6)?}) }))? {
+        structural.push(row?);
+    }
+    drop(statement);
+    let mut statement = transaction.prepare("SELECT id,parent_agent_session_id,task_attempt_id,role,state,effective_model,requested_model,effective_reasoning_effort,requested_reasoning_effort,started_at,completed_at FROM agent_sessions WHERE run_id=?1 ORDER BY started_at,id")?;
+    for row in statement.query_map([run_id.as_str()], |row| Ok(TraceProjectionStructuralReceipt { id: format!("agent:{}", row.get::<_, String>(0)?), kind: "agent".to_owned(), occurred_at: row.get(9)?, metadata: json!({"parent_agent_session_id":row.get::<_, Option<String>>(1)?,"task_attempt_id":row.get::<_, Option<String>>(2)?,"role":row.get::<_, String>(3)?,"state":row.get::<_, String>(4)?,"model":row.get::<_, Option<String>>(5)?.or(row.get(6)?),"reasoning_effort":row.get::<_, Option<String>>(7)?.or(row.get(8)?),"completed_at":row.get::<_, Option<i64>>(10)?}) }))? {
+        structural.push(row?);
+    }
+    Ok(structural)
+}
+
+fn trace_structural_digest(
+    structural: &[TraceProjectionStructuralReceipt],
+) -> Result<String, StoreError> {
+    Ok(sha256(serde_json::to_string(structural)?.as_bytes()))
 }
 
 fn enforce_trace_snapshot_limits(
