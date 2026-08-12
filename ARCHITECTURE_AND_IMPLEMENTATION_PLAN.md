@@ -905,6 +905,13 @@ integrator              160k tokens
 final auditor           120k tokens
 ```
 
+These allocations are controller policy, not planner-authored limits. The
+controller assigns 80k to a bounded worker and 140k to a high-risk worker,
+then includes those amounts in the feasibility check. A plan cannot lower a
+session below the applicable allocation or raise it without operator policy.
+Before launch, the controller also verifies that the assembled prompt leaves
+room for bounded implementation and a final handoff.
+
 The goal API carries the active budget where supported. The controller ledger remains authoritative across turns and subagents.
 
 Governor budgets use two independent bounds. A goal envelope limits consecutive

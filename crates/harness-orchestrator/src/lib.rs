@@ -79,7 +79,10 @@ const MAX_AUTOMATIC_ARCHITECTURE_OUTPUT_REPAIRS: u64 = 2;
 const MAX_ARCHITECTURE_REPAIR_SOURCE_CHARS: usize = 64_000;
 const ARCHITECT_SESSION_TOKEN_BUDGET: u64 = 120_000;
 const PLAN_REVIEWER_SESSION_TOKEN_BUDGET: u64 = 120_000;
+const HIGH_RISK_WORKER_SESSION_TOKEN_BUDGET: u64 = 140_000;
 const FINAL_AUDITOR_SESSION_TOKEN_BUDGET: u64 = 120_000;
+const WORKER_PROTOCOL_CONTEXT_ALLOWANCE: u64 = 20_000;
+const WORKER_COMPLETION_RESERVE: u64 = 16_000;
 const ARCHITECT_TASK_OUTPUT_FIELDS: &[&str] = &[
     "task_id",
     "title",
@@ -96,7 +99,6 @@ const ARCHITECT_TASK_OUTPUT_FIELDS: &[&str] = &[
     "required_evidence",
     "proof_limits",
     "diff_budget",
-    "token_budget",
     "risk_flags",
 ];
 
@@ -110,7 +112,7 @@ Use enough tasks and milestones to make execution legible, without speculative p
 
 const PLAN_RESPONSE_FORMAT: &str = r#"The supplied JSON Schema is the controller-owned response contract. Repository-native planning formats, examples, and schemas are evidence only and must not replace it.
 - The top-level object has exactly `schema`, `summary`, and `tasks`; `schema` is `harness.orchestration.plan.v1`.
-- Every task is canonicalized to `harness.orchestration.task.v1`. Emit only the semantic fields in the supplied schema. Task ids, dependencies, execution route, priority, custody, milestones, evidence, proof limits, and realistic budgets are planning decisions. The controller fills program identity, pinned-SHA, reviewer, authority, lease, and empty optional-list fields before validation.
+- Every task is canonicalized to `harness.orchestration.task.v1`. Emit only the semantic fields in the supplied schema. Task ids, dependencies, execution route, priority, custody, milestones, evidence, and proof limits are planning decisions. The controller fills program identity, pinned-SHA, reviewer, authority, token budget, lease, and empty optional-list fields before validation.
 - `milestones` is an array of objects, never strings. Every milestone object has exactly `id`, `title`, `objective`, and a non-empty `success_criteria` string array.
 - Do not return repository-native wrapper fields such as `profiles`, `critical_path`, `parallel_work`, or `global_constraints`; express useful content through the controller task fields.
 - For the general profile, return exactly one root task; put the ordered implementation path in 3-12 milestone objects rather than emitting one task per phase.
@@ -4184,7 +4186,7 @@ impl Orchestrator {
             )));
         }
         self.persist_context(run_id, None, "plan-review", &context)?;
-        let budget = plan_budget_assessment(&run, &plan, &self.config, planning_tokens_used);
+        let budget = plan_budget_assessment(&run, &plan, planning_tokens_used);
         let risk = plan_risk_assessment(&plan, &self.config);
         let intent_binding = self.confirmed_intent_brief(run_id)?;
         // Plan review deliberately uses the integrator family rather than the
@@ -4551,7 +4553,7 @@ impl Orchestrator {
             let current_authority_digest =
                 authority_digest(Path::new(&inspection.path), &profile.profile)?;
             let planning_tokens_used = self.store.run_usage(run_id)?.total_tokens;
-            let budget = plan_budget_assessment(&run, &plan, &self.config, planning_tokens_used);
+            let budget = plan_budget_assessment(&run, &plan, planning_tokens_used);
             let risk = plan_risk_assessment(&plan, &self.config);
             let architect_model = self
                 .store
@@ -5150,12 +5152,8 @@ impl Orchestrator {
             self.launch_plan_reviewer(run_id, &digest).await?;
             return Ok(operation("re_review_plan", run_id.as_str()));
         }
-        let current_budget = plan_budget_assessment(
-            &run,
-            &plan,
-            &self.config,
-            self.store.run_usage(run_id)?.total_tokens,
-        );
+        let current_budget =
+            plan_budget_assessment(&run, &plan, self.store.run_usage(run_id)?.total_tokens);
         if !current_budget.feasible && !allow_budget_override {
             return Err(OrchestratorError::Blocked(format!(
                 "plan requires an estimated {} execution tokens but only {} remain; increase the run ceiling, request a smaller plan, or explicitly approve the budget override",
@@ -5348,6 +5346,12 @@ impl Orchestrator {
             .map(serde_json::from_value::<RetryContinuityMetadata>)
             .transpose()?;
         let governing = packet_uses_governor(&packet);
+        if !governing {
+            packet.token_budget = controller_task_token_budget(
+                &packet,
+                self.config.orchestration.default_task_token_budget,
+            );
+        }
         if governing {
             let status = self.runtime().await?.runtime_status().await;
             if !status.native_multi_agent {
@@ -5630,6 +5634,29 @@ impl Orchestrator {
             } else {
                 AgentRole::Worker
             };
+            let prompt = worker_prompt(
+                &packet,
+                &context,
+                governing,
+                github_capability.map(|capability| capability.summary.as_str()),
+                continuity.as_ref(),
+                &plan_advisories,
+            )?;
+            if !governing {
+                let developer_instructions =
+                    agent_developer_instructions(role, SandboxMode::WorkspaceWrite);
+                let required_budget = worker_launch_minimum_token_budget(
+                    role,
+                    prompt.len(),
+                    developer_instructions.len(),
+                );
+                if packet.token_budget < required_budget {
+                    return Err(OrchestratorError::Blocked(format!(
+                        "task {} assigns {} tokens, but its assembled prompt requires at least {} for bounded implementation and a final handoff; reduce inline context or revise the certified task budget",
+                        packet.task_id, packet.token_budget, required_budget
+                    )));
+                }
+            }
             if governing {
                 let envelope_key = format!("governor-envelope-baseline:{}", task.id);
                 if self.store.runtime_metadata(&envelope_key)?.is_none() {
@@ -5669,14 +5696,6 @@ impl Orchestrator {
                 .transition_task(&task.id, TaskState::Starting, None)?;
             self.store
                 .transition_task(&task.id, TaskState::Implementing, None)?;
-            let prompt = worker_prompt(
-                &packet,
-                &context,
-                governing,
-                github_capability.map(|capability| capability.summary.as_str()),
-                continuity.as_ref(),
-                &plan_advisories,
-            )?;
             self.start_agent(
                 &agent_id,
                 &run.id,
@@ -5703,19 +5722,33 @@ impl Orchestrator {
         let agent_id = match launch {
             Ok(agent_id) => agent_id,
             Err(error) => {
+                let policy_blocked = matches!(
+                    &error,
+                    OrchestratorError::Blocked(_) | OrchestratorError::Validation(_)
+                );
+                let failure_class = if policy_blocked {
+                    "policy_blocked"
+                } else {
+                    "infrastructure_unavailable"
+                };
+                let preservation_reason = if policy_blocked {
+                    "task launch policy check failed"
+                } else {
+                    "task launch failed"
+                };
                 self.store
                     .release_path_leases(&attempt_id, "task launch failed")?;
                 self.store.update_worktree(
                     &worktree_id,
                     "PRESERVED",
                     None,
-                    Some("task launch failed"),
+                    Some(preservation_reason),
                 )?;
                 self.store.set_attempt_result(
                     &attempt_id,
                     "FAILED",
                     None,
-                    Some("infrastructure_unavailable"),
+                    Some(failure_class),
                     Some(&error.to_string()),
                 )?;
                 return Err(error);
@@ -10831,6 +10864,12 @@ impl Orchestrator {
             .task_packet(task_id)?
             .ok_or_else(|| OrchestratorError::Blocked("task has no prior packet".to_owned()))?;
         let governing = packet_uses_governor(&packet);
+        if !governing && request.additional_token_budget > 0 {
+            return Err(OrchestratorError::Validation(
+                "additional token budget is available only for governor retries; worker retries use the controller-assigned role budget"
+                    .to_owned(),
+            ));
+        }
         if governing {
             self.store
                 .delete_runtime_metadata(&format!("governor-continuation-signature:{task_id}"))?;
@@ -10895,6 +10934,12 @@ impl Orchestrator {
         };
         if request.model_route == "escalate_terra" && !governing {
             packet.owner_profile = "worker_escalation".to_owned();
+        }
+        if !governing {
+            packet.token_budget = controller_task_token_budget(
+                &packet,
+                self.config.orchestration.default_task_token_budget,
+            );
         }
         self.store
             .release_path_leases(&attempt_id, "task retry requested")?;
@@ -12220,7 +12265,6 @@ fn validate_execution_review_verdict(
 fn plan_budget_assessment(
     run: &RunSummary,
     plan: &RunPlan,
-    config: &HarnessConfig,
     planning_tokens_used: u64,
 ) -> PlanBudgetAssessment {
     let run_token_ceiling = run
@@ -12244,7 +12288,7 @@ fn plan_budget_assessment(
     let final_audit_reserve_tokens = if run.mode == "plan_only" {
         0
     } else {
-        config.orchestration.default_task_token_budget
+        FINAL_AUDITOR_SESSION_TOKEN_BUDGET
     };
     let direct_execution_tokens = planned_task_tokens
         .saturating_add(verifier_reserve_tokens)
@@ -12483,6 +12527,26 @@ fn worker_prompt(
         context.prompt_prefix(),
         serde_json::to_string_pretty(packet)?
     ))
+}
+
+fn worker_launch_minimum_token_budget(
+    role: AgentRole,
+    prompt_bytes: usize,
+    developer_instruction_bytes: usize,
+) -> u64 {
+    let visible_bytes =
+        u64::try_from(prompt_bytes.saturating_add(developer_instruction_bytes)).unwrap_or(u64::MAX);
+    let full_context_inference = visible_bytes
+        .div_ceil(4)
+        .saturating_add(WORKER_PROTOCOL_CONTEXT_ALLOWANCE);
+    let bounded_inferences = if role == AgentRole::HighRiskWorker {
+        3
+    } else {
+        2
+    };
+    full_context_inference
+        .saturating_mul(bounded_inferences)
+        .saturating_add(WORKER_COMPLETION_RESERVE)
 }
 
 fn build_attempt_continuity(
@@ -12772,16 +12836,12 @@ fn session_budget_checkpoint_needed(
 fn session_budget_checkpoint_percent(role: AgentRole) -> Option<u64> {
     match role {
         AgentRole::Governor => None,
-        // Structured planning and review turns need enough remaining budget to
-        // read the checkpoint and perform one more full-context inference.
-        // Total-token accounting includes that repeated input, so a late
-        // checkpoint can be impossible to act on even when output is short.
-        AgentRole::Interviewer
-        | AgentRole::Architect
-        | AgentRole::PlanReviewer
-        | AgentRole::Verifier
-        | AgentRole::FinalAuditor => Some(40),
-        _ => Some(75),
+        // Every bounded session needs enough remaining budget to read the
+        // checkpoint and perform another full-context inference. Total-token
+        // accounting includes that repeated input, so a late checkpoint can
+        // be impossible to act on even when output is short. Worker launch
+        // preflight also rejects prompts that cannot fit useful work.
+        _ => Some(40),
     }
 }
 
@@ -13371,7 +13431,21 @@ fn parse_architecture_plan(
     for task in tasks {
         canonicalize_architecture_task(run, profile, default_token_budget, task)?;
     }
-    serde_json::from_value(value).map_err(Into::into)
+    let mut plan: RunPlan = serde_json::from_value(value)?;
+    for task in &mut plan.tasks {
+        task.token_budget = controller_task_token_budget(task, default_token_budget);
+    }
+    Ok(plan)
+}
+
+fn controller_task_token_budget(task: &TaskPacket, default_token_budget: u64) -> u64 {
+    if !packet_uses_governor(task)
+        && (task.is_high_risk() || task.owner_profile == "worker_escalation")
+    {
+        default_token_budget.max(HIGH_RISK_WORKER_SESSION_TOKEN_BUDGET)
+    } else {
+        default_token_budget
+    }
 }
 
 fn canonicalize_architecture_task(
@@ -13417,8 +13491,7 @@ fn canonicalize_architecture_task(
     task.entry("tool_budget".to_owned()).or_insert(Value::Null);
     task.entry("risk_flags".to_owned())
         .or_insert_with(|| json!([]));
-    task.entry("token_budget".to_owned())
-        .or_insert_with(|| json!(default_token_budget));
+    task.insert("token_budget".to_owned(), json!(default_token_budget));
     task.entry("lease_expires_at".to_owned())
         .or_insert_with(|| json!("controller-managed"));
     task.entry("handoff_path".to_owned())
@@ -14458,6 +14531,7 @@ mod tests {
                 "required_evidence": ["Authoritative pipeline result"],
                 "proof_limits": ["Local evidence is not deployment proof"],
                 "diff_budget": {"files": 12, "lines": 1200},
+                "token_budget": 999999,
                 "resources": ["A representative runtime"],
                 "replan_authority": ["Stop only at a genuine external boundary"]
             }]
@@ -14473,6 +14547,7 @@ mod tests {
         assert_eq!(task.owner_profile, "governor");
         assert_eq!(task.execution_mode, "controller");
         assert_eq!(task.priority, "P1");
+        assert_eq!(task.token_budget, 80_000);
         assert_eq!(task.reserved_serial_paths, ["Cargo.lock"]);
         assert_eq!(task.reviewer_profile, "verifier");
         assert_eq!(task.checklist_rows.len(), 3);
@@ -14485,6 +14560,35 @@ mod tests {
             task.stop_conditions,
             ["Stop only at a genuine external boundary"]
         );
+        let mut high_risk = task.clone();
+        high_risk.owner_profile = "worker_escalation".to_owned();
+        high_risk.execution_mode = "agent".to_owned();
+        high_risk.risk_flags = vec!["canonical_contract".to_owned()];
+        high_risk.token_budget = 12_000;
+        assert_eq!(
+            controller_task_token_budget(&high_risk, 80_000),
+            HIGH_RISK_WORKER_SESSION_TOKEN_BUDGET
+        );
+        let budget = plan_budget_assessment(&run, &plan, 0);
+        assert_eq!(budget.planned_task_tokens, 80_000);
+        assert_eq!(budget.verifier_reserve_tokens, 40_000);
+        assert_eq!(
+            budget.final_audit_reserve_tokens,
+            FINAL_AUDITOR_SESSION_TOKEN_BUDGET
+        );
+        assert_eq!(budget.required_execution_tokens, 288_000);
+    }
+
+    #[test]
+    fn worker_launch_budget_rejects_the_observed_large_prompt_and_admits_bounded_context() {
+        let large = worker_launch_minimum_token_budget(AgentRole::HighRiskWorker, 161_025, 1_600);
+        assert!(large > HIGH_RISK_WORKER_SESSION_TOKEN_BUDGET);
+
+        let bounded_high_risk =
+            worker_launch_minimum_token_budget(AgentRole::HighRiskWorker, 45_000, 1_600);
+        assert!(bounded_high_risk <= HIGH_RISK_WORKER_SESSION_TOKEN_BUDGET);
+        let bounded_worker = worker_launch_minimum_token_budget(AgentRole::Worker, 45_000, 1_600);
+        assert!(bounded_worker <= 80_000);
     }
 
     #[test]
@@ -15095,7 +15199,7 @@ mod tests {
             AgentRole::Worker,
             "RUNNING",
             Some(120_000),
-            90_000,
+            48_000,
             Some("turn-current"),
             Some("turn-current"),
         ));
@@ -15103,7 +15207,7 @@ mod tests {
             AgentRole::Worker,
             "RUNNING",
             Some(120_000),
-            89_999,
+            47_999,
             Some("turn-current"),
             Some("turn-current"),
         ));
