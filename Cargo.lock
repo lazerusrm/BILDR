@@ -946,6 +946,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-eval"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "harness-evidence"
 version = "0.1.0"
 dependencies = [

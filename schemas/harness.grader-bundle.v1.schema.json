@@ -4,10 +4,10 @@
   "title": "Harness grader bundle",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "grader_bundle_id", "revision", "signals", "hard_gates", "negative_controls", "isolation", "sha256"],
+  "required": ["schema", "grader_bundle_id", "revision", "signals", "hard_gates", "negative_controls", "reward_integrity_required", "isolation", "sha256"],
   "properties": {
     "schema": {"const": "harness.grader-bundle.v1"},
-    "grader_bundle_id": {"type": "string", "minLength": 1},
+    "grader_bundle_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
     "revision": {"type": "integer", "minimum": 1},
     "signals": {
       "type": "array",
@@ -17,7 +17,7 @@
         "additionalProperties": false,
         "required": ["id", "kind", "direction", "weight", "required", "definition_digest"],
         "properties": {
-          "id": {"type": "string", "minLength": 1},
+          "id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
           "kind": {"enum": ["deterministic", "state_effect", "model_rubric", "human", "delayed", "cost", "latency", "safety"]},
           "direction": {"enum": ["maximize", "minimize", "boolean_pass"]},
           "weight": {"type": "number", "minimum": 0},
@@ -27,20 +27,23 @@
         }
       }
     },
-    "hard_gates": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "hard_gates": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"}},
     "negative_controls": {
       "type": "array",
+      "minItems": 1,
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "expected_relationship", "failure_action"],
+        "required": ["id", "signal_id", "expected_relationship", "failure_action"],
         "properties": {
-          "id": {"type": "string", "minLength": 1},
+          "id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
+          "signal_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
           "expected_relationship": {"type": "string", "minLength": 1},
           "failure_action": {"enum": ["block", "invalidate", "adjudicate"]}
         }
       }
     },
+    "reward_integrity_required": {"const": true},
     "isolation": {
       "type": "object",
       "additionalProperties": false,

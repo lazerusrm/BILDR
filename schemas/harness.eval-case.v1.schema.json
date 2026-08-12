@@ -4,10 +4,10 @@
   "title": "Harness evaluation case revision",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "case_id", "revision", "title", "task_family", "objective", "source", "split", "runtime", "custody", "acceptance", "grader_bundle_id", "privacy", "sha256"],
+  "required": ["schema", "case_id", "revision", "title", "task_family", "objective", "source", "split", "runtime", "custody", "acceptance", "grader_bundle_id", "grader_bundle_revision", "grader_bundle_digest", "privacy", "sha256"],
   "properties": {
     "schema": {"const": "harness.eval-case.v1"},
-    "case_id": {"type": "string", "minLength": 1},
+    "case_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
     "revision": {"type": "integer", "minimum": 1},
     "title": {"type": "string", "minLength": 1},
     "task_family": {"type": "string", "minLength": 1},
@@ -55,14 +55,16 @@
         "additionalProperties": false,
         "required": ["claim_id", "kind", "required"],
         "properties": {
-          "claim_id": {"type": "string", "minLength": 1},
+          "claim_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
           "kind": {"enum": ["command", "state", "artifact", "side_effect", "human_rubric", "delayed_outcome"]},
           "required": {"type": "boolean"},
           "spec": {"type": "object"}
         }
       }
     },
-    "grader_bundle_id": {"type": "string", "minLength": 1},
+    "grader_bundle_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
+    "grader_bundle_revision": {"type": "integer", "minimum": 1},
+    "grader_bundle_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "privacy": {
       "type": "object",
       "additionalProperties": false,

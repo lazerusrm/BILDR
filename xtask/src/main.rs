@@ -1055,6 +1055,27 @@ mod tests {
     }
 
     #[test]
+    fn taskset_schema_rejects_open_split_and_extra_case_fields() {
+        let registry = jsonschema::Registry::new().prepare().unwrap();
+        let schema: Value =
+            serde_json::from_str(include_str!("../../schemas/harness.taskset.v1.schema.json"))
+                .unwrap();
+        let validator =
+            compile_schema(Path::new("taskset.schema.json"), &schema, &registry).unwrap();
+        let example: Value = serde_json::from_str(include_str!(
+            "../../examples/self-improvement/taskset.example.json"
+        ))
+        .unwrap();
+        assert!(validator.is_valid(&example));
+        let mut split = example.clone();
+        split["cases"][0]["split"] = json!("unreviewed");
+        assert!(!validator.is_valid(&split));
+        let mut open = example;
+        open["cases"][0]["answer"] = json!("secret");
+        assert!(!validator.is_valid(&open));
+    }
+
+    #[test]
     fn example_validation_rejects_unknown_discriminators_and_extra_fields() {
         let schema_path = PathBuf::from("shape.schema.json");
         let schema = json!({
