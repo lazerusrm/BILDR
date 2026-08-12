@@ -5440,12 +5440,6 @@ impl Orchestrator {
         } else {
             None
         };
-        let continuity = build_attempt_continuity(
-            prior_context.as_ref(),
-            retry_metadata.as_ref(),
-            &packet,
-            persisted_handoff.as_deref(),
-        )?;
         let attempt_id = harness_domain::AttemptId::new();
         let governor_route = governing.then(|| self.governor_route(run)).transpose()?;
         let route = if governing {
@@ -5628,6 +5622,25 @@ impl Orchestrator {
                 if governing { "governor" } else { "worker" },
                 &context,
             )?;
+            let diff_policy = task_diff_policy(&packet, &profile.profile);
+            let prior_candidate_copied = if governing {
+                false
+            } else {
+                self.materialize_prior_attempt_candidate(
+                    prior_context.as_ref(),
+                    &worktree.path,
+                    &composed_base,
+                    &diff_policy,
+                )
+                .await?
+            };
+            let continuity = build_attempt_continuity(
+                prior_context.as_ref(),
+                retry_metadata.as_ref(),
+                &packet,
+                persisted_handoff.as_deref(),
+                prior_candidate_copied,
+            )?;
             let role = if governing {
                 AgentRole::Governor
             } else if packet.is_high_risk() || packet.owner_profile == "worker_escalation" {
@@ -5717,11 +5730,13 @@ impl Orchestrator {
                 },
             )
             .await?;
-            Ok::<AgentSessionId, OrchestratorError>(agent_id)
+            Ok::<(AgentSessionId, Option<AttemptContinuity>), OrchestratorError>((
+                agent_id, continuity,
+            ))
         }
         .await;
-        let agent_id = match launch {
-            Ok(agent_id) => agent_id,
+        let (agent_id, continuity) = match launch {
+            Ok(started) => started,
             Err(error) => {
                 let policy_blocked = matches!(
                     &error,
@@ -5789,6 +5804,47 @@ impl Orchestrator {
             }
         });
         Ok(())
+    }
+
+    async fn materialize_prior_attempt_candidate(
+        &self,
+        prior: Option<&PriorAttemptContext>,
+        current_worktree: &Path,
+        expected_base: &str,
+        policy: &DiffPolicy,
+    ) -> Result<bool, OrchestratorError> {
+        let Some(prior_worktree) = prior.and_then(|value| value.worktree_path.as_deref()) else {
+            return Ok(false);
+        };
+        if !prior_worktree.exists() {
+            return Ok(false);
+        }
+        let verified = match self
+            .git
+            .verify_diff(prior_worktree, expected_base, policy)
+            .await
+        {
+            Ok(verified)
+                if verified.acceptable()
+                    && verified.head_sha == expected_base
+                    && !verified.changed_paths.is_empty() =>
+            {
+                verified
+            }
+            Ok(_) => return Ok(false),
+            Err(error) => {
+                warn!(
+                    prior_worktree = %prior_worktree.display(),
+                    %error,
+                    "prior attempt candidate was not eligible for retry materialization"
+                );
+                return Ok(false);
+            }
+        };
+        self.git
+            .materialize_verified_diff(current_worktree, expected_base, &verified)
+            .await?;
+        Ok(true)
     }
 
     fn governor_route(&self, run: &RunSummary) -> Result<ModelRoute, OrchestratorError> {
@@ -7910,19 +7966,7 @@ impl Orchestrator {
             .verify_diff(
                 &worktree,
                 &base_sha,
-                &DiffPolicy {
-                    owned_paths: packet.owned_paths.clone(),
-                    forbidden_paths: packet
-                        .forbidden_paths
-                        .iter()
-                        .chain(profile.profile.forbidden_generated_runtime_paths.iter())
-                        .cloned()
-                        .collect(),
-                    serial_paths: profile.profile.serial_paths.clone(),
-                    reserved_serial_paths: packet.reserved_serial_paths.clone(),
-                    max_files: packet.diff_budget.files,
-                    max_lines: packet.diff_budget.lines,
-                },
+                &task_diff_policy(&packet, &profile.profile),
             )
             .await
         {
@@ -12530,6 +12574,22 @@ fn worker_prompt(
     ))
 }
 
+fn task_diff_policy(packet: &TaskPacket, profile: &RepositoryProfile) -> DiffPolicy {
+    DiffPolicy {
+        owned_paths: packet.owned_paths.clone(),
+        forbidden_paths: packet
+            .forbidden_paths
+            .iter()
+            .chain(profile.forbidden_generated_runtime_paths.iter())
+            .cloned()
+            .collect(),
+        serial_paths: profile.serial_paths.clone(),
+        reserved_serial_paths: packet.reserved_serial_paths.clone(),
+        max_files: packet.diff_budget.files,
+        max_lines: packet.diff_budget.lines,
+    }
+}
+
 fn worker_launch_minimum_token_budget(
     role: AgentRole,
     prompt_bytes: usize,
@@ -12555,6 +12615,7 @@ fn build_attempt_continuity(
     retry: Option<&RetryContinuityMetadata>,
     packet: &TaskPacket,
     persisted_handoff: Option<&str>,
+    prior_candidate_copied: bool,
 ) -> Result<Option<AttemptContinuity>, OrchestratorError> {
     let Some(prior) = prior else {
         return Ok(None);
@@ -12617,11 +12678,7 @@ fn build_attempt_continuity(
         "operator_retry_guidance": retry_reason,
         "durable_handoff": durable_handoff,
         "last_agent_message": last_agent_message,
-        "custody": {
-            "prior_worktree_is_read_only_reference": true,
-            "prior_uncommitted_changes_copied": false,
-            "current_worktree_is_only_mutable_root": true,
-        },
+        "custody": retry_custody_receipt(prior_candidate_copied),
     }))?;
     Ok(Some(AttemptContinuity {
         strategy: "bounded_handoff".to_owned(),
@@ -12629,6 +12686,14 @@ fn build_attempt_continuity(
         reason,
         prompt,
     }))
+}
+
+fn retry_custody_receipt(prior_candidate_copied: bool) -> Value {
+    json!({
+        "prior_worktree_is_read_only_reference": true,
+        "prior_uncommitted_changes_copied": prior_candidate_copied,
+        "current_worktree_is_only_mutable_root": true,
+    })
 }
 
 fn read_bounded_handoff(worktree: &Path, handoff_path: &str) -> Option<String> {
@@ -14611,6 +14676,22 @@ mod tests {
         );
         assert!(WORKER_EXECUTION_CONTRACT.contains("iterate from concrete failures"));
         assert!(WORKER_EXECUTION_CONTRACT.contains("inspect that diff first"));
+    }
+
+    #[test]
+    fn retry_custody_receipt_reports_materialized_candidate_truthfully() {
+        assert_eq!(
+            retry_custody_receipt(true)["prior_uncommitted_changes_copied"],
+            json!(true)
+        );
+        assert_eq!(
+            retry_custody_receipt(false)["prior_uncommitted_changes_copied"],
+            json!(false)
+        );
+        assert_eq!(
+            retry_custody_receipt(true)["current_worktree_is_only_mutable_root"],
+            json!(true)
+        );
     }
 
     #[test]
