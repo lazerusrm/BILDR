@@ -78,6 +78,165 @@ id_type!(EvidenceId);
 id_type!(FindingId);
 id_type!(OperationId);
 id_type!(PublicationId);
+id_type!(TraceId);
+id_type!(OutcomeId);
+id_type!(FailureId);
+id_type!(TasksetId);
+id_type!(EvalCaseId);
+id_type!(GraderBundleId);
+id_type!(PolicyBundleId);
+id_type!(CandidateId);
+id_type!(ExperimentId);
+id_type!(PromotionId);
+id_type!(RollbackId);
+id_type!(KnowledgeId);
+id_type!(ImprovementEventId);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImprovementRecordKind {
+    Trace,
+    Outcome,
+    Failure,
+    Taskset,
+    EvalCase,
+    GraderBundle,
+    PolicyBundle,
+    Candidate,
+    Experiment,
+    Promotion,
+    Rollback,
+    Knowledge,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImprovementSchema {
+    TraceV1,
+    EvalCaseV1,
+    GraderBundleV1,
+    ImprovementCandidateV1,
+    ExperimentV1,
+    KnowledgeItemV1,
+    PromotionDecisionV1,
+}
+
+impl ImprovementSchema {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TraceV1 => "harness.trace.v1",
+            Self::EvalCaseV1 => "harness.eval-case.v1",
+            Self::GraderBundleV1 => "harness.grader-bundle.v1",
+            Self::ImprovementCandidateV1 => "harness.improvement-candidate.v1",
+            Self::ExperimentV1 => "harness.experiment.v1",
+            Self::KnowledgeItemV1 => "harness.knowledge-item.v1",
+            Self::PromotionDecisionV1 => "harness.promotion-decision.v1",
+        }
+    }
+    #[must_use]
+    pub const fn kind(self) -> ImprovementRecordKind {
+        match self {
+            Self::TraceV1 => ImprovementRecordKind::Trace,
+            Self::EvalCaseV1 => ImprovementRecordKind::EvalCase,
+            Self::GraderBundleV1 => ImprovementRecordKind::GraderBundle,
+            Self::ImprovementCandidateV1 => ImprovementRecordKind::Candidate,
+            Self::ExperimentV1 => ImprovementRecordKind::Experiment,
+            Self::KnowledgeItemV1 => ImprovementRecordKind::Knowledge,
+            Self::PromotionDecisionV1 => ImprovementRecordKind::Promotion,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SensitivityClass {
+    Public,
+    Internal,
+    Confidential,
+    Restricted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetentionClass {
+    Ephemeral,
+    Operational,
+    Evaluation,
+    Governance,
+    LegalHold,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImprovementState {
+    Captured,
+    Observed,
+    Proposed,
+    Validated,
+    Rejected,
+    ExperimentReady,
+    Superseded,
+    Active,
+    Quarantined,
+    Retired,
+    Revoked,
+    Running,
+    Passed,
+    Failed,
+    Inconclusive,
+    Promoted,
+    RolledBack,
+    Requested,
+    Completed,
+    Candidate,
+    Expired,
+    Contradicted,
+    Decided,
+}
+
+impl ImprovementState {
+    #[must_use]
+    pub const fn allowed_for(self, kind: ImprovementRecordKind) -> bool {
+        use ImprovementRecordKind as K;
+        use ImprovementState as S;
+        match kind {
+            K::Trace => matches!(self, S::Captured),
+            K::Outcome | K::Failure => matches!(self, S::Observed | S::Superseded),
+            K::Taskset | K::EvalCase | K::GraderBundle | K::PolicyBundle => matches!(
+                self,
+                S::Proposed | S::Active | S::Quarantined | S::Retired | S::Superseded | S::Revoked
+            ),
+            K::Candidate => matches!(
+                self,
+                S::Proposed | S::Validated | S::Rejected | S::ExperimentReady | S::Superseded
+            ),
+            K::Experiment => matches!(
+                self,
+                S::Proposed
+                    | S::Validated
+                    | S::Running
+                    | S::Passed
+                    | S::Failed
+                    | S::Inconclusive
+                    | S::Promoted
+                    | S::RolledBack
+                    | S::Retired
+            ),
+            K::Promotion => matches!(self, S::Decided),
+            K::Rollback => matches!(self, S::Requested | S::Completed),
+            K::Knowledge => matches!(
+                self,
+                S::Candidate
+                    | S::Active
+                    | S::Expired
+                    | S::Contradicted
+                    | S::Superseded
+                    | S::Rejected
+            ),
+        }
+    }
+}
 
 #[must_use]
 pub fn now_ms() -> i64 {

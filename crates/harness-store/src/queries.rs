@@ -5,10 +5,11 @@ use std::{
 
 use harness_domain::{
     ActivityItem, AgentSessionId, AgentSummary, ApprovalId, ApprovalSummary, ArtifactId, AttemptId,
-    CostConfidence, CostEstimate, DomainEvent, LatestAgentMessage, ModelUsageSummary,
-    PlanRevisionId, RepositoryId, RepositorySummary, RunId, RunPlan, RunState, RunSummary, TaskId,
-    TaskState, TaskSummary, TokenUsage, UsageBreakdown, UsageGroup, UsageSummary, WorktreeId,
-    WorktreeSummary, format_timestamp, now_ms,
+    CostConfidence, CostEstimate, DomainEvent, ImprovementRecordKind, ImprovementSchema,
+    ImprovementState, LatestAgentMessage, ModelUsageSummary, PlanRevisionId, RepositoryId,
+    RepositorySummary, RetentionClass, RunId, RunPlan, RunState, RunSummary, SensitivityClass,
+    TaskId, TaskState, TaskSummary, TokenUsage, UsageBreakdown, UsageGroup, UsageSummary,
+    WorktreeId, WorktreeSummary, format_timestamp, now_ms,
 };
 use rusqlite::{OptionalExtension, Row, params};
 use serde::Serialize;
@@ -16,13 +17,118 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ArtifactRecord, NativeSubagentActivityRecord, NewAgentSession, NewApproval, NewArtifact,
-    NewCommandRecord, NewContextPacket, NewEvidenceRecord, NewRepository, NewRun, NewTaskAttempt,
-    NewValidationRecord, NewWorktree, PriorAttemptContext, RawEventInput, RepositoryHealthInput,
-    Store, StoreError, StoredSession,
+    ArtifactRecord, ImprovementEventRecord, ImprovementRevisionRecord,
+    NativeSubagentActivityRecord, NewAgentSession, NewApproval, NewArtifact, NewCommandRecord,
+    NewContextPacket, NewEvidenceRecord, NewImprovementRevision, NewRepository, NewRun,
+    NewTaskAttempt, NewValidationRecord, NewWorktree, PriorAttemptContext, RawEventInput,
+    RepositoryHealthInput, Store, StoreError, StoredSession,
 };
 
 impl Store {
+    pub fn append_improvement_revision(
+        &self,
+        input: &NewImprovementRevision,
+    ) -> Result<(ImprovementRevisionRecord, ImprovementEventRecord), StoreError> {
+        validate_improvement_input(input)?;
+        let payload_json = serde_json::to_string(&input.payload)?;
+        let now = now_ms();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        if let Some((revision_id, event_id)) = transaction
+            .query_row(
+                "SELECT revision_id,id FROM improvement_events WHERE idempotency_key=?1",
+                [&input.idempotency_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            let record = read_improvement_revision(&transaction, &revision_id)?;
+            if record.aggregate_kind != input.aggregate_kind
+                || record.aggregate_id != input.aggregate_id
+                || record.payload_sha256 != input.payload_sha256
+                || record.schema != input.schema
+                || record.state != input.state
+                || record.sensitivity != input.sensitivity
+                || record.retention_class != input.retention_class
+                || record.export_allowed != input.export_allowed
+                || record.source_domain_event_id != input.source_domain_event_id
+            {
+                return Err(StoreError::Conflict(
+                    "improvement idempotency key was reused with different content".to_owned(),
+                ));
+            }
+            let event = read_improvement_event(&transaction, &event_id)?;
+            if event.id != input.event_id || event.source_raw_event_id != input.source_raw_event_id
+            {
+                return Err(StoreError::Conflict(
+                    "improvement idempotency key was reused with different event provenance"
+                        .to_owned(),
+                ));
+            }
+            transaction.commit()?;
+            return Ok((record, event));
+        }
+        if let Some((prior_state, prior_sensitivity, prior_retention, prior_export_allowed)) = transaction.query_row(
+            "SELECT lifecycle_state,sensitivity,retention_class,export_allowed FROM improvement_current_revisions WHERE aggregate_kind=?1 AND aggregate_id=?2",
+            params![enum_text(&input.aggregate_kind)?, input.aggregate_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, bool>(3)?)),
+        ).optional()? {
+            let prior_state = parse_improvement_enum(prior_state)?;
+            let prior_sensitivity = parse_improvement_enum(prior_sensitivity)?;
+            let prior_retention = parse_improvement_enum(prior_retention)?;
+            if !improvement_transition_allowed(input.aggregate_kind, prior_state, input.state)
+                || sensitivity_rank(prior_sensitivity) > sensitivity_rank(input.sensitivity)
+                || retention_rank(prior_retention) > retention_rank(input.retention_class)
+                || (!prior_export_allowed && input.export_allowed) {
+                return Err(StoreError::Conflict("illegal improvement revision transition or classification downgrade".to_owned()));
+            }
+        }
+        let next: i64 = transaction.query_row(
+            "SELECT coalesce(max(revision),0)+1 FROM improvement_revisions WHERE aggregate_kind=?1 AND aggregate_id=?2",
+            params![enum_text(&input.aggregate_kind)?, input.aggregate_id], |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO improvement_revisions(id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![input.id, enum_text(&input.aggregate_kind)?, input.aggregate_id, next, input.schema.as_str(), enum_text(&input.state)?, payload_json, input.payload_sha256, enum_text(&input.sensitivity)?, enum_text(&input.retention_class)?, input.export_allowed, input.source_domain_event_id, now],
+        )?;
+        let event_payload =
+            serde_json::json!({"schema": input.schema.as_str(), "state": enum_text(&input.state)?})
+                .to_string();
+        let event_payload_sha256 = sha256(event_payload.as_bytes());
+        transaction.execute(
+            "INSERT INTO improvement_events(id,aggregate_kind,aggregate_id,revision_id,sequence,event_type,payload_json,payload_sha256,idempotency_key,source_raw_event_id,occurred_at) VALUES(?1,?2,?3,?4,?5,'revision_recorded',?6,?7,?8,?9,?10)",
+            params![input.event_id.as_str(), enum_text(&input.aggregate_kind)?, input.aggregate_id, input.id, next, event_payload, event_payload_sha256, input.idempotency_key, input.source_raw_event_id, now],
+        )?;
+        let record = read_improvement_revision(&transaction, &input.id)?;
+        let event = read_improvement_event(&transaction, input.event_id.as_str())?;
+        transaction.commit()?;
+        Ok((record, event))
+    }
+
+    pub fn improvement_current_revision(
+        &self,
+        kind: ImprovementRecordKind,
+        aggregate_id: &str,
+    ) -> Result<Option<ImprovementRevisionRecord>, StoreError> {
+        let connection = self.connection()?;
+        connection.query_row("SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_current_revisions WHERE aggregate_kind=?1 AND aggregate_id=?2", params![enum_text(&kind)?, aggregate_id], map_improvement_revision).optional().map_err(Into::into)
+    }
+
+    pub fn list_improvement_events(
+        &self,
+        kind: ImprovementRecordKind,
+        aggregate_id: &str,
+    ) -> Result<Vec<ImprovementEventRecord>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare("SELECT id,aggregate_kind,aggregate_id,revision_id,sequence,event_type,payload_sha256,idempotency_key,source_raw_event_id,occurred_at FROM improvement_events WHERE aggregate_kind=?1 AND aggregate_id=?2 ORDER BY sequence")?;
+        statement
+            .query_map(
+                params![enum_text(&kind)?, aggregate_id],
+                map_improvement_event,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
     pub fn put_runtime_metadata(&self, key: &str, value: &Value) -> Result<(), StoreError> {
         self.connection()?.execute(
             "INSERT INTO runtime_metadata(key,value_json,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
@@ -2592,7 +2698,247 @@ fn parse_enum<T: serde::de::DeserializeOwned>(value: &str) -> rusqlite::Result<T
     })
 }
 
-fn sha256(bytes: &[u8]) -> String {
+fn parse_improvement_enum<T: serde::de::DeserializeOwned>(value: String) -> rusqlite::Result<T> {
+    serde_json::from_value(Value::String(value)).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })
+}
+
+fn parse_improvement_schema(value: &str) -> rusqlite::Result<ImprovementSchema> {
+    let schema = match value {
+        "harness.trace.v1" => ImprovementSchema::TraceV1,
+        "harness.eval-case.v1" => ImprovementSchema::EvalCaseV1,
+        "harness.grader-bundle.v1" => ImprovementSchema::GraderBundleV1,
+        "harness.improvement-candidate.v1" => ImprovementSchema::ImprovementCandidateV1,
+        "harness.experiment.v1" => ImprovementSchema::ExperimentV1,
+        "harness.knowledge-item.v1" => ImprovementSchema::KnowledgeItemV1,
+        "harness.promotion-decision.v1" => ImprovementSchema::PromotionDecisionV1,
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                "unknown improvement schema".into(),
+            ));
+        }
+    };
+    Ok(schema)
+}
+
+fn validate_improvement_input(input: &NewImprovementRevision) -> Result<(), StoreError> {
+    if input.id.is_empty() || input.aggregate_id.is_empty() || input.idempotency_key.is_empty() {
+        return Err(StoreError::Validation(
+            "improvement IDs and idempotency key must be nonempty".to_owned(),
+        ));
+    }
+    if input.schema.kind() != input.aggregate_kind || !input.state.allowed_for(input.aggregate_kind)
+    {
+        return Err(StoreError::Validation(
+            "improvement schema, kind, or state is not allowed".to_owned(),
+        ));
+    }
+    if input.sensitivity == SensitivityClass::Restricted && input.export_allowed {
+        return Err(StoreError::Validation(
+            "restricted improvement records cannot be exportable".to_owned(),
+        ));
+    }
+    if input.payload.get("schema").and_then(Value::as_str) != Some(input.schema.as_str()) {
+        return Err(StoreError::Validation(
+            "improvement payload schema discriminator mismatch".to_owned(),
+        ));
+    }
+    let serialized = serde_json::to_string(&input.payload)?;
+    if input.payload_sha256.len() != 64
+        || !input
+            .payload_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || sha256(serialized.as_bytes()) != input.payload_sha256
+    {
+        return Err(StoreError::Validation(
+            "improvement payload SHA-256 is invalid or mismatched".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn sensitivity_rank(value: SensitivityClass) -> u8 {
+    match value {
+        SensitivityClass::Public => 0,
+        SensitivityClass::Internal => 1,
+        SensitivityClass::Confidential => 2,
+        SensitivityClass::Restricted => 3,
+    }
+}
+
+fn retention_rank(value: RetentionClass) -> u8 {
+    match value {
+        RetentionClass::Ephemeral => 0,
+        RetentionClass::Operational => 1,
+        RetentionClass::Evaluation => 2,
+        RetentionClass::Governance => 3,
+        RetentionClass::LegalHold => 4,
+    }
+}
+
+fn improvement_transition_allowed(
+    kind: ImprovementRecordKind,
+    from: ImprovementState,
+    to: ImprovementState,
+) -> bool {
+    if !from.allowed_for(kind) || !to.allowed_for(kind) {
+        return false;
+    }
+    if matches!(
+        kind,
+        ImprovementRecordKind::Taskset
+            | ImprovementRecordKind::EvalCase
+            | ImprovementRecordKind::GraderBundle
+            | ImprovementRecordKind::PolicyBundle
+    ) && from == ImprovementState::Proposed
+        && to == ImprovementState::Active
+    {
+        return true;
+    }
+    if kind == ImprovementRecordKind::Experiment
+        && from == ImprovementState::Validated
+        && to == ImprovementState::Running
+    {
+        return true;
+    }
+    if kind == ImprovementRecordKind::Rollback
+        && from == ImprovementState::Requested
+        && to == ImprovementState::Completed
+    {
+        return true;
+    }
+    from == to
+        || matches!(
+            (from, to),
+            (
+                ImprovementState::Proposed,
+                ImprovementState::Validated
+                    | ImprovementState::Rejected
+                    | ImprovementState::ExperimentReady
+                    | ImprovementState::Superseded
+            ) | (
+                ImprovementState::Validated,
+                ImprovementState::ExperimentReady
+                    | ImprovementState::Rejected
+                    | ImprovementState::Superseded
+            ) | (
+                ImprovementState::ExperimentReady,
+                ImprovementState::Running | ImprovementState::Superseded
+            ) | (
+                ImprovementState::Running,
+                ImprovementState::Passed
+                    | ImprovementState::Failed
+                    | ImprovementState::Inconclusive
+                    | ImprovementState::Promoted
+                    | ImprovementState::RolledBack
+            ) | (
+                ImprovementState::Candidate,
+                ImprovementState::Active
+                    | ImprovementState::Rejected
+                    | ImprovementState::Expired
+                    | ImprovementState::Contradicted
+                    | ImprovementState::Superseded
+            ) | (
+                ImprovementState::Active,
+                ImprovementState::Quarantined
+                    | ImprovementState::Retired
+                    | ImprovementState::Revoked
+                    | ImprovementState::Expired
+                    | ImprovementState::Contradicted
+                    | ImprovementState::Superseded
+            ) | (ImprovementState::Observed, ImprovementState::Superseded)
+        )
+}
+
+fn map_improvement_revision(row: &Row<'_>) -> rusqlite::Result<ImprovementRevisionRecord> {
+    let record = ImprovementRevisionRecord {
+        id: row.get(0)?,
+        aggregate_kind: parse_improvement_enum(row.get(1)?)?,
+        aggregate_id: row.get(2)?,
+        revision: positive_database_u64(row.get::<_, i64>(3)?, "improvement revision")?,
+        schema: parse_improvement_schema(&row.get::<_, String>(4)?)?,
+        state: parse_improvement_enum(row.get(5)?)?,
+        payload: serde_json::from_str(&row.get::<_, String>(6)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        payload_sha256: row.get(7)?,
+        sensitivity: parse_improvement_enum(row.get(8)?)?,
+        retention_class: parse_improvement_enum(row.get(9)?)?,
+        export_allowed: row.get(10)?,
+        source_domain_event_id: row.get(11)?,
+        created_at: row.get(12)?,
+    };
+    if record.schema.kind() != record.aggregate_kind
+        || !record.state.allowed_for(record.aggregate_kind)
+        || (record.sensitivity == SensitivityClass::Restricted && record.export_allowed)
+        || record.payload.get("schema").and_then(Value::as_str) != Some(record.schema.as_str())
+        || record.payload_sha256.len() != 64
+        || sha256(
+            serde_json::to_string(&record.payload)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
+                .as_bytes(),
+        ) != record.payload_sha256
+    {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            "invalid stored improvement revision".into(),
+        ));
+    }
+    Ok(record)
+}
+
+fn map_improvement_event(row: &Row<'_>) -> rusqlite::Result<ImprovementEventRecord> {
+    Ok(ImprovementEventRecord {
+        id: harness_domain::ImprovementEventId::from(row.get::<_, String>(0)?),
+        aggregate_kind: parse_improvement_enum(row.get(1)?)?,
+        aggregate_id: row.get(2)?,
+        revision_id: row.get(3)?,
+        sequence: positive_database_u64(row.get::<_, i64>(4)?, "improvement event sequence")?,
+        event_type: row.get(5)?,
+        payload_sha256: row.get(6)?,
+        idempotency_key: row.get(7)?,
+        source_raw_event_id: row.get(8)?,
+        occurred_at: row.get(9)?,
+    })
+}
+
+fn positive_database_u64(value: i64, field: &str) -> rusqlite::Result<u64> {
+    u64::try_from(value)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Integer,
+                format!("invalid {field}").into(),
+            )
+        })
+}
+
+fn read_improvement_revision(
+    transaction: &rusqlite::Transaction<'_>,
+    id: &str,
+) -> Result<ImprovementRevisionRecord, StoreError> {
+    transaction.query_row("SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_revisions WHERE id=?1", [id], map_improvement_revision).map_err(Into::into)
+}
+
+fn read_improvement_event(
+    transaction: &rusqlite::Transaction<'_>,
+    id: &str,
+) -> Result<ImprovementEventRecord, StoreError> {
+    transaction.query_row("SELECT id,aggregate_kind,aggregate_id,revision_id,sequence,event_type,payload_sha256,idempotency_key,source_raw_event_id,occurred_at FROM improvement_events WHERE id=?1", [id], map_improvement_event).map_err(Into::into)
+}
+
+pub(crate) fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
@@ -2729,5 +3075,33 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn improvement_transitions_are_kind_aware() {
+        use harness_domain::{ImprovementRecordKind as K, ImprovementState as S};
+        for kind in [K::Taskset, K::EvalCase, K::GraderBundle, K::PolicyBundle] {
+            assert!(improvement_transition_allowed(kind, S::Proposed, S::Active));
+        }
+        assert!(improvement_transition_allowed(
+            K::Experiment,
+            S::Validated,
+            S::Running
+        ));
+        assert!(improvement_transition_allowed(
+            K::Rollback,
+            S::Requested,
+            S::Completed
+        ));
+        assert!(!improvement_transition_allowed(
+            K::Candidate,
+            S::Validated,
+            S::Running
+        ));
+        assert!(!improvement_transition_allowed(
+            K::Experiment,
+            S::Requested,
+            S::Completed
+        ));
     }
 }

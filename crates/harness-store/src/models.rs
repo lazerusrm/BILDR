@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use harness_domain::{
     AgentRole, AgentSessionId, ApprovalId, ArtifactId, AttemptId, CommandRunId, EvidenceId,
-    ProofTier, RepositoryId, ResultClass, RiskLevel, RunId, SandboxMode, TaskId, TaskPacket,
-    ValidationId, WorktreeId,
+    ImprovementEventId, ImprovementRecordKind, ImprovementSchema, ImprovementState, ProofTier,
+    RepositoryId, ResultClass, RetentionClass, RiskLevel, RunId, SandboxMode, SensitivityClass,
+    TaskId, TaskPacket, ValidationId, WorktreeId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -281,4 +282,53 @@ pub struct StoredSession {
     pub expires_at: i64,
     pub csrf_secret_hash: String,
     pub revoked: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewImprovementRevision {
+    pub id: String,
+    pub aggregate_kind: ImprovementRecordKind,
+    pub aggregate_id: String,
+    pub schema: ImprovementSchema,
+    pub state: ImprovementState,
+    pub payload: Value,
+    pub payload_sha256: String,
+    pub sensitivity: SensitivityClass,
+    pub retention_class: RetentionClass,
+    pub export_allowed: bool,
+    pub idempotency_key: String,
+    pub event_id: ImprovementEventId,
+    pub source_raw_event_id: Option<i64>,
+    pub source_domain_event_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ImprovementRevisionRecord {
+    pub id: String,
+    pub aggregate_kind: ImprovementRecordKind,
+    pub aggregate_id: String,
+    pub revision: u64,
+    pub schema: ImprovementSchema,
+    pub state: ImprovementState,
+    pub payload: Value,
+    pub payload_sha256: String,
+    pub sensitivity: SensitivityClass,
+    pub retention_class: RetentionClass,
+    pub export_allowed: bool,
+    pub source_domain_event_id: Option<i64>,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ImprovementEventRecord {
+    pub id: ImprovementEventId,
+    pub aggregate_kind: ImprovementRecordKind,
+    pub aggregate_id: String,
+    pub revision_id: String,
+    pub sequence: u64,
+    pub event_type: String,
+    pub payload_sha256: String,
+    pub idempotency_key: String,
+    pub source_raw_event_id: Option<i64>,
+    pub occurred_at: i64,
 }

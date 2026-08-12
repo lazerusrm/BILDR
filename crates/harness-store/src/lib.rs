@@ -28,6 +28,8 @@ const ATTEMPT_CONTINUITY_MIGRATION: &str =
     include_str!("../../../migrations/0004_attempt_continuity.sql");
 const ACCOUNT_ATTRIBUTION_MIGRATION: &str =
     include_str!("../../../migrations/0005_account_attribution.sql");
+const SELF_IMPROVEMENT_MIGRATION: &str =
+    include_str!("../../../migrations/0006_self_improvement.sql");
 
 #[derive(Clone)]
 pub struct Store {
@@ -235,8 +237,18 @@ fn apply_runtime_migrations(connection: &mut Connection) -> Result<(), StoreErro
         transaction.execute_batch(ACCOUNT_ATTRIBUTION_MIGRATION)?;
         transaction.commit()?;
     }
+    let has_improvement_revisions: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='improvement_revisions')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_improvement_revisions {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(SELF_IMPROVEMENT_MIGRATION)?;
+        transaction.commit()?;
+    }
     connection.execute(
-        "INSERT INTO schema_migrations_meta(key, value) VALUES('runtime_schema_version', '5') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        "INSERT INTO schema_migrations_meta(key, value) VALUES('runtime_schema_version', '6') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         [],
     )?;
     Ok(())
@@ -277,7 +289,7 @@ mod tests {
         assert!(store.check().unwrap().ready);
         drop(store);
         let reopened = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(reopened.migration_version().unwrap(), "5");
+        assert_eq!(reopened.migration_version().unwrap(), "6");
         let has_worktree_fingerprint: bool = reopened
             .connection()
             .unwrap()
@@ -319,6 +331,228 @@ mod tests {
         store.backup(&backup).unwrap();
         let restored = Store::open(&backup, &temp.path().join("b")).unwrap();
         assert!(restored.check().unwrap().ready);
+    }
+
+    fn improvement_input(id: &str, key: &str) -> NewImprovementRevision {
+        use harness_domain::{
+            ImprovementEventId, ImprovementRecordKind, ImprovementSchema, ImprovementState,
+            RetentionClass, SensitivityClass,
+        };
+        let payload = serde_json::json!({"schema": "harness.improvement-candidate.v1"});
+        let payload_sha256 = crate::queries::sha256(payload.to_string().as_bytes());
+        NewImprovementRevision {
+            id: id.to_owned(),
+            aggregate_kind: ImprovementRecordKind::Candidate,
+            aggregate_id: "candidate-1".to_owned(),
+            schema: ImprovementSchema::ImprovementCandidateV1,
+            state: ImprovementState::Proposed,
+            payload,
+            payload_sha256,
+            sensitivity: SensitivityClass::Internal,
+            retention_class: RetentionClass::Governance,
+            export_allowed: false,
+            idempotency_key: key.to_owned(),
+            event_id: ImprovementEventId::new(),
+            source_raw_event_id: None,
+            source_domain_event_id: None,
+        }
+    }
+
+    #[test]
+    fn improvement_append_is_idempotent_immutable_and_backupable() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Store::open(&temp.path().join("source.sqlite3"), &temp.path().join("a")).unwrap();
+        let input = improvement_input("candidate-revision-1", "candidate-key-1");
+        let (revision, event) = store.append_improvement_revision(&input).unwrap();
+        let (replay, replay_event) = store.append_improvement_revision(&input).unwrap();
+        assert_eq!(revision.id, replay.id);
+        assert_eq!(event.id, replay_event.id);
+        let mut state_only = input.clone();
+        state_only.id = "candidate-revision-2".to_owned();
+        state_only.idempotency_key = "candidate-key-2".to_owned();
+        state_only.event_id = harness_domain::ImprovementEventId::new();
+        state_only.state = harness_domain::ImprovementState::Validated;
+        let (second, _) = store.append_improvement_revision(&state_only).unwrap();
+        assert_eq!(second.revision, 2);
+        assert_eq!(second.payload_sha256, revision.payload_sha256);
+        assert_eq!(
+            store
+                .list_improvement_events(revision.aggregate_kind, &revision.aggregate_id)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            store
+                .connection()
+                .unwrap()
+                .execute("DELETE FROM improvement_revisions", [])
+                .is_err()
+        );
+        let backup = temp.path().join("backup.sqlite3");
+        store.backup(&backup).unwrap();
+        let restored = Store::open(&backup, &temp.path().join("b")).unwrap();
+        assert_eq!(
+            restored
+                .improvement_current_revision(revision.aggregate_kind, &revision.aggregate_id)
+                .unwrap()
+                .unwrap()
+                .payload_sha256,
+            revision.payload_sha256
+        );
+    }
+
+    #[test]
+    fn improvement_rejects_unknown_state_and_restricted_export() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::in_memory(&temp.path().join("a")).unwrap();
+        let mut input = improvement_input("candidate-revision-1", "candidate-key-1");
+        input.sensitivity = harness_domain::SensitivityClass::Restricted;
+        input.export_allowed = true;
+        assert!(store.append_improvement_revision(&input).is_err());
+        store.connection().unwrap().execute("INSERT INTO improvement_revisions(id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,created_at) VALUES('bad','candidate','bad',1,'harness.improvement-candidate.v1','unknown','{}','0000000000000000000000000000000000000000000000000000000000000000','internal','governance',0,1)", []).unwrap();
+        assert!(
+            store
+                .improvement_current_revision(
+                    harness_domain::ImprovementRecordKind::Candidate,
+                    "bad"
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v5_upgrade_creates_improvement_schema_and_accepts_records() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("v5.sqlite3");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.execute_batch(INITIAL_MIGRATION).unwrap();
+        connection.execute_batch(RUNTIME_MIGRATION).unwrap();
+        connection
+            .execute_batch(APPROVAL_WORKTREE_BINDING_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(ATTEMPT_CONTINUITY_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(ACCOUNT_ATTRIBUTION_MIGRATION)
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE schema_migrations_meta SET value='5' WHERE key='runtime_schema_version'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let store = Store::open(&database, &temp.path().join("artifacts")).unwrap();
+        assert_eq!(store.migration_version().unwrap(), "6");
+        for name in [
+            "improvement_revisions",
+            "improvement_events",
+            "improvement_current_revisions",
+            "improvement_revisions_no_update",
+        ] {
+            let exists: bool = store
+                .connection()
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "missing upgraded object {name}");
+        }
+        let input = improvement_input("v5-upgrade", "v5-upgrade-key");
+        let (revision, _) = store.append_improvement_revision(&input).unwrap();
+        assert_eq!(
+            store
+                .improvement_current_revision(revision.aggregate_kind, &revision.aggregate_id)
+                .unwrap()
+                .unwrap()
+                .id,
+            revision.id
+        );
+    }
+
+    #[test]
+    fn corrupt_improvement_rows_and_replay_provenance_fail_closed() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::in_memory(&temp.path().join("a")).unwrap();
+        let bad_rows = [
+            (
+                "kind",
+                "trace",
+                "harness.improvement-candidate.v1",
+                "captured",
+                r#"{"schema":"harness.improvement-candidate.v1"}"#,
+                "internal",
+                0,
+            ),
+            (
+                "state",
+                "candidate",
+                "harness.improvement-candidate.v1",
+                "active",
+                r#"{"schema":"harness.improvement-candidate.v1"}"#,
+                "internal",
+                0,
+            ),
+            (
+                "disc",
+                "candidate",
+                "harness.improvement-candidate.v1",
+                "proposed",
+                r#"{"schema":"harness.trace.v1"}"#,
+                "internal",
+                0,
+            ),
+            (
+                "digest",
+                "candidate",
+                "harness.improvement-candidate.v1",
+                "proposed",
+                r#"{"schema":"harness.improvement-candidate.v1"}"#,
+                "internal",
+                0,
+            ),
+            (
+                "restricted",
+                "candidate",
+                "harness.improvement-candidate.v1",
+                "proposed",
+                r#"{"schema":"harness.improvement-candidate.v1"}"#,
+                "restricted",
+                1,
+            ),
+        ];
+        for (id, kind, schema, state, payload, sensitivity, export) in bad_rows {
+            store.connection().unwrap().execute("INSERT INTO improvement_revisions(id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,created_at) VALUES(?1,?2,?1,1,?3,?4,?5,?6,?7,'governance',?8,1)", rusqlite::params![id,kind,schema,state,payload, "0".repeat(64),sensitivity,export]).unwrap();
+            assert!(
+                store
+                    .improvement_current_revision(
+                        harness_domain::ImprovementRecordKind::Candidate,
+                        id
+                    )
+                    .is_err()
+                    || kind != "candidate"
+            );
+        }
+        let input = improvement_input("replay", "replay-key");
+        store.append_improvement_revision(&input).unwrap();
+        let mut collision = input.clone();
+        collision.event_id = harness_domain::ImprovementEventId::new();
+        assert!(store.append_improvement_revision(&collision).is_err());
+        let mut widened = input.clone();
+        widened.id = "replay-second".to_owned();
+        widened.idempotency_key = "replay-second-key".to_owned();
+        widened.event_id = harness_domain::ImprovementEventId::new();
+        widened.export_allowed = true;
+        assert!(store.append_improvement_revision(&widened).is_err());
+        for bad in [-1_i64, 0] {
+            store.connection().unwrap().execute("INSERT INTO improvement_revisions(id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,created_at) VALUES(?1,'candidate',?1,?2,'harness.improvement-candidate.v1','proposed','{\"schema\":\"harness.improvement-candidate.v1\"}',?3,'internal','governance',0,1)", rusqlite::params![format!("bad-revision-{bad}"), bad, crate::queries::sha256(b"{\"schema\":\"harness.improvement-candidate.v1\"}")]).unwrap_err();
+        }
     }
 
     #[test]
