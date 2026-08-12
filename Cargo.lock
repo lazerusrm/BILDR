@@ -1069,6 +1069,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-trace"
+version = "0.1.0"
+dependencies = [
+ "harness-domain",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "harness-usage"
 version = "0.1.0"
 dependencies = [
@@ -1102,6 +1114,7 @@ dependencies = [
  "harness-orchestrator",
  "harness-profile",
  "harness-store",
+ "harness-trace",
  "mime_guess",
  "rust-embed",
  "serde_json",

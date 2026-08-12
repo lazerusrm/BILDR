@@ -1,0 +1,18 @@
+{
+  "schema": "harness.trace.v2",
+  "trace_id": "trace_example_v2",
+  "run_id": "run_example",
+  "task_attempt_id": "attempt_example",
+  "source_event_range": {"first_id": 1, "last_id": 2},
+  "runtime_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "redaction_policy_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "sensitivity": "internal",
+  "nodes": [
+    {"id": "n_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "kind": "user_message", "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "source_receipts": [{"source": "raw_event", "raw_event_id": 1}], "redaction_class": "content_withheld", "timestamp_ms": 1, "metadata": {"receipt_count": 1}},
+    {"id": "n_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "kind": "runtime_restart", "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "source_receipts": [{"source": "structural", "receipt_id": "r_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}], "redaction_class": "none", "timestamp_ms": 2, "metadata": {}}
+  ],
+  "edges": [{"from": "n_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "to": "n_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "kind": "derived_from"}],
+  "branches": [{"id": "b_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "root_node_id": "n_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "leaf_node_id": "n_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "node_ids": ["n_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "n_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"], "metadata": {"path_bound": 256}}],
+  "diagnostics": [],
+  "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+}
