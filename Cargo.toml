@@ -12,6 +12,7 @@ members = [
     "crates/harness-evidence",
     "crates/harness-usage",
     "crates/harness-trace",
+    "crates/harness-learning",
     "crates/harness-api",
     "bins/harnessd",
     "bins/harnessctl",

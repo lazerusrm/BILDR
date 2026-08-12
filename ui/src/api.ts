@@ -5,6 +5,9 @@ import type {
   CodexAccountLoginStatus,
   CodexAccountsSnapshot,
   EvidenceSnapshot,
+  FailureOverview,
+  FailureTrace,
+  OutcomeVector,
   OperatorSettings,
   Repository,
   RepositoryDiscovery,
@@ -104,6 +107,16 @@ class HarnessApi {
   usageBreakdown = () => this.get<UsageBreakdown>("/usage");
   evidence = (runId: string) =>
     this.get<EvidenceSnapshot>(`/runs/${runId}/evidence`);
+  outcomes = (runId: string) =>
+    this.get<OutcomeVector>(`/improvement/outcomes?run_id=${encodeURIComponent(runId)}`);
+  improvementFailures = (repositoryId: string) =>
+    this.get<FailureOverview>(
+      `/improvement/failures?repository_id=${encodeURIComponent(repositoryId)}`,
+    );
+  improvementTrace = (traceId: string) =>
+    this.get<FailureTrace>(
+      `/improvement/traces/${encodeURIComponent(traceId)}`,
+    );
   worktreeDiff = (worktreeId: string) =>
     this.get<WorktreeDiffSummary>(`/worktrees/${worktreeId}/diff`);
 
@@ -229,6 +242,21 @@ class HarnessApi {
 
   archiveRun(runId: string) {
     return this.post<Run>(`/runs/${runId}/archive`);
+  }
+
+  recordOperatorOutcome(body: {
+    run_id: string;
+    subject: { kind: "run" | "task_attempt" | "publication"; id: string };
+    dimension: "operator_acceptance" | "operator_correction" | "review_regression" | "pr_reopened" | "rollback" | "downstream_regression";
+    classification: "positive" | "negative" | "neutral" | "unknown";
+    code: string;
+    reason_code?: string | null;
+    note?: string | null;
+    correction_artifact_id?: string | null;
+    supersedes?: string[];
+    idempotency_key: string;
+  }) {
+    return this.post("/improvement/outcomes", body);
   }
 }
 

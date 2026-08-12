@@ -24,6 +24,7 @@ use harness_codex::{
 use harness_orchestrator::Orchestrator;
 use harness_profile::{HarnessConfig, ResolvedPaths, load_profile};
 use harness_store::Store;
+use observation::ObservationService;
 use rust_embed::RustEmbed;
 use serde_json::json;
 use tokio::{
@@ -160,6 +161,7 @@ async fn serve(
     let runtime = runtime_manager
         .as_ref()
         .map(|runtime| Arc::clone(runtime) as Arc<dyn CodexRuntime>);
+    let observation_enabled = config.self_improvement_runtime_status().observation_enabled;
     let orchestrator = Arc::new(
         Orchestrator::new(config, paths, profile, store, runtime)
             .await
@@ -240,6 +242,17 @@ async fn serve(
             }
         }
     });
+    let observation_task = observation_enabled.then(|| {
+        let observer = ObservationService::new(orchestrator.store().clone());
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(15));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                observer.observe_once();
+            }
+        })
+    });
 
     let app = harness_api::router(Arc::clone(&orchestrator))
         .fallback(static_asset)
@@ -283,6 +296,9 @@ async fn serve(
     };
     info!("BILDR stopping");
     shutting_down.store(true, Ordering::Release);
+    if let Some(task) = observation_task {
+        task.abort();
+    }
     signal_task.abort();
     maintenance_task.abort();
     event_pump.abort();
@@ -492,3 +508,4 @@ async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
         }
     }
 }
+mod observation;

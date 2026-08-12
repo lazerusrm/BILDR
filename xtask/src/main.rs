@@ -1015,6 +1015,46 @@ mod tests {
     }
 
     #[test]
+    fn outcome_schema_enforces_closed_manual_label_pairs() {
+        let registry = jsonschema::Registry::new().prepare().unwrap();
+        let schema: Value =
+            serde_json::from_str(include_str!("../../schemas/harness.outcome.v1.schema.json"))
+                .unwrap();
+        let validator =
+            compile_schema(Path::new("outcome.schema.json"), &schema, &registry).unwrap();
+        let example: Value = serde_json::from_str(include_str!(
+            "../../examples/self-improvement/outcome.example.json"
+        ))
+        .unwrap();
+        assert!(validator.is_valid(&example));
+
+        let mut acceptance_wrong_pair = example.clone();
+        acceptance_wrong_pair["classification"] = json!("negative");
+        acceptance_wrong_pair["code"] = json!("accepted_after_correction");
+        assert!(!validator.is_valid(&acceptance_wrong_pair));
+
+        let mut review_wrong_code = example.clone();
+        review_wrong_code["dimension"] = json!("review_regression");
+        review_wrong_code["classification"] = json!("negative");
+        review_wrong_code["code"] = json!("arbitrary");
+        assert!(!validator.is_valid(&review_wrong_code));
+
+        let mut rollback_wrong_pair = example;
+        rollback_wrong_pair["dimension"] = json!("rollback");
+        rollback_wrong_pair["classification"] = json!("positive");
+        rollback_wrong_pair["code"] = json!("rollback_recorded");
+        assert!(!validator.is_valid(&rollback_wrong_pair));
+
+        let mut automated_wrong_pair = rollback_wrong_pair;
+        automated_wrong_pair["dimension"] = json!("ci_required_checks");
+        automated_wrong_pair["classification"] = json!("positive");
+        automated_wrong_pair["code"] = json!("failed");
+        automated_wrong_pair["confidence"] = json!("authoritative");
+        automated_wrong_pair["source"]["kind"] = json!("validation");
+        assert!(!validator.is_valid(&automated_wrong_pair));
+    }
+
+    #[test]
     fn example_validation_rejects_unknown_discriminators_and_extra_fields() {
         let schema_path = PathBuf::from("shape.schema.json");
         let schema = json!({

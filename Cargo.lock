@@ -982,6 +982,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-learning"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "jsonschema",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "harness-orchestrator"
 version = "0.1.0"
 dependencies = [
@@ -1054,6 +1066,7 @@ name = "harness-store"
 version = "0.1.0"
 dependencies = [
  "harness-domain",
+ "harness-learning",
  "harness-usage",
  "hex",
  "rusqlite",
@@ -1111,6 +1124,7 @@ dependencies = [
  "clap",
  "harness-api",
  "harness-codex",
+ "harness-domain",
  "harness-orchestrator",
  "harness-profile",
  "harness-store",
@@ -1118,6 +1132,7 @@ dependencies = [
  "mime_guess",
  "rust-embed",
  "serde_json",
+ "sha2",
  "tokio",
  "tower-http 0.7.0",
  "tracing",

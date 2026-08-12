@@ -48,6 +48,10 @@ enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    Improvement {
+        #[command(subcommand)]
+        command: ImprovementCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -195,6 +199,44 @@ enum AgentCommand {
     Show { agent_id: String },
     Steer { agent_id: String, message: String },
     Interrupt { agent_id: String },
+}
+
+#[derive(Subcommand)]
+enum ImprovementCommand {
+    Outcomes {
+        #[command(subcommand)]
+        command: OutcomeCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum OutcomeCommand {
+    List {
+        #[arg(long)]
+        run: String,
+    },
+    Record {
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long, value_parser = ["operator_acceptance", "operator_correction", "review_regression", "pr_reopened", "rollback", "downstream_regression"])]
+        dimension: String,
+        #[arg(long, value_parser = ["positive", "negative", "neutral", "unknown"])]
+        classification: String,
+        #[arg(long)]
+        code: String,
+        #[arg(long)]
+        reason_code: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long)]
+        correction_artifact: Option<String>,
+        #[arg(long = "supersedes")]
+        supersedes: Vec<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
 }
 
 struct ApiClient {
@@ -516,6 +558,47 @@ async fn execute(api: &ApiClient, command: Command) -> Result<Value> {
                 )
                 .await
             }
+        },
+        Command::Improvement { command } => match command {
+            ImprovementCommand::Outcomes { command } => match command {
+                OutcomeCommand::List { run } => api
+                    .get(&format!("/api/v1/improvement/outcomes?run_id={run}"))
+                    .await,
+                OutcomeCommand::Record {
+                    run,
+                    subject,
+                    dimension,
+                    classification,
+                    code,
+                    reason_code,
+                    note,
+                    correction_artifact,
+                    supersedes,
+                    idempotency_key,
+                } => {
+                    let (kind, id) = subject.split_once(':').context(
+                        "--subject must be run:ID, task_attempt:ID, or publication:ID",
+                    )?;
+                    if !matches!(kind, "run" | "task_attempt" | "publication") || id.is_empty() {
+                        bail!("--subject must be run:ID, task_attempt:ID, or publication:ID");
+                    }
+                    api.post(
+                        "/api/v1/improvement/outcomes",
+                        json!({
+                            "run_id": run,
+                            "subject": {"kind": kind, "id": id},
+                            "dimension": dimension,
+                            "classification": classification,
+                            "code": code,
+                            "reason_code": reason_code,
+                            "note": note,
+                            "correction_artifact_id": correction_artifact,
+                            "supersedes": supersedes,
+                            "idempotency_key": idempotency_key,
+                        }),
+                    ).await
+                }
+            },
         },
         Command::Worktree { command } => match command {
             WorktreeCommand::List { run } => {

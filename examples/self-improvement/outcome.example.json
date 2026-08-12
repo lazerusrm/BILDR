@@ -1,0 +1,17 @@
+{
+  "schema": "harness.outcome.v1",
+  "outcome_id": "outcome_example_acceptance",
+  "run_id": "run_example",
+  "subject": {"kind": "run", "id": "run_example"},
+  "dimension": "operator_acceptance",
+  "classification": "positive",
+  "code": "accepted_after_correction",
+  "observed_at": 1735689600000,
+  "confidence": "operator_asserted",
+  "source": {"kind": "human_action", "record_id": "42", "record_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "source_sha": null, "source_domain_event_id": null},
+  "supersedes": [],
+  "reason_code": "verification_gap_corrected",
+  "correction_artifact_id": "artifact_correction_example",
+  "redactor_version": "outcome-v1",
+  "free_text_redacted": false
+}

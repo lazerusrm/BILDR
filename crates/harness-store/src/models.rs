@@ -332,3 +332,162 @@ pub struct ImprovementEventRecord {
     pub source_raw_event_id: Option<i64>,
     pub occurred_at: i64,
 }
+
+#[derive(Clone, Debug)]
+pub struct TraceProjectionSnapshot {
+    pub run_id: RunId,
+    pub base_sha: String,
+    pub authority_digest: String,
+    pub profile_digest: String,
+    pub raw_events: Vec<TraceProjectionRawReceipt>,
+    pub domain_events: Vec<TraceProjectionDomainReceipt>,
+    pub structural_receipts: Vec<TraceProjectionStructuralReceipt>,
+    pub relations: Vec<TraceProjectionRelation>,
+    pub max_raw_event_id: i64,
+    pub max_domain_event_id: i64,
+    pub structural_digest: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct TraceProjectionRawReceipt {
+    pub agent_session_id: Option<String>,
+    pub id: i64,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub direction: String,
+    pub method: String,
+    pub request_id: Option<String>,
+    pub received_at: i64,
+    pub payload: Value,
+    pub payload_sha256: String,
+    pub source_sequence: Option<String>,
+    pub redaction_class: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct TraceProjectionDomainReceipt {
+    pub source_raw_event_id: Option<i64>,
+    pub id: i64,
+    pub event_type: String,
+    pub occurred_at: i64,
+    pub payload: Value,
+    pub payload_sha256: String,
+    pub redaction_class: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TraceProjectionStructuralReceipt {
+    pub id: String,
+    pub kind: String,
+    pub occurred_at: Option<i64>,
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct TraceProjectionRelation {
+    pub from: String,
+    pub to: String,
+    pub kind: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewOperatorOutcome {
+    pub run_id: RunId,
+    pub subject: harness_domain::OutcomeSubject,
+    pub dimension: harness_domain::OutcomeDimension,
+    pub classification: harness_domain::OutcomeClassification,
+    pub code: String,
+    pub reason_code: Option<String>,
+    pub note: Option<String>,
+    pub correction_artifact_id: Option<ArtifactId>,
+    pub supersedes: Vec<String>,
+    pub actor: String,
+    pub idempotency_key: String,
+}
+
+// SI-007 failure observation Store contracts. These are read-model records and
+// closed edit inputs; they deliberately carry no free-text rationale/payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailureProjectionReceipt {
+    pub inserted: u64,
+    pub already_projected: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailureOccurrenceRecord {
+    pub id: String,
+    pub repository_id: RepositoryId,
+    pub source_kind: String,
+    pub source_id: String,
+    pub terminal_code: Option<String>,
+    pub automatic_class: String,
+    pub severity: String,
+    pub fingerprint_sha256: String,
+    pub cost_scope_id: Option<String>,
+    pub cost_lower_microusd: Option<u64>,
+    pub cost_upper_microusd: Option<u64>,
+    pub source_domain_event_id: Option<i64>,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailureClusterOverview {
+    pub cluster_id: String,
+    pub repository_id: RepositoryId,
+    pub version: u64,
+    pub occurrences: u64,
+    pub unknown_cost_occurrences: u64,
+    pub cost_lower_microusd: u64,
+    pub cost_upper_microusd: u64,
+    pub representative_occurrence_id: Option<String>,
+    pub representative_run_id: Option<RunId>,
+    pub representative_trace_id: Option<String>,
+    pub effective_class: Option<String>,
+    pub severity: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailureTraceSummary {
+    pub occurrence_id: String,
+    pub source_kind: String,
+    /// Digest of the durable source identity; never exposes raw IDs or text.
+    pub source_receipt_sha256: String,
+    pub source_domain_event_id: Option<i64>,
+    pub automatic_class: String,
+    pub severity: String,
+}
+
+/// Store-neutral read composition: an already-redacted persisted TraceV2
+/// revision plus the closed outcome vector for its run.
+#[derive(Clone, Debug)]
+pub struct FailureTraceComposition {
+    pub trace_id: String,
+    pub run_id: RunId,
+    pub trace_manifest: Value,
+    pub outcomes: harness_domain::OutcomeVector,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailureSplitMove {
+    pub occurrence_id: String,
+    pub target_cluster_id: String,
+    pub expected_target_version: u64,
+}
+
+/// A closed observation assembled only from a durable Store authority.
+/// This is deliberately separate from `NewOperatorOutcome`: no actor, note,
+/// or caller-provided provenance may cross this boundary.
+#[derive(Clone, Debug)]
+pub struct AuthoritativeOutcomeInput {
+    pub run_id: RunId,
+    pub subject: harness_domain::OutcomeSubject,
+    pub dimension: harness_domain::OutcomeDimension,
+    pub classification: harness_domain::OutcomeClassification,
+    pub code: String,
+    pub source_kind: harness_domain::OutcomeSourceKind,
+    pub source_record_id: String,
+    pub source_record_sha256: String,
+    pub source_sha: Option<String>,
+    pub source_domain_event_id: Option<i64>,
+    pub observed_at: i64,
+}

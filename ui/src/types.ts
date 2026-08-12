@@ -68,6 +68,123 @@ export interface RuntimeStatus {
   };
 }
 
+export type OutcomeDimension =
+  | "operator_acceptance"
+  | "operator_correction"
+  | "validation"
+  | "evidence"
+  | "verifier_findings"
+  | "completion_state"
+  | "resource_use"
+  | "ci_required_checks"
+  | "review_regression"
+  | "pr_reopened"
+  | "rollback"
+  | "downstream_regression";
+
+export interface OutcomeVector {
+  run_id: string;
+  items: OutcomeVectorItem[];
+}
+
+export interface OutcomeVectorItem {
+  outcome_id: string;
+  subject: { kind: "run" | "task_attempt" | "publication"; id: string };
+  dimension: OutcomeDimension;
+  revisions: OutcomeRevision[];
+  conflicted: boolean;
+}
+
+export interface FailureOverview {
+  taxonomy_version: "harness.failure-taxonomy.v1";
+  classified_occurrences: number;
+  unknown_occurrences: number;
+  clusters: FailureClusterSummary[];
+}
+
+export type FailureClass =
+  | "unknown"
+  | "policy_blocked"
+  | "budget_exhausted"
+  | "infrastructure_unavailable"
+  | "protocol_error"
+  | "integration_conflict"
+  | "source_failure"
+  | "inconclusive"
+  | "cancelled_superseded";
+
+export type FailureSeverity = "unknown" | "low" | "medium" | "high" | "critical";
+
+export interface FailureClusterSummary {
+  id: string;
+  failure_class: FailureClass;
+  frequency: number;
+  severity: FailureSeverity;
+  cost_upper_microusd: number | null;
+  unknown_cost_occurrences: number;
+  representative_occurrence_id: string | null;
+  representative_run_id: string | null;
+  representative_trace_id: string | null;
+}
+
+export type FailureTraceKind =
+  | "system_message"
+  | "developer_message"
+  | "user_message"
+  | "model_message"
+  | "reasoning_summary"
+  | "tool_request"
+  | "tool_result"
+  | "command"
+  | "file_read"
+  | "file_change"
+  | "approval_request"
+  | "approval_decision"
+  | "compaction"
+  | "subagent_spawn"
+  | "subagent_join"
+  | "validation"
+  | "finding"
+  | "operator_feedback"
+  | "outcome"
+  | "unknown_protocol"
+  | "run_lifecycle"
+  | "attempt_boundary"
+  | "runtime_restart";
+
+export type FailureTraceRedaction =
+  | "none"
+  | "secret_removed"
+  | "private_reasoning_removed"
+  | "customer_data_removed"
+  | "content_withheld";
+
+export interface FailureTraceRow {
+  id: string;
+  kind: FailureTraceKind;
+  timestamp_ms: number | null;
+  redaction_class: FailureTraceRedaction;
+  source_receipt_count: number;
+}
+
+export interface FailureTrace {
+  trace_id: string;
+  run_id: string;
+  rows: FailureTraceRow[];
+  outcomes: OutcomeVector;
+}
+
+export interface OutcomeRevision {
+  revision_id: string;
+  revision: number;
+  outcome: {
+    classification: "positive" | "negative" | "neutral" | "unknown";
+    code: string;
+    supersedes: string[];
+  };
+  is_head: boolean;
+}
+
 export interface Repository {
   id: string;
   profile_id: string;

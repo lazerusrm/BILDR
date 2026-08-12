@@ -1,15 +1,21 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
 use harness_domain::{
     ActivityItem, AgentSessionId, AgentSummary, ApprovalId, ApprovalSummary, ArtifactId, AttemptId,
     CostConfidence, CostEstimate, DomainEvent, ImprovementRecordKind, ImprovementSchema,
-    ImprovementState, LatestAgentMessage, ModelUsageSummary, PlanRevisionId, RepositoryId,
+    ImprovementState, LatestAgentMessage, ModelUsageSummary, OutcomeConfidence, OutcomeHistory,
+    OutcomeId, OutcomeRevisionReceipt, OutcomeRevisionView, OutcomeSource, OutcomeSourceKind,
+    OutcomeVector, OutcomeVectorItem, OutcomeWireV1, PlanRevisionId, RepositoryId,
     RepositorySummary, RetentionClass, RunId, RunPlan, RunState, RunSummary, SensitivityClass,
     TaskId, TaskState, TaskSummary, TokenUsage, UsageBreakdown, UsageGroup, UsageSummary,
-    WorktreeId, WorktreeSummary, format_timestamp, now_ms,
+    WorktreeId, WorktreeSummary, format_timestamp, now_ms, validate_operator_outcome_label,
+};
+use harness_learning::{
+    CostAttribution, EditReason, FailureClass, FailureOccurrence, FailureScope, FailureWireCost,
+    MembershipAction, Severity, TerminalCode,
 };
 use rusqlite::{OptionalExtension, Row, params};
 use serde::Serialize;
@@ -17,14 +23,1201 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ArtifactRecord, ImprovementEventRecord, ImprovementRevisionRecord,
-    NativeSubagentActivityRecord, NewAgentSession, NewApproval, NewArtifact, NewCommandRecord,
-    NewContextPacket, NewEvidenceRecord, NewImprovementRevision, NewRepository, NewRun,
-    NewTaskAttempt, NewValidationRecord, NewWorktree, PriorAttemptContext, RawEventInput,
-    RepositoryHealthInput, Store, StoreError, StoredSession,
+    ArtifactRecord, AuthoritativeOutcomeInput, FailureClusterOverview, FailureProjectionReceipt,
+    FailureSplitMove, FailureTraceComposition, FailureTraceSummary, ImprovementEventRecord,
+    ImprovementRevisionRecord, NativeSubagentActivityRecord, NewAgentSession, NewApproval,
+    NewArtifact, NewCommandRecord, NewContextPacket, NewEvidenceRecord, NewImprovementRevision,
+    NewOperatorOutcome, NewRepository, NewRun, NewTaskAttempt, NewValidationRecord, NewWorktree,
+    PriorAttemptContext, RawEventInput, RepositoryHealthInput, Store, StoreError, StoredSession,
+    TraceProjectionDomainReceipt, TraceProjectionRawReceipt, TraceProjectionSnapshot,
+    TraceProjectionStructuralReceipt,
 };
 
 impl Store {
+    // SI-007: project only Store-owned, typed terminal and outcome receipts.
+    // Neither failure reasons nor outcome notes are read or persisted here.
+    pub fn project_failures_for_run(
+        &self,
+        run_id: &RunId,
+    ) -> Result<FailureProjectionReceipt, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let repository_id: String = transaction.query_row(
+            "SELECT repository_id FROM runs WHERE id=?1",
+            [run_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let now = now_ms();
+        let mut inserted = 0;
+        let mut already_projected = 0;
+        let mut project = |source_kind: FailureScope,
+                           source_id: String,
+                           terminal: Option<TerminalCode>,
+                           severity: Severity,
+                           source_domain_event_id: Option<i64>|
+         -> Result<(), StoreError> {
+            validate_failure_identifier(&source_id)?;
+            let automatic = terminal.map_or(FailureClass::Unknown, TerminalCode::class);
+            // Cost accounting can finish after a terminal receipt arrives.
+            // Keep the immutable occurrence independent of that live ledger;
+            // the overview derives the latest priced run estimate read-only.
+            let occurrence_cost = CostAttribution::unknown();
+            let wire_cost = FailureWireCost::try_from(&occurrence_cost)
+                .map_err(|error| StoreError::Validation(error.to_string()))?;
+            let fingerprint =
+                FailureOccurrence::fingerprint_for(&repository_id, source_kind, automatic);
+            let (scope_id, lower, upper) = failure_cost_columns(wire_cost)?;
+            let id = format!(
+                "failure-{}",
+                sha256(format!("{}\0{}", failure_scope_text(source_kind), source_id).as_bytes())
+            );
+            let changed = transaction.execute(
+                "INSERT OR IGNORE INTO failure_occurrences(id,repository_id,source_kind,source_id,terminal_code,automatic_class,severity,taxonomy_version,fingerprint_sha256,cost_scope_id,cost_lower_microusd,cost_upper_microusd,source_domain_event_id,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,'harness.failure-taxonomy.v1',?8,?9,?10,?11,?12,?13)",
+                params![id, repository_id, failure_scope_text(source_kind), source_id, terminal.map(terminal_code_text), failure_class_text(automatic), severity_text(severity), fingerprint, scope_id, lower, upper, source_domain_event_id, now],
+            )?;
+            if changed == 1 {
+                let cluster_id = format!("failure-cluster-{fingerprint}");
+                transaction.execute(
+                    "INSERT OR IGNORE INTO failure_clusters(id,repository_id,version,created_at) VALUES(?1,?2,0,?3)",
+                    params![cluster_id, repository_id, now],
+                )?;
+                append_failure_membership_tx(
+                    &transaction,
+                    &id,
+                    &cluster_id,
+                    MembershipAction::Assigned,
+                    "system",
+                    EditReason::SourceCorrection,
+                )?;
+                bump_failure_cluster(&transaction, &cluster_id)?;
+                inserted += 1;
+            } else {
+                let matches: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM failure_occurrences WHERE source_kind=?1 AND source_id=?2 AND repository_id=?3 AND terminal_code IS ?4 AND automatic_class=?5 AND severity=?6 AND fingerprint_sha256=?7 AND cost_scope_id IS ?8 AND cost_lower_microusd IS ?9 AND cost_upper_microusd IS ?10 AND source_domain_event_id IS ?11)",
+                    params![failure_scope_text(source_kind),source_id,repository_id,terminal.map(terminal_code_text),failure_class_text(automatic),severity_text(severity),fingerprint,scope_id,lower,upper,source_domain_event_id], |r| r.get(0),
+                )?;
+                if !matches {
+                    return Err(StoreError::Conflict(
+                        "failure projection source collision has different immutable semantics"
+                            .to_owned(),
+                    ));
+                }
+                already_projected += 1;
+            }
+            Ok(())
+        };
+        let run_terminal: Option<String> = transaction.query_row(
+            "SELECT failure_class FROM runs WHERE id=?1",
+            [run_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if let Some(code) = run_terminal {
+            let terminal_events = terminal_run_failure_events(&transaction, run_id, &code)?;
+            for event_id in terminal_events {
+                project(
+                    FailureScope::RunTerminal,
+                    format!("domain-event-{event_id}"),
+                    TerminalCode::parse(&code),
+                    Severity::Unknown,
+                    Some(event_id),
+                )?;
+            }
+        }
+        let mut attempts = transaction.prepare("SELECT a.id,a.terminal_class FROM task_attempts a JOIN tasks t ON t.id=a.task_id WHERE t.run_id=?1 AND a.terminal_class IS NOT NULL ORDER BY a.id")?;
+        let attempt_rows = attempts
+            .query_map([run_id.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(attempts);
+        for (id, code) in attempt_rows {
+            project(
+                FailureScope::AttemptTerminal,
+                id.clone(),
+                TerminalCode::parse(&code),
+                Severity::Unknown,
+                None,
+            )?;
+        }
+        let mut outcomes = transaction.prepare("SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_revisions WHERE aggregate_kind='outcome' ORDER BY aggregate_id,revision")?;
+        let outcome_rows = outcomes
+            .query_map([], map_improvement_revision)?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(outcomes);
+        for revision in outcome_rows {
+            let outcome: OutcomeWireV1 = serde_json::from_value(revision.payload)?;
+            outcome
+                .validate()
+                .map_err(|error| StoreError::Validation(error.to_string()))?;
+            if outcome.run_id == *run_id
+                && matches!(
+                    outcome.classification,
+                    harness_domain::OutcomeClassification::Negative
+                        | harness_domain::OutcomeClassification::Unknown
+                )
+            {
+                project(
+                    FailureScope::TypedOutcome,
+                    revision.id,
+                    TerminalCode::parse(&outcome.code),
+                    Severity::Unknown,
+                    revision.source_domain_event_id,
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(FailureProjectionReceipt {
+            inserted,
+            already_projected,
+        })
+    }
+
+    pub fn create_failure_cluster(
+        &self,
+        repository_id: &RepositoryId,
+        cluster_id: &str,
+    ) -> Result<(), StoreError> {
+        validate_failure_identifier(cluster_id)?;
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO failure_clusters(id,repository_id,version,created_at) VALUES(?1,?2,0,?3)",
+            params![cluster_id, repository_id.as_str(), now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn reclassify_failure(
+        &self,
+        occurrence_id: &str,
+        expected_revision: u64,
+        class: FailureClass,
+        actor: &str,
+        reason: EditReason,
+    ) -> Result<(), StoreError> {
+        validate_failure_actor(actor)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let actual: i64 = transaction.query_row(
+            "SELECT count(*) FROM failure_classification_revisions WHERE occurrence_id=?1",
+            [occurrence_id],
+            |r| r.get(0),
+        )?;
+        if u64::try_from(actual).ok() != Some(expected_revision) {
+            return Err(StoreError::Conflict(format!(
+                "stale failure occurrence {occurrence_id}"
+            )));
+        }
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM failure_occurrences WHERE id=?1)",
+            [occurrence_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::NotFound(format!(
+                "failure occurrence {occurrence_id}"
+            )));
+        }
+        transaction.execute("INSERT INTO failure_classification_revisions(occurrence_id,revision,class,actor,reason_code,created_at) VALUES(?1,?2,?3,?4,?5,?6)", params![occurrence_id, actual + 1, failure_class_text(class), actor, edit_reason_text(reason), now_ms()])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn assign_failure_to_cluster(
+        &self,
+        occurrence_id: &str,
+        cluster_id: &str,
+        expected_cluster_version: u64,
+        actor: &str,
+        reason: EditReason,
+    ) -> Result<(), StoreError> {
+        self.append_failure_membership(
+            occurrence_id,
+            cluster_id,
+            expected_cluster_version,
+            MembershipAction::Assigned,
+            actor,
+            reason,
+        )
+    }
+
+    pub fn failure_cluster_overview(
+        &self,
+        repository_id: &RepositoryId,
+    ) -> Result<Vec<FailureClusterOverview>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare("SELECT c.id,c.repository_id,c.version,m.occurrence_id,o.cost_scope_id,o.cost_lower_microusd,o.cost_upper_microusd,o.automatic_class,o.severity,o.source_kind FROM failure_clusters c LEFT JOIN failure_cluster_membership_revisions m ON m.cluster_id=c.id AND m.revision=(SELECT max(m2.revision) FROM failure_cluster_membership_revisions m2 WHERE m2.occurrence_id=m.occurrence_id) LEFT JOIN failure_occurrences o ON o.id=m.occurrence_id WHERE c.repository_id=?1 ORDER BY c.id,m.occurrence_id")?;
+        let rows = statement
+            .query_map([repository_id.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut grouped = BTreeMap::<String, FailureClusterOverview>::new();
+        let mut scopes = BTreeMap::<String, BTreeMap<String, (u64, u64)>>::new();
+        for (
+            id,
+            repo,
+            version,
+            occurrence,
+            scope,
+            lower,
+            upper,
+            automatic,
+            severity,
+            source_kind,
+        ) in rows
+        {
+            let entry = grouped.entry(id.clone()).or_insert(FailureClusterOverview {
+                cluster_id: id,
+                repository_id: RepositoryId::from(repo),
+                version: u64::try_from(version).map_err(|_| {
+                    StoreError::Validation("negative failure cluster version".to_owned())
+                })?,
+                occurrences: 0,
+                unknown_cost_occurrences: 0,
+                cost_lower_microusd: 0,
+                cost_upper_microusd: 0,
+                representative_occurrence_id: occurrence.clone(),
+                representative_run_id: None,
+                representative_trace_id: None,
+                effective_class: automatic,
+                severity,
+            });
+            if occurrence.is_some() {
+                entry.occurrences += 1;
+                let effective_cost = match (scope, lower, upper) {
+                    (Some(scope), Some(lower), Some(upper)) => Some((scope, lower, upper)),
+                    _ if source_kind.as_deref() == Some("run_terminal") => {
+                        let run_id = match occurrence.as_deref() {
+                            Some(occurrence_id) => {
+                                failure_occurrence_run(&connection, occurrence_id)?
+                            }
+                            None => None,
+                        };
+                        match run_id {
+                            Some(run_id) => failure_run_cost_columns(&connection, &run_id)?,
+                            None => None,
+                        }
+                    }
+                    _ => None,
+                };
+                match effective_cost {
+                    Some((scope, lower, upper)) => {
+                        scopes.entry(scope).or_default().insert(
+                            entry.cluster_id.clone(),
+                            (lower.max(0) as u64, upper.max(0) as u64),
+                        );
+                    }
+                    None => entry.unknown_cost_occurrences += 1,
+                }
+            }
+        }
+        // A cost scope appearing in multiple cluster lineages is ambiguous;
+        // never award it to an arbitrary first cluster.
+        for affected in scopes.values() {
+            if affected.len() == 1 {
+                let (cluster_id, (lower, upper)) = affected.first_key_value().expect("one entry");
+                let cluster = grouped.get_mut(cluster_id).expect("known cluster");
+                cluster.cost_lower_microusd = cluster.cost_lower_microusd.saturating_add(*lower);
+                cluster.cost_upper_microusd = cluster.cost_upper_microusd.saturating_add(*upper);
+            } else {
+                for cluster_id in affected.keys() {
+                    if let Some(cluster) = grouped.get_mut(cluster_id) {
+                        cluster.unknown_cost_occurrences =
+                            cluster.unknown_cost_occurrences.saturating_add(1);
+                    }
+                }
+            }
+        }
+        for cluster in grouped.values_mut() {
+            if let Some(occurrence) = &cluster.representative_occurrence_id {
+                let mut statement = connection.prepare("SELECT DISTINCT coalesce((SELECT class FROM failure_classification_revisions r WHERE r.occurrence_id=o.id ORDER BY revision DESC LIMIT 1),o.automatic_class),o.severity FROM failure_occurrences o JOIN failure_cluster_membership_revisions m ON m.occurrence_id=o.id WHERE m.cluster_id=?1 AND m.revision=(SELECT max(m2.revision) FROM failure_cluster_membership_revisions m2 WHERE m2.occurrence_id=o.id) ORDER BY 1,2")?;
+                let values = statement
+                    .query_map([cluster.cluster_id.as_str()], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let classes = values
+                    .iter()
+                    .map(|(class, _)| class)
+                    .collect::<BTreeSet<_>>();
+                cluster.effective_class = (classes.len() == 1)
+                    .then(|| classes.iter().next().expect("one").to_string())
+                    .or_else(|| Some("unknown".to_owned()));
+                cluster.severity = values
+                    .iter()
+                    .map(|(_, severity)| severity.as_str())
+                    .max_by_key(|severity| severity_rank(severity))
+                    .map(str::to_owned);
+                cluster.representative_run_id = failure_occurrence_run(&connection, occurrence)?;
+                if let Some(run_id) = &cluster.representative_run_id {
+                    cluster.representative_trace_id = connection.query_row("SELECT aggregate_id FROM improvement_current_revisions WHERE aggregate_kind='trace' AND json_extract(payload_json,'$.run_id')=?1 ORDER BY created_at DESC LIMIT 1", [run_id.as_str()], |r| r.get(0)).optional()?;
+                }
+            }
+        }
+        let mut overview = grouped.into_values().collect::<Vec<_>>();
+        overview.sort_by(|a, b| {
+            b.cost_upper_microusd
+                .cmp(&a.cost_upper_microusd)
+                .then_with(|| b.occurrences.cmp(&a.occurrences))
+                .then_with(|| a.cluster_id.cmp(&b.cluster_id))
+        });
+        Ok(overview)
+    }
+
+    pub fn failure_trace_summary(
+        &self,
+        occurrence_id: &str,
+    ) -> Result<FailureTraceSummary, StoreError> {
+        let connection = self.connection()?;
+        connection.query_row("SELECT id,source_kind,source_id,source_domain_event_id,automatic_class,severity FROM failure_occurrences WHERE id=?1", [occurrence_id], |row| {
+            let source_kind: String = row.get(1)?;
+            let source_id: String = row.get(2)?;
+            let source_domain_event_id: Option<i64> = row.get(3)?;
+            let source_receipt_sha256 = sha256(
+                format!(
+                    "failure-source.v2\0{source_kind}\0{source_id}\0{}",
+                    source_domain_event_id.map_or_else(String::new, |id| id.to_string())
+                )
+                .as_bytes(),
+            );
+            Ok(FailureTraceSummary { occurrence_id: row.get(0)?, source_receipt_sha256, source_kind, source_domain_event_id, automatic_class: row.get(4)?, severity: row.get(5)? })
+        }).map_err(Into::into)
+    }
+
+    pub fn failure_trace_composition(
+        &self,
+        trace_id: &str,
+    ) -> Result<FailureTraceComposition, StoreError> {
+        validate_failure_identifier(trace_id)?;
+        let record = self
+            .improvement_current_revision(ImprovementRecordKind::Trace, trace_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("trace {trace_id}")))?;
+        if record.schema != ImprovementSchema::TraceV2 {
+            return Err(StoreError::Validation(
+                "stored trace schema is not TraceV2".to_owned(),
+            ));
+        }
+        let manifest = record.payload;
+        if manifest.get("schema").and_then(Value::as_str) != Some("harness.trace.v2") {
+            return Err(StoreError::Validation(
+                "stored trace is not TraceV2".to_owned(),
+            ));
+        }
+        let run_id = RunId::from(
+            manifest
+                .get("run_id")
+                .and_then(Value::as_str)
+                .filter(|v| safe_outcome_identifier(v, 128))
+                .ok_or_else(|| StoreError::Validation("invalid persisted trace run_id".to_owned()))?
+                .to_owned(),
+        );
+        let connection = self.connection()?;
+        Ok(FailureTraceComposition {
+            trace_id: trace_id.to_owned(),
+            outcomes: outcome_vector_conn(&connection, &run_id)?,
+            run_id,
+            trace_manifest: manifest,
+        })
+    }
+
+    pub fn merge_failure_clusters(
+        &self,
+        source_cluster_id: &str,
+        expected_source_version: u64,
+        target_cluster_id: &str,
+        expected_target_version: u64,
+        actor: &str,
+        reason: EditReason,
+    ) -> Result<(), StoreError> {
+        if source_cluster_id == target_cluster_id {
+            return Err(StoreError::Conflict(
+                "cannot merge a cluster into itself".to_owned(),
+            ));
+        }
+        validate_failure_actor(actor)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let source_repo = failure_cluster_repository(&transaction, source_cluster_id)?;
+        if source_repo != failure_cluster_repository(&transaction, target_cluster_id)? {
+            return Err(StoreError::Conflict(
+                "failure merge crosses repositories".to_owned(),
+            ));
+        }
+        require_failure_cluster_version(&transaction, source_cluster_id, expected_source_version)?;
+        require_failure_cluster_version(&transaction, target_cluster_id, expected_target_version)?;
+        for occurrence_id in current_failure_members(&transaction, source_cluster_id)? {
+            append_failure_membership_tx(
+                &transaction,
+                &occurrence_id,
+                target_cluster_id,
+                MembershipAction::Merged,
+                actor,
+                reason,
+            )?;
+        }
+        append_failure_cluster_edit(
+            &transaction,
+            source_cluster_id,
+            Some(target_cluster_id),
+            "merged",
+            actor,
+            reason,
+            &[target_cluster_id],
+        )?;
+        bump_failure_cluster(&transaction, source_cluster_id)?;
+        bump_failure_cluster(&transaction, target_cluster_id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn split_failure_cluster(
+        &self,
+        source_cluster_id: &str,
+        expected_source_version: u64,
+        moves: &[FailureSplitMove],
+        actor: &str,
+        reason: EditReason,
+    ) -> Result<(), StoreError> {
+        if moves.is_empty() {
+            return Err(StoreError::Validation(
+                "failure split needs at least one move".to_owned(),
+            ));
+        }
+        validate_failure_actor(actor)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        require_failure_cluster_version(&transaction, source_cluster_id, expected_source_version)?;
+        let repository = failure_cluster_repository(&transaction, source_cluster_id)?;
+        let members = current_failure_members(&transaction, source_cluster_id)?;
+        let mut seen = BTreeSet::new();
+        let mut targets = BTreeSet::new();
+        for movement in moves {
+            if movement.target_cluster_id == source_cluster_id
+                || !seen.insert(&movement.occurrence_id)
+                || !members.contains(&movement.occurrence_id)
+            {
+                return Err(StoreError::Conflict(
+                    "invalid failure split membership".to_owned(),
+                ));
+            }
+            if repository != failure_cluster_repository(&transaction, &movement.target_cluster_id)?
+            {
+                return Err(StoreError::Conflict(
+                    "failure split crosses repositories".to_owned(),
+                ));
+            }
+            require_failure_cluster_version(
+                &transaction,
+                &movement.target_cluster_id,
+                movement.expected_target_version,
+            )?;
+            targets.insert(movement.target_cluster_id.as_str());
+        }
+        for movement in moves {
+            append_failure_membership_tx(
+                &transaction,
+                &movement.occurrence_id,
+                &movement.target_cluster_id,
+                MembershipAction::Split,
+                actor,
+                reason,
+            )?;
+        }
+        let targets = targets.into_iter().collect::<Vec<_>>();
+        append_failure_cluster_edit(
+            &transaction,
+            source_cluster_id,
+            None,
+            "split",
+            actor,
+            reason,
+            &targets,
+        )?;
+        bump_failure_cluster(&transaction, source_cluster_id)?;
+        for target in targets {
+            bump_failure_cluster(&transaction, target)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn append_failure_membership(
+        &self,
+        occurrence_id: &str,
+        cluster_id: &str,
+        expected_cluster_version: u64,
+        action: MembershipAction,
+        actor: &str,
+        reason: EditReason,
+    ) -> Result<(), StoreError> {
+        validate_failure_actor(actor)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let occurrence_repository: String = transaction
+            .query_row(
+                "SELECT repository_id FROM failure_occurrences WHERE id=?1",
+                [occurrence_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("failure occurrence {occurrence_id}")))?;
+        if occurrence_repository != failure_cluster_repository(&transaction, cluster_id)? {
+            return Err(StoreError::Conflict(
+                "failure membership crosses repositories".to_owned(),
+            ));
+        }
+        require_failure_cluster_version(&transaction, cluster_id, expected_cluster_version)?;
+        let prior: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM failure_cluster_membership_revisions WHERE occurrence_id=?1)",
+            [occurrence_id],
+            |row| row.get(0),
+        )?;
+        if prior {
+            return Err(StoreError::Conflict(
+                "failure occurrence already has cluster lineage".to_owned(),
+            ));
+        }
+        append_failure_membership_tx(
+            &transaction,
+            occurrence_id,
+            cluster_id,
+            action,
+            actor,
+            reason,
+        )?;
+        bump_failure_cluster(&transaction, cluster_id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+    /// Project closed outcome labels from durable Store authorities only.
+    /// It intentionally has no API-shaped input and never creates a human action.
+    pub fn project_authoritative_outcomes(&self, run_id: &RunId) -> Result<(), StoreError> {
+        let connection = self.connection()?;
+        let mut inputs = Vec::new();
+        let mut validations = connection.prepare(
+            "SELECT id,task_attempt_id,validator_id,proof_tier,result_class,source_sha,command_run_id,started_at,completed_at FROM validations WHERE run_id=?1 AND state='completed' AND result_class IS NOT NULL AND invalidated_at IS NULL ORDER BY id",
+        )?;
+        for row in validations.query_map([run_id.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, i64>(8)?,
+            ))
+        })? {
+            let (
+                id,
+                task_attempt_id,
+                validator_id,
+                proof_tier,
+                result,
+                source_sha,
+                command_run_id,
+                started_at,
+                observed_at,
+            ) = row?;
+            let (classification, code) = authoritative_result_label(&result);
+            let (dimension, code) = if validator_id == "draft-pr-required-ci" {
+                (harness_domain::OutcomeDimension::CiRequiredChecks, code)
+            } else {
+                (harness_domain::OutcomeDimension::Validation, code)
+            };
+            let receipt = json!({
+                "id": id, "task_attempt_id": task_attempt_id, "validator_id": validator_id,
+                "proof_tier": proof_tier, "result_class": result, "source_sha": source_sha,
+                "command_run_id": command_run_id, "started_at": started_at, "completed_at": observed_at,
+            });
+            inputs.push(AuthoritativeOutcomeInput {
+                run_id: run_id.clone(),
+                subject: outcome_subject(run_id, task_attempt_id),
+                dimension,
+                classification,
+                code: code.to_owned(),
+                source_kind: harness_domain::OutcomeSourceKind::Validation,
+                source_record_sha256: sha256(serde_json::to_string(&receipt)?.as_bytes()),
+                source_record_id: id,
+                source_sha: Some(source_sha),
+                source_domain_event_id: None,
+                observed_at,
+            });
+        }
+        drop(validations);
+        let mut evidence = connection.prepare(
+            "SELECT id,task_attempt_id,result_class,evidence_sha256,source_sha,created_at FROM evidence_records WHERE run_id=?1 AND invalidated_at IS NULL ORDER BY id",
+        )?;
+        for row in evidence.query_map([run_id.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })? {
+            let (id, task_attempt_id, result, evidence_sha256, source_sha, observed_at) = row?;
+            let (classification, code) = authoritative_evidence_label(&result);
+            inputs.push(AuthoritativeOutcomeInput {
+                run_id: run_id.clone(),
+                subject: outcome_subject(run_id, task_attempt_id),
+                dimension: harness_domain::OutcomeDimension::Evidence,
+                classification,
+                code: code.to_owned(),
+                source_kind: harness_domain::OutcomeSourceKind::Evidence,
+                source_record_id: id,
+                source_record_sha256: evidence_sha256,
+                source_sha: Some(source_sha),
+                source_domain_event_id: None,
+                observed_at,
+            });
+        }
+        drop(evidence);
+        let mut findings = connection.prepare(
+            "SELECT id,task_attempt_id,severity,state,created_at FROM findings WHERE run_id=?1 AND verifier_agent_session_id IS NOT NULL ORDER BY id",
+        )?;
+        for row in findings.query_map([run_id.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })? {
+            let (id, task_attempt_id, severity, state, observed_at) = row?;
+            let code = if matches!(severity.as_str(), "high" | "critical") {
+                "blocking"
+            } else {
+                "nonblocking"
+            };
+            inputs.push(AuthoritativeOutcomeInput {
+                run_id: run_id.clone(),
+                subject: outcome_subject(run_id, task_attempt_id),
+                dimension: harness_domain::OutcomeDimension::VerifierFindings,
+                classification: harness_domain::OutcomeClassification::Negative,
+                code: code.to_owned(),
+                source_kind: harness_domain::OutcomeSourceKind::Finding,
+                source_record_sha256: sha256(
+                    format!("finding\0{id}\0{severity}\0{state}").as_bytes(),
+                ),
+                source_record_id: id,
+                source_sha: None,
+                source_domain_event_id: None,
+                observed_at,
+            });
+        }
+        drop(findings);
+        let (budget, sample_count, total_tokens): (Option<i64>, i64, i64) = connection.query_row(
+            "SELECT r.run_token_budget,count(ts.id),coalesce(sum(ts.total_tokens),0) FROM runs r LEFT JOIN agent_sessions a ON a.run_id=r.id LEFT JOIN codex_threads ct ON ct.agent_session_id=a.id LEFT JOIN token_samples ts ON ts.thread_id=ct.thread_id WHERE r.id=?1 GROUP BY r.id",
+            [run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let mut lifecycle = connection.prepare(
+            "SELECT id,occurred_at,payload_json FROM domain_events WHERE run_id=?1 AND event_type='run.lifecycle.transitioned' ORDER BY id",
+        )?;
+        for row in lifecycle.query_map([run_id.as_str()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (id, observed_at, payload_json) = row?;
+            let payload: Value = serde_json::from_str(&payload_json)?;
+            let Some(next) = payload.get("next_state").and_then(Value::as_str) else {
+                continue;
+            };
+            let code = match next {
+                "COMPLETED" => "completed",
+                "BLOCKED" => "blocked",
+                "CANCELED" => "stopped",
+                _ => continue,
+            };
+            inputs.push(AuthoritativeOutcomeInput {
+                run_id: run_id.clone(),
+                subject: harness_domain::OutcomeSubject {
+                    kind: harness_domain::OutcomeSubjectKind::Run,
+                    id: run_id.to_string(),
+                },
+                dimension: harness_domain::OutcomeDimension::CompletionState,
+                classification: harness_domain::OutcomeClassification::Neutral,
+                code: code.to_owned(),
+                source_kind: harness_domain::OutcomeSourceKind::DomainEvent,
+                source_record_id: id.to_string(),
+                source_record_sha256: sha256(payload_json.as_bytes()),
+                source_sha: None,
+                source_domain_event_id: Some(id),
+                observed_at,
+            });
+            let (classification, resource_code) = match budget.filter(|budget| *budget > 0) {
+                _ if sample_count == 0 => (
+                    harness_domain::OutcomeClassification::Unknown,
+                    "unavailable",
+                ),
+                Some(budget) if total_tokens > budget => (
+                    harness_domain::OutcomeClassification::Negative,
+                    "budget_exceeded",
+                ),
+                Some(_) => (
+                    harness_domain::OutcomeClassification::Neutral,
+                    "within_budget",
+                ),
+                None => (
+                    harness_domain::OutcomeClassification::Unknown,
+                    "unavailable",
+                ),
+            };
+            let ledger = json!({"budget": budget, "sample_count": sample_count, "total_tokens": total_tokens});
+            inputs.push(AuthoritativeOutcomeInput {
+                run_id: run_id.clone(),
+                subject: harness_domain::OutcomeSubject {
+                    kind: harness_domain::OutcomeSubjectKind::Run,
+                    id: run_id.to_string(),
+                },
+                dimension: harness_domain::OutcomeDimension::ResourceUse,
+                classification,
+                code: resource_code.to_owned(),
+                source_kind: harness_domain::OutcomeSourceKind::DomainEvent,
+                source_record_id: id.to_string(),
+                source_record_sha256: sha256(
+                    format!("{}\0{}", payload_json, serde_json::to_string(&ledger)?).as_bytes(),
+                ),
+                source_sha: None,
+                source_domain_event_id: Some(id),
+                observed_at,
+            });
+        }
+        drop(lifecycle);
+        let mut verified = connection.prepare(
+            "SELECT id,occurred_at,payload_json FROM domain_events WHERE run_id=?1 AND event_type='task.verified' ORDER BY id",
+        )?;
+        for row in verified.query_map([run_id.as_str()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (id, observed_at, payload_json) = row?;
+            inputs.push(AuthoritativeOutcomeInput {
+                run_id: run_id.clone(),
+                subject: harness_domain::OutcomeSubject {
+                    kind: harness_domain::OutcomeSubjectKind::Run,
+                    id: run_id.to_string(),
+                },
+                dimension: harness_domain::OutcomeDimension::VerifierFindings,
+                classification: harness_domain::OutcomeClassification::Positive,
+                code: "none".to_owned(),
+                source_kind: harness_domain::OutcomeSourceKind::DomainEvent,
+                source_record_id: id.to_string(),
+                source_record_sha256: sha256(payload_json.as_bytes()),
+                source_sha: None,
+                source_domain_event_id: Some(id),
+                observed_at,
+            });
+        }
+        drop(verified);
+        drop(connection);
+        for input in inputs {
+            self.record_authoritative_outcome(&input)?;
+        }
+        Ok(())
+    }
+
+    fn record_authoritative_outcome(
+        &self,
+        input: &AuthoritativeOutcomeInput,
+    ) -> Result<(), StoreError> {
+        harness_domain::validate_outcome_label(input.dimension, input.classification, &input.code)
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        let outcome_id = stable_authoritative_outcome_id(input)?;
+        let payload = OutcomeWireV1 {
+            schema: "harness.outcome.v1".to_owned(),
+            outcome_id: outcome_id.clone(),
+            run_id: input.run_id.clone(),
+            subject: input.subject.clone(),
+            dimension: input.dimension,
+            classification: input.classification,
+            code: input.code.clone(),
+            observed_at: input.observed_at,
+            confidence: OutcomeConfidence::Authoritative,
+            source: OutcomeSource {
+                kind: input.source_kind,
+                record_id: input.source_record_id.clone(),
+                record_sha256: input.source_record_sha256.clone(),
+                source_sha: input.source_sha.clone(),
+                source_domain_event_id: input.source_domain_event_id,
+            },
+            supersedes: Vec::new(),
+            reason_code: None,
+            correction_artifact_id: None,
+            redactor_version: "outcome-redactor.v1".to_owned(),
+            free_text_redacted: false,
+        };
+        payload.validate().map_err(|error| {
+            StoreError::Validation(format!("invalid authoritative outcome: {error}"))
+        })?;
+        let raw = serde_json::to_value(&payload)?;
+        let raw_sha256 = sha256(serde_json::to_string(&raw)?.as_bytes());
+        let classification = serde_json::to_string(&input.classification)?;
+        let identity = sha256(
+            format!(
+                "harness.outcome.authoritative.v1\0mapping-v1\0{}\0{}\0{}\0{}",
+                outcome_id, input.source_record_sha256, classification, input.code
+            )
+            .as_bytes(),
+        );
+        self.append_improvement_revision(&NewImprovementRevision {
+            id: format!("outcome-revision-{identity}"),
+            aggregate_kind: ImprovementRecordKind::Outcome,
+            aggregate_id: outcome_id.to_string(),
+            schema: ImprovementSchema::OutcomeV1,
+            state: ImprovementState::Observed,
+            payload: raw,
+            payload_sha256: raw_sha256,
+            sensitivity: SensitivityClass::Internal,
+            retention_class: RetentionClass::Governance,
+            export_allowed: false,
+            idempotency_key: format!("outcome:authoritative:{identity}"),
+            event_id: harness_domain::ImprovementEventId::from(format!("outcome-event-{identity}")),
+            source_raw_event_id: None,
+            source_domain_event_id: input.source_domain_event_id,
+        })?;
+        Ok(())
+    }
+
+    pub fn record_operator_outcome(
+        &self,
+        input: &NewOperatorOutcome,
+    ) -> Result<OutcomeRevisionReceipt, StoreError> {
+        validate_operator_outcome_input(input)?;
+        validate_operator_outcome_label(input.dimension, input.classification, &input.code)
+            .map_err(|e| StoreError::Validation(e.to_string()))?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE id=?1)",
+            [input.run_id.as_str()],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::NotFound(format!("run {}", input.run_id)));
+        }
+        let subject_ok: bool = match input.subject.kind { harness_domain::OutcomeSubjectKind::Run => input.subject.id == input.run_id.as_str(), harness_domain::OutcomeSubjectKind::TaskAttempt => transaction.query_row("SELECT EXISTS(SELECT 1 FROM task_attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=?1 AND t.run_id=?2)", params![input.subject.id,input.run_id.as_str()], |r| r.get(0))?, harness_domain::OutcomeSubjectKind::Publication => transaction.query_row("SELECT EXISTS(SELECT 1 FROM publications WHERE id=?1 AND run_id=?2)", params![input.subject.id,input.run_id.as_str()], |r| r.get(0))? };
+        if !subject_ok {
+            return Err(StoreError::Validation(
+                "outcome subject is not owned by run".to_owned(),
+            ));
+        }
+        if let Some(artifact) = &input.correction_artifact_id {
+            let ok: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM artifacts WHERE id=?1 AND run_id=?2)",
+                params![artifact.as_str(), input.run_id.as_str()],
+                |r| r.get(0),
+            )?;
+            if !ok {
+                return Err(StoreError::NotFound(format!("artifact {artifact}")));
+            }
+        }
+        let outcome_id = stable_outcome_id(input)?;
+        let action_payload = json!({"dimension":input.dimension,"classification":input.classification,"code":input.code,"reason_code":input.reason_code,"note_redacted":input.note.is_some()});
+        let action_json = serde_json::to_string(&action_payload)?;
+        let action_sha = sha256(action_json.as_bytes());
+        let now = now_ms();
+        let identity = sha256(
+            format!(
+                "harness.outcome.replay.v1\0{}\0{}\0{}",
+                input.idempotency_key, outcome_id, action_json
+            )
+            .as_bytes(),
+        );
+        let revision_id = format!("outcome-revision-{identity}");
+        let event_id = format!("outcome-event-{identity}");
+        let replay: Option<String> = transaction
+            .query_row(
+                "SELECT revision_id FROM improvement_events WHERE idempotency_key=?1",
+                [&input.idempotency_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(existing_revision_id) = replay {
+            let (stored_id, stored_raw): (String, String) = transaction.query_row(
+                "SELECT id,payload_json FROM improvement_revisions WHERE id=?1 AND aggregate_kind='outcome'",
+                [&existing_revision_id], |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let stored: OutcomeWireV1 = serde_json::from_str(&stored_raw)?;
+            let event_matches: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM improvement_events WHERE idempotency_key=?1 AND id=?2 AND revision_id=?3 AND aggregate_kind='outcome' AND aggregate_id=?4 AND event_type='revision_recorded')",
+                params![input.idempotency_key, event_id, revision_id, outcome_id.as_str()], |r| r.get(0),
+            )?;
+            let action_matches: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM human_actions WHERE id=?1 AND run_id=?2 AND actor=?3 AND action_type='operator_outcome' AND target_type='outcome' AND target_id=?4 AND payload_json=?5 AND payload_sha256=?6)",
+                params![stored.source.record_id,input.run_id.as_str(),input.actor,outcome_id.as_str(),action_json,action_sha], |r| r.get(0),
+            )?;
+            if stored_id != revision_id
+                || !event_matches
+                || !action_matches
+                || !outcome_matches_input(&stored, input, &outcome_id)
+            {
+                return Err(StoreError::Conflict(
+                    "operator outcome idempotency key was reused with different content".to_owned(),
+                ));
+            }
+            let vector = outcome_vector_tx(&transaction, &input.run_id)?;
+            let revision: i64 = transaction.query_row(
+                "SELECT revision FROM improvement_revisions WHERE id=?1",
+                [&existing_revision_id],
+                |r| r.get(0),
+            )?;
+            transaction.commit()?;
+            return Ok(OutcomeRevisionReceipt {
+                outcome_id,
+                revision_id: existing_revision_id,
+                revision: positive_database_u64(revision, "outcome revision")?,
+                vector,
+            });
+        }
+        validate_outcome_supersedes(&transaction, &outcome_id, &input.supersedes)?;
+        transaction.execute("INSERT INTO human_actions(run_id,actor,action_type,target_type,target_id,occurred_at,payload_json,payload_sha256) VALUES(?1,?2,'operator_outcome','outcome',?3,?4,?5,?6)", params![input.run_id.as_str(),input.actor,outcome_id.as_str(),now,action_json,action_sha])?;
+        let action_id = transaction.last_insert_rowid();
+        let payload = OutcomeWireV1 {
+            schema: "harness.outcome.v1".to_owned(),
+            outcome_id: outcome_id.clone(),
+            run_id: input.run_id.clone(),
+            subject: input.subject.clone(),
+            dimension: input.dimension,
+            classification: input.classification,
+            code: input.code.clone(),
+            observed_at: now,
+            confidence: OutcomeConfidence::OperatorAsserted,
+            source: OutcomeSource {
+                kind: OutcomeSourceKind::HumanAction,
+                record_id: action_id.to_string(),
+                record_sha256: action_sha,
+                source_sha: None,
+                source_domain_event_id: None,
+            },
+            supersedes: input.supersedes.clone(),
+            reason_code: input.reason_code.clone(),
+            correction_artifact_id: input.correction_artifact_id.clone(),
+            redactor_version: "outcome-redactor.v1".to_owned(),
+            free_text_redacted: input.note.is_some(),
+        };
+        payload.validate().map_err(|error| {
+            StoreError::Validation(format!("invalid operator outcome: {error}"))
+        })?;
+        // Persist the canonical JSON `Value` representation used by the
+        // generic immutable-revision validator (object key order is part of
+        // the Store digest convention).
+        let raw = serde_json::to_string(&serde_json::to_value(&payload)?)?;
+        let digest = sha256(raw.as_bytes());
+        let rev:i64=transaction.query_row("SELECT coalesce(max(revision),0)+1 FROM improvement_revisions WHERE aggregate_kind='outcome' AND aggregate_id=?1", [outcome_id.as_str()], |r| r.get(0))?;
+        transaction.execute("INSERT INTO improvement_revisions(id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,created_at) VALUES(?1,'outcome',?2,?3,'harness.outcome.v1','observed',?4,?5,'internal','governance',0,?6)", params![revision_id,outcome_id.as_str(),rev,raw,digest,now])?;
+        transaction.execute("INSERT INTO improvement_events(id,aggregate_kind,aggregate_id,revision_id,sequence,event_type,payload_json,payload_sha256,idempotency_key,occurred_at) VALUES(?1,'outcome',?2,?3,?4,'revision_recorded','{}',?5,?6,?7)", params![event_id,outcome_id.as_str(),revision_id,rev,sha256(b"{}"),input.idempotency_key,now])?;
+        let vector = outcome_vector_tx(&transaction, &input.run_id)?;
+        transaction.commit()?;
+        Ok(OutcomeRevisionReceipt {
+            outcome_id,
+            revision_id,
+            revision: positive_database_u64(rev, "outcome revision")?,
+            vector,
+        })
+    }
+    pub fn outcome_vector(&self, run_id: &RunId) -> Result<OutcomeVector, StoreError> {
+        let c = self.connection()?;
+        outcome_vector_conn(&c, run_id)
+    }
+    pub fn outcome_history(&self, outcome_id: &OutcomeId) -> Result<OutcomeHistory, StoreError> {
+        let c = self.connection()?;
+        let record = c.query_row("SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_revisions WHERE aggregate_kind='outcome' AND aggregate_id=?1 ORDER BY revision LIMIT 1",[outcome_id.as_str()],map_improvement_revision)?;
+        let outcome: OutcomeWireV1 = serde_json::from_value(record.payload)?;
+        outcome
+            .validate()
+            .map_err(|error| StoreError::Validation(format!("invalid stored outcome: {error}")))?;
+        let run = outcome.run_id.to_string();
+        let v = outcome_vector_conn(&c, &RunId::from(run.clone()))?;
+        let item = v
+            .items
+            .into_iter()
+            .find(|x| x.outcome_id == *outcome_id)
+            .ok_or_else(|| StoreError::NotFound(outcome_id.to_string()))?;
+        Ok(OutcomeHistory {
+            outcome_id: outcome_id.clone(),
+            run_id: RunId::from(run),
+            revisions: item.revisions,
+            conflicted: item.conflicted,
+        })
+    }
+    pub fn trace_projection_candidate_runs(&self) -> Result<Vec<RunId>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare("SELECT id FROM runs ORDER BY created_at,id")?;
+        statement
+            .query_map([], |row| Ok(RunId::from(row.get::<_, String>(0)?)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+    /// Return one consistent, read-only receipt snapshot for a historical run.
+    /// Raw rows without `run_id` are included only when their agent session is
+    /// durably bound to this run, which covers legacy child-agent rows.
+    pub fn trace_projection_snapshot(
+        &self,
+        run_id: &RunId,
+    ) -> Result<TraceProjectionSnapshot, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let (base_sha, authority_digest, profile_digest): (String, String, String) = transaction
+            .query_row(
+                "SELECT base_sha,authority_digest,profile_digest FROM runs WHERE id=?1",
+                [run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        let mut raw_statement = transaction.prepare("SELECT re.id,re.agent_session_id,re.thread_id,re.turn_id,re.direction,re.method,re.request_id,re.received_at,re.payload_json,re.payload_sha256,re.source_sequence,re.redaction_class FROM raw_events re LEFT JOIN agent_sessions a ON a.id=re.agent_session_id WHERE re.run_id=?1 OR (re.run_id IS NULL AND a.run_id=?1) ORDER BY re.id")?;
+        let raw_events = raw_statement
+            .query_map([run_id.as_str()], |row| {
+                let payload: Value =
+                    serde_json::from_str(&row.get::<_, String>(8)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            8,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                let payload_sha256: String = row.get(9)?;
+                if sha256(
+                    serde_json::to_string(&payload)
+                        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
+                        .as_bytes(),
+                ) != payload_sha256
+                {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        9,
+                        rusqlite::types::Type::Text,
+                        "raw payload digest mismatch".into(),
+                    ));
+                }
+                Ok(TraceProjectionRawReceipt {
+                    id: row.get(0)?,
+                    agent_session_id: row.get(1)?,
+                    thread_id: row.get(2)?,
+                    turn_id: row.get(3)?,
+                    direction: row.get(4)?,
+                    method: row.get(5)?,
+                    request_id: row.get(6)?,
+                    received_at: row.get(7)?,
+                    payload,
+                    payload_sha256,
+                    source_sequence: row.get(10)?,
+                    redaction_class: row.get(11)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(raw_statement);
+        let mut domain_statement = transaction.prepare("SELECT id,event_type,occurred_at,payload_json,source_raw_event_id FROM domain_events WHERE run_id=?1 ORDER BY id")?;
+        let domain_events = domain_statement
+            .query_map([run_id.as_str()], |row| {
+                let payload: Value =
+                    serde_json::from_str(&row.get::<_, String>(3)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                let payload_sha256 = sha256(
+                    serde_json::to_string(&payload)
+                        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
+                        .as_bytes(),
+                );
+                Ok(TraceProjectionDomainReceipt {
+                    id: row.get(0)?,
+                    source_raw_event_id: row.get(4)?,
+                    event_type: row.get(1)?,
+                    occurred_at: row.get(2)?,
+                    payload,
+                    payload_sha256,
+                    redaction_class: "none".to_owned(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(domain_statement);
+        let mut structural = vec![TraceProjectionStructuralReceipt {
+            id: format!("run:{run_id}"),
+            kind: "run".to_owned(),
+            occurred_at: None,
+            metadata: json!({"base_sha":base_sha,"authority_digest":authority_digest,"profile_digest":profile_digest}),
+        }];
+        let mut statement = transaction.prepare("SELECT a.id,a.state,a.base_sha,a.head_sha,a.terminal_class,a.created_at,a.completed_at FROM task_attempts a JOIN tasks t ON t.id=a.task_id WHERE t.run_id=?1 ORDER BY a.created_at,a.id")?;
+        for row in statement.query_map([run_id.as_str()], |row| Ok(TraceProjectionStructuralReceipt { id: format!("attempt:{}", row.get::<_, String>(0)?), kind: "attempt".to_owned(), occurred_at: row.get(5)?, metadata: json!({"state":row.get::<_, String>(1)?,"base_sha":row.get::<_, String>(2)?,"head_sha":row.get::<_, Option<String>>(3)?,"terminal_class":row.get::<_, Option<String>>(4)?,"completed_at":row.get::<_, Option<i64>>(6)?}) }))? { structural.push(row?); }
+        drop(statement);
+        let mut statement = transaction.prepare("SELECT id,parent_agent_session_id,task_attempt_id,role,state,effective_model,requested_model,effective_reasoning_effort,requested_reasoning_effort,started_at,completed_at FROM agent_sessions WHERE run_id=?1 ORDER BY started_at,id")?;
+        for row in statement.query_map([run_id.as_str()], |row| Ok(TraceProjectionStructuralReceipt { id: format!("agent:{}", row.get::<_, String>(0)?), kind: "agent".to_owned(), occurred_at: row.get(9)?, metadata: json!({"parent_agent_session_id":row.get::<_, Option<String>>(1)?,"task_attempt_id":row.get::<_, Option<String>>(2)?,"role":row.get::<_, String>(3)?,"state":row.get::<_, String>(4)?,"model":row.get::<_, Option<String>>(5)?.or(row.get(6)?),"reasoning_effort":row.get::<_, Option<String>>(7)?.or(row.get(8)?),"completed_at":row.get::<_, Option<i64>>(10)?}) }))? { structural.push(row?); }
+        drop(statement);
+        let structural_json = serde_json::to_string(&structural)?;
+        let mut relations = Vec::new();
+        for raw in &raw_events {
+            if let Some(agent) = &raw.agent_session_id {
+                relations.push(crate::TraceProjectionRelation {
+                    from: format!("structural:agent:{agent}"),
+                    to: format!("raw:{}", raw.id),
+                    kind: "context_parent".to_owned(),
+                });
+            }
+        }
+        let mut parent_agents = transaction.prepare(
+            "SELECT id,parent_agent_session_id FROM agent_sessions WHERE run_id=?1 AND parent_agent_session_id IS NOT NULL ORDER BY id",
+        )?;
+        for row in parent_agents.query_map([run_id.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (child, parent) = row?;
+            relations.push(crate::TraceProjectionRelation {
+                from: format!("structural:agent:{parent}"),
+                to: format!("structural:agent:{child}"),
+                kind: "spawned_by".to_owned(),
+            });
+        }
+        drop(parent_agents);
+        for domain in &domain_events {
+            if let Some(raw) = domain.source_raw_event_id {
+                relations.push(crate::TraceProjectionRelation {
+                    from: format!("raw:{raw}"),
+                    to: format!("domain:{}", domain.id),
+                    kind: "derived_from".to_owned(),
+                });
+            }
+        }
+        let snapshot = TraceProjectionSnapshot {
+            run_id: run_id.clone(),
+            base_sha,
+            authority_digest,
+            profile_digest,
+            max_raw_event_id: raw_events.last().map_or(0, |row| row.id),
+            max_domain_event_id: domain_events.last().map_or(0, |row| row.id),
+            structural_digest: sha256(structural_json.as_bytes()),
+            raw_events,
+            domain_events,
+            structural_receipts: structural,
+            relations,
+        };
+        transaction.commit()?;
+        Ok(snapshot)
+    }
     pub fn append_improvement_revision(
         &self,
         input: &NewImprovementRevision,
@@ -2707,6 +3900,8 @@ fn parse_improvement_enum<T: serde::de::DeserializeOwned>(value: String) -> rusq
 fn parse_improvement_schema(value: &str) -> rusqlite::Result<ImprovementSchema> {
     let schema = match value {
         "harness.trace.v1" => ImprovementSchema::TraceV1,
+        "harness.trace.v2" => ImprovementSchema::TraceV2,
+        "harness.outcome.v1" => ImprovementSchema::OutcomeV1,
         "harness.eval-case.v1" => ImprovementSchema::EvalCaseV1,
         "harness.grader-bundle.v1" => ImprovementSchema::GraderBundleV1,
         "harness.improvement-candidate.v1" => ImprovementSchema::ImprovementCandidateV1,
@@ -2893,6 +4088,23 @@ fn map_improvement_revision(row: &Row<'_>) -> rusqlite::Result<ImprovementRevisi
             "invalid stored improvement revision".into(),
         ));
     }
+    if record.schema == ImprovementSchema::OutcomeV1 {
+        let outcome: OutcomeWireV1 =
+            serde_json::from_value(record.payload.clone()).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        outcome.validate().map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    }
     Ok(record)
 }
 
@@ -2922,6 +4134,585 @@ fn positive_database_u64(value: i64, field: &str) -> rusqlite::Result<u64> {
                 format!("invalid {field}").into(),
             )
         })
+}
+
+// SI-007 Store-only helpers. Identifiers are intentionally opaque, bounded
+// grammar tokens so traces, edits, and their hashes cannot become text sinks.
+fn failure_scope_text(scope: FailureScope) -> &'static str {
+    match scope {
+        FailureScope::AttemptTerminal => "attempt_terminal",
+        FailureScope::RunTerminal => "run_terminal",
+        FailureScope::TypedOutcome => "typed_outcome",
+    }
+}
+
+fn terminal_code_text(code: TerminalCode) -> &'static str {
+    match code {
+        TerminalCode::PolicyBlocked => "policy_blocked",
+        TerminalCode::BudgetExhausted => "budget_exhausted",
+        TerminalCode::InfrastructureUnavailable => "infrastructure_unavailable",
+        TerminalCode::ProtocolError => "protocol_error",
+        TerminalCode::IntegrationConflict => "integration_conflict",
+        TerminalCode::SourceFailure => "source_failure",
+        TerminalCode::Inconclusive => "inconclusive",
+        TerminalCode::CancelledSuperseded => "cancelled_superseded",
+    }
+}
+
+fn failure_class_text(class: FailureClass) -> &'static str {
+    match class {
+        FailureClass::Unknown => "unknown",
+        FailureClass::PolicyBlocked => "policy_blocked",
+        FailureClass::BudgetExhausted => "budget_exhausted",
+        FailureClass::InfrastructureUnavailable => "infrastructure_unavailable",
+        FailureClass::ProtocolError => "protocol_error",
+        FailureClass::IntegrationConflict => "integration_conflict",
+        FailureClass::SourceFailure => "source_failure",
+        FailureClass::Inconclusive => "inconclusive",
+        FailureClass::CancelledSuperseded => "cancelled_superseded",
+    }
+}
+
+fn severity_text(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Unknown => "unknown",
+        Severity::Low => "low",
+        Severity::Medium => "medium",
+        Severity::High => "high",
+        Severity::Critical => "critical",
+    }
+}
+
+fn severity_rank(value: &str) -> u8 {
+    match value {
+        "critical" => 5,
+        "high" => 4,
+        "medium" => 3,
+        "low" => 2,
+        _ => 1,
+    }
+}
+
+fn edit_reason_text(reason: EditReason) -> &'static str {
+    match reason {
+        EditReason::OperatorCorrection => "operator_correction",
+        EditReason::DuplicateCluster => "duplicate_cluster",
+        EditReason::DistinctFailureMode => "distinct_failure_mode",
+        EditReason::SourceCorrection => "source_correction",
+    }
+}
+
+fn validate_failure_identifier(value: &str) -> Result<(), StoreError> {
+    if !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+    {
+        Ok(())
+    } else {
+        Err(StoreError::Validation(
+            "failure identifier must be an opaque bounded token".to_owned(),
+        ))
+    }
+}
+
+fn validate_failure_actor(value: &str) -> Result<(), StoreError> {
+    validate_failure_identifier(value)
+}
+
+type FailureCostColumns = (Option<String>, Option<i64>, Option<i64>);
+
+fn failure_cost_columns(cost: FailureWireCost) -> Result<FailureCostColumns, StoreError> {
+    match cost {
+        FailureWireCost::Unknown => Ok((None, None, None)),
+        FailureWireCost::Known {
+            scope_id,
+            lower_microusd,
+            additional_microusd,
+        } => {
+            validate_failure_identifier(&scope_id)?;
+            let lower = i64::try_from(lower_microusd)
+                .map_err(|_| StoreError::Validation("cost exceeds SQLite range".to_owned()))?;
+            let upper = lower_microusd
+                .checked_add(additional_microusd)
+                .ok_or_else(|| StoreError::Validation("cost overflow".to_owned()))?;
+            Ok((
+                Some(scope_id),
+                Some(lower),
+                Some(
+                    i64::try_from(upper).map_err(|_| {
+                        StoreError::Validation("cost exceeds SQLite range".to_owned())
+                    })?,
+                ),
+            ))
+        }
+    }
+}
+
+fn failure_run_cost(
+    connection: &rusqlite::Connection,
+    run_id: &RunId,
+) -> Result<CostAttribution, StoreError> {
+    let (samples, priced, lower, upper): (i64, i64, i64, i64) = connection.query_row(
+        "SELECT count(ts.id),count(c.token_sample_id),coalesce(sum(c.lower_microusd),0),coalesce(sum(c.upper_microusd),0) FROM token_samples ts JOIN codex_threads ct ON ct.thread_id=ts.thread_id JOIN agent_sessions a ON a.id=ct.agent_session_id LEFT JOIN cost_entries c ON c.token_sample_id=ts.id WHERE a.run_id=?1",
+        [run_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+    )?;
+    if samples == 0 || samples != priced || lower < 0 || upper < lower {
+        return Ok(CostAttribution::unknown());
+    }
+    Ok(CostAttribution::known(
+        format!("run:{}", run_id.as_str()),
+        lower as u64,
+        upper as u64,
+    ))
+}
+
+fn failure_run_cost_columns(
+    connection: &rusqlite::Connection,
+    run_id: &RunId,
+) -> Result<Option<(String, i64, i64)>, StoreError> {
+    let wire = FailureWireCost::try_from(&failure_run_cost(connection, run_id)?)
+        .map_err(|error| StoreError::Validation(error.to_string()))?;
+    let (scope, lower, upper) = failure_cost_columns(wire)?;
+    Ok(match (scope, lower, upper) {
+        (Some(scope), Some(lower), Some(upper)) => Some((scope, lower, upper)),
+        _ => None,
+    })
+}
+
+fn terminal_run_failure_events(
+    transaction: &rusqlite::Transaction<'_>,
+    run_id: &RunId,
+    failure_class: &str,
+) -> Result<Vec<i64>, StoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT id FROM domain_events WHERE run_id=?1 AND aggregate_type='run' AND aggregate_id=?1 AND event_type='run.lifecycle.transitioned' AND json_extract(payload_json,'$.failure_class')=?2 ORDER BY id",
+    )?;
+    Ok(statement
+        .query_map(params![run_id.as_str(), failure_class], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+fn failure_cluster_repository(
+    transaction: &rusqlite::Transaction<'_>,
+    cluster_id: &str,
+) -> Result<String, StoreError> {
+    transaction
+        .query_row(
+            "SELECT repository_id FROM failure_clusters WHERE id=?1",
+            [cluster_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound(format!("failure cluster {cluster_id}")))
+}
+
+fn failure_occurrence_run(
+    connection: &rusqlite::Connection,
+    occurrence_id: &str,
+) -> Result<Option<RunId>, StoreError> {
+    let (kind, source, source_domain_event_id): (String, String, Option<i64>) = connection.query_row(
+        "SELECT source_kind,source_id,source_domain_event_id FROM failure_occurrences WHERE id=?1",
+        [occurrence_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let run_id: Option<String> = match kind.as_str() {
+        "run_terminal" => match source_domain_event_id {
+            Some(event_id) => connection
+                .query_row(
+                    "SELECT run_id FROM domain_events WHERE id=?1 AND event_type='run.lifecycle.transitioned'",
+                    [event_id],
+                    |r| r.get(0),
+                )
+                .optional()?,
+            None => None,
+        },
+        "attempt_terminal" => connection.query_row("SELECT t.run_id FROM task_attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=?1", [source], |r| r.get(0)).optional()?,
+        "typed_outcome" => connection.query_row("SELECT json_extract(payload_json,'$.run_id') FROM improvement_revisions WHERE aggregate_kind='outcome' AND id=?1", [source], |r| r.get(0)).optional()?,
+        _ => None,
+    };
+    Ok(run_id.map(RunId::from))
+}
+
+fn require_failure_cluster_version(
+    transaction: &rusqlite::Transaction<'_>,
+    cluster_id: &str,
+    expected: u64,
+) -> Result<(), StoreError> {
+    let actual: i64 = transaction
+        .query_row(
+            "SELECT version FROM failure_clusters WHERE id=?1",
+            [cluster_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound(format!("failure cluster {cluster_id}")))?;
+    if u64::try_from(actual).ok() == Some(expected) {
+        Ok(())
+    } else {
+        Err(StoreError::Conflict(format!(
+            "stale failure cluster {cluster_id}"
+        )))
+    }
+}
+
+fn append_failure_membership_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    occurrence_id: &str,
+    cluster_id: &str,
+    action: MembershipAction,
+    actor: &str,
+    reason: EditReason,
+) -> Result<(), StoreError> {
+    transaction.execute("INSERT INTO failure_cluster_membership_revisions(occurrence_id,cluster_id,action,actor,reason_code,created_at) VALUES(?1,?2,?3,?4,?5,?6)", params![occurrence_id,cluster_id,membership_action_text(action),actor,edit_reason_text(reason),now_ms()])?;
+    Ok(())
+}
+
+fn membership_action_text(action: MembershipAction) -> &'static str {
+    match action {
+        MembershipAction::Assigned => "assigned",
+        MembershipAction::Merged => "merged",
+        MembershipAction::Split => "split",
+    }
+}
+
+fn bump_failure_cluster(
+    transaction: &rusqlite::Transaction<'_>,
+    cluster_id: &str,
+) -> Result<(), StoreError> {
+    let changed = transaction.execute(
+        "UPDATE failure_clusters SET version=version+1 WHERE id=?1",
+        [cluster_id],
+    )?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(StoreError::NotFound(format!(
+            "failure cluster {cluster_id}"
+        )))
+    }
+}
+
+fn current_failure_members(
+    transaction: &rusqlite::Transaction<'_>,
+    cluster_id: &str,
+) -> Result<BTreeSet<String>, StoreError> {
+    let mut statement = transaction.prepare("SELECT occurrence_id FROM failure_cluster_membership_revisions WHERE cluster_id=?1 AND revision=(SELECT max(m2.revision) FROM failure_cluster_membership_revisions m2 WHERE m2.occurrence_id=failure_cluster_membership_revisions.occurrence_id) ORDER BY occurrence_id")?;
+    Ok(statement
+        .query_map([cluster_id], |row| row.get(0))?
+        .collect::<Result<BTreeSet<_>, _>>()?)
+}
+
+fn append_failure_cluster_edit(
+    transaction: &rusqlite::Transaction<'_>,
+    source_cluster_id: &str,
+    target_cluster_id: Option<&str>,
+    action: &str,
+    actor: &str,
+    reason: EditReason,
+    target_cluster_ids: &[&str],
+) -> Result<(), StoreError> {
+    let mut targets = target_cluster_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    if targets.is_empty()
+        || targets
+            .iter()
+            .any(|id| validate_failure_identifier(id).is_err())
+    {
+        return Err(StoreError::Validation(
+            "invalid failure cluster edit target".to_owned(),
+        ));
+    }
+    let targets_json = serde_json::to_string(&targets)?;
+    let digest = sha256(targets_json.as_bytes());
+    let identity = sha256(format!("failure.cluster.edit.v1\0{source_cluster_id}\0{}\0{action}\0{actor}\0{}\0{targets_json}", target_cluster_id.unwrap_or(""), edit_reason_text(reason)).as_bytes());
+    transaction.execute("INSERT INTO failure_cluster_edits(id,source_cluster_id,target_cluster_id,action,actor,reason_code,target_cluster_ids_json,target_cluster_ids_sha256,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![format!("failure-edit-{identity}"),source_cluster_id,target_cluster_id,action,actor,edit_reason_text(reason),targets_json,digest,now_ms()])?;
+    Ok(())
+}
+
+fn safe_outcome_identifier(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn authoritative_result_label(
+    result: &str,
+) -> (harness_domain::OutcomeClassification, &'static str) {
+    match result {
+        "success" => (harness_domain::OutcomeClassification::Positive, "passed"),
+        "inconclusive" | "not_selected" | "skipped_draft" => (
+            harness_domain::OutcomeClassification::Unknown,
+            "unavailable",
+        ),
+        "source_failure" | "infrastructure_unavailable" | "quarantined_failure" => {
+            (harness_domain::OutcomeClassification::Negative, "failed")
+        }
+        _ => (
+            harness_domain::OutcomeClassification::Unknown,
+            "unavailable",
+        ),
+    }
+}
+
+fn authoritative_evidence_label(
+    result: &str,
+) -> (harness_domain::OutcomeClassification, &'static str) {
+    match result {
+        "success" => (harness_domain::OutcomeClassification::Positive, "proved"),
+        "inconclusive" | "not_selected" | "skipped_draft" => (
+            harness_domain::OutcomeClassification::Unknown,
+            "unavailable",
+        ),
+        "source_failure" | "infrastructure_unavailable" | "quarantined_failure" => {
+            (harness_domain::OutcomeClassification::Negative, "unproved")
+        }
+        _ => (
+            harness_domain::OutcomeClassification::Unknown,
+            "unavailable",
+        ),
+    }
+}
+
+fn outcome_subject(
+    run_id: &RunId,
+    task_attempt_id: Option<String>,
+) -> harness_domain::OutcomeSubject {
+    match task_attempt_id {
+        Some(id) => harness_domain::OutcomeSubject {
+            kind: harness_domain::OutcomeSubjectKind::TaskAttempt,
+            id,
+        },
+        None => harness_domain::OutcomeSubject {
+            kind: harness_domain::OutcomeSubjectKind::Run,
+            id: run_id.to_string(),
+        },
+    }
+}
+
+fn stable_authoritative_outcome_id(
+    input: &AuthoritativeOutcomeInput,
+) -> Result<OutcomeId, StoreError> {
+    let subject_kind = serde_json::to_string(&input.subject.kind)?;
+    let dimension = serde_json::to_string(&input.dimension)?;
+    Ok(OutcomeId::from(sha256(
+        format!(
+            "harness.outcome.id.v1\0{}\0{}\0{}\0{}",
+            input.run_id, subject_kind, input.subject.id, dimension
+        )
+        .as_bytes(),
+    )))
+}
+
+fn validate_operator_outcome_input(input: &NewOperatorOutcome) -> Result<(), StoreError> {
+    if !safe_outcome_identifier(input.run_id.as_str(), 128)
+        || !safe_outcome_identifier(&input.subject.id, 128)
+        || !safe_outcome_identifier(&input.code, 80)
+        || !safe_outcome_identifier(&input.actor, 128)
+        || !safe_outcome_identifier(&input.idempotency_key, 200)
+        || input
+            .reason_code
+            .as_ref()
+            .is_some_and(|value| !harness_domain::is_safe_outcome_reason_code(value))
+        || input
+            .correction_artifact_id
+            .as_ref()
+            .is_some_and(|value| !safe_outcome_identifier(value.as_str(), 128))
+        || input
+            .note
+            .as_ref()
+            .is_some_and(|value| value.chars().count() > 1_000)
+        || input
+            .supersedes
+            .iter()
+            .any(|value| !safe_outcome_identifier(value, 128))
+    {
+        return Err(StoreError::Validation(
+            "invalid bounded operator outcome input".to_owned(),
+        ));
+    }
+    let mut unique = BTreeSet::new();
+    if input.supersedes.iter().any(|value| !unique.insert(value)) {
+        return Err(StoreError::Validation(
+            "duplicate outcome supersedes target".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn stable_outcome_id(input: &NewOperatorOutcome) -> Result<OutcomeId, StoreError> {
+    let subject_kind = serde_json::to_string(&input.subject.kind)?;
+    let dimension = serde_json::to_string(&input.dimension)?;
+    Ok(OutcomeId::from(sha256(
+        format!(
+            "harness.outcome.id.v1\0{}\0{}\0{}\0{}",
+            input.run_id, subject_kind, input.subject.id, dimension
+        )
+        .as_bytes(),
+    )))
+}
+
+fn outcome_matches_input(
+    stored: &OutcomeWireV1,
+    input: &NewOperatorOutcome,
+    outcome_id: &OutcomeId,
+) -> bool {
+    stored.schema == "harness.outcome.v1"
+        && stored.outcome_id == *outcome_id
+        && stored.run_id == input.run_id
+        && stored.subject == input.subject
+        && stored.dimension == input.dimension
+        && stored.classification == input.classification
+        && stored.code == input.code
+        && stored.confidence == OutcomeConfidence::OperatorAsserted
+        && stored.source.kind == OutcomeSourceKind::HumanAction
+        && stored.supersedes == input.supersedes
+        && stored.reason_code == input.reason_code
+        && stored.correction_artifact_id == input.correction_artifact_id
+        && stored.redactor_version == "outcome-redactor.v1"
+        && stored.free_text_redacted == input.note.is_some()
+}
+
+fn validate_outcome_supersedes(
+    transaction: &rusqlite::Transaction<'_>,
+    outcome_id: &OutcomeId,
+    supersedes: &[String],
+) -> Result<(), StoreError> {
+    if supersedes.is_empty() {
+        return Ok(());
+    }
+    let mut heads = BTreeSet::new();
+    let mut all = BTreeSet::new();
+    let mut statement = transaction.prepare(
+        "SELECT id,payload_json FROM improvement_revisions WHERE aggregate_kind='outcome' AND aggregate_id=?1",
+    )?;
+    let mut superseded = BTreeSet::new();
+    for row in statement.query_map([outcome_id.as_str()], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })? {
+        let (id, payload) = row?;
+        let outcome: OutcomeWireV1 = serde_json::from_str(&payload)?;
+        all.insert(id.clone());
+        heads.insert(id);
+        superseded.extend(outcome.supersedes);
+    }
+    for target in superseded {
+        heads.remove(&target);
+    }
+    for target in supersedes {
+        if !all.contains(target) {
+            return Err(StoreError::Conflict(
+                "outcome supersedes target is cross-outcome or unknown".to_owned(),
+            ));
+        }
+        if !heads.contains(target) {
+            return Err(StoreError::Conflict(
+                "outcome supersedes target is not a current head".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn outcome_vector_from_rows(
+    run_id: &RunId,
+    rows: Vec<(String, i64, String)>,
+) -> Result<OutcomeVector, StoreError> {
+    let mut groups: BTreeMap<String, Vec<OutcomeRevisionView>> = BTreeMap::new();
+    for (id, revision, raw) in rows {
+        let outcome: OutcomeWireV1 = serde_json::from_str(&raw)?;
+        groups
+            .entry(outcome.outcome_id.to_string())
+            .or_default()
+            .push(OutcomeRevisionView {
+                revision_id: id,
+                revision: positive_database_u64(revision, "outcome revision")?,
+                outcome,
+                is_head: false,
+            });
+    }
+    let items = groups
+        .into_values()
+        .map(|mut revisions| {
+            let superseded: BTreeSet<String> = revisions
+                .iter()
+                .flat_map(|row| row.outcome.supersedes.iter().cloned())
+                .collect();
+            for row in &mut revisions {
+                row.is_head = !superseded.contains(&row.revision_id);
+            }
+            let first = &revisions[0].outcome;
+            let conflicted = revisions.iter().filter(|row| row.is_head).count() > 1;
+            OutcomeVectorItem {
+                outcome_id: first.outcome_id.clone(),
+                subject: first.subject.clone(),
+                dimension: first.dimension,
+                revisions,
+                conflicted,
+            }
+        })
+        .collect();
+    Ok(OutcomeVector {
+        run_id: run_id.clone(),
+        items,
+    })
+}
+
+fn outcome_vector_conn(
+    connection: &rusqlite::Connection,
+    run_id: &RunId,
+) -> Result<OutcomeVector, StoreError> {
+    let mut s=connection.prepare("SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_revisions WHERE aggregate_kind='outcome' AND json_extract(payload_json,'$.run_id')=?1 ORDER BY aggregate_id,revision")?;
+    let rows = s.query_map([run_id.as_str()], map_improvement_revision)?;
+    let rows = rows
+        .map(|row| {
+            row.and_then(|record| {
+                let revision = i64::try_from(record.revision).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Integer,
+                        "outcome revision exceeds database range".into(),
+                    )
+                })?;
+                let payload = serde_json::to_string(&record.payload)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                Ok((record.id, revision, payload))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    outcome_vector_from_rows(run_id, rows)
+}
+fn outcome_vector_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    run_id: &RunId,
+) -> Result<OutcomeVector, StoreError> {
+    let c = transaction;
+    let mut s=c.prepare("SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_revisions WHERE aggregate_kind='outcome' AND json_extract(payload_json,'$.run_id')=?1 ORDER BY aggregate_id,revision")?;
+    let rows = s.query_map([run_id.as_str()], map_improvement_revision)?;
+    let rows = rows
+        .map(|row| {
+            row.and_then(|record| {
+                let revision = i64::try_from(record.revision).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Integer,
+                        "outcome revision exceeds database range".into(),
+                    )
+                })?;
+                let payload = serde_json::to_string(&record.payload)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                Ok((record.id, revision, payload))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    outcome_vector_from_rows(run_id, rows)
 }
 
 fn read_improvement_revision(
@@ -3012,6 +4803,468 @@ mod tests {
             })
             .unwrap();
         (store, run_id)
+    }
+
+    fn operator_outcome(run_id: &RunId, key: &str, code: &str) -> NewOperatorOutcome {
+        NewOperatorOutcome {
+            run_id: run_id.clone(),
+            subject: harness_domain::OutcomeSubject {
+                kind: harness_domain::OutcomeSubjectKind::Run,
+                id: run_id.to_string(),
+            },
+            dimension: harness_domain::OutcomeDimension::OperatorAcceptance,
+            classification: harness_domain::OutcomeClassification::Positive,
+            code: code.to_owned(),
+            reason_code: None,
+            note: Some("operator-only free text".to_owned()),
+            correction_artifact_id: None,
+            supersedes: Vec::new(),
+            actor: "local-user".to_owned(),
+            idempotency_key: key.to_owned(),
+        }
+    }
+
+    #[test]
+    fn failure_clusters_enforce_repository_custody_and_hide_source_ids() {
+        let (store, run_id) = store_with_created_run();
+        let repository_id = RepositoryId::from("repository-lifecycle-event");
+        let other_repository = RepositoryId::from("repository-other");
+        store
+            .create_repository(&NewRepository {
+                id: other_repository.clone(),
+                profile_id: "fixture".into(),
+                profile_version: 1,
+                display_name: "other".into(),
+                root_path: PathBuf::from("/tmp/other"),
+                origin_url: None,
+                default_branch: "main".into(),
+                expected_coordination_branch: None,
+                state: "READY".into(),
+            })
+            .unwrap();
+        store.connection().unwrap().execute(
+            "INSERT INTO failure_occurrences(id,repository_id,source_kind,source_id,terminal_code,automatic_class,severity,taxonomy_version,fingerprint_sha256,created_at) VALUES('failure-one',?1,'run_terminal','run-lifecycle-event','budget_exhausted','budget_exhausted','unknown','harness.failure-taxonomy.v1',?2,1)",
+            params![repository_id.as_str(), "a".repeat(64)],
+        ).unwrap();
+        store
+            .create_failure_cluster(&repository_id, "cluster-a")
+            .unwrap();
+        store
+            .create_failure_cluster(&other_repository, "cluster-b")
+            .unwrap();
+        assert!(
+            store
+                .assign_failure_to_cluster(
+                    "failure-one",
+                    "cluster-b",
+                    0,
+                    "operator",
+                    EditReason::OperatorCorrection
+                )
+                .is_err()
+        );
+        store
+            .assign_failure_to_cluster(
+                "failure-one",
+                "cluster-a",
+                0,
+                "operator",
+                EditReason::OperatorCorrection,
+            )
+            .unwrap();
+        let trace = store.failure_trace_summary("failure-one").unwrap();
+        assert_ne!(trace.source_receipt_sha256, run_id.as_str());
+        assert_eq!(trace.source_receipt_sha256.len(), 64);
+        assert_eq!(
+            store.failure_cluster_overview(&repository_id).unwrap()[0].occurrences,
+            1
+        );
+    }
+
+    #[test]
+    fn known_priced_run_scope_is_accepted_by_failure_projection_contract() {
+        let columns = failure_cost_columns(FailureWireCost::Known {
+            scope_id: "run:priced-run".to_owned(),
+            lower_microusd: 10,
+            additional_microusd: 5,
+        })
+        .unwrap();
+        assert_eq!(
+            columns,
+            (Some("run:priced-run".to_owned()), Some(10), Some(15))
+        );
+    }
+
+    #[test]
+    fn failure_projection_is_replay_stable_and_derives_late_cost_read_only() {
+        let (store, run_id) = store_with_created_run();
+        let lifecycle_event_id = {
+            let connection = store.connection().unwrap();
+            connection
+                .execute(
+                    "UPDATE runs SET failure_class='budget_exhausted' WHERE id=?1",
+                    [run_id.as_str()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json) VALUES(?1,'run',?1,'run.lifecycle.transitioned',1,?2)",
+                    params![run_id.as_str(), json!({"failure_class":"budget_exhausted"}).to_string()],
+                )
+                .unwrap();
+            connection.last_insert_rowid()
+        };
+
+        assert_eq!(
+            store.project_failures_for_run(&run_id).unwrap(),
+            FailureProjectionReceipt {
+                inserted: 1,
+                already_projected: 0,
+            }
+        );
+        assert_eq!(
+            store.project_failures_for_run(&run_id).unwrap(),
+            FailureProjectionReceipt {
+                inserted: 0,
+                already_projected: 1,
+            }
+        );
+        let repository_id = RepositoryId::from("repository-lifecycle-event");
+        let initial = store.failure_cluster_overview(&repository_id).unwrap();
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].representative_run_id, Some(run_id.clone()));
+        assert_eq!(initial[0].unknown_cost_occurrences, 1);
+        assert_eq!(initial[0].cost_upper_microusd, 0);
+
+        {
+            let connection = store.connection().unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO agent_sessions(id,run_id,runtime_kind,role,requested_model,requested_reasoning_effort,sandbox_mode,approval_policy,cwd,state) VALUES('failure-agent','run-lifecycle-event','test','worker','model','low','read_only','never','/tmp','COMPLETED');
+                     INSERT INTO codex_threads(thread_id,agent_session_id,created_at,updated_at) VALUES('failure-thread','failure-agent',1,1);
+                     INSERT INTO token_samples(id,thread_id,effective_model,observed_at,input_tokens,cached_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,sample_kind) VALUES('failure-sample','failure-thread','model',1,10,0,5,0,15,'session_total');
+                     INSERT INTO pricing_snapshots(id,model,currency,effective_at,input_microusd_per_million,cached_input_microusd_per_million,output_microusd_per_million,cache_write_multiplier_numerator,cache_write_multiplier_denominator,source_label,created_at) VALUES('failure-price','model','USD',1,1,1,1,1,1,'fixture',1);
+                     INSERT INTO cost_entries(id,token_sample_id,pricing_snapshot_id,lower_microusd,upper_microusd,confidence,explanation,created_at) VALUES('failure-cost','failure-sample','failure-price',10,15,'exact','fixture',1);",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json) VALUES(?1,'run',?1,'run.lifecycle.transitioned',2,?2)",
+                    params![run_id.as_str(), json!({"failure_class":"unrelated"}).to_string()],
+                )
+                .unwrap();
+        }
+
+        let replay = store.project_failures_for_run(&run_id).unwrap();
+        assert_eq!(replay.inserted, 0);
+        assert_eq!(replay.already_projected, 1);
+        let priced = store.failure_cluster_overview(&repository_id).unwrap();
+        assert_eq!(priced[0].unknown_cost_occurrences, 0);
+        assert_eq!(priced[0].cost_lower_microusd, 10);
+        assert_eq!(priced[0].cost_upper_microusd, 15);
+        let occurrence_id: String = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM failure_occurrences WHERE source_domain_event_id=?1",
+                [lifecycle_event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            failure_occurrence_run(&store.connection().unwrap(), &occurrence_id).unwrap(),
+            Some(run_id.clone())
+        );
+
+        let mut negative = operator_outcome(&run_id, "failure-outcome", "changes_requested");
+        negative.classification = harness_domain::OutcomeClassification::Negative;
+        let receipt = store.record_operator_outcome(&negative).unwrap();
+        store.project_failures_for_run(&run_id).unwrap();
+        let typed_occurrence: String = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM failure_occurrences WHERE source_kind='typed_outcome' AND source_id=?1",
+                [receipt.revision_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            failure_occurrence_run(&store.connection().unwrap(), &typed_occurrence).unwrap(),
+            Some(run_id)
+        );
+    }
+
+    #[test]
+    fn failure_overview_keeps_unique_cost_when_another_scope_is_shared() {
+        let (store, _) = store_with_created_run();
+        let repository_id = RepositoryId::from("repository-lifecycle-event");
+        {
+            let connection = store.connection().unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO failure_occurrences(id,repository_id,source_kind,source_id,automatic_class,severity,taxonomy_version,fingerprint_sha256,cost_scope_id,cost_lower_microusd,cost_upper_microusd,created_at) VALUES
+                     ('failure-unique','repository-lifecycle-event','attempt_terminal','attempt-unique','unknown','low','harness.failure-taxonomy.v1','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','scope:unique',10,15,1),
+                     ('failure-shared-a','repository-lifecycle-event','attempt_terminal','attempt-shared-a','unknown','medium','harness.failure-taxonomy.v1','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','scope:shared',20,25,2),
+                     ('failure-shared-b','repository-lifecycle-event','attempt_terminal','attempt-shared-b','unknown','high','harness.failure-taxonomy.v1','cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc','scope:shared',20,25,3);",
+                )
+                .unwrap();
+        }
+        store
+            .create_failure_cluster(&repository_id, "cluster-cost-a")
+            .unwrap();
+        store
+            .create_failure_cluster(&repository_id, "cluster-cost-b")
+            .unwrap();
+        store
+            .assign_failure_to_cluster(
+                "failure-unique",
+                "cluster-cost-a",
+                0,
+                "operator",
+                EditReason::OperatorCorrection,
+            )
+            .unwrap();
+        store
+            .assign_failure_to_cluster(
+                "failure-shared-a",
+                "cluster-cost-a",
+                1,
+                "operator",
+                EditReason::OperatorCorrection,
+            )
+            .unwrap();
+        store
+            .assign_failure_to_cluster(
+                "failure-shared-b",
+                "cluster-cost-b",
+                0,
+                "operator",
+                EditReason::OperatorCorrection,
+            )
+            .unwrap();
+
+        let overview = store.failure_cluster_overview(&repository_id).unwrap();
+        let cluster_a = overview
+            .iter()
+            .find(|cluster| cluster.cluster_id == "cluster-cost-a")
+            .unwrap();
+        assert_eq!(cluster_a.occurrences, 2);
+        assert_eq!(cluster_a.cost_lower_microusd, 10);
+        assert_eq!(cluster_a.cost_upper_microusd, 15);
+        assert_eq!(cluster_a.unknown_cost_occurrences, 1);
+        assert_eq!(cluster_a.severity.as_deref(), Some("medium"));
+        let cluster_b = overview
+            .iter()
+            .find(|cluster| cluster.cluster_id == "cluster-cost-b")
+            .unwrap();
+        assert_eq!(cluster_b.cost_upper_microusd, 0);
+        assert_eq!(cluster_b.unknown_cost_occurrences, 1);
+        assert_eq!(cluster_b.severity.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn operator_outcomes_are_idempotent_sanitized_and_head_aware() {
+        let (store, run_id) = store_with_created_run();
+        let first = operator_outcome(&run_id, "outcome-one", "accepted_without_correction");
+        let first_receipt = store.record_operator_outcome(&first).unwrap();
+        let replay = store.record_operator_outcome(&first).unwrap();
+        assert_eq!(first_receipt.revision_id, replay.revision_id);
+        let action_count: i64 = store
+            .connection()
+            .unwrap()
+            .query_row("SELECT count(*) FROM human_actions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(action_count, 1);
+        let persisted: String = store
+            .connection()
+            .unwrap()
+            .query_row("SELECT payload_json FROM human_actions", [], |r| r.get(0))
+            .unwrap();
+        assert!(!persisted.contains("operator-only free text"));
+        let mut changed = first.clone();
+        changed.code = "accepted_after_correction".to_owned();
+        assert!(matches!(
+            store.record_operator_outcome(&changed),
+            Err(StoreError::Conflict(_))
+        ));
+
+        let second = operator_outcome(&run_id, "outcome-two", "accepted_after_correction");
+        let second_receipt = store.record_operator_outcome(&second).unwrap();
+        assert!(second_receipt.vector.items[0].conflicted);
+        let mut resolution =
+            operator_outcome(&run_id, "outcome-three", "accepted_after_correction");
+        resolution.supersedes = vec![
+            first_receipt.revision_id.clone(),
+            second_receipt.revision_id.clone(),
+        ];
+        let resolved = store.record_operator_outcome(&resolution).unwrap();
+        assert!(!resolved.vector.items[0].conflicted);
+        assert_eq!(
+            resolved.vector.items[0]
+                .revisions
+                .iter()
+                .filter(|r| r.is_head)
+                .count(),
+            1
+        );
+        let mut stale = operator_outcome(&run_id, "outcome-four", "accepted_after_correction");
+        stale.supersedes = vec![first_receipt.revision_id];
+        assert!(matches!(
+            store.record_operator_outcome(&stale),
+            Err(StoreError::Conflict(_))
+        ));
+
+        let mut invalid_reason = operator_outcome(
+            &run_id,
+            "outcome-invalid-reason",
+            "accepted_without_correction",
+        );
+        invalid_reason.reason_code = Some("Reason-Code".to_owned());
+        assert!(matches!(
+            store.record_operator_outcome(&invalid_reason),
+            Err(StoreError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn authoritative_outcomes_are_typed_idempotent_and_never_human_actions() {
+        let (store, run_id) = store_with_created_run();
+        {
+            let connection = store.connection().unwrap();
+            connection
+                .pragma_update(None, "foreign_keys", false)
+                .unwrap();
+            connection.execute_batch(
+                "INSERT INTO validations(id,run_id,worktree_id,validator_id,proof_tier,source_sha,selector_reason,state,result_class,started_at,completed_at) VALUES('validation-1','run-lifecycle-event','worktree-1','validator','T1','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','fixture','completed','success',1,2);
+                 INSERT INTO validations(id,run_id,worktree_id,validator_id,proof_tier,source_sha,selector_reason,state,result_class,started_at,completed_at) VALUES('validation-ci','run-lifecycle-event','worktree-1','draft-pr-required-ci','T1','dddddddddddddddddddddddddddddddddddddddd','fixture','completed','success',2,3);
+                 INSERT INTO validations(id,run_id,worktree_id,validator_id,proof_tier,source_sha,selector_reason,state,result_class) VALUES('validation-pending','run-lifecycle-event','worktree-1','validator','T1','eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee','fixture','running',NULL);
+                 INSERT INTO validations(id,run_id,worktree_id,validator_id,proof_tier,source_sha,selector_reason,state,result_class,completed_at,invalidated_at) VALUES('validation-invalid','run-lifecycle-event','worktree-1','validator','T1','ffffffffffffffffffffffffffffffffffffffff','fixture','completed','success',4,5);
+                 INSERT INTO evidence_records(id,run_id,claim_id,checklist_rows_json,source_sha,proof_tier,result_class,evidence_json,evidence_sha256,unproved_claims_json,created_at) VALUES('evidence-1','run-lifecycle-event','claim','[]','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','T1','source_failure','{}','cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc','[]',3);
+                 INSERT INTO evidence_records(id,run_id,claim_id,checklist_rows_json,source_sha,proof_tier,result_class,evidence_json,evidence_sha256,unproved_claims_json,created_at,invalidated_at) VALUES('evidence-invalid','run-lifecycle-event','claim','[]','eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee','T1','success','{}','ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff','[]',4,5);
+                 INSERT INTO findings(id,run_id,verifier_agent_session_id,severity,category,invariant,description,required_correction,state,created_at) VALUES('finding-1','run-lifecycle-event','verifier-1','high','fixture','fixture','fixture','fixture','open',4);
+                 UPDATE runs SET run_token_budget=1 WHERE id='run-lifecycle-event';
+                 INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json) VALUES('run-lifecycle-event','run','run-lifecycle-event','run.lifecycle.transitioned',5,'{\"next_state\":\"COMPLETED\"}');
+                 INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json) VALUES('run-lifecycle-event','task','task-1','task.verified',6,'{}');"
+            ).unwrap();
+            connection
+                .pragma_update(None, "foreign_keys", true)
+                .unwrap();
+        }
+        store.project_authoritative_outcomes(&run_id).unwrap();
+        store.project_authoritative_outcomes(&run_id).unwrap();
+        let vector = store.outcome_vector(&run_id).unwrap();
+        assert_eq!(vector.items.len(), 6);
+        assert!(vector.items.iter().any(|item| item.dimension
+            == harness_domain::OutcomeDimension::Validation
+            && item.revisions[0].outcome.code == "passed"));
+        assert!(vector.items.iter().any(|item| item.dimension
+            == harness_domain::OutcomeDimension::CiRequiredChecks
+            && item.revisions[0].outcome.code == "passed"));
+        assert!(vector.items.iter().any(|item| item.dimension
+            == harness_domain::OutcomeDimension::Evidence
+            && item.revisions[0].outcome.code == "unproved"));
+        let verifier = vector
+            .items
+            .iter()
+            .find(|item| item.dimension == harness_domain::OutcomeDimension::VerifierFindings)
+            .unwrap();
+        assert!(
+            verifier
+                .revisions
+                .iter()
+                .any(|revision| revision.outcome.code == "blocking")
+        );
+        assert!(verifier.revisions.iter().any(|revision| {
+            revision.outcome.code == "none"
+                && revision.outcome.classification
+                    == harness_domain::OutcomeClassification::Positive
+                && revision.outcome.source.kind == OutcomeSourceKind::DomainEvent
+        }));
+        let completion = vector
+            .items
+            .iter()
+            .find(|item| item.dimension == harness_domain::OutcomeDimension::CompletionState)
+            .unwrap();
+        assert_eq!(
+            completion.revisions[0].outcome.classification,
+            harness_domain::OutcomeClassification::Neutral
+        );
+        assert_eq!(completion.revisions[0].outcome.code, "completed");
+        assert!(vector.items.iter().any(|item| item.dimension
+            == harness_domain::OutcomeDimension::ResourceUse
+            && item.revisions[0].outcome.code == "unavailable"));
+        assert!(
+            vector.items.iter().all(
+                |item| item.revisions[0].outcome.confidence == OutcomeConfidence::Authoritative
+            )
+        );
+        let actions: i64 = store
+            .connection()
+            .unwrap()
+            .query_row("SELECT count(*) FROM human_actions", [], |row| row.get(0))
+            .unwrap();
+        let revisions: i64 = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM improvement_revisions WHERE aggregate_kind='outcome'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(actions, 0);
+        assert_eq!(revisions, 7);
+        assert!(
+            vector
+                .items
+                .iter()
+                .flat_map(|item| item.revisions.iter())
+                .all(|revision| {
+                    !matches!(
+                        revision.outcome.source.record_id.as_str(),
+                        "validation-pending" | "validation-invalid" | "evidence-invalid"
+                    )
+                })
+        );
+        assert_eq!(
+            authoritative_result_label("new_result_class").1,
+            "unavailable"
+        );
+        assert_eq!(
+            outcome_subject(&run_id, Some("attempt-1".to_owned())).kind,
+            harness_domain::OutcomeSubjectKind::TaskAttempt
+        );
+    }
+
+    #[test]
+    fn outcome_id_wire_contract_is_stable() {
+        let (_, run_id) = store_with_created_run();
+        let input = operator_outcome(&run_id, "outcome-wire", "accepted_without_correction");
+        assert_eq!(
+            stable_outcome_id(&input).unwrap().as_str(),
+            "bce7860801efea10255ba97f654d8dcfe4feb13829fc7fb59925c1734302a109"
+        );
+
+        let mut manual = operator_outcome(&run_id, "outcome-same-id", "passed");
+        manual.dimension = harness_domain::OutcomeDimension::Validation;
+        let authoritative = AuthoritativeOutcomeInput {
+            run_id: run_id.clone(),
+            subject: manual.subject.clone(),
+            dimension: manual.dimension,
+            classification: manual.classification,
+            code: manual.code.clone(),
+            source_kind: OutcomeSourceKind::Validation,
+            source_record_id: "validation-same-id".to_owned(),
+            source_record_sha256: "a".repeat(64),
+            source_sha: Some("b".repeat(40)),
+            source_domain_event_id: None,
+            observed_at: 1,
+        };
+        assert_eq!(
+            stable_outcome_id(&manual).unwrap(),
+            stable_authoritative_outcome_id(&authoritative).unwrap()
+        );
     }
 
     #[test]

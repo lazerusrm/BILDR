@@ -8,15 +8,18 @@ license.workspace = true
 [dependencies]
 harness-api = { path = "../../crates/harness-api" }
 harness-codex = { path = "../../crates/harness-codex" }
+harness-domain = { path = "../../crates/harness-domain" }
 harness-orchestrator = { path = "../../crates/harness-orchestrator" }
 harness-profile = { path = "../../crates/harness-profile" }
 harness-store = { path = "../../crates/harness-store" }
+harness-trace = { path = "../../crates/harness-trace" }
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
 mime_guess.workspace = true
 rust-embed.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true

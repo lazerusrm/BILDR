@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:harness:failure.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "repository_id", "source", "terminal_code", "automatic_class", "severity", "taxonomy_version", "fingerprint_sha256", "cost"],
+  "properties": {
+    "schema": {"const": "harness.failure.v1"},
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
+    "repository_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
+    "source": {"type": "object", "additionalProperties": false, "required": ["kind", "id"], "properties": {"kind": {"enum": ["attempt_terminal", "run_terminal", "typed_outcome"]}, "id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"}}},
+    "terminal_code": {"type": ["string", "null"], "enum": ["policy_blocked", "budget_exhausted", "infrastructure_unavailable", "protocol_error", "integration_conflict", "source_failure", "inconclusive", "cancelled_superseded", null]},
+    "automatic_class": {"enum": ["unknown", "policy_blocked", "budget_exhausted", "infrastructure_unavailable", "protocol_error", "integration_conflict", "source_failure", "inconclusive", "cancelled_superseded"]},
+    "severity": {"enum": ["unknown", "low", "medium", "high", "critical"]},
+    "taxonomy_version": {"const": "harness.failure-taxonomy.v1"},
+    "fingerprint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "cost": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"const": "unknown"}}}, {"type": "object", "additionalProperties": false, "required": ["kind", "scope_id", "lower_microusd", "additional_microusd"], "properties": {"kind": {"const": "known"}, "scope_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"}, "lower_microusd": {"type": "integer", "minimum": 0}, "additional_microusd": {"type": "integer", "minimum": 0}}}]}
+  },
+  "allOf": [
+    {"if": {"properties": {"terminal_code": {"type": "null"}}, "required": ["terminal_code"]}, "then": {"properties": {"automatic_class": {"const": "unknown"}}}},
+    {"if": {"properties": {"terminal_code": {"const": "policy_blocked"}}, "required": ["terminal_code"]}, "then": {"properties": {"automatic_class": {"const": "policy_blocked"}}}},
+    {"if": {"properties": {"terminal_code": {"const": "budget_exhausted"}}, "required": ["terminal_code"]}, "then": {"properties": {"automatic_class": {"const": "budget_exhausted"}}}},
+    {"if": {"properties": {"terminal_code": {"const": "infrastructure_unavailable"}}, "required": ["terminal_code"]}, "then": {"properties": {"automatic_class": {"const": "infrastructure_unavailable"}}}},
+    {"if": {"properties": {"terminal_code": {"const": "protocol_error"}}, "required": ["terminal_code"]}, "then": {"properties": {"automatic_class": {"const": "protocol_error"}}}},
+    {"if": {"properties": {"terminal_code": {"const": "integration_conflict"}}, "required": ["terminal_code"]}, "then": {"properties": {"automatic_class": {"const": "integration_conflict"}}}},
+    {"if": {"properties": {"terminal_code": {"const": "source_failure"}}, "required": ["terminal_code"]}, "then": {"properties": {"automatic_class": {"const": "source_failure"}}}},
+    {"if": {"properties": {"terminal_code": {"const": "inconclusive"}}, "required": ["terminal_code"]}, "then": {"properties": {"automatic_class": {"const": "inconclusive"}}}},
+    {"if": {"properties": {"terminal_code": {"const": "cancelled_superseded"}}, "required": ["terminal_code"]}, "then": {"properties": {"automatic_class": {"const": "cancelled_superseded"}}}}
+  ]
+}

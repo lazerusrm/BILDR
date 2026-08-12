@@ -113,6 +113,8 @@ pub enum ImprovementRecordKind {
 #[serde(rename_all = "snake_case")]
 pub enum ImprovementSchema {
     TraceV1,
+    TraceV2,
+    OutcomeV1,
     EvalCaseV1,
     GraderBundleV1,
     ImprovementCandidateV1,
@@ -126,6 +128,8 @@ impl ImprovementSchema {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TraceV1 => "harness.trace.v1",
+            Self::TraceV2 => "harness.trace.v2",
+            Self::OutcomeV1 => "harness.outcome.v1",
             Self::EvalCaseV1 => "harness.eval-case.v1",
             Self::GraderBundleV1 => "harness.grader-bundle.v1",
             Self::ImprovementCandidateV1 => "harness.improvement-candidate.v1",
@@ -138,6 +142,8 @@ impl ImprovementSchema {
     pub const fn kind(self) -> ImprovementRecordKind {
         match self {
             Self::TraceV1 => ImprovementRecordKind::Trace,
+            Self::TraceV2 => ImprovementRecordKind::Trace,
+            Self::OutcomeV1 => ImprovementRecordKind::Outcome,
             Self::EvalCaseV1 => ImprovementRecordKind::EvalCase,
             Self::GraderBundleV1 => ImprovementRecordKind::GraderBundle,
             Self::ImprovementCandidateV1 => ImprovementRecordKind::Candidate,
@@ -919,6 +925,374 @@ pub enum ImprovementRiskClass {
     Red,
 }
 
+/// Closed, observational outcome dimensions. These are deliberately a vector,
+/// never an aggregate "success" value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeDimension {
+    OperatorAcceptance,
+    OperatorCorrection,
+    Validation,
+    Evidence,
+    VerifierFindings,
+    CompletionState,
+    ResourceUse,
+    CiRequiredChecks,
+    ReviewRegression,
+    PrReopened,
+    Rollback,
+    DownstreamRegression,
+}
+
+/// A label describes only its own dimension; it is not permission to promote.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeClassification {
+    Positive,
+    Negative,
+    Neutral,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum OutcomeLabelValidationError {
+    #[error("{dimension:?} is not an operator-entered outcome dimension")]
+    NotOperatorDimension { dimension: OutcomeDimension },
+    #[error("invalid {classification:?} code {code:?} for {dimension:?}")]
+    InvalidCode {
+        dimension: OutcomeDimension,
+        classification: OutcomeClassification,
+        code: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum OutcomeWireValidationError {
+    #[error("invalid outcome wire field: {0}")]
+    InvalidField(&'static str),
+    #[error(transparent)]
+    InvalidLabel(#[from] OutcomeLabelValidationError),
+}
+
+#[must_use]
+pub fn is_safe_outcome_identifier(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+#[must_use]
+pub fn is_safe_outcome_reason_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 80
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value.bytes().all(|byte| {
+            byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())
+        })
+}
+
+/// Validates the finite semantic label space for every observation dimension.
+pub fn validate_outcome_label(
+    dimension: OutcomeDimension,
+    classification: OutcomeClassification,
+    code: &str,
+) -> Result<(), OutcomeLabelValidationError> {
+    use OutcomeClassification::{Negative, Neutral, Positive, Unknown};
+    use OutcomeDimension::{
+        CiRequiredChecks, CompletionState, DownstreamRegression, Evidence, OperatorAcceptance,
+        OperatorCorrection, PrReopened, ResourceUse, ReviewRegression, Rollback, Validation,
+        VerifierFindings,
+    };
+    let valid = matches!(
+        (dimension, classification, code),
+        (
+            OperatorAcceptance,
+            Positive,
+            "accepted_without_correction" | "accepted_after_correction"
+        ) | (
+            OperatorAcceptance,
+            Negative,
+            "changes_requested" | "abandoned_wrong" | "abandoned_cost"
+        ) | (OperatorCorrection, Neutral, "correction_recorded")
+            | (OperatorCorrection, Unknown, "correction_not_available")
+            | (ReviewRegression, Negative, "review_regression")
+            | (ReviewRegression, Positive, "review_no_regression")
+            | (PrReopened, Negative, "reopened")
+            | (PrReopened, Positive, "not_reopened")
+            | (Rollback, Negative, "rollback_recorded")
+            | (Rollback, Neutral, "no_rollback")
+            | (DownstreamRegression, Negative, "downstream_regression")
+            | (DownstreamRegression, Positive, "no_downstream_regression")
+            | (Validation, Positive, "passed")
+            | (Validation, Negative, "failed")
+            | (Validation, Unknown, "unavailable")
+            | (Evidence, Positive, "proved")
+            | (Evidence, Negative, "unproved")
+            | (Evidence, Unknown, "unavailable")
+            | (VerifierFindings, Positive, "none")
+            | (VerifierFindings, Negative, "blocking" | "nonblocking")
+            | (VerifierFindings, Unknown, "unavailable")
+            | (
+                CompletionState,
+                Neutral,
+                "completed" | "blocked" | "stopped"
+            )
+            | (CompletionState, Unknown, "unknown")
+            | (ResourceUse, Neutral, "within_budget")
+            | (ResourceUse, Negative, "budget_exceeded")
+            | (ResourceUse, Unknown, "unavailable")
+            | (CiRequiredChecks, Positive, "passed")
+            | (CiRequiredChecks, Negative, "failed" | "head_mismatch")
+            | (CiRequiredChecks, Unknown, "unavailable")
+    );
+    if valid {
+        Ok(())
+    } else {
+        Err(OutcomeLabelValidationError::InvalidCode {
+            dimension,
+            classification,
+            code: code.to_owned(),
+        })
+    }
+}
+
+/// The manual boundary is a strict subset of the full observation vector.
+pub fn validate_operator_outcome_label(
+    dimension: OutcomeDimension,
+    classification: OutcomeClassification,
+    code: &str,
+) -> Result<(), OutcomeLabelValidationError> {
+    use OutcomeDimension::{
+        DownstreamRegression, OperatorAcceptance, OperatorCorrection, PrReopened, ReviewRegression,
+        Rollback,
+    };
+    if !matches!(
+        dimension,
+        OperatorAcceptance
+            | OperatorCorrection
+            | ReviewRegression
+            | PrReopened
+            | Rollback
+            | DownstreamRegression
+    ) {
+        return Err(OutcomeLabelValidationError::NotOperatorDimension { dimension });
+    }
+    validate_outcome_label(dimension, classification, code)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeConfidence {
+    Authoritative,
+    OperatorAsserted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeSubjectKind {
+    Run,
+    TaskAttempt,
+    Publication,
+}
+
+/// Sources are closed so untyped provider text cannot become outcome authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeSourceKind {
+    HumanAction,
+    Validation,
+    Evidence,
+    Finding,
+    Publication,
+    DomainEvent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutcomeSubject {
+    pub kind: OutcomeSubjectKind,
+    pub id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutcomeSource {
+    pub kind: OutcomeSourceKind,
+    pub record_id: String,
+    pub record_sha256: String,
+    pub source_sha: Option<String>,
+    pub source_domain_event_id: Option<i64>,
+}
+
+/// Stable OutcomeV1 wire payload. Code is dimension-specific and constrained
+/// by the JSON schema; Rust leaves schema validation to the boundary layer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutcomeWireV1 {
+    pub schema: String,
+    pub outcome_id: OutcomeId,
+    pub run_id: RunId,
+    pub subject: OutcomeSubject,
+    pub dimension: OutcomeDimension,
+    pub classification: OutcomeClassification,
+    pub code: String,
+    pub observed_at: i64,
+    pub confidence: OutcomeConfidence,
+    pub source: OutcomeSource,
+    pub supersedes: Vec<String>,
+    pub reason_code: Option<String>,
+    pub correction_artifact_id: Option<ArtifactId>,
+    pub redactor_version: String,
+    pub free_text_redacted: bool,
+}
+
+impl OutcomeWireV1 {
+    /// Validates the persisted/returned OutcomeV1 contract before it crosses an
+    /// authority boundary. It intentionally accepts every closed source kind;
+    /// source-to-record ownership is verified by the Store.
+    pub fn validate(&self) -> Result<(), OutcomeWireValidationError> {
+        if self.schema != "harness.outcome.v1" {
+            return Err(OutcomeWireValidationError::InvalidField("schema"));
+        }
+        if !is_safe_outcome_identifier(self.outcome_id.as_str(), 128) {
+            return Err(OutcomeWireValidationError::InvalidField("outcome_id"));
+        }
+        if !is_safe_outcome_identifier(self.run_id.as_str(), 128) {
+            return Err(OutcomeWireValidationError::InvalidField("run_id"));
+        }
+        if !is_safe_outcome_identifier(&self.subject.id, 128) {
+            return Err(OutcomeWireValidationError::InvalidField("subject.id"));
+        }
+        validate_outcome_label(self.dimension, self.classification, &self.code)?;
+        let source_is_allowed = matches!(
+            (self.dimension, self.confidence, self.source.kind),
+            (
+                OutcomeDimension::Validation,
+                OutcomeConfidence::Authoritative,
+                OutcomeSourceKind::Validation
+            ) | (
+                OutcomeDimension::Evidence,
+                OutcomeConfidence::Authoritative,
+                OutcomeSourceKind::Evidence
+            ) | (
+                OutcomeDimension::VerifierFindings,
+                OutcomeConfidence::Authoritative,
+                OutcomeSourceKind::Finding | OutcomeSourceKind::DomainEvent
+            ) | (
+                OutcomeDimension::CompletionState | OutcomeDimension::ResourceUse,
+                OutcomeConfidence::Authoritative,
+                OutcomeSourceKind::DomainEvent
+            ) | (
+                OutcomeDimension::CiRequiredChecks,
+                OutcomeConfidence::Authoritative,
+                OutcomeSourceKind::Validation | OutcomeSourceKind::Evidence
+            ) | (
+                OutcomeDimension::OperatorAcceptance
+                    | OutcomeDimension::OperatorCorrection
+                    | OutcomeDimension::ReviewRegression
+                    | OutcomeDimension::PrReopened
+                    | OutcomeDimension::Rollback
+                    | OutcomeDimension::DownstreamRegression,
+                OutcomeConfidence::OperatorAsserted,
+                OutcomeSourceKind::HumanAction
+            )
+        );
+        if !source_is_allowed {
+            return Err(OutcomeWireValidationError::InvalidField(
+                "dimension/confidence/source",
+            ));
+        }
+        if self.observed_at < 0 {
+            return Err(OutcomeWireValidationError::InvalidField("observed_at"));
+        }
+        if !is_safe_outcome_identifier(&self.source.record_id, 128)
+            || !is_lower_hex(&self.source.record_sha256, 64)
+            || self
+                .source
+                .source_sha
+                .as_deref()
+                .is_some_and(|value| !is_lower_hex(value, 40))
+            || self
+                .source
+                .source_domain_event_id
+                .is_some_and(|value| value <= 0)
+        {
+            return Err(OutcomeWireValidationError::InvalidField("source"));
+        }
+        if self
+            .supersedes
+            .iter()
+            .any(|value| !is_safe_outcome_identifier(value, 128))
+            || self
+                .reason_code
+                .as_deref()
+                .is_some_and(|value| !is_safe_outcome_reason_code(value))
+            || self
+                .correction_artifact_id
+                .as_ref()
+                .is_some_and(|value| !is_safe_outcome_identifier(value.as_str(), 128))
+            || !is_safe_outcome_identifier(&self.redactor_version, 128)
+        {
+            return Err(OutcomeWireValidationError::InvalidField(
+                "bounded identifiers",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutcomeRevisionView {
+    pub revision_id: String,
+    pub revision: u64,
+    pub outcome: OutcomeWireV1,
+    pub is_head: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutcomeVectorItem {
+    pub outcome_id: OutcomeId,
+    pub subject: OutcomeSubject,
+    pub dimension: OutcomeDimension,
+    pub revisions: Vec<OutcomeRevisionView>,
+    pub conflicted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutcomeVector {
+    pub run_id: RunId,
+    pub items: Vec<OutcomeVectorItem>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutcomeHistory {
+    pub outcome_id: OutcomeId,
+    pub run_id: RunId,
+    pub revisions: Vec<OutcomeRevisionView>,
+    pub conflicted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutcomeRevisionReceipt {
+    pub outcome_id: OutcomeId,
+    pub revision_id: String,
+    pub revision: u64,
+    pub vector: OutcomeVector,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum CandidateEditValidationError {
     #[error("unknown improvement dimension: {0}")]
@@ -1290,5 +1664,109 @@ mod tests {
             validate_candidate_edit("later_dimension", ImprovementRiskClass::Green),
             Err(CandidateEditValidationError::UnknownDimension(_))
         ));
+    }
+
+    #[test]
+    fn outcome_wire_stays_observational_and_closed() {
+        assert_eq!(ImprovementSchema::OutcomeV1.as_str(), "harness.outcome.v1");
+        assert_eq!(ImprovementSchema::TraceV2.as_str(), "harness.trace.v2");
+        assert_eq!(
+            ImprovementSchema::OutcomeV1.kind(),
+            ImprovementRecordKind::Outcome
+        );
+        assert!(ImprovementState::Observed.allowed_for(ImprovementRecordKind::Outcome));
+        assert!(!ImprovementState::Passed.allowed_for(ImprovementRecordKind::Outcome));
+        assert!(serde_json::from_str::<OutcomeClassification>("\"positive\"").is_ok());
+        assert!(serde_json::from_str::<OutcomeClassification>("\"success\"").is_err());
+        assert!(
+            validate_operator_outcome_label(
+                OutcomeDimension::OperatorAcceptance,
+                OutcomeClassification::Positive,
+                "accepted_after_correction",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_operator_outcome_label(
+                OutcomeDimension::OperatorAcceptance,
+                OutcomeClassification::Positive,
+                "changes_requested",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_operator_outcome_label(
+                OutcomeDimension::CiRequiredChecks,
+                OutcomeClassification::Positive,
+                "passed",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_outcome_label(
+                OutcomeDimension::CiRequiredChecks,
+                OutcomeClassification::Positive,
+                "passed",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_outcome_label(
+                OutcomeDimension::CiRequiredChecks,
+                OutcomeClassification::Positive,
+                "failed",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn outcome_wire_rejects_unbounded_or_contradictory_response_data() {
+        let mut wire = OutcomeWireV1 {
+            schema: "harness.outcome.v1".to_owned(),
+            outcome_id: OutcomeId::from("outcome_01"),
+            run_id: RunId::from("run_01"),
+            subject: OutcomeSubject {
+                kind: OutcomeSubjectKind::Run,
+                id: "run_01".to_owned(),
+            },
+            dimension: OutcomeDimension::Validation,
+            classification: OutcomeClassification::Positive,
+            code: "passed".to_owned(),
+            observed_at: 1,
+            confidence: OutcomeConfidence::Authoritative,
+            source: OutcomeSource {
+                kind: OutcomeSourceKind::Validation,
+                record_id: "validation_01".to_owned(),
+                record_sha256: "a".repeat(64),
+                source_sha: Some("b".repeat(40)),
+                source_domain_event_id: Some(1),
+            },
+            supersedes: Vec::new(),
+            reason_code: None,
+            correction_artifact_id: None,
+            redactor_version: "outcome-redactor.v1".to_owned(),
+            free_text_redacted: false,
+        };
+        assert!(wire.validate().is_ok());
+        wire.dimension = OutcomeDimension::VerifierFindings;
+        wire.classification = OutcomeClassification::Positive;
+        wire.code = "none".to_owned();
+        wire.source.kind = OutcomeSourceKind::DomainEvent;
+        assert!(wire.validate().is_ok());
+        wire.source.kind = OutcomeSourceKind::Validation;
+        assert!(wire.validate().is_err());
+        wire.source.kind = OutcomeSourceKind::DomainEvent;
+        wire.dimension = OutcomeDimension::Validation;
+        wire.code = "passed".to_owned();
+        wire.source.kind = OutcomeSourceKind::Validation;
+        wire.code = "failed".to_owned();
+        assert!(wire.validate().is_err());
+        wire.code = "passed".to_owned();
+        wire.source.record_sha256 = "not-a-digest".to_owned();
+        assert!(wire.validate().is_err());
+        wire.source.record_sha256 = "a".repeat(64);
+        wire.source.kind = OutcomeSourceKind::Evidence;
+        assert!(wire.validate().is_err());
     }
 }

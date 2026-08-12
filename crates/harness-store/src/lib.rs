@@ -30,6 +30,8 @@ const ACCOUNT_ATTRIBUTION_MIGRATION: &str =
     include_str!("../../../migrations/0005_account_attribution.sql");
 const SELF_IMPROVEMENT_MIGRATION: &str =
     include_str!("../../../migrations/0006_self_improvement.sql");
+const FAILURE_OBSERVATION_MIGRATION: &str =
+    include_str!("../../../migrations/0007_failure_observation.sql");
 
 #[derive(Clone)]
 pub struct Store {
@@ -247,8 +249,18 @@ fn apply_runtime_migrations(connection: &mut Connection) -> Result<(), StoreErro
         transaction.execute_batch(SELF_IMPROVEMENT_MIGRATION)?;
         transaction.commit()?;
     }
+    let has_failure_occurrences: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='failure_occurrences')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_failure_occurrences {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(FAILURE_OBSERVATION_MIGRATION)?;
+        transaction.commit()?;
+    }
     connection.execute(
-        "INSERT INTO schema_migrations_meta(key, value) VALUES('runtime_schema_version', '6') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        "INSERT INTO schema_migrations_meta(key, value) VALUES('runtime_schema_version', '7') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         [],
     )?;
     Ok(())
@@ -289,7 +301,7 @@ mod tests {
         assert!(store.check().unwrap().ready);
         drop(store);
         let reopened = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(reopened.migration_version().unwrap(), "6");
+        assert_eq!(reopened.migration_version().unwrap(), "7");
         let has_worktree_fingerprint: bool = reopened
             .connection()
             .unwrap()
@@ -320,6 +332,16 @@ mod tests {
             )
             .unwrap();
         assert!(has_codex_account_id);
+        let has_failure_observations: bool = reopened
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='failure_occurrences')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_failure_observations);
     }
 
     #[test]
@@ -446,7 +468,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let store = Store::open(&database, &temp.path().join("artifacts")).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "6");
+        assert_eq!(store.migration_version().unwrap(), "7");
         for name in [
             "improvement_revisions",
             "improvement_events",
@@ -464,6 +486,17 @@ mod tests {
                 .unwrap();
             assert!(exists, "missing upgraded object {name}");
         }
+
+        let failure_table: bool = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='failure_occurrences')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(failure_table);
         let input = improvement_input("v5-upgrade", "v5-upgrade-key");
         let (revision, _) = store.append_improvement_revision(&input).unwrap();
         assert_eq!(
@@ -473,6 +506,94 @@ mod tests {
                 .unwrap()
                 .id,
             revision.id
+        );
+    }
+
+    #[test]
+    fn v6_upgrade_installs_failure_observation_schema_append_only_and_reopens() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("v6.sqlite3");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.execute_batch(INITIAL_MIGRATION).unwrap();
+        connection.execute_batch(RUNTIME_MIGRATION).unwrap();
+        connection
+            .execute_batch(APPROVAL_WORKTREE_BINDING_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(ATTEMPT_CONTINUITY_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(ACCOUNT_ATTRIBUTION_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(SELF_IMPROVEMENT_MIGRATION)
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE schema_migrations_meta SET value='6' WHERE key='runtime_schema_version'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let artifacts = temp.path().join("artifacts");
+        let store = Store::open(&database, &artifacts).unwrap();
+        assert_eq!(store.migration_version().unwrap(), "7");
+        for name in [
+            "failure_occurrences",
+            "failure_clusters",
+            "failure_classification_revisions",
+            "failure_cluster_membership_revisions",
+            "failure_cluster_edits",
+            "failure_occurrences_no_update",
+            "failure_cluster_membership_revisions_no_delete",
+        ] {
+            let exists: bool = store
+                .connection()
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "missing v7 object {name}");
+        }
+        let repository = harness_domain::RepositoryId::from("repository-v6-upgrade");
+        store
+            .create_repository(&NewRepository {
+                id: repository.clone(),
+                profile_id: "fixture".into(),
+                profile_version: 1,
+                display_name: "fixture".into(),
+                root_path: temp.path().join("checkout"),
+                origin_url: None,
+                default_branch: "main".into(),
+                expected_coordination_branch: None,
+                state: "READY".into(),
+            })
+            .unwrap();
+        store.connection().unwrap().execute(
+            "INSERT INTO failure_occurrences(id,repository_id,source_kind,source_id,terminal_code,automatic_class,severity,taxonomy_version,fingerprint_sha256,created_at) VALUES('failure-v6',?1,'run_terminal','run-v6','budget_exhausted','budget_exhausted','unknown','harness.failure-taxonomy.v1',?2,1)",
+            rusqlite::params![repository.as_str(), "b".repeat(64)],
+        ).unwrap();
+        assert!(
+            store
+                .connection()
+                .unwrap()
+                .execute(
+                    "UPDATE failure_occurrences SET severity='high' WHERE id='failure-v6'",
+                    []
+                )
+                .is_err()
+        );
+        drop(store);
+        let reopened = Store::open(&database, &artifacts).unwrap();
+        assert_eq!(reopened.migration_version().unwrap(), "7");
+        assert!(
+            reopened
+                .backup(&temp.path().join("v6-backup.sqlite3"))
+                .is_ok()
         );
     }
 
@@ -553,6 +674,71 @@ mod tests {
         for bad in [-1_i64, 0] {
             store.connection().unwrap().execute("INSERT INTO improvement_revisions(id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,created_at) VALUES(?1,'candidate',?1,?2,'harness.improvement-candidate.v1','proposed','{\"schema\":\"harness.improvement-candidate.v1\"}',?3,'internal','governance',0,1)", rusqlite::params![format!("bad-revision-{bad}"), bad, crate::queries::sha256(b"{\"schema\":\"harness.improvement-candidate.v1\"}")]).unwrap_err();
         }
+    }
+
+    #[test]
+    fn trace_snapshot_includes_domain_only_and_legacy_child_raw_rows() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::in_memory(&temp.path().join("a")).unwrap();
+        {
+            let connection = store.connection().unwrap();
+            connection
+                .pragma_update(None, "foreign_keys", false)
+                .unwrap();
+            connection.execute_batch("INSERT INTO runs(id,repository_id,title,requested_objective,mode,publication_mode,state,phase,base_ref,base_sha,authority_digest,profile_digest,requested_by,created_at,updated_at) VALUES('run-trace','repo','t','o','m','p','CREATED','p','main','0000000000000000000000000000000000000000','authority','profile','test',1,1); INSERT INTO agent_sessions(id,run_id,runtime_kind,role,requested_model,requested_reasoning_effort,sandbox_mode,approval_policy,cwd,state) VALUES('child','run-trace','test','worker','model','low','read_only','never','/tmp','COMPLETED');").unwrap();
+        }
+        let payload = serde_json::json!({"value":"child"});
+        store.connection().unwrap().execute("INSERT INTO raw_events(run_id,agent_session_id,direction,method,received_at,payload_json,payload_sha256,redaction_class) VALUES(NULL,'child','inbound','item/completed',1,?1,?2,'none')", rusqlite::params![payload.to_string(), crate::queries::sha256(payload.to_string().as_bytes())]).unwrap();
+        store
+            .emit_domain_event(
+                Some(&harness_domain::RunId::from("run-trace")),
+                "run",
+                "run-trace",
+                "run.observed",
+                &serde_json::json!({"ok":true}),
+                Some(1),
+            )
+            .unwrap();
+        let first = store
+            .trace_projection_snapshot(&harness_domain::RunId::from("run-trace"))
+            .unwrap();
+        assert_eq!(first.raw_events.len(), 1);
+        assert_eq!(first.domain_events.len(), 1);
+        assert!(
+            first
+                .structural_receipts
+                .iter()
+                .any(|receipt| receipt.id == "agent:child")
+        );
+        assert!(
+            first
+                .relations
+                .iter()
+                .any(|relation| relation.from == "structural:agent:child"
+                    && relation.to == "raw:1"
+                    && relation.kind == "context_parent")
+        );
+        assert!(
+            first
+                .relations
+                .iter()
+                .any(|relation| relation.from == "raw:1"
+                    && relation.to == "domain:1"
+                    && relation.kind == "derived_from")
+        );
+        assert!(
+            !first
+                .relations
+                .iter()
+                .any(|relation| relation.kind == "next")
+        );
+        assert_eq!(
+            first.structural_digest,
+            store
+                .trace_projection_snapshot(&harness_domain::RunId::from("run-trace"))
+                .unwrap()
+                .structural_digest
+        );
     }
 
     #[test]
