@@ -732,8 +732,12 @@ impl Store {
             [run_id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
+        // Lifecycle receipts are rare, while a long-running run can own
+        // hundreds of thousands of protocol-derived domain events.  Enter
+        // through the aggregate index so observation does not walk the whole
+        // run history merely to find controller-owned run transitions.
         let mut lifecycle = connection.prepare(
-            "SELECT id,occurred_at,payload_json FROM domain_events WHERE run_id=?1 AND event_type='run.lifecycle.transitioned' ORDER BY id",
+            "SELECT id,occurred_at,payload_json FROM domain_events INDEXED BY idx_domain_events_aggregate WHERE aggregate_type='run' AND aggregate_id=?1 AND run_id=?1 AND event_type='run.lifecycle.transitioned' ORDER BY id",
         )?;
         for row in lifecycle.query_map([run_id.as_str()], |row| {
             Ok((
@@ -808,8 +812,11 @@ impl Store {
             });
         }
         drop(lifecycle);
+        // Task lifecycle events are likewise a tiny aggregate partition.  The
+        // task join verifies ownership and gives SQLite each exact aggregate
+        // key, rather than asking it to walk the broad per-run event feed.
         let mut verified = connection.prepare(
-            "SELECT id,occurred_at,payload_json FROM domain_events WHERE run_id=?1 AND event_type='task.verified' ORDER BY id",
+            "SELECT de.id,de.occurred_at,de.payload_json FROM tasks t INDEXED BY idx_tasks_run_state JOIN domain_events de INDEXED BY idx_domain_events_aggregate ON de.aggregate_type='task' AND de.aggregate_id=t.id WHERE t.run_id=?1 AND de.run_id=?1 AND de.event_type='task.verified' ORDER BY de.id",
         )?;
         for row in verified.query_map([run_id.as_str()], |row| {
             Ok((
@@ -5282,9 +5289,12 @@ mod tests {
                  INSERT INTO evidence_records(id,run_id,claim_id,checklist_rows_json,source_sha,proof_tier,result_class,evidence_json,evidence_sha256,unproved_claims_json,created_at) VALUES('evidence-1','run-lifecycle-event','claim','[]','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','T1','source_failure','{}','cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc','[]',3);
                  INSERT INTO evidence_records(id,run_id,claim_id,checklist_rows_json,source_sha,proof_tier,result_class,evidence_json,evidence_sha256,unproved_claims_json,created_at,invalidated_at) VALUES('evidence-invalid','run-lifecycle-event','claim','[]','eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee','T1','success','{}','ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff','[]',4,5);
                  INSERT INTO findings(id,run_id,verifier_agent_session_id,severity,category,invariant,description,required_correction,state,created_at) VALUES('finding-1','run-lifecycle-event','verifier-1','high','fixture','fixture','fixture','fixture','open',4);
+                 INSERT INTO tasks(id,run_id,plan_revision_id,external_task_id,title,objective,priority,owner_profile,reviewer_profile,state,current_attempt_number,created_at,updated_at,version) VALUES('task-1','run-lifecycle-event','plan-fixture','fixture-task','fixture','fixture','normal','fixture','fixture','VERIFIED',0,1,1,1);
                  UPDATE runs SET run_token_budget=1 WHERE id='run-lifecycle-event';
                  INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json) VALUES('run-lifecycle-event','run','run-lifecycle-event','run.lifecycle.transitioned',5,'{\"next_state\":\"COMPLETED\"}');
-                 INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json) VALUES('run-lifecycle-event','task','task-1','task.verified',6,'{}');"
+                 INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json) VALUES('run-lifecycle-event','task','task-1','task.verified',6,'{}');
+                 INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json) VALUES('run-lifecycle-event','agent','agent-decoy','run.lifecycle.transitioned',7,'{\"next_state\":\"COMPLETED\"}');
+                 INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json) VALUES('run-lifecycle-event','agent','agent-decoy','task.verified',8,'{}');"
             ).unwrap();
             connection
                 .pragma_update(None, "foreign_keys", true)
