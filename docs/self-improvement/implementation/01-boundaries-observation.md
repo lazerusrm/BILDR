@@ -63,12 +63,12 @@ candidate.
 
 **Scope**
 
-- extract run execution, planning, retry, verification, integration, and
-  publication services from the large orchestrator module;
-- define stable observer hooks for run events and outcomes;
-- split `App.tsx` into route-level feature modules;
-- add architecture dependency checks preventing new improvement crates from
-  importing internal orchestrator implementation.
+- record each successful guarded run lifecycle transition as one durable domain
+  event in the same store transaction, without changing the event cursor or
+  SSE read contract;
+- defer extraction of orchestration services, UI route modules, and additional
+  observer interfaces until a real improvement consumer establishes the needed
+  interface boundary.
 
 **Tests**
 
@@ -79,8 +79,9 @@ candidate.
 
 **Exit gate**
 
-New improvement services can subscribe through interfaces without adding
-evaluation logic to the production orchestrator.
+The observe-only reader can replay guarded lifecycle transitions through the
+existing domain-event cursor and SSE seam; broader orchestration and UI
+extraction remains deferred until a consumer demonstrates the interface need.
 
 ### SI-003 — Strengthen schema and fixture validation
 

@@ -351,7 +351,16 @@ impl Store {
         expected_version: Option<u64>,
         failure: Option<(&str, &str)>,
     ) -> Result<RunSummary, StoreError> {
-        let current = self.run(id)?;
+        let connection = self.connection()?;
+        let transaction = connection.unchecked_transaction()?;
+        let current = transaction
+            .query_row(
+                &format!("{} WHERE r.id=?1", run_select()),
+                [id.as_str()],
+                map_run,
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("run {id}")))?;
         if expected_version.is_some_and(|version| version != current.version) {
             return Err(StoreError::Conflict(format!(
                 "run {id} is version {}, not {}",
@@ -369,7 +378,7 @@ impl Store {
         let completed = next.is_terminal().then_some(now);
         let (failure_class, failure_reason) = failure.unzip();
         let current_version = sqlite_version(current.version)?;
-        let changed = self.connection()?.execute(
+        let changed = transaction.execute(
             "UPDATE runs SET state=?2,phase=?3,updated_at=?4,completed_at=coalesce(?5,completed_at),failure_class=?6,failure_reason=?7,version=version+1 WHERE id=?1 AND version=?8",
             params![
                 id.as_str(),
@@ -387,7 +396,34 @@ impl Store {
                 "run {id} changed concurrently"
             )));
         }
-        self.run(id)
+        let resulting_version = current.version.checked_add(1).ok_or_else(|| {
+            StoreError::Validation(format!("run {id} version exceeds supported range"))
+        })?;
+        let payload = json!({
+            "prior_state": current.state.to_string(),
+            "next_state": next.to_string(),
+            "phase": phase,
+            "run_version": resulting_version,
+            "failure_class": failure_class,
+        });
+        transaction.execute(
+            "INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json,source_raw_event_id) VALUES(?1,?2,?3,?4,?5,?6,NULL)",
+            params![
+                id.as_str(),
+                "run",
+                id.as_str(),
+                "run.lifecycle.transitioned",
+                now,
+                serde_json::to_string(&payload)?,
+            ],
+        )?;
+        let updated = transaction.query_row(
+            &format!("{} WHERE r.id=?1", run_select()),
+            [id.as_str()],
+            map_run,
+        )?;
+        transaction.commit()?;
+        Ok(updated)
     }
 
     pub fn set_scheduler_paused(&self, id: &RunId, paused: bool) -> Result<RunSummary, StoreError> {
@@ -2580,4 +2616,118 @@ pub fn packet_digest<T: Serialize>(value: &T) -> Result<String, StoreError> {
 
 pub fn operation_payload(kind: &str, target: &str) -> Value {
     json!({"kind": kind, "target": target})
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn store_with_created_run() -> (Store, RunId) {
+        let temp = TempDir::new().unwrap();
+        let artifacts = temp.path().join("artifacts");
+        let store = Store::in_memory(&artifacts).unwrap();
+        let repository_id = RepositoryId::from("repository-lifecycle-event");
+        store
+            .create_repository(&NewRepository {
+                id: repository_id.clone(),
+                profile_id: "fixture".to_owned(),
+                profile_version: 1,
+                display_name: "Lifecycle event fixture".to_owned(),
+                root_path: PathBuf::from("/tmp/lifecycle-event-fixture"),
+                origin_url: None,
+                default_branch: "main".to_owned(),
+                expected_coordination_branch: None,
+                state: "READY".to_owned(),
+            })
+            .unwrap();
+        let run_id = RunId::from("run-lifecycle-event");
+        store
+            .create_run(&NewRun {
+                id: run_id.clone(),
+                repository_id,
+                title: "Lifecycle event fixture".to_owned(),
+                objective: "Verify lifecycle transition persistence".to_owned(),
+                mode: "standard".to_owned(),
+                publication_mode: "none".to_owned(),
+                state: RunState::Created.to_string(),
+                phase: "created".to_owned(),
+                base_ref: "main".to_owned(),
+                base_sha: "fixture".to_owned(),
+                authority_digest: "fixture".to_owned(),
+                profile_digest: "fixture".to_owned(),
+                codex_version: None,
+                protocol_schema_sha256: None,
+                requested_by: "test".to_owned(),
+                token_budget: None,
+            })
+            .unwrap();
+        (store, run_id)
+    }
+
+    #[test]
+    fn successful_run_transition_emits_one_lifecycle_event_after_cursor() {
+        let (store, run_id) = store_with_created_run();
+        let cursor = store.latest_domain_cursor().unwrap();
+
+        let updated = store
+            .transition_run(&run_id, RunState::Preparing, "prepare", Some(1), None)
+            .unwrap();
+
+        assert_eq!(updated.state, RunState::Preparing);
+        assert_eq!(updated.version, 2);
+        let events = store.list_domain_events(cursor, Some(&run_id), 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].run_id, Some(run_id.clone()));
+        assert_eq!(events[0].aggregate_type, "run");
+        assert_eq!(events[0].aggregate_id, run_id.as_str());
+        assert_eq!(events[0].event_type, "run.lifecycle.transitioned");
+        assert_eq!(
+            events[0].payload,
+            json!({
+                "prior_state": "CREATED",
+                "next_state": "PREPARING",
+                "phase": "prepare",
+                "run_version": 2,
+                "failure_class": null,
+            })
+        );
+        assert!(
+            store
+                .list_domain_events(events[0].id, Some(&run_id), 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rejected_run_transition_leaves_run_and_event_journal_unchanged() {
+        let (store, run_id) = store_with_created_run();
+        let before = store.run(&run_id).unwrap();
+        let cursor = store.latest_domain_cursor().unwrap();
+
+        assert!(
+            store
+                .transition_run(&run_id, RunState::Completed, "complete", Some(1), None)
+                .is_err()
+        );
+        assert!(
+            store
+                .transition_run(&run_id, RunState::Preparing, "prepare", Some(2), None)
+                .is_err()
+        );
+
+        let after = store.run(&run_id).unwrap();
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.version, before.version);
+        assert!(
+            store
+                .list_domain_events(cursor, Some(&run_id), 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
