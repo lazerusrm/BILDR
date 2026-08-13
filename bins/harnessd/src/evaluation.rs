@@ -70,6 +70,9 @@ pub struct EvaluationService {
     git: GitManager,
     worktree_root: PathBuf,
     spool_root: PathBuf,
+    #[cfg(test)]
+    failure_after_authority_writes:
+        std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<&'static str>>>,
 }
 
 struct MaterializedOverlay {
@@ -152,6 +155,10 @@ impl EvaluationService {
             git: GitManager::new(&worktree_root)?,
             worktree_root,
             spool_root,
+            #[cfg(test)]
+            failure_after_authority_writes: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
         })
     }
 
@@ -192,16 +199,16 @@ impl EvaluationService {
         {
             bail!("historical observer snapshot reproduction was not trusted");
         }
-        let (taskset_revision, grader_revision, case_revision) = self.ensure_fixed_eval_wires(
-            &repository_id,
-            &historical.controller_evidence.evidence_sha256,
-        )?;
+        let (taskset_revision, grader_revision, case_revision) = self
+            .ensure_fixed_eval_wires(&repository_id, &observer_snapshot_historical_wire_digest())?;
         self.store
             .append_taskset_membership(&NewTasksetMembership {
                 taskset_revision_id: taskset_revision.clone(),
                 eval_case_revision_id: case_revision.clone(),
                 ordinal: 0,
             })?;
+        #[cfg(test)]
+        self.fail_after_authority_write("taskset_membership")?;
         let fixed_plan = &plan.arms[1];
         let fixed_run = self.ensure_controller_run(&repository_id, fixed_plan)?;
         let fixed = self
@@ -229,6 +236,8 @@ impl EvaluationService {
             challenger_policy_digest: None,
             idempotency_key: "m2-observer-snapshot-fixed-evaluation-v1".to_owned(),
         })?;
+        #[cfg(test)]
+        self.fail_after_authority_write("evaluation_run")?;
         let pins = self
             .store
             .evaluation_launch_pins(&taskset_revision, &grader_revision)?;
@@ -275,6 +284,8 @@ impl EvaluationService {
             sample,
             idempotency_key: "m2-observer-snapshot-fixed-sample-v1".to_owned(),
         })?;
+        #[cfg(test)]
+        self.fail_after_authority_write("sample")?;
         self.complete_from_sample(&sample_receipt, &repository_id)?;
         Ok(format!(
             "{}:{}",
@@ -318,6 +329,8 @@ impl EvaluationService {
                 receipt_digest: sample.sample_digest.clone(),
                 idempotency_key: "m2-observer-snapshot-fixed-evaluation-completed-v1".to_owned(),
             })?;
+        #[cfg(test)]
+        self.fail_after_authority_write("completed_status")?;
         Ok(())
     }
 
@@ -393,6 +406,27 @@ impl EvaluationService {
             token_budget: None,
         })?;
         Ok(run_id)
+    }
+
+    #[cfg(test)]
+    fn inject_failures_after_authority_writes(
+        &self,
+        writes: impl IntoIterator<Item = &'static str>,
+    ) {
+        self.failure_after_authority_writes
+            .lock()
+            .unwrap()
+            .extend(writes);
+    }
+
+    #[cfg(test)]
+    fn fail_after_authority_write(&self, write: &str) -> Result<()> {
+        let mut requested = self.failure_after_authority_writes.lock().unwrap();
+        if requested.front().copied() == Some(write) {
+            requested.pop_front();
+            bail!("injected failure after evaluation authority write: {write}");
+        }
+        Ok(())
     }
 
     /// Append the three immutable controller wires in dependency order. The
@@ -548,7 +582,8 @@ impl EvaluationService {
         run_id: harness_domain::RunId,
     ) -> Result<PersistedArm> {
         let attempt = execution_attempt_suffix()?;
-        let expected_path = self.worktree_root.join(&arm.relative_worktree);
+        let relative_worktree = attempt_worktree_path(arm, &attempt);
+        let expected_path = self.worktree_root.join(&relative_worktree);
         let managed_root = std::fs::canonicalize(&self.worktree_root)
             .context("managed evaluation worktree root is unavailable")?;
         if expected_path.exists() {
@@ -585,7 +620,7 @@ impl EvaluationService {
             .git
             .create_worktree(&WorktreeSpec {
                 repository_root: repository.to_path_buf(),
-                relative_path: arm.relative_worktree.clone(),
+                relative_path: relative_worktree,
                 base_sha: arm.base_sha.to_owned(),
                 branch: None,
             })
@@ -1157,7 +1192,7 @@ impl EvaluationService {
         let result = (|| {
             sealed_copy_registry(&lock, &registry, &registry_snapshot)?;
             sealed_empty_git_snapshot(&git_snapshot)?;
-            sealed_copy_tree(&toolchain, &toolchain_snapshot)?;
+            sealed_copy_toolchain_runtime(&toolchain, &toolchain_snapshot)?;
             std::fs::create_dir_all(&target_root)?;
             std::fs::create_dir(&target)?;
             let registry_manifest_digest = content_manifest_digest(&registry_snapshot)?;
@@ -1208,6 +1243,27 @@ impl EvaluationService {
 
 fn evaluation_artifact_id(arm: &str, name: &str) -> harness_domain::ArtifactId {
     harness_domain::ArtifactId::from(format!("m2-observer-snapshot-{arm}-{name}"))
+}
+
+fn attempt_worktree_path(arm: &ObserverSnapshotArmPlan, attempt: &str) -> PathBuf {
+    arm.relative_worktree.join(attempt)
+}
+
+// The immutable eval-case wire must survive a fresh controller attempt after
+// partial persistence. Its source binds only the closed historical contract;
+// attempt-scoped command/evidence receipts remain audit records and must not
+// rewrite this stable downstream authority.
+fn observer_snapshot_historical_wire_digest() -> String {
+    digest_text(&format!(
+        "harness.m2.observer.historical-wire.v1\0{}\0{}\0{}\0{}",
+        OBSERVER_SNAPSHOT_HISTORICAL_BASE,
+        observer_snapshot_fixture_digest(ObserverSnapshotArm::Historical),
+        observer_snapshot_setup_digest(
+            ObserverSnapshotArm::Historical,
+            OBSERVER_SNAPSHOT_HISTORICAL_BASE,
+        ),
+        observer_snapshot_command_digest(),
+    ))
 }
 
 fn command_wire(parts: &[&str]) -> serde_json::Value {
@@ -1428,6 +1484,7 @@ fn sealed_copy_tree_with_budget(
     copy(source, source, target, 0, budget)
 }
 
+#[cfg(test)]
 fn sealed_copy_tree(source: &Path, target: &Path) -> Result<()> {
     let result = sealed_copy_tree_with_budget(source, target, &mut SnapshotBudget::default());
     match result {
@@ -1436,6 +1493,49 @@ fn sealed_copy_tree(source: &Path, target: &Path) -> Result<()> {
             Ok(()) => Err(error),
             Err(cleanup_error) => bail!(
                 "sealed snapshot copy failed ({error}); partial copy cleanup also failed: {cleanup_error}"
+            ),
+        },
+    }
+}
+
+/// Seal exactly the Rust toolchain components used by the isolated Cargo
+/// command.  `share` is deliberately excluded: it contains documentation and
+/// shell completions, is not mounted as an executable authority, and copying
+/// it would make a bounded controller evaluation needlessly expensive.
+fn sealed_copy_toolchain_runtime(source: &Path, target: &Path) -> Result<()> {
+    const RUNTIME_COMPONENTS: [&str; 4] = ["bin", "etc", "lib", "libexec"];
+
+    let result = (|| {
+        let metadata = std::fs::symlink_metadata(source)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("Rust toolchain source must be a real directory");
+        }
+        std::fs::create_dir(target)?;
+        let mut budget = SnapshotBudget::default();
+        for component in RUNTIME_COMPONENTS {
+            let component_source = source.join(component);
+            let component_metadata = std::fs::symlink_metadata(&component_source)?;
+            if component_metadata.file_type().is_symlink() || !component_metadata.is_dir() {
+                bail!("Rust toolchain runtime component {component} must be a real directory");
+            }
+            budget.admit(component, 0)?;
+            sealed_copy_tree_with_budget(&component_source, &target.join(component), &mut budget)?;
+        }
+        for required in ["bin/cargo", "bin/rustc", "lib/rustlib"] {
+            let path = target.join(required);
+            if !(path.is_file() || path.is_dir()) {
+                bail!("sealed Rust toolchain runtime is missing {required}");
+            }
+        }
+        seal_directory(target)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => match remove_custody_tree(target) {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => bail!(
+                "sealed Rust toolchain runtime copy failed ({error}); partial copy cleanup also failed: {cleanup_error}"
             ),
         },
     }
@@ -1913,6 +2013,21 @@ mod tests {
             observer_snapshot_fixture_digest(plan.arms[0].arm),
             observer_snapshot_fixture_digest(plan.arms[1].arm)
         );
+        assert_ne!(
+            attempt_worktree_path(&plan.arms[0], "a1"),
+            attempt_worktree_path(&plan.arms[0], "a2")
+        );
+    }
+
+    #[test]
+    fn immutable_wire_input_excludes_attempt_scoped_receipts() {
+        let stable = observer_snapshot_historical_wire_digest();
+        let first_attempt_receipt = digest_text("historical-a1-attempt-scoped-receipt");
+        let retried_attempt_receipt = digest_text("historical-a2-attempt-scoped-receipt");
+        assert_ne!(first_attempt_receipt, retried_attempt_receipt);
+        assert_eq!(stable, observer_snapshot_historical_wire_digest());
+        assert_ne!(stable, first_attempt_receipt);
+        assert_ne!(stable, retried_attempt_receipt);
     }
 
     #[test]
@@ -1967,11 +2082,14 @@ mod tests {
             temp.path().join("spool"),
         )
         .unwrap();
-        let source = "a".repeat(64);
         let repository_id = harness_domain::RepositoryId::from("test-repository");
-        let _ = service
-            .ensure_fixed_eval_wires(&repository_id, &source)
+        let first = service
+            .ensure_fixed_eval_wires(&repository_id, &observer_snapshot_historical_wire_digest())
             .unwrap();
+        let replay = service
+            .ensure_fixed_eval_wires(&repository_id, &observer_snapshot_historical_wire_digest())
+            .unwrap();
+        assert_eq!(first, replay);
         for (kind, id) in [
             (
                 harness_domain::ImprovementRecordKind::Taskset,
@@ -2052,6 +2170,57 @@ mod tests {
         let deep_target = temp.path().join("deep-target");
         assert!(sealed_copy_tree(&deep_source, &deep_target).is_err());
         assert!(!deep_target.exists());
+    }
+
+    #[test]
+    fn sealed_toolchain_runtime_excludes_non_executable_share_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("toolchain");
+        for directory in ["bin", "etc", "lib/rustlib", "libexec", "share/doc"] {
+            std::fs::create_dir_all(source.join(directory)).unwrap();
+        }
+        for executable in ["cargo", "rustc"] {
+            let executable = source.join("bin").join(executable);
+            std::fs::write(&executable, b"runtime executable").unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(source.join("etc/config.toml"), b"runtime configuration").unwrap();
+        std::fs::write(source.join("lib/rustlib/runtime"), b"runtime library").unwrap();
+        std::fs::write(source.join("libexec/helper"), b"runtime helper").unwrap();
+        std::fs::write(
+            source.join("share/doc/manual"),
+            b"non-executable documentation",
+        )
+        .unwrap();
+
+        let sealed = temp.path().join("sealed-toolchain");
+        sealed_copy_toolchain_runtime(&source, &sealed).unwrap();
+
+        for required in [
+            "bin/cargo",
+            "bin/rustc",
+            "etc/config.toml",
+            "lib/rustlib/runtime",
+            "libexec/helper",
+        ] {
+            assert!(sealed.join(required).is_file(), "missing {required}");
+        }
+        assert!(!sealed.join("share").exists());
+        assert_eq!(
+            std::fs::metadata(sealed.join("bin/cargo"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o555
+        );
+        assert_eq!(
+            std::fs::metadata(&sealed).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        remove_custody_tree(&sealed).unwrap();
     }
 
     #[test]
@@ -2214,7 +2383,7 @@ checksum = "{checksum}"
     }
 
     #[tokio::test]
-    #[ignore = "runs two real isolated pinned-worktree Cargo evaluations"]
+    #[ignore = "runs real isolated pinned-worktree Cargo evaluation recovery"]
     async fn isolated_controller_smoke_persists_and_replays() {
         fn contains_transient_custody(path: &Path) -> bool {
             std::fs::read_dir(path).is_ok_and(|entries| {
@@ -2267,6 +2436,21 @@ checksum = "{checksum}"
             spool_root.clone(),
         )
         .unwrap();
+        // This is the real end-to-end recovery boundary: a prior historical
+        // attempt has already persisted authority, but the membership write
+        // aborts before the fixed arm. The next invocation must accept the
+        // durable wires and complete from a fresh attempt.
+        service.inject_failures_after_authority_writes(["taskset_membership"]);
+        let injected = service
+            .run_observer_snapshot_once(repository.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            injected
+                .to_string()
+                .contains("injected failure after evaluation authority write: taskset_membership"),
+            "unexpected membership recovery failure: {injected:#}"
+        );
         let first = service
             .run_observer_snapshot_once(repository.clone())
             .await
@@ -2286,12 +2470,24 @@ checksum = "{checksum}"
                 .status,
             EvaluationRunStatus::Completed
         );
-        for run_id in [
-            harness_domain::RunId::from("m2-observer-snapshot-historical"),
-            harness_domain::RunId::from("m2-observer-snapshot-fixed"),
+        for (run_id, expected_attempts) in [
+            (
+                harness_domain::RunId::from("m2-observer-snapshot-historical"),
+                2,
+            ),
+            (harness_domain::RunId::from("m2-observer-snapshot-fixed"), 1),
         ] {
             let evidence = store.evidence_snapshot(&run_id).unwrap();
-            assert_eq!(evidence["evidence"].as_array().unwrap().len(), 2);
+            // The injected membership failure occurs after the first
+            // historical arm. Retry keeps that completed attempt as immutable
+            // audit evidence and records a fresh, attempt-scoped chain.
+            assert_eq!(
+                evidence["evidence"].as_array().unwrap().len(),
+                expected_attempts * 2
+            );
+            // Both historical attempts materialize the same closed fixture.
+            // Artifact custody is content-addressed, so one immutable blob is
+            // linked by both evidence chains rather than stored twice.
             assert_eq!(evidence["artifacts"].as_array().unwrap().len(), 1);
             assert!(
                 store
