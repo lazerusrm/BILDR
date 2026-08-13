@@ -71,6 +71,8 @@ jobs:
           meson setup bubblewrap-0.11.0/build bubblewrap-0.11.0 --prefix /usr
           meson compile -C bubblewrap-0.11.0/build
           sudo meson install -C bubblewrap-0.11.0/build
+          sudo chmod 4755 /usr/bin/bwrap
+          test "$(stat --format '%a:%U:%G' /usr/bin/bwrap)" = "4755:root:root"
           test "$(/usr/bin/bwrap --version)" = "bubblewrap 0.11.0"
       - name: Install browser dependencies
         run: npm --prefix ui ci && npm --prefix ui exec -- playwright install --with-deps chromium
