@@ -884,6 +884,8 @@ export default function App() {
               light={light}
               accounts={codexAccounts}
               onAccounts={setCodexAccounts}
+              onSettings={setOperatorSettings}
+              onRefresh={refresh}
               onAddAccount={() => {
                 setAccountLoginTargetId(undefined);
                 setModal("account-login");
@@ -4838,10 +4840,12 @@ function HostView({
   );
 }
 
-function SettingsView({
+export function SettingsView({
   light,
   accounts,
   onAccounts,
+  onSettings,
+  onRefresh,
   onAddAccount,
   onReauthenticate,
   onTheme,
@@ -4849,6 +4853,8 @@ function SettingsView({
   light: boolean;
   accounts: CodexAccountsSnapshot;
   onAccounts: (snapshot: CodexAccountsSnapshot) => void;
+  onSettings: (settings: OperatorSettings) => void;
+  onRefresh: () => Promise<void>;
   onAddAccount: () => void;
   onReauthenticate: (accountId: string) => void;
   onTheme: () => void;
@@ -4871,6 +4877,7 @@ function SettingsView({
       | "adaptive_governor_budgets"
       | "automatic_governor_continuation"
       | "automatic_plan_approval"
+      | "supervision_observe_only"
       | "governor_goal_token_budget"
       | "governor_attempt_token_ceiling",
     value: boolean | number,
@@ -4878,7 +4885,10 @@ function SettingsView({
     setBusy(key);
     setError("");
     try {
-      setSettings(await api.updateSettings({ [key]: value }));
+      const next = await api.updateSettings({ [key]: value });
+      setSettings(next);
+      onSettings(next);
+      await onRefresh();
     } catch (caught) {
       setError(message(caught));
     } finally {
@@ -4908,6 +4918,14 @@ function SettingsView({
           {light ? "Dark theme" : "Light theme"}
         </button>
       </div>
+      <div className="settings-section-title">Supervision</div>
+      <SettingToggle
+        title="Observe-only supervision"
+        text="Record bounded, immutable controller snapshots for material run events. On never starts Terra or Sol, changes tasks, or takes automatic actions."
+        enabled={settings?.supervision_observe_only ?? false}
+        disabled={!settings || busy === "supervision_observe_only"}
+        onChange={(value) => update("supervision_observe_only", value)}
+      />
       <div className="settings-section-title">
         Planning and governor autonomy
       </div>

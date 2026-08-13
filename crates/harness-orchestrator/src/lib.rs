@@ -31,7 +31,8 @@ use harness_evidence::{EvidenceArtifactInput, EvidenceClaim, EvidenceService};
 use harness_git::{DiffPolicy, GitManager, WorktreeSpec, validate_public_change_metadata};
 use harness_profile::{
     AcceptanceKind, AcceptanceRule, HarnessConfig, LoadedProfile, ModelRoute, RepositoryProfile,
-    ResolvedPaths, ValidationGate, ValidatorEvidenceClass, ValidatorRule, load_profile,
+    ResolvedPaths, SupervisionConfig, ValidationGate, ValidatorEvidenceClass, ValidatorRule,
+    load_profile,
 };
 use harness_runner::{CommandOutcome, CommandRunner, CommandSpec, ResourceManager};
 use harness_store::{
@@ -65,6 +66,7 @@ const SETTING_AUTOMATIC_ACCOUNT_HANDOFF: &str = "settings.automatic_account_hand
 const SETTING_ADAPTIVE_GOVERNOR_BUDGETS: &str = "settings.adaptive_governor_budgets";
 const SETTING_AUTOMATIC_GOVERNOR_CONTINUATION: &str = "settings.automatic_governor_continuation";
 const SETTING_AUTOMATIC_PLAN_APPROVAL: &str = "settings.automatic_plan_approval";
+const SETTING_SUPERVISION_OBSERVE_ONLY: &str = "settings.supervision_observe_only";
 const SETTING_GOVERNOR_GOAL_TOKEN_BUDGET: &str = "settings.governor_goal_token_budget";
 const SETTING_GOVERNOR_ATTEMPT_TOKEN_CEILING: &str = "settings.governor_attempt_token_ceiling";
 const DEFAULT_GOVERNOR_GOAL_TOKEN_BUDGET: u64 = 5_000_000;
@@ -318,6 +320,9 @@ pub struct OperatorSettings {
     pub adaptive_governor_budgets: bool,
     pub automatic_governor_continuation: bool,
     pub automatic_plan_approval: bool,
+    /// The sole runtime-enabled supervisory mode. It only persists bounded
+    /// controller snapshots and cannot create model turns or actions.
+    pub supervision_observe_only: bool,
     pub governor_goal_token_budget: u64,
     pub governor_attempt_token_ceiling: u64,
     pub recommended_governor_attempt_tokens: u64,
@@ -335,6 +340,7 @@ pub struct UpdateOperatorSettingsRequest {
     pub adaptive_governor_budgets: Option<bool>,
     pub automatic_governor_continuation: Option<bool>,
     pub automatic_plan_approval: Option<bool>,
+    pub supervision_observe_only: Option<bool>,
     pub governor_goal_token_budget: Option<u64>,
     pub governor_attempt_token_ceiling: Option<u64>,
 }
@@ -897,10 +903,11 @@ impl Orchestrator {
 
     pub async fn maintenance_tick(&self) -> Result<(), OrchestratorError> {
         let runs = self.store.list_runs(None, false)?;
+        let supervision = self.effective_supervision_config();
         for run in &runs {
             if let Err(error) = supervision::observe_run(
                 &self.store,
-                &self.config.supervision,
+                &supervision,
                 self.config.orchestration.max_total_agent_threads,
                 &run.id,
             ) {
@@ -1643,6 +1650,7 @@ impl Orchestrator {
             automatic_governor_continuation,
             automatic_plan_approval: self
                 .stored_setting_bool(SETTING_AUTOMATIC_PLAN_APPROVAL, false),
+            supervision_observe_only: self.supervision_observe_only_enabled(),
             governor_goal_token_budget,
             governor_attempt_token_ceiling,
             recommended_governor_attempt_tokens,
@@ -1710,6 +1718,10 @@ impl Orchestrator {
             self.store
                 .put_runtime_metadata(SETTING_AUTOMATIC_PLAN_APPROVAL, &json!(value))?;
         }
+        if let Some(value) = request.supervision_observe_only {
+            self.store
+                .put_runtime_metadata(SETTING_SUPERVISION_OBSERVE_ONLY, &json!(value))?;
+        }
         if request.governor_goal_token_budget.is_some() {
             self.store.put_runtime_metadata(
                 SETTING_GOVERNOR_GOAL_TOKEN_BUDGET,
@@ -1741,6 +1753,23 @@ impl Orchestrator {
             .flatten()
             .and_then(|value| value.as_bool())
             .unwrap_or(default)
+    }
+
+    fn supervision_observe_only_enabled(&self) -> bool {
+        self.stored_setting_bool(
+            SETTING_SUPERVISION_OBSERVE_ONLY,
+            self.config.supervision.mode == SupervisorMode::ObserveOnly,
+        )
+    }
+
+    fn effective_supervision_config(&self) -> SupervisionConfig {
+        let mut supervision = self.config.supervision.clone();
+        // Runtime settings are deliberately binary. No setting can unlock a
+        // future shadow/advisory/active mode: the only enabled mode compiled
+        // into this release remains bounded, read-only observation.
+        supervision.mode =
+            supervision_mode_for_operator_setting(self.supervision_observe_only_enabled());
+        supervision
     }
 
     fn stored_setting_u64(&self, key: &str, default: u64) -> u64 {
@@ -2535,7 +2564,7 @@ impl Orchestrator {
             automatic_plan_approval,
             preferred_codex_account_id,
             governor_progress,
-            supervision_mode: self.config.supervision.mode,
+            supervision_mode: self.effective_supervision_config().mode,
             supervisor_snapshot: self.store.latest_supervisor_snapshot(run_id)?,
         })
     }
@@ -14337,6 +14366,14 @@ fn stored_bool(store: &Store, key: &str, default: bool) -> Result<bool, Orchestr
         .unwrap_or(default))
 }
 
+fn supervision_mode_for_operator_setting(enabled: bool) -> SupervisorMode {
+    if enabled {
+        SupervisorMode::ObserveOnly
+    } else {
+        SupervisorMode::Disabled
+    }
+}
+
 fn repository_search_roots() -> Vec<PathBuf> {
     if let Some(configured) = std::env::var_os("HARNESS_REPOSITORY_SEARCH_ROOTS") {
         let roots = std::env::split_paths(&configured).collect::<Vec<_>>();
@@ -14658,6 +14695,18 @@ pub enum OrchestratorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operator_supervision_toggle_can_only_select_observation_or_disabled() {
+        assert_eq!(
+            supervision_mode_for_operator_setting(false),
+            SupervisorMode::Disabled
+        );
+        assert_eq!(
+            supervision_mode_for_operator_setting(true),
+            SupervisorMode::ObserveOnly
+        );
+    }
 
     #[test]
     fn structured_json_can_be_unwrapped_from_fence() {

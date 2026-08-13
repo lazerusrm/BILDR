@@ -1704,7 +1704,7 @@ components:
     OperatorSettings:
       type: object
       additionalProperties: false
-      required: [store_reasoning_summaries, store_raw_reasoning, yolo_mode, allow_automatic_external_writes, automatic_external_writes_locked, automatic_account_handoff, adaptive_governor_budgets, automatic_governor_continuation, automatic_plan_approval, governor_goal_token_budget, governor_attempt_token_ceiling, recommended_governor_attempt_tokens, governor_budget_sample_count, governor_budget_reason]
+      required: [store_reasoning_summaries, store_raw_reasoning, yolo_mode, allow_automatic_external_writes, automatic_external_writes_locked, automatic_account_handoff, adaptive_governor_budgets, automatic_governor_continuation, automatic_plan_approval, supervision_observe_only, governor_goal_token_budget, governor_attempt_token_ceiling, recommended_governor_attempt_tokens, governor_budget_sample_count, governor_budget_reason]
       properties:
         store_reasoning_summaries: {type: boolean}
         store_raw_reasoning: {type: boolean}
@@ -1715,6 +1715,7 @@ components:
         adaptive_governor_budgets: {type: boolean}
         automatic_governor_continuation: {type: boolean}
         automatic_plan_approval: {type: boolean}
+        supervision_observe_only: {type: boolean}
         governor_goal_token_budget: {type: integer, minimum: 500000, maximum: 1000000000}
         governor_attempt_token_ceiling: {type: integer, minimum: 400000, maximum: 100000000}
         recommended_governor_attempt_tokens: {type: integer, minimum: 400000}
@@ -1731,6 +1732,7 @@ components:
         adaptive_governor_budgets: {type: boolean}
         automatic_governor_continuation: {type: boolean}
         automatic_plan_approval: {type: boolean}
+        supervision_observe_only: {type: boolean}
         governor_goal_token_budget: {type: integer, minimum: 500000, maximum: 1000000000}
         governor_attempt_token_ceiling: {type: integer, minimum: 400000, maximum: 100000000}
     Repository:

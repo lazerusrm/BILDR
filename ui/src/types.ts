@@ -277,6 +277,7 @@ export interface OperatorSettings {
   adaptive_governor_budgets: boolean;
   automatic_governor_continuation: boolean;
   automatic_plan_approval: boolean;
+  supervision_observe_only: boolean;
   governor_goal_token_budget: number;
   governor_attempt_token_ceiling: number;
   recommended_governor_attempt_tokens: number;

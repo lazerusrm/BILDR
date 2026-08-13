@@ -162,6 +162,7 @@ class HarnessApi {
         | "adaptive_governor_budgets"
         | "automatic_governor_continuation"
         | "automatic_plan_approval"
+        | "supervision_observe_only"
         | "governor_goal_token_budget"
         | "governor_attempt_token_ceiling"
       >

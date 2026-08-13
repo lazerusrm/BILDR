@@ -3,6 +3,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   LiveTurnTelemetry,
+  SettingsView,
   SupervisorObservationPanel,
   accountOptionLabel,
   agentEffort,
@@ -108,6 +109,23 @@ describe("workspace presentation helpers", () => {
     expect(observing).toContain("Terra, Sol, and automatic actions remain off");
     expect(observing).toContain("Latest snapshot r3");
     expect(observing).toContain("Event 42");
+  });
+
+  it("exposes the observe-only supervisory control in settings", () => {
+    const settings = renderToStaticMarkup(
+      createElement(SettingsView, {
+        light: false,
+        accounts: { accounts: [] },
+        onAccounts: () => undefined,
+        onSettings: () => undefined,
+        onRefresh: async () => undefined,
+        onAddAccount: () => undefined,
+        onReauthenticate: () => undefined,
+        onTheme: () => undefined,
+      }),
+    );
+    expect(settings).toContain("Observe-only supervision");
+    expect(settings).toContain("never starts Terra or Sol");
   });
 
   it("offers a concrete recovery for an interrupted plan review before tasks exist", () => {

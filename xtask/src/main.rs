@@ -441,6 +441,7 @@ fn openapi_check(root: &Path) -> Result<()> {
         bail!("RuntimeStatus fixture does not conform to OpenAPI: {error}")
     }
     validate_run_detail_supervision_contract(&value)?;
+    validate_operator_settings_supervision_contract(&value)?;
     let documented_routes = mapping
         .get("paths")
         .and_then(serde_yaml::Value::as_mapping)
@@ -468,7 +469,7 @@ fn openapi_check(root: &Path) -> Result<()> {
         )
     }
     println!(
-        "openapi-check: {} local references resolved; RuntimeStatus fixture and supervisory RunDetail contract conform; {} router paths match",
+        "openapi-check: {} local references resolved; RuntimeStatus fixture and supervisory RunDetail/operator settings contracts conform; {} router paths match",
         pointers.len(),
         documented_routes.len()
     );
@@ -504,6 +505,31 @@ fn validate_run_detail_supervision_contract(openapi: &serde_yaml::Value) -> Resu
         });
     if !has_snapshot_ref {
         bail!("RunDetail supervisor_snapshot must reference SupervisorSnapshot")
+    }
+    Ok(())
+}
+
+fn validate_operator_settings_supervision_contract(openapi: &serde_yaml::Value) -> Result<()> {
+    for pointer in [
+        "/components/schemas/OperatorSettings/properties",
+        "/components/schemas/UpdateOperatorSettingsRequest/properties",
+    ] {
+        let properties = yaml_pointer(openapi, pointer)
+            .and_then(serde_yaml::Value::as_mapping)
+            .with_context(|| format!("operator settings properties are missing at {pointer}"))?;
+        let key = serde_yaml::Value::String("supervision_observe_only".to_owned());
+        if !properties.contains_key(&key) {
+            bail!("operator settings must declare supervision_observe_only at {pointer}")
+        }
+    }
+    let required = yaml_pointer(openapi, "/components/schemas/OperatorSettings/required")
+        .and_then(serde_yaml::Value::as_sequence)
+        .context("OperatorSettings required fields are missing from OpenAPI")?;
+    if !required
+        .iter()
+        .any(|value| value.as_str() == Some("supervision_observe_only"))
+    {
+        bail!("OperatorSettings must require supervision_observe_only")
     }
     Ok(())
 }
