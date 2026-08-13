@@ -69,8 +69,8 @@ jobs:
             bubblewrap-0.11.0.tar.xz | sha256sum --check --strict
           tar --extract --file bubblewrap-0.11.0.tar.xz
           meson setup bubblewrap-0.11.0/build bubblewrap-0.11.0 --prefix /usr
-          meson compile --directory bubblewrap-0.11.0/build
-          sudo meson install --directory bubblewrap-0.11.0/build
+          meson compile -C bubblewrap-0.11.0/build
+          sudo meson install -C bubblewrap-0.11.0/build
           test "$(/usr/bin/bwrap --version)" = "bubblewrap 0.11.0"
       - name: Install browser dependencies
         run: npm --prefix ui ci && npm --prefix ui exec -- playwright install --with-deps chromium
