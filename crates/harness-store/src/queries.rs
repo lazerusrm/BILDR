@@ -4924,11 +4924,11 @@ fn map_repository(row: &Row<'_>) -> rusqlite::Result<RepositorySummary> {
     })
 }
 
-fn run_select() -> &'static str {
+pub(crate) fn run_select() -> &'static str {
     "SELECT r.id,r.repository_id,r.title,r.requested_objective,r.mode,r.publication_mode,r.state,r.phase,r.base_ref,r.base_sha,r.integration_branch,r.integration_sha,r.authority_digest,r.created_at,r.started_at,r.completed_at,r.scheduler_paused,r.run_token_budget,r.version,r.failure_reason FROM runs r"
 }
 
-fn map_run(row: &Row<'_>) -> rusqlite::Result<RunSummary> {
+pub(crate) fn map_run(row: &Row<'_>) -> rusqlite::Result<RunSummary> {
     let state: String = row.get(6)?;
     Ok(RunSummary {
         id: RunId::from(row.get::<_, String>(0)?),
@@ -4962,11 +4962,11 @@ fn map_run(row: &Row<'_>) -> rusqlite::Result<RunSummary> {
     })
 }
 
-fn agent_select() -> &'static str {
+pub(crate) fn agent_select() -> &'static str {
     "SELECT a.id,a.parent_agent_session_id,t.id,a.role,a.codex_account_id,a.nickname,a.state,a.requested_model,a.effective_model,a.requested_reasoning_effort,a.effective_reasoning_effort,a.sandbox_mode,a.cwd,a.current_goal,d.current_action,a.token_budget,coalesce(a.goal_tokens_used,0),coalesce((SELECT sum(c.lower_microusd) FROM codex_threads ct JOIN token_samples ts ON ts.thread_id=ct.thread_id JOIN cost_entries c ON c.token_sample_id=ts.id WHERE ct.agent_session_id=a.id),0),coalesce((SELECT sum(c.upper_microusd) FROM codex_threads ct JOIN token_samples ts ON ts.thread_id=ct.thread_id JOIN cost_entries c ON c.token_sample_id=ts.id WHERE ct.agent_session_id=a.id),0),a.last_heartbeat_at,ct.thread_id,d.active_turn_id,coalesce(d.context_strategy,'fresh_independent'),d.context_source_attempt_id,d.context_reuse_reason,a.version,active_turn.started_at,active_usage.id,active_usage.input_tokens,active_usage.cached_input_tokens,active_usage.cache_write_input_tokens,active_usage.output_tokens,active_usage.reasoning_output_tokens,active_usage.total_tokens,active_usage.model_context_window,a.failure_reason,a.started_at,a.completed_at FROM agent_sessions a LEFT JOIN task_attempts at ON at.id=a.task_attempt_id LEFT JOIN tasks t ON t.id=at.task_id LEFT JOIN agent_runtime_details d ON d.agent_session_id=a.id LEFT JOIN codex_threads ct ON ct.agent_session_id=a.id LEFT JOIN codex_turns active_turn ON active_turn.turn_id=d.active_turn_id LEFT JOIN token_samples active_usage ON active_usage.turn_id=d.active_turn_id AND active_usage.sample_kind='turn_total'"
 }
 
-fn map_agent(row: &Row<'_>) -> rusqlite::Result<AgentSummary> {
+pub(crate) fn map_agent(row: &Row<'_>) -> rusqlite::Result<AgentSummary> {
     let role: String = row.get(3)?;
     let sandbox: String = row.get(11)?;
     let active_turn_usage = if row.get::<_, Option<String>>(27)?.is_some() {
@@ -5038,7 +5038,7 @@ fn map_worktree(row: &Row<'_>) -> rusqlite::Result<WorktreeSummary> {
     })
 }
 
-fn map_task(row: &Row<'_>) -> rusqlite::Result<TaskSummary> {
+pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<TaskSummary> {
     let state: String = row.get(5)?;
     let dependencies: Option<String> = row.get(14)?;
     Ok(TaskSummary {
@@ -5072,7 +5072,7 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<TaskSummary> {
     })
 }
 
-fn map_domain_event(row: &Row<'_>) -> rusqlite::Result<DomainEvent> {
+pub(crate) fn map_domain_event(row: &Row<'_>) -> rusqlite::Result<DomainEvent> {
     let payload: String = row.get(6)?;
     Ok(DomainEvent {
         id: row.get(0)?,

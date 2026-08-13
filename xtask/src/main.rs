@@ -440,6 +440,7 @@ fn openapi_check(root: &Path) -> Result<()> {
     if let Err(error) = runtime_status_validator.validate(&runtime_status_fixture) {
         bail!("RuntimeStatus fixture does not conform to OpenAPI: {error}")
     }
+    validate_run_detail_supervision_contract(&value)?;
     let documented_routes = mapping
         .get("paths")
         .and_then(serde_yaml::Value::as_mapping)
@@ -467,10 +468,43 @@ fn openapi_check(root: &Path) -> Result<()> {
         )
     }
     println!(
-        "openapi-check: {} local references resolved; RuntimeStatus fixture conforms; {} router paths match",
+        "openapi-check: {} local references resolved; RuntimeStatus fixture and supervisory RunDetail contract conform; {} router paths match",
         pointers.len(),
         documented_routes.len()
     );
+    Ok(())
+}
+
+fn validate_run_detail_supervision_contract(openapi: &serde_yaml::Value) -> Result<()> {
+    let properties = yaml_pointer(openapi, "/components/schemas/RunDetail/properties")
+        .and_then(serde_yaml::Value::as_mapping)
+        .context("RunDetail properties are missing from OpenAPI")?;
+    let required = yaml_pointer(openapi, "/components/schemas/RunDetail/required")
+        .and_then(serde_yaml::Value::as_sequence)
+        .context("RunDetail required fields are missing from OpenAPI")?;
+    for field in ["supervision_mode", "supervisor_snapshot"] {
+        let field_key = serde_yaml::Value::String(field.to_owned());
+        if !properties.contains_key(&field_key)
+            || !required.iter().any(|value| value.as_str() == Some(field))
+        {
+            bail!("RunDetail must declare required {field} output")
+        }
+    }
+    let snapshot = properties
+        .get(serde_yaml::Value::String("supervisor_snapshot".to_owned()))
+        .context("RunDetail supervisor_snapshot schema is missing")?;
+    let has_snapshot_ref = snapshot
+        .get("anyOf")
+        .and_then(serde_yaml::Value::as_sequence)
+        .is_some_and(|variants| {
+            variants.iter().any(|variant| {
+                variant.get("$ref").and_then(serde_yaml::Value::as_str)
+                    == Some("#/components/schemas/SupervisorSnapshot")
+            })
+        });
+    if !has_snapshot_ref {
+        bail!("RunDetail supervisor_snapshot must reference SupervisorSnapshot")
+    }
     Ok(())
 }
 

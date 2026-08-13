@@ -6,8 +6,8 @@
 //! reconstructing one from mutable live state.
 
 use harness_domain::{
-    AgentSummary, DomainEvent, RunPlan, RunState, RunSummary, SupervisorMode, SupervisorSnapshotId,
-    TaskState, TaskSummary, format_timestamp, now_ms,
+    AgentSummary, DomainEvent, RunId, RunPlan, RunState, RunSummary, SupervisorMode,
+    SupervisorSnapshotId, TaskState, TaskSummary, format_timestamp, now_ms,
 };
 use harness_profile::SupervisionConfig;
 use harness_store::{Store, StoreError, SupervisorSnapshotRecord, packet_digest};
@@ -26,7 +26,7 @@ pub(crate) fn observe_run(
     store: &Store,
     config: &SupervisionConfig,
     max_thread_count: u32,
-    run: &RunSummary,
+    run_id: &RunId,
 ) -> Result<Option<SupervisorSnapshotRecord>, StoreError> {
     if config.mode == SupervisorMode::Disabled {
         return Ok(None);
@@ -36,17 +36,17 @@ pub(crate) fn observe_run(
             "supervision mode is not enabled by the observation-only runtime".to_owned(),
         ));
     }
-    let cursor = store.supervisor_observation_cursor(&run.id)?;
-    let events = store.list_domain_events(cursor, Some(&run.id), MAX_EVENTS_PER_OBSERVATION)?;
-    let Some(last_event) = events.last() else {
+    let observation = store.capture_supervisor_observation(run_id, MAX_EVENTS_PER_OBSERVATION)?;
+    let Some(last_event) = observation.events.last() else {
         return Ok(None);
     };
-    let material = events
+    let material = observation
+        .events
         .iter()
         .filter(|event| material_trigger(event).is_some())
         .collect::<Vec<_>>();
     if material.is_empty() {
-        store.advance_supervisor_observation_cursor(&run.id, last_event.id)?;
+        store.advance_supervisor_observation_cursor(run_id, last_event.id)?;
         return Ok(None);
     }
     let latest_material = material.last().expect("material events are non-empty");
@@ -55,17 +55,13 @@ pub(crate) fn observe_run(
     if now_ms().saturating_sub(latest_material.occurred_at) < coalesce_ms {
         return Ok(None);
     }
-    let Some((_, plan, _, plan_revision)) = store.latest_plan(&run.id)? else {
+    let Some((plan, plan_revision)) = observation.latest_plan else {
         // A snapshot contract binds a plan digest. Preserve a precise cursor
         // boundary while no plan exists; the next material plan event gets a
         // new snapshot instead of inventing a digest.
-        store.advance_supervisor_observation_cursor(&run.id, last_event.id)?;
+        store.advance_supervisor_observation_cursor(run_id, last_event.id)?;
         return Ok(None);
     };
-    let tasks = store.list_tasks(&run.id)?;
-    let agents = store.list_agents(&run.id)?;
-    let usage = store.run_usage(&run.id)?;
-    let repository = store.repository(&run.repository_id)?;
     let trigger = material_trigger(latest_material).expect("material trigger checked");
     let event_cursor = last_event.id;
     let material_events = material
@@ -76,20 +72,20 @@ pub(crate) fn observe_run(
         .map(|event| (*event).clone())
         .collect::<Vec<_>>();
     let snapshot = store.record_supervisor_snapshot(
-        &run.id,
+        run_id,
         event_cursor,
         trigger,
         |snapshot_id, revision| {
             let payload = build_snapshot(
                 snapshot_id,
                 revision,
-                run,
+                &observation.run,
                 &plan,
                 plan_revision,
-                &tasks,
-                &agents,
-                usage.total_tokens,
-                &repository.profile_id,
+                &observation.tasks,
+                &observation.agents,
+                observation.run_tokens_used,
+                &observation.repository_profile_id,
                 &material_events,
                 event_cursor,
                 config,

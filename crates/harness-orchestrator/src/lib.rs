@@ -902,7 +902,7 @@ impl Orchestrator {
                 &self.store,
                 &self.config.supervision,
                 self.config.orchestration.max_total_agent_threads,
-                run,
+                &run.id,
             ) {
                 warn!(run_id = %run.id, %error, "supervisory observation remains pending");
             }

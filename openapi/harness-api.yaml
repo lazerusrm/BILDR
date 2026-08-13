@@ -1972,10 +1972,27 @@ components:
         total_tokens_used: {type: integer}
         final_audit: {type: [object, 'null']}
         human_decision: {type: [object, 'null']}
+    SupervisorMode:
+      type: string
+      enum: [disabled, observe_only, shadow, advisory, active_low_risk, active]
+    SupervisorSnapshot:
+      type: object
+      additionalProperties: false
+      required: [id, run_id, revision, event_cursor, trigger_kind, payload, payload_sha256, byte_length, created_at]
+      properties:
+        id: {type: string}
+        run_id: {type: string}
+        revision: {type: integer, minimum: 1}
+        event_cursor: {type: integer, minimum: 0}
+        trigger_kind: {type: string}
+        payload: {type: object}
+        payload_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        byte_length: {type: integer, minimum: 1}
+        created_at: {type: string, format: date-time}
     RunDetail:
       type: object
       additionalProperties: false
-      required: [run, intent_interview, tasks, agents, worktrees, approvals, plan_review_history, planning_tokens_used, signoff_packet, draft_pr_ci, automatic_plan_approval]
+      required: [run, intent_interview, tasks, agents, worktrees, approvals, plan_review_history, planning_tokens_used, signoff_packet, draft_pr_ci, automatic_plan_approval, governor_progress, supervision_mode, supervisor_snapshot]
       properties:
         run: {$ref: '#/components/schemas/Run'}
         intent_interview:
@@ -2001,6 +2018,14 @@ components:
         draft_pr_ci: {type: [object, 'null']}
         automatic_plan_approval: {type: boolean}
         preferred_codex_account_id: {type: [string, 'null']}
+        governor_progress:
+          type: object
+          additionalProperties: {}
+        supervision_mode: {$ref: '#/components/schemas/SupervisorMode'}
+        supervisor_snapshot:
+          anyOf:
+            - {$ref: '#/components/schemas/SupervisorSnapshot'}
+            - {type: 'null'}
     RunPage:
       type: object
       additionalProperties: false

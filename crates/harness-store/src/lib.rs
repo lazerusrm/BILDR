@@ -330,13 +330,38 @@ fn apply_runtime_migrations(connection: &mut Connection) -> Result<(), StoreErro
         |row| row.get(0),
     )?;
     if !has_supervisor_snapshots {
-        let transaction = connection.transaction()?;
-        transaction.execute_batch(SUPERVISION_OBSERVE_MIGRATION)?;
-        transaction.commit()?;
+        apply_supervision_observe_migration(connection, || Ok(()))?;
+    } else {
+        set_runtime_schema_version(connection, "12")?;
     }
+    Ok(())
+}
+
+/// Install the supervisory tables and their schema marker as one SQLite
+/// transaction.  A database must never advertise v12 after only part of this
+/// append-only schema has been installed.
+fn apply_supervision_observe_migration<F>(
+    connection: &mut Connection,
+    after_schema: F,
+) -> Result<(), StoreError>
+where
+    F: FnOnce() -> Result<(), StoreError>,
+{
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(SUPERVISION_OBSERVE_MIGRATION)?;
+    // This seam deliberately permits a regression test to fail exactly after
+    // DDL. Dropping the transaction then proves SQLite rolls back both the
+    // schema objects and the v12 marker together.
+    after_schema()?;
+    set_runtime_schema_version(&transaction, "12")?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn set_runtime_schema_version(connection: &Connection, version: &str) -> Result<(), StoreError> {
     connection.execute(
-        "INSERT INTO schema_migrations_meta(key, value) VALUES('runtime_schema_version', '12') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        [],
+        "INSERT INTO schema_migrations_meta(key, value) VALUES('runtime_schema_version', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [version],
     )?;
     Ok(())
 }
@@ -490,6 +515,47 @@ mod tests {
             )
             .unwrap();
         assert!(has_failure_observations);
+    }
+
+    #[test]
+    fn supervision_schema_and_v12_marker_roll_back_together_on_failure() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::in_memory(&temp.path().join("artifacts")).unwrap();
+        let mut connection = store.connection().unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER supervisor_snapshots_no_update;
+                 DROP TRIGGER supervisor_snapshots_no_delete;
+                 DROP TABLE supervisor_observation_cursors;
+                 DROP TABLE supervisor_snapshots;
+                 UPDATE schema_migrations_meta SET value='11' WHERE key='runtime_schema_version';",
+            )
+            .unwrap();
+
+        let error = apply_supervision_observe_migration(&mut connection, || {
+            Err(StoreError::Migration(
+                "injected failure after supervisory DDL".to_owned(),
+            ))
+        })
+        .expect_err("a migration failure must roll back its schema marker");
+        assert!(error.to_string().contains("injected failure"));
+
+        let snapshot_table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='supervisor_snapshots')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let version: String = connection
+            .query_row(
+                "SELECT value FROM schema_migrations_meta WHERE key='runtime_schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!snapshot_table_exists);
+        assert_eq!(version, "11");
     }
 
     #[test]
