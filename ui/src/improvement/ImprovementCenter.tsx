@@ -1,12 +1,62 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
-import type { EvaluationOccurrenceSource, FailureClusterSummary, FailureOverview, FailureTrace } from "../types";
+import type {
+  EvaluationOccurrenceSource,
+  FailureClusterSummary,
+  FailureOverview,
+  FailureTrace,
+  RuntimeStatus,
+} from "../types";
 import { EvaluationSourceCard } from "./EvaluationSourceCard";
 import { OutcomePanel } from "./OutcomePanel";
 import { TraceExplorer } from "./TraceExplorer";
 import { VirtualRows } from "./VirtualRows";
 
-export function ImprovementCenter({ repositoryId }: { repositoryId?: string }) {
+export type ImprovementModePresentation = {
+  label: string;
+  detail: string;
+  alert: boolean;
+};
+
+export function improvementModePresentation(
+  runtime?: RuntimeStatus,
+): ImprovementModePresentation {
+  const status = runtime?.self_improvement;
+  if (!status) {
+    return {
+      label: "Status unavailable",
+      detail: "The runtime has not reported its self-improvement safety state yet.",
+      alert: true,
+    };
+  }
+  if (!status.anchor_match) {
+    return {
+      label: "Safety anchor mismatch",
+      detail: status.detail || "Observation is disabled until the configured safety anchor matches.",
+      alert: true,
+    };
+  }
+  if (status.effective_mode !== "observe_only" || !status.observation_enabled) {
+    return {
+      label: "Improvement disabled",
+      detail: status.detail || "No observation or candidate capability is active.",
+      alert: false,
+    };
+  }
+  return {
+    label: "Observe only",
+    detail: "Failure observations are receipt-backed. Unknown remains unknown.",
+    alert: false,
+  };
+}
+
+export function ImprovementCenter({
+  repositoryId,
+  runtime,
+}: {
+  repositoryId?: string;
+  runtime?: RuntimeStatus;
+}) {
   const [overview, setOverview] = useState<FailureOverview>();
   const [selected, setSelected] = useState<FailureClusterSummary>();
   const [trace, setTrace] = useState<FailureTrace>();
@@ -71,12 +121,14 @@ export function ImprovementCenter({ repositoryId }: { repositoryId?: string }) {
     () => [...(overview?.clusters || [])].sort(compareClusters),
     [overview],
   );
+  const mode = improvementModePresentation(runtime);
   return (
     <div className="page improvement-page">
       <header className="page-title">
-        <div><span className="eyebrow">Observe only</span><h1>Improvement Center</h1></div>
-        <p>Failure observations are receipt-backed. Unknown remains unknown.</p>
+        <div><span className="eyebrow">{mode.label}</span><h1>Improvement Center</h1></div>
+        <p>{mode.detail}</p>
       </header>
+      {mode.alert && <p role="alert" className="form-error">{mode.detail}</p>}
       {!repositoryId && <p className="improvement-empty">Register a repository to inspect durable failure observations.</p>}
       {error && <p role="alert" className="form-error">{error}</p>}
       {overview && <>

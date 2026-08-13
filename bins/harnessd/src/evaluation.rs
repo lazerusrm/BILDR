@@ -879,14 +879,17 @@ impl EvaluationService {
             .command
             .as_ref()
             .context("grader isolation did not produce a durable command receipt")?;
+        // Command output includes non-deterministic timing and compiler
+        // progress. A retry after any earlier persistence boundary therefore
+        // gets its own custody IDs instead of colliding with a prior attempt.
         let candidate_stdout =
-            self.register_capture(run_id, arm_label, "candidate-stdout", &candidate.stdout)?;
+            self.register_capture(run_id, &arm_name, "candidate-stdout", &candidate.stdout)?;
         let candidate_stderr =
-            self.register_capture(run_id, arm_label, "candidate-stderr", &candidate.stderr)?;
+            self.register_capture(run_id, &arm_name, "candidate-stderr", &candidate.stderr)?;
         let grader_stdout =
-            self.register_capture(run_id, arm_label, "grader-stdout", &grader.stdout)?;
+            self.register_capture(run_id, &arm_name, "grader-stdout", &grader.stdout)?;
         let grader_stderr =
-            self.register_capture(run_id, arm_label, "grader-stderr", &grader.stderr)?;
+            self.register_capture(run_id, &arm_name, "grader-stderr", &grader.stderr)?;
         let candidate_command = command_wire(&OBSERVER_SNAPSHOT_COMMAND);
         let candidate_command_digest = digest_json(&candidate_command)?;
         let candidate_id = harness_domain::CommandRunId::from(format!(
@@ -980,7 +983,7 @@ impl EvaluationService {
             })?;
         let materialization_artifact = self.register_file(
             run_id,
-            arm_label,
+            &arm_name,
             "materialization",
             &execution.materialization.artifact_path,
             "application/json",
@@ -1023,7 +1026,7 @@ impl EvaluationService {
         let stored = self.store.artifacts().put_file(&capture.path)?;
         self.store
             .register_or_validate_evaluation_artifact(&NewArtifact {
-                id: harness_domain::ArtifactId::from(format!("m2-observer-snapshot-{arm}-{name}")),
+                id: evaluation_artifact_id(arm, name),
                 run_id: Some(run_id.clone()),
                 task_attempt_id: None,
                 kind: "command_stream".to_owned(),
@@ -1051,7 +1054,7 @@ impl EvaluationService {
         let stored = self.store.artifacts().put_file(path)?;
         self.store
             .register_or_validate_evaluation_artifact(&NewArtifact {
-                id: harness_domain::ArtifactId::from(format!("m2-observer-snapshot-{arm}-{name}")),
+                id: evaluation_artifact_id(arm, name),
                 run_id: Some(run_id.clone()),
                 task_attempt_id: None,
                 kind: "evaluation_materialization".to_owned(),
@@ -1201,6 +1204,10 @@ impl EvaluationService {
             }
         }
     }
+}
+
+fn evaluation_artifact_id(arm: &str, name: &str) -> harness_domain::ArtifactId {
+    harness_domain::ArtifactId::from(format!("m2-observer-snapshot-{arm}-{name}"))
 }
 
 fn command_wire(parts: &[&str]) -> serde_json::Value {
@@ -1905,6 +1912,48 @@ mod tests {
         assert_ne!(
             observer_snapshot_fixture_digest(plan.arms[0].arm),
             observer_snapshot_fixture_digest(plan.arms[1].arm)
+        );
+    }
+
+    #[test]
+    fn retry_after_partial_command_stream_persistence_uses_attempt_scoped_artifacts() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = Store::in_memory(&temp.path().join("artifacts")).unwrap();
+        let register_stdout = |attempt: &str, bytes: &[u8]| {
+            let stored = store.artifacts().put(bytes).unwrap();
+            let input = NewArtifact {
+                id: evaluation_artifact_id(attempt, "candidate-stdout"),
+                run_id: None,
+                task_attempt_id: None,
+                kind: "command_stream".to_owned(),
+                logical_name: "candidate-stdout".to_owned(),
+                storage_path: stored.path,
+                sha256: stored.digest,
+                media_type: "text/plain".to_owned(),
+                compression: None,
+                sensitivity: "internal".to_owned(),
+                byte_length: stored.byte_length,
+                retention_class: "evaluation".to_owned(),
+                pinned: true,
+            };
+            store
+                .register_or_validate_evaluation_artifact(&input)
+                .unwrap()
+        };
+
+        // A failure after this first write leaves an append-only receipt. The
+        // rerun has different command bytes, and therefore must not attempt
+        // to mutate that receipt under the old deterministic ID.
+        let partial = register_stdout("fixed-1", b"compiler progress: 10%\n");
+        let resumed = register_stdout("fixed-2", b"compiler progress: 11%\n");
+        assert_ne!(partial, resumed);
+        assert_eq!(
+            store.artifact(&partial).unwrap().logical_name,
+            "candidate-stdout"
+        );
+        assert_eq!(
+            store.artifact(&resumed).unwrap().logical_name,
+            "candidate-stdout"
         );
     }
 

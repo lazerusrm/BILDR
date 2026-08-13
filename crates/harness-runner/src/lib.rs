@@ -645,7 +645,7 @@ impl EvaluationIsolationRunner {
             Ok(version) => version,
             Err(_) => return isolation_receipt("unavailable", false, "none", "none", "none"),
         };
-        if !version.starts_with("bubblewrap 0.11.") {
+        if !supported_bubblewrap_version(&version) {
             return isolation_receipt(&version, false, "none", "none", "none");
         }
         let probe = CommandSpec {
@@ -892,6 +892,10 @@ impl EvaluationIsolationRunner {
         }
         Ok(staged)
     }
+}
+
+fn supported_bubblewrap_version(version: &str) -> bool {
+    version == "bubblewrap 0.11.0"
 }
 
 fn unavailable_outcome(receipt: EvaluationIsolationReceipt) -> EvaluationIsolationOutcome {
@@ -2131,6 +2135,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn observer_snapshot_accepts_only_the_receipt_pinned_bubblewrap_version() {
+        assert!(supported_bubblewrap_version("bubblewrap 0.11.0"));
+        assert!(!supported_bubblewrap_version("bubblewrap 0.11.1"));
+        assert!(!supported_bubblewrap_version("bubblewrap 0.10.0"));
+        assert!(!supported_bubblewrap_version("bubblewrap 0.11.0-dev"));
+    }
+
     #[tokio::test]
     async fn bubblewrap_executes_custody_boundary_when_available() {
         let temp = TempDir::new().unwrap();
@@ -2156,9 +2168,10 @@ mod tests {
             temp.path().join("staging"),
         )
         .unwrap();
-        if !isolated.probe(&candidate).await.available {
-            return;
-        }
+        assert!(
+            isolated.probe(&candidate).await.available,
+            "the supported BILDR host must provide Bubblewrap 0.11.0 with namespace isolation"
+        );
         let host_network_namespace = std::fs::read_link("/proc/self/ns/net")
             .unwrap()
             .to_string_lossy()

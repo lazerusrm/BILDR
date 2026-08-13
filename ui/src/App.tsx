@@ -861,7 +861,10 @@ export default function App() {
             <UsageView breakdown={usageBreakdown} accounts={codexAccounts} />
           )}
           {view === "improvement" && (
-            <ImprovementCenter repositoryId={currentRun?.repository_id || repositories[0]?.id} />
+            <ImprovementCenter
+              repositoryId={currentRun?.repository_id || repositories[0]?.id}
+              runtime={runtime}
+            />
           )}
           {view === "host" && (
             <HostView runtime={runtime} repositories={repositories} />

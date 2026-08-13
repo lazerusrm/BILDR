@@ -1,58 +1,50 @@
-# BILDR validation report
+# BILDR PR2 validation report
 
-**Validated:** August 10, 2026
+**Validated:** August 12, 2026
 **Platform:** Linux x86_64
-**Release candidate:** 0.1.0
+**Candidate:** local PR2 remediation worktree
 
 ## Result
 
-The local release candidate passes the repository's build, contract, lint, unit,
-and browser acceptance gates.
+The PR2 remediation passes the repository's local build, contract, lint, unit,
+and browser acceptance gates. The change closes the release-review findings for
+legacy evaluation-custody migration safety, partial-persistence retry custody,
+truthful improvement-mode presentation, and the Bubblewrap isolation boundary.
 
-Planning certification now fails closed around a structured certificate. The
-certificate binds the plan, base, profile, authority set, reviewer, feasibility
-assessment, and review evidence. Human findings use the same revision path as
-reviewer findings. Blocking findings trigger revision; advisory findings remain
-in execution context without forcing another full planning cycle. Repeated,
-oscillating, or nonshrinking blockers stop for an explicit decision instead of
-consuming the remaining run budget.
-
-Execution completion now depends on controller-owned evidence from the exact
-integrated head. Profiles bind validators to lifecycle gates and changed paths.
-Code changes require behavioral proof. Automated acceptance and operator
-attestations bind to the integrated SHA and deterministic signoff packet. Human
-review is a resting state with approve and request-changes paths. Required
-draft-PR checks prove only the expected remote head; incomplete, stale, or
-malformed check results cannot advance the run.
-
-The public repository uses neutral orchestration schemas, examples, role names,
-and profile shapes. The strict BILDR profile validates Rust, browser, contract,
-and delivery paths without importing policy from another repository. Public
-change metadata rejects automation attribution, and the repository policy check
-rejects tool-specific root instruction files.
+In particular, a legacy v8 database with no evaluation records is rebuilt to
+the current custody shape. A populated legacy v8 database is rejected before
+its schema-version marker is changed, because controller/evidence ownership
+cannot be attributed safely after the fact. Retried observer-snapshot arms use
+attempt-scoped custody IDs, so changed command output cannot collide with a
+partial prior attempt. Observe-only readiness now requires Bubblewrap exactly
+0.11.0 with namespace isolation.
 
 ## Verification
 
-The following checks passed on the final local code shape:
+The following checks passed on the candidate worktree:
 
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --offline --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --locked --offline --workspace --all-targets`
+  - 219 tests passed; the repository's real two-arm pinned-worktree smoke remains intentionally ignored in the normal suite.
+  - The legacy-v8 empty-repair and populated-fail-closed migrations passed.
+  - The partial-command-stream retry and supported Bubblewrap isolation-boundary tests passed.
 - `cargo xtask check`
-  - 8 JSON schema and example files parsed.
-  - 59 OpenAPI references resolved.
-  - 50 API routes matched their implementations.
-  - The pinned protocol schema digest matched.
-  - The production browser application built.
-  - All 77 Rust tests passed.
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  - 20 JSON schemas and 17 examples conformed.
+  - 85 local OpenAPI references resolved, the runtime-status fixture conformed, and 62 router paths matched.
 - `npm --prefix ui run typecheck`
-- `npm --prefix ui test -- --run`: 7 tests passed.
-- `npm --prefix ui run test:e2e`: 2 browser flows passed.
+- `npm --prefix ui test`
+  - 16 tests passed, including disabled, observe-only, and anchor-mismatch Improvement Center states.
+- `npm --prefix ui run build`
+- `npm --prefix ui run test:e2e`
+  - 4 browser flows passed.
 - `bash .github/scripts/check-repository-policy.sh`
-- Positive and negative contribution-metadata policy checks.
 - `git diff --check`
 
 ## Proof limits
 
-This local report does not claim hosted CI, release publication, or live
-deployment proof. The draft pull request must run the public workflow on the
-published head before the controller can record CI proof. BILDR never merges
-automatically.
+This report is local source and host-boundary evidence only. It does not claim
+hosted CI for the unpublished remediation, release publication, a live
+production deployment, or completion of the intentionally separate two-arm
+observer-snapshot evaluation. Those require the exact committed candidate,
+final independent review, and staged/local-harness evidence.

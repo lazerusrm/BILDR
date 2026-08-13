@@ -24,6 +24,7 @@ use harness_codex::{
 };
 use harness_orchestrator::Orchestrator;
 use harness_profile::{HarnessConfig, ResolvedPaths, load_profile};
+use harness_runner::{CommandRunner, EvaluationIsolationReceipt, EvaluationIsolationRunner};
 use harness_store::Store;
 use observation::ObservationService;
 use rust_embed::RustEmbed;
@@ -353,6 +354,17 @@ async fn doctor(
     } else {
         Some(probe_compatibility(&codex_settings(&config, &paths)).await?)
     };
+    let observer_isolation = if config.self_improvement_runtime_status().observation_enabled {
+        let receipt = probe_observer_isolation(&paths).await?;
+        if !receipt.available {
+            bail!(
+                "observe_only mode requires Bubblewrap 0.11.0 with namespace isolation; install the documented prerequisite or disable self-improvement"
+            );
+        }
+        Some(receipt)
+    } else {
+        None
+    };
     let report = json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
@@ -369,6 +381,7 @@ async fn doctor(
         },
         "database": database,
         "codex": compatibility.clone(),
+        "observer_isolation": observer_isolation,
     });
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -395,8 +408,37 @@ async fn doctor(
         } else {
             println!("  codex: skipped");
         }
+        if let Some(receipt) = &observer_isolation {
+            println!(
+                "  observer isolation: {} ({})",
+                receipt.backend, receipt.backend_version
+            );
+        } else {
+            println!("  observer isolation: not required while self-improvement is disabled");
+        }
     }
     Ok(())
+}
+
+async fn probe_observer_isolation(paths: &ResolvedPaths) -> Result<EvaluationIsolationReceipt> {
+    let root = paths.cache_dir.join("doctor-observer-isolation");
+    let worktree = root.join("worktree");
+    let grader = root.join("grader");
+    let holdout = root.join("holdout");
+    let artifacts = root.join("artifacts");
+    for directory in [&worktree, &grader, &holdout, &artifacts] {
+        std::fs::create_dir_all(directory)?;
+    }
+    let commands = CommandRunner::new(root.join("spool"), Default::default()).await?;
+    let runner = EvaluationIsolationRunner::new(
+        commands,
+        &worktree,
+        &grader,
+        &holdout,
+        &artifacts,
+        root.join("staging"),
+    )?;
+    Ok(runner.probe(&worktree).await)
 }
 
 fn codex_settings(config: &HarnessConfig, paths: &ResolvedPaths) -> CodexSettings {

@@ -38,6 +38,8 @@ const LEARNING_POLICY_BINDING_MIGRATION: &str =
     include_str!("../../../migrations/0009_learning_policy_binding.sql");
 const ARTIFACT_RUN_CUSTODY_MIGRATION: &str =
     include_str!("../../../migrations/0010_artifact_run_custody.sql");
+const EVALUATION_CUSTODY_REPAIR_MIGRATION: &str =
+    include_str!("../../../migrations/0011_evaluation_custody_repair.sql");
 
 #[derive(Clone)]
 pub struct Store {
@@ -214,6 +216,17 @@ impl Store {
 }
 
 fn apply_runtime_migrations(connection: &mut Connection) -> Result<(), StoreError> {
+    // A populated v8 evaluation database has receipts that predate required
+    // controller/evidence ownership. Refuse it before the generic runtime
+    // migration can touch its version marker or any unrelated schema shape.
+    if evaluation_custody_tables_exist(connection)?
+        && !has_current_evaluation_custody(connection)?
+        && legacy_evaluation_receipts_present(connection)?
+    {
+        return Err(StoreError::Migration(
+            "legacy v8 evaluation custody contains receipts that lack controller/evidence ownership; restore a pre-v8 backup or retain this database with the matching binary".to_owned(),
+        ));
+    }
     connection.execute_batch(RUNTIME_MIGRATION)?;
     let has_worktree_fingerprint: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('approvals') WHERE name='expected_worktree_fingerprint')",
@@ -275,6 +288,11 @@ fn apply_runtime_migrations(connection: &mut Connection) -> Result<(), StoreErro
         transaction.execute_batch(EVALUATION_CUSTODY_MIGRATION)?;
         transaction.commit()?;
     }
+    if !has_current_evaluation_custody(connection)? {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(EVALUATION_CUSTODY_REPAIR_MIGRATION)?;
+        transaction.commit()?;
+    }
     let has_policy_champion_bindings: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='policy_champion_bindings')",
         [],
@@ -302,12 +320,77 @@ fn apply_runtime_migrations(connection: &mut Connection) -> Result<(), StoreErro
     Ok(())
 }
 
+fn has_current_evaluation_custody(connection: &Connection) -> Result<bool, StoreError> {
+    [
+        ("evaluation_runs", "controller_run_id"),
+        ("evaluation_samples", "controller_evidence_id"),
+        ("evaluation_samples", "grader_evidence_id"),
+    ]
+    .into_iter()
+    .map(|(table, column)| table_has_column(connection, table, column))
+    .collect::<Result<Vec<_>, _>>()
+    .map(|columns| columns.into_iter().all(|present| present))
+}
+
+fn evaluation_custody_tables_exist(connection: &Connection) -> Result<bool, StoreError> {
+    [
+        "evaluation_runs",
+        "evaluation_run_status_revisions",
+        "evaluation_samples",
+        "evaluation_stat_verdicts",
+        "evaluation_invalidations",
+    ]
+    .into_iter()
+    .map(|table| {
+        connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get::<_, bool>(0),
+        )
+    })
+    .collect::<Result<Vec<_>, _>>()
+    .map(|tables| tables.into_iter().all(|present| present))
+    .map_err(Into::into)
+}
+
+fn table_has_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, StoreError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+            [table, column],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn legacy_evaluation_receipts_present(connection: &Connection) -> Result<bool, StoreError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM evaluation_runs
+                UNION ALL SELECT 1 FROM evaluation_run_status_revisions
+                UNION ALL SELECT 1 FROM evaluation_samples
+                UNION ALL SELECT 1 FROM evaluation_stat_verdicts
+                UNION ALL SELECT 1 FROM evaluation_invalidations
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("migration safety error: {0}")]
+    Migration(String),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("database connection mutex was poisoned")]
@@ -1055,6 +1138,194 @@ mod tests {
                 .unwrap(),
             "10"
         );
+    }
+
+    fn materialize_legacy_v8_evaluation_schema(connection: &rusqlite::Connection) {
+        connection
+            .execute_batch(
+                "
+                DROP TRIGGER IF EXISTS evaluation_run_revision_kinds;
+                DROP TRIGGER IF EXISTS evaluation_sample_membership;
+                DROP TABLE evaluation_samples;
+                DROP TABLE evaluation_runs;
+                CREATE TABLE evaluation_runs (
+                    id TEXT PRIMARY KEY,
+                    taskset_revision_id TEXT NOT NULL REFERENCES improvement_revisions(id),
+                    grader_bundle_revision_id TEXT NOT NULL REFERENCES improvement_revisions(id),
+                    split TEXT NOT NULL,
+                    base_sha TEXT NOT NULL,
+                    fixture_digest TEXT NOT NULL,
+                    runtime_digest TEXT NOT NULL,
+                    seed_policy_digest TEXT NOT NULL,
+                    champion_policy_digest TEXT NOT NULL,
+                    challenger_policy_digest TEXT,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE evaluation_samples (
+                    id TEXT PRIMARY KEY,
+                    evaluation_run_id TEXT NOT NULL REFERENCES evaluation_runs(id),
+                    eval_case_revision_id TEXT NOT NULL REFERENCES improvement_revisions(id),
+                    arm TEXT NOT NULL,
+                    seed INTEGER NOT NULL,
+                    classification TEXT NOT NULL,
+                    sample_digest TEXT NOT NULL,
+                    trace_digest TEXT,
+                    evidence_digest TEXT,
+                    artifact_digest TEXT,
+                    cost_receipt_digest TEXT,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    created_at INTEGER NOT NULL,
+                    UNIQUE(evaluation_run_id, eval_case_revision_id, arm, seed)
+                );
+                CREATE TRIGGER evaluation_run_revision_kinds
+                BEFORE INSERT ON evaluation_runs BEGIN
+                    SELECT CASE WHEN (SELECT aggregate_kind FROM improvement_revisions WHERE id=NEW.taskset_revision_id) <> 'taskset'
+                                      OR (SELECT aggregate_kind FROM improvement_revisions WHERE id=NEW.grader_bundle_revision_id) <> 'grader_bundle'
+                        THEN RAISE(ABORT, 'evaluation run revision kind mismatch') END;
+                END;
+                CREATE TRIGGER evaluation_sample_membership
+                BEFORE INSERT ON evaluation_samples BEGIN
+                    SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM evaluation_runs r JOIN taskset_revision_memberships m ON m.taskset_revision_id=r.taskset_revision_id WHERE r.id=NEW.evaluation_run_id AND m.eval_case_revision_id=NEW.eval_case_revision_id)
+                        THEN RAISE(ABORT, 'evaluation sample case is not taskset member') END;
+                END;
+                UPDATE schema_migrations_meta SET value='8' WHERE key='runtime_schema_version';
+                ",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn empty_legacy_v8_evaluation_schema_is_rebuilt_before_version_is_advanced() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("legacy-v8-empty.sqlite3");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.execute_batch(INITIAL_MIGRATION).unwrap();
+        connection.execute_batch(RUNTIME_MIGRATION).unwrap();
+        connection
+            .execute_batch(APPROVAL_WORKTREE_BINDING_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(ATTEMPT_CONTINUITY_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(ACCOUNT_ATTRIBUTION_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(SELF_IMPROVEMENT_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(FAILURE_OBSERVATION_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(EVALUATION_CUSTODY_MIGRATION)
+            .unwrap();
+        materialize_legacy_v8_evaluation_schema(&connection);
+        drop(connection);
+
+        let artifacts = temp.path().join("artifacts");
+        let store = Store::open(&database, &artifacts).unwrap();
+        assert_eq!(store.migration_version().unwrap(), "10");
+        for (table, column) in [
+            ("evaluation_runs", "controller_run_id"),
+            ("evaluation_samples", "controller_evidence_id"),
+            ("evaluation_samples", "grader_evidence_id"),
+        ] {
+            assert!(table_has_column(&store.connection().unwrap(), table, column).unwrap());
+        }
+        for trigger in [
+            "evaluation_runs_no_update",
+            "evaluation_runs_no_delete",
+            "evaluation_samples_no_update",
+            "evaluation_samples_no_delete",
+        ] {
+            let present: bool = store
+                .connection()
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)",
+                    [trigger],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "missing repaired append-only trigger: {trigger}");
+        }
+        let backup = temp.path().join("legacy-v8-empty-backup.sqlite3");
+        store.backup(&backup).unwrap();
+        drop(store);
+        assert!(
+            Store::open(&backup, &temp.path().join("backup-artifacts"))
+                .unwrap()
+                .check()
+                .unwrap()
+                .ready
+        );
+    }
+
+    #[test]
+    fn populated_legacy_v8_evaluation_schema_fails_closed_before_version_is_advanced() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("legacy-v8-populated.sqlite3");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.execute_batch(INITIAL_MIGRATION).unwrap();
+        connection.execute_batch(RUNTIME_MIGRATION).unwrap();
+        connection
+            .execute_batch(APPROVAL_WORKTREE_BINDING_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(ATTEMPT_CONTINUITY_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(ACCOUNT_ATTRIBUTION_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(SELF_IMPROVEMENT_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(FAILURE_OBSERVATION_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(EVALUATION_CUSTODY_MIGRATION)
+            .unwrap();
+        materialize_legacy_v8_evaluation_schema(&connection);
+        let legacy_version: String = connection
+            .query_row(
+                "SELECT value FROM schema_migrations_meta WHERE key='runtime_schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_version, "8");
+        // The historical process had already accepted this row before the
+        // controller/evidence foreign keys existed. Model that on-disk shape
+        // directly; migration detection rejects the populated custody tables
+        // before it considers a rebuild.
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF;")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO evaluation_runs(id,taskset_revision_id,grader_bundle_revision_id,split,base_sha,fixture_digest,runtime_digest,seed_policy_digest,champion_policy_digest,idempotency_key,created_at) VALUES('legacy-run','missing-taskset','missing-grader','development',?1,?2,?2,?2,?2,'legacy-run',1)",
+                rusqlite::params!["a".repeat(40), "b".repeat(64)],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = match Store::open(&database, &temp.path().join("artifacts")) {
+            Ok(_) => panic!("a populated legacy v8 evaluation database must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("legacy v8 evaluation custody"));
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let version: String = connection
+            .query_row(
+                "SELECT value FROM schema_migrations_meta WHERE key='runtime_schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "8");
+        assert!(!table_has_column(&connection, "evaluation_runs", "controller_run_id").unwrap());
     }
 
     #[test]
