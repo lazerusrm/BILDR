@@ -1,0 +1,62 @@
+{
+  "schema": "harness.supervisor-decision.v1",
+  "decision_id": "decision-1",
+  "snapshot_id": "snapshot-1",
+  "run_id": "run-1",
+  "snapshot_revision": 1,
+  "created_at": "2026-08-13T15:50:05Z",
+  "requested_model": "terra",
+  "effective_model": "terra",
+  "requested_effort": "high",
+  "effective_effort": "high",
+  "summary": "No intervention is needed before the next material event.",
+  "goal_assessment": {
+    "status": "on_track",
+    "progress_class": "advancing",
+    "drift_detected": false,
+    "rationale": "The latest event advances the approved critical path and no blocker requires intervention.",
+    "critical_path_summary": "Wait for independent verification evidence.",
+    "criteria_proven_ids": [],
+    "criteria_missing_ids": ["criterion-1"],
+    "evidence_refs": []
+  },
+  "task_assessments": [],
+  "agent_assessments": [],
+  "actions": [
+    {
+      "action_id": "action-1",
+      "kind": "wait",
+      "target": {
+        "kind": "run",
+        "id": "run-1",
+        "task_id": null,
+        "attempt_id": null,
+        "session_id": null
+      },
+      "priority": "when_ready",
+      "impact": "low",
+      "reason_code": "HEALTHY_PROGRESS",
+      "summary": "Wait for a material validation or verifier event.",
+      "prompt": null,
+      "model_route": null,
+      "expected_observable_outcome": "A validation, verifier, blocker, or liveness event creates the next review.",
+      "preconditions": ["The snapshot remains current."],
+      "evidence_refs": [],
+      "dedupe_key": "run-1:wait:revision-1",
+      "expires_at": "2026-08-13T16:20:05Z",
+      "expert_brief": null
+    }
+  ],
+  "confidence": {
+    "overall": "high",
+    "goal_assessment": "high",
+    "action_plan": "high",
+    "reason_codes": ["CONTROLLER_EVIDENCE_SUFFICIENT"]
+  },
+  "uncertainties": [],
+  "next_review": {
+    "mode": "on_event",
+    "at": null,
+    "reason": "A material event should determine the next supervisory turn."
+  }
+}
