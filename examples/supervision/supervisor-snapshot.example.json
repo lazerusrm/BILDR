@@ -1,0 +1,70 @@
+{
+  "schema": "harness.supervisor-snapshot.v1",
+  "snapshot_id": "snapshot-1",
+  "run_id": "run-1",
+  "revision": 1,
+  "generated_at": "2026-08-13T15:50:00Z",
+  "event_cursor": 42,
+  "base_sha": "0123456789abcdef0123456789abcdef01234567",
+  "profile_id": "bildr",
+  "plan_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "goal_revision": 1,
+  "trigger": {
+    "kind": "agent_completed",
+    "occurred_at": "2026-08-13T15:49:59Z",
+    "event_ids": ["event-42"],
+    "coalesced_count": 1
+  },
+  "goal": {
+    "original_objective": "Deliver the approved change with exact evidence.",
+    "refined_objective": "Complete the approved task graph and independent verification.",
+    "status": "active",
+    "hard_constraints": ["The controller retains publication authority."],
+    "non_goals": ["Do not broaden the approved scope."],
+    "success_criteria": [
+      {
+        "id": "criterion-1",
+        "statement": "The exact-head verifier accepts the candidate.",
+        "state": "in_progress",
+        "evidence_refs": []
+      }
+    ],
+    "milestones": [
+      {
+        "id": "milestone-1",
+        "title": "Produce and verify the candidate",
+        "state": "in_progress",
+        "critical_path": true,
+        "task_ids": []
+      }
+    ],
+    "critical_path_task_ids": []
+  },
+  "run": {
+    "state": "executing",
+    "phase": "implementation",
+    "elapsed_seconds": 900,
+    "last_material_progress_at": "2026-08-13T15:49:59Z",
+    "ready_task_ids": [],
+    "blocked_task_ids": [],
+    "active_task_ids": [],
+    "completion_candidate": false
+  },
+  "tasks": [],
+  "agents": [],
+  "budgets": {
+    "run_tokens_used": 12000,
+    "run_tokens_remaining": 88000,
+    "supervisor_tokens_used": 0,
+    "supervisor_tokens_remaining": 24000,
+    "expert_tokens_used": 0,
+    "expert_tokens_remaining": 80000,
+    "expert_requests_remaining": 2,
+    "active_thread_count": 0,
+    "max_thread_count": 10
+  },
+  "allowed_actions": ["wait"],
+  "evidence_refs": [],
+  "prior_decision": null,
+  "expert_consultations": []
+}
