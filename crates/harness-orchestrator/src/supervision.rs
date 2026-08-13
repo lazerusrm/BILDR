@@ -13,7 +13,11 @@ use harness_profile::SupervisionConfig;
 use harness_store::{Store, StoreError, SupervisorSnapshotRecord, packet_digest};
 use serde_json::{Value, json};
 
-const MAX_EVENTS_PER_OBSERVATION: u32 = 100;
+// A 10k telemetry backlog must not postpone a later material event for hours
+// at the normal maintenance cadence. The snapshot itself still includes at
+// most the schema's 100 evidence event references.
+const MAX_EVENTS_PER_OBSERVATION: u32 = 10_000;
+const MAX_MATERIAL_EVENTS_PER_SNAPSHOT: usize = 100;
 const MAX_TASKS_PER_SNAPSHOT: usize = 50;
 const MAX_AGENTS_PER_SNAPSHOT: usize = 50;
 const EFFICIENCY_POLICY_VERSION: &str = "supervision-efficiency.v1";
@@ -66,6 +70,9 @@ pub(crate) fn observe_run(
     let event_cursor = last_event.id;
     let material_events = material
         .iter()
+        .rev()
+        .take(MAX_MATERIAL_EVENTS_PER_SNAPSHOT)
+        .rev()
         .map(|event| (*event).clone())
         .collect::<Vec<_>>();
     let snapshot = store.record_supervisor_snapshot(
@@ -459,7 +466,7 @@ fn parse_timestamp_millis(value: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::material_trigger;
+    use super::{MAX_EVENTS_PER_OBSERVATION, MAX_MATERIAL_EVENTS_PER_SNAPSHOT, material_trigger};
     use harness_domain::{DomainEvent, RunId};
     use serde_json::json;
 
@@ -504,5 +511,11 @@ mod tests {
             material_trigger(&event("task.verified", json!({}))),
             Some("verifier_completed")
         );
+    }
+
+    #[test]
+    fn telemetry_backlog_catch_up_remains_bounded_without_deferring_material_events() {
+        assert_eq!(MAX_EVENTS_PER_OBSERVATION, 10_000);
+        assert_eq!(MAX_MATERIAL_EVENTS_PER_SNAPSHOT, 100);
     }
 }
