@@ -8,7 +8,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -777,6 +777,7 @@ pub struct Orchestrator {
     context: Arc<ContextCompiler>,
     runtime: Arc<RwLock<Option<Arc<dyn CodexRuntime>>>>,
     yolo_mode: Arc<AtomicBool>,
+    settings_lock: Arc<StdMutex<()>>,
     operation_lock: Arc<Mutex<()>>,
     hygiene_lock: Arc<Mutex<()>>,
     account_logins: Arc<Mutex<BTreeMap<String, CodexAccountLoginEntry>>>,
@@ -841,6 +842,7 @@ impl Orchestrator {
             store,
             runtime: Arc::new(RwLock::new(runtime)),
             yolo_mode: Arc::new(AtomicBool::new(yolo_mode)),
+            settings_lock: Arc::new(StdMutex::new(())),
             operation_lock: Arc::new(Mutex::new(())),
             hygiene_lock: Arc::new(Mutex::new(())),
             account_logins: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1600,6 +1602,14 @@ impl Orchestrator {
 
     #[must_use]
     pub fn operator_settings(&self) -> OperatorSettings {
+        let _guard = self
+            .settings_lock
+            .lock()
+            .expect("settings lock is not poisoned");
+        self.operator_settings_unlocked()
+    }
+
+    fn operator_settings_unlocked(&self) -> OperatorSettings {
         let adaptive_governor_budgets =
             self.stored_setting_bool(SETTING_ADAPTIVE_GOVERNOR_BUDGETS, true);
         let automatic_governor_continuation =
@@ -1622,23 +1632,7 @@ impl Orchestrator {
                 None,
             )
             .unwrap_or_default();
-        let recommended_governor_attempt_tokens = if adaptive_governor_budgets {
-            recommend_governor_budget(&samples, governor_attempt_token_ceiling)
-        } else {
-            DEFAULT_GOVERNOR_ATTEMPT_TOKENS.min(governor_attempt_token_ceiling)
-        };
-        let governor_budget_reason = if samples.len() >= 2 && adaptive_governor_budgets {
-            format!(
-                "Based on the 75th percentile of {} recent productive governor attempts, with 50% headroom.",
-                samples.len()
-            )
-        } else if adaptive_governor_budgets {
-            "Using the bounded governor cold-start default until at least two productive attempts are available."
-                .to_owned()
-        } else {
-            "Adaptive budgeting is disabled; the bounded governor default is used.".to_owned()
-        };
-        OperatorSettings {
+        let mut settings = OperatorSettings {
             store_reasoning_summaries: self.projection.store_reasoning_summaries(),
             store_raw_reasoning: self.projection.store_raw_reasoning(),
             yolo_mode: self.yolo_mode.load(Ordering::Acquire),
@@ -1653,17 +1647,26 @@ impl Orchestrator {
             supervision_observe_only: self.supervision_observe_only_enabled(),
             governor_goal_token_budget,
             governor_attempt_token_ceiling,
-            recommended_governor_attempt_tokens,
-            governor_budget_sample_count: samples.len(),
-            governor_budget_reason,
-        }
+            recommended_governor_attempt_tokens: 0,
+            governor_budget_sample_count: 0,
+            governor_budget_reason: String::new(),
+        };
+        refresh_governor_budget_fields(&mut settings, &samples);
+        settings
     }
 
     pub fn update_operator_settings(
         &self,
         request: UpdateOperatorSettingsRequest,
     ) -> Result<OperatorSettings, OrchestratorError> {
-        let current = self.operator_settings();
+        // Settings is a single control-plane document. Serialize its
+        // read/derive/write/receipt lifecycle so concurrently submitted
+        // independent toggles cannot return an older composite response.
+        let _guard = self
+            .settings_lock
+            .lock()
+            .expect("settings lock is not poisoned");
+        let current = self.operator_settings_unlocked();
         let governor_goal_token_budget = request
             .governor_goal_token_budget
             .unwrap_or(current.governor_goal_token_budget);
@@ -1747,6 +1750,17 @@ impl Orchestrator {
                 json!(governor_attempt_token_ceiling),
             ));
         }
+        let governor_route = &self.profile.profile.models.governor;
+        let samples = self
+            .store
+            .governor_token_samples(
+                24,
+                &governor_route.model,
+                &governor_route.reasoning_effort,
+                None,
+            )
+            .unwrap_or_default();
+        refresh_governor_budget_fields(&mut settings, &samples);
         let payload = serde_json::to_value(&settings)?;
         let update_refs = updates
             .iter()
@@ -1763,7 +1777,9 @@ impl Orchestrator {
         if let Some(value) = request.yolo_mode {
             self.yolo_mode.store(value, Ordering::Release);
         }
-        Ok(settings)
+        // Return the post-commit projection so derived budget fields and all
+        // independently changed toggles match the persisted receipt exactly.
+        Ok(self.operator_settings_unlocked())
     }
 
     fn stored_setting_bool(&self, key: &str, default: bool) -> bool {
@@ -14394,6 +14410,26 @@ fn supervision_mode_for_operator_setting(enabled: bool) -> SupervisorMode {
     }
 }
 
+fn refresh_governor_budget_fields(settings: &mut OperatorSettings, samples: &[u64]) {
+    settings.governor_budget_sample_count = samples.len();
+    settings.recommended_governor_attempt_tokens = if settings.adaptive_governor_budgets {
+        recommend_governor_budget(samples, settings.governor_attempt_token_ceiling)
+    } else {
+        DEFAULT_GOVERNOR_ATTEMPT_TOKENS.min(settings.governor_attempt_token_ceiling)
+    };
+    settings.governor_budget_reason = if samples.len() >= 2 && settings.adaptive_governor_budgets {
+        format!(
+            "Based on the 75th percentile of {} recent productive governor attempts, with 50% headroom.",
+            samples.len()
+        )
+    } else if settings.adaptive_governor_budgets {
+        "Using the bounded governor cold-start default until at least two productive attempts are available."
+            .to_owned()
+    } else {
+        "Adaptive budgeting is disabled; the bounded governor default is used.".to_owned()
+    };
+}
+
 fn repository_search_roots() -> Vec<PathBuf> {
     if let Some(configured) = std::env::var_os("HARNESS_REPOSITORY_SEARCH_ROOTS") {
         let roots = std::env::split_paths(&configured).collect::<Vec<_>>();
@@ -14715,6 +14751,48 @@ pub enum OrchestratorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    async fn operator_settings_test_orchestrator() -> (Orchestrator, TempDir) {
+        let temp = TempDir::new().expect("temporary directory");
+        let root = temp.path();
+        let paths = ResolvedPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+            state_dir: root.join("state"),
+            database: root.join("data/harness.sqlite3"),
+            artifact_root: root.join("data/artifacts"),
+            worktree_root: root.join("worktrees"),
+            log_dir: root.join("state/logs"),
+        };
+        paths.create_securely().expect("secure test paths");
+        let config = HarnessConfig::load(None).expect("default test config");
+        let profile = load_profile("general", &paths.config_dir).expect("test profile");
+        let store = Store::open(&paths.database, &paths.artifact_root).expect("test store");
+        let orchestrator = Orchestrator::new(config, paths, profile, store, None)
+            .await
+            .expect("test orchestrator");
+        (orchestrator, temp)
+    }
+
+    fn operator_settings_request(
+        supervision_observe_only: Option<bool>,
+        automatic_plan_approval: Option<bool>,
+    ) -> UpdateOperatorSettingsRequest {
+        UpdateOperatorSettingsRequest {
+            store_reasoning_summaries: None,
+            store_raw_reasoning: None,
+            yolo_mode: None,
+            automatic_account_handoff: None,
+            adaptive_governor_budgets: None,
+            automatic_governor_continuation: None,
+            automatic_plan_approval,
+            supervision_observe_only,
+            governor_goal_token_budget: None,
+            governor_attempt_token_ceiling: None,
+        }
+    }
 
     #[test]
     fn operator_supervision_toggle_can_only_select_observation_or_disabled() {
@@ -14725,6 +14803,82 @@ mod tests {
         assert_eq!(
             supervision_mode_for_operator_setting(true),
             SupervisorMode::ObserveOnly
+        );
+    }
+
+    #[test]
+    fn settings_receipt_recomputes_derived_governor_fields_after_a_change() {
+        let mut settings = OperatorSettings {
+            store_reasoning_summaries: true,
+            store_raw_reasoning: false,
+            yolo_mode: false,
+            allow_automatic_external_writes: false,
+            automatic_external_writes_locked: true,
+            automatic_account_handoff: true,
+            adaptive_governor_budgets: false,
+            automatic_governor_continuation: true,
+            automatic_plan_approval: false,
+            supervision_observe_only: false,
+            governor_goal_token_budget: 5_000_000,
+            governor_attempt_token_ceiling: 400_000,
+            recommended_governor_attempt_tokens: 1,
+            governor_budget_sample_count: 0,
+            governor_budget_reason: "stale".to_owned(),
+        };
+
+        refresh_governor_budget_fields(&mut settings, &[400_000, 900_000]);
+
+        assert_eq!(settings.governor_budget_sample_count, 2);
+        assert_eq!(settings.recommended_governor_attempt_tokens, 400_000);
+        assert_eq!(
+            settings.governor_budget_reason,
+            "Adaptive budgeting is disabled; the bounded governor default is used."
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_settings_updates_return_and_persist_a_coherent_control_plane() {
+        let (orchestrator, _temp) = operator_settings_test_orchestrator().await;
+        let left = orchestrator.clone();
+        let right = orchestrator.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let left_barrier = Arc::clone(&barrier);
+        let right_barrier = Arc::clone(&barrier);
+
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(move || {
+                left_barrier.wait();
+                left.update_operator_settings(operator_settings_request(Some(true), None))
+                    .expect("supervision update")
+            });
+            let second = scope.spawn(move || {
+                right_barrier.wait();
+                right
+                    .update_operator_settings(operator_settings_request(None, Some(true)))
+                    .expect("plan approval update")
+            });
+            (
+                first.join().expect("first update thread"),
+                second.join().expect("second update thread"),
+            )
+        });
+
+        let final_settings = orchestrator.operator_settings();
+        assert!(final_settings.supervision_observe_only);
+        assert!(final_settings.automatic_plan_approval);
+        assert!(
+            (first.supervision_observe_only && first.automatic_plan_approval)
+                || (second.supervision_observe_only && second.automatic_plan_approval),
+            "the last serialized response contains both independently persisted updates"
+        );
+        let receipts = orchestrator
+            .store()
+            .list_domain_events(0, None, 10)
+            .expect("settings receipts");
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(
+            receipts.last().expect("latest receipt").payload,
+            serde_json::to_value(&final_settings).expect("settings payload")
         );
     }
 

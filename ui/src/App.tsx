@@ -4862,6 +4862,7 @@ export function SettingsView({
   const [settings, setSettings] = useState<OperatorSettings>();
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const settingsUpdateLocked = !settings || busy !== "";
   useEffect(() => {
     api
       .settings()
@@ -4923,7 +4924,7 @@ export function SettingsView({
         title="Observe-only supervision"
         text="Record bounded, immutable controller snapshots for material run events. On never starts Terra or Sol, changes tasks, or takes automatic actions."
         enabled={settings?.supervision_observe_only ?? false}
-        disabled={!settings || busy === "supervision_observe_only"}
+        disabled={settingsUpdateLocked}
         onChange={(value) => update("supervision_observe_only", value)}
       />
       <div className="settings-section-title">
@@ -4933,28 +4934,28 @@ export function SettingsView({
         title="Automatically approve certified plans"
         text="Every plan first passes independent adversarial review. When off, Harness pauses after certification; when on, a zero-finding certified digest begins implementation automatically."
         enabled={settings?.automatic_plan_approval ?? false}
-        disabled={!settings || busy === "automatic_plan_approval"}
+        disabled={settingsUpdateLocked}
         onChange={(value) => update("automatic_plan_approval", value)}
       />
       <SettingToggle
         title="Automatic governor continuation"
         text="Roll productive, incomplete governor checkpoints into a fresh bounded attempt without asking you to babysit each turn."
         enabled={settings?.automatic_governor_continuation ?? true}
-        disabled={!settings || busy === "automatic_governor_continuation"}
+        disabled={settingsUpdateLocked}
         onChange={(value) => update("automatic_governor_continuation", value)}
       />
       <SettingToggle
         title="Automatic account handoff"
         text="Between attempts, move new work to a ready Codex account when the selected account has 10% capacity or less. Active threads are never transplanted."
         enabled={settings?.automatic_account_handoff ?? true}
-        disabled={!settings || busy === "automatic_account_handoff"}
+        disabled={settingsUpdateLocked}
         onChange={(value) => update("automatic_account_handoff", value)}
       />
       <SettingToggle
         title="Adaptive attempt budgets"
         text="Use successful governor history to choose the next attempt budget while respecting your hard ceiling."
         enabled={settings?.adaptive_governor_budgets ?? true}
-        disabled={!settings || busy === "adaptive_governor_budgets"}
+        disabled={settingsUpdateLocked}
         onChange={(value) => update("adaptive_governor_budgets", value)}
       />
       <div className="settings-card autonomy-settings">
@@ -4975,7 +4976,7 @@ export function SettingsView({
             <span>Goal budget</span>
             <select
               value={settings?.governor_goal_token_budget || 5_000_000}
-              disabled={!settings || busy === "governor_goal_token_budget"}
+              disabled={settingsUpdateLocked}
               onChange={(event) =>
                 update("governor_goal_token_budget", Number(event.target.value))
               }
@@ -4995,7 +4996,7 @@ export function SettingsView({
             <span>Per-attempt limit</span>
             <select
               value={settings?.governor_attempt_token_ceiling || 1_000_000}
-              disabled={!settings || busy === "governor_attempt_token_ceiling"}
+              disabled={settingsUpdateLocked}
               onChange={(event) =>
                 update(
                   "governor_attempt_token_ceiling",
@@ -5028,14 +5029,14 @@ export function SettingsView({
         title="Reasoning summaries"
         text="Retain concise reasoning summaries in the local event journal."
         enabled={settings?.store_reasoning_summaries ?? true}
-        disabled={!settings || busy === "store_reasoning_summaries"}
+        disabled={settingsUpdateLocked}
         onChange={(value) => update("store_reasoning_summaries", value)}
       />
       <SettingToggle
         title="Raw reasoning events"
         text="Retain raw reasoning payloads locally. Leave this off unless you need protocol-level diagnostics."
         enabled={settings?.store_raw_reasoning ?? false}
-        disabled={!settings || busy === "store_raw_reasoning"}
+        disabled={settingsUpdateLocked}
         warning
         onChange={(value) => update("store_raw_reasoning", value)}
       />
@@ -5043,7 +5044,7 @@ export function SettingsView({
         title="YOLO mode for managed worktrees"
         text="New writable Codex threads run without per-command or per-file prompts. Path custody and the managed-worktree boundary still apply."
         enabled={settings?.yolo_mode ?? false}
-        disabled={!settings || busy === "yolo_mode"}
+        disabled={settingsUpdateLocked}
         warning
         onChange={(value) => update("yolo_mode", value)}
       />

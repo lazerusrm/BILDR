@@ -535,10 +535,10 @@ mod tests {
             )
             .unwrap();
 
-        let enabled = json!(true);
+        let enabled = serde_json::json!(true);
         let result = store.update_runtime_metadata_with_settings_receipt(
             &[("settings.supervision_observe_only", &enabled)],
-            &json!({"supervision_observe_only": true}),
+            &serde_json::json!({"supervision_observe_only": true}),
         );
 
         assert!(result.is_err());
