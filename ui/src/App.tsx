@@ -745,6 +745,13 @@ export default function App() {
                   "Independent final plan review resumed",
                 )
               }
+              onRequestSupervisorReview={() =>
+                runAction(
+                  "supervisor-review",
+                  () => api.requestSupervisorReview(currentRun.id),
+                  "Terra started a read-only blocker analysis; recovery still requires your approval",
+                )
+              }
               onStop={() =>
                 runAction(
                   "stop",
@@ -1994,6 +2001,7 @@ function RunWorkspace({
   onApprove,
   onRequestPlanChanges,
   onResumePlanReview,
+  onRequestSupervisorReview,
   onApproveIntegration,
   onApproveSignoff,
   onRequestSignoffChanges,
@@ -2021,6 +2029,7 @@ function RunWorkspace({
   onApprove: (allowBudgetOverride?: boolean) => void;
   onRequestPlanChanges: (finding: string) => void;
   onResumePlanReview: () => void;
+  onRequestSupervisorReview: () => void;
   onApproveIntegration: () => void;
   onApproveSignoff: () => void;
   onRequestSignoffChanges: (file: string, finding: string) => void;
@@ -2245,12 +2254,18 @@ function RunWorkspace({
         <strong>Run lifecycle</strong>
         <span>{runLifecycleSummary(run)}</span>
       </div>
-      <SupervisorObservationPanel detail={detail} />
+      <SupervisorObservationPanel
+        detail={detail}
+        busy={busy}
+        onRequestReview={onRequestSupervisorReview}
+      />
       <BlockedRunRecoveryPanel
         detail={detail}
         busy={busy}
         onResumeReview={onResumePlanReview}
         onRequestChanges={onRequestPlanChanges}
+        onResumeWork={() => onPause(0)}
+        onRetry={(taskId) => onRetry(taskId, "", 0)}
       />
       {detail.intent_interview && (
         <IntentInterviewPanel
@@ -3275,26 +3290,47 @@ export function blockedPlanRecovery(run: Run, planDigest?: string) {
   return undefined;
 }
 
-export function SupervisorObservationPanel({ detail }: { detail: RunDetail }) {
+export function SupervisorObservationPanel({
+  detail,
+  busy = "",
+  onRequestReview = () => undefined,
+}: {
+  detail: RunDetail;
+  busy?: string;
+  onRequestReview?: () => void;
+}) {
   const mode = detail.supervision_mode || "disabled";
   const snapshot = detail.supervisor_snapshot;
+  const review = detail.supervisor_review;
+  const decision = detail.supervisor_decision;
   const observing = mode === "observe_only";
+  const advisory = mode === "advisory";
+  const reviewRunning = ["STARTING", "RUNNING"].includes(review?.state || "");
+  const canRequest = advisory && !reviewRunning && !terminal(detail.run.state);
   return (
     <section className="supervisor-observation" aria-label="Supervisory observation">
       <header>
         <div className="supervisor-observation-icon" aria-hidden="true">
-          <Database size={17} />
+          {advisory ? <Bot size={17} /> : <Database size={17} />}
         </div>
         <div>
-          <div className="eyebrow">Supervisory observation</div>
-          <h2>{observing ? "Observe-only custody" : "Supervision is disabled"}</h2>
+          <div className="eyebrow">Thread supervision</div>
+          <h2>
+            {advisory
+              ? "Human-approved recovery advisor"
+              : observing
+                ? "Observe-only custody"
+                : "Supervision is disabled"}
+          </h2>
           <p>
-            {observing
+            {advisory
+              ? "Terra can analyze a fresh immutable blocker snapshot, read-only. It cannot resume, retry, replan, edit, approve proof, or take any action; those remain your choices below."
+              : observing
               ? "Immutable controller snapshots are being recorded. Terra, Sol, and automatic actions remain off."
               : "No supervisory model is running, no snapshot is being recorded, and no automatic action is available."}
           </p>
         </div>
-        <StatusBadge value={observing ? "OBSERVE ONLY" : "DISABLED"} />
+        <StatusBadge value={advisory ? "ADVISORY" : observing ? "OBSERVE ONLY" : "DISABLED"} />
       </header>
       {snapshot && (
         <div className="supervisor-observation-receipt">
@@ -3305,6 +3341,45 @@ export function SupervisorObservationPanel({ detail }: { detail: RunDetail }) {
           <span title={snapshot.payload_sha256}>
             Event {snapshot.event_cursor} · SHA-256 {snapshot.payload_sha256.slice(0, 12)}…
           </span>
+        </div>
+      )}
+      {review && (
+        <div className="supervisor-observation-receipt">
+          <span>
+            Terra review · {humanAgentState(review.state)} · started {formatLocalTimestamp(review.created_at)}
+          </span>
+          <span>
+            {review.completed_at
+              ? `Completed ${formatLocalTimestamp(review.completed_at)}`
+              : review.failure_reason || "Read-only analysis in progress"}
+          </span>
+        </div>
+      )}
+      {decision && (
+        <div className="supervisor-decision">
+          <strong>{decision.policy_state === "STALE" ? "Superseded analysis" : "Terra’s read-only assessment"}</strong>
+          <p>{decision.payload.summary || "A bounded assessment was recorded without a displayable summary."}</p>
+          {decision.policy_state !== "STALE" && decision.payload.actions?.length ? (
+            <div className="supervisor-proposals" aria-label="Advisory recovery proposals">
+              {decision.payload.actions.slice(0, 3).map((action, index) => (
+                <span key={action.action_id || index}>
+                  {action.kind?.replaceAll("_", " ") || "proposal"}: {action.summary || action.expected_observable_outcome || "Review the recorded evidence before acting."}
+                </span>
+              ))}
+            </div>
+          ) : null}
+          {decision.payload.uncertainties?.length ? (
+            <p className="muted">Uncertainty: {decision.payload.uncertainties[0]}</p>
+          ) : null}
+        </div>
+      )}
+      {canRequest && (
+        <div className="supervisor-observation-actions">
+          <button className="button" onClick={onRequestReview} disabled={!!busy}>
+            <Search size={14} />
+            {snapshot ? "Analyze current blocker" : "Analyze this run"}
+          </button>
+          <span>Starts one bounded, read-only Terra turn. It will not act on its recommendation.</span>
         </div>
       )}
     </section>
@@ -3320,18 +3395,30 @@ function BlockedRunRecoveryPanel({
   busy,
   onResumeReview,
   onRequestChanges,
+  onResumeWork,
+  onRetry,
 }: {
   detail: RunDetail;
   busy: string;
   onResumeReview: () => void;
   onRequestChanges: (finding: string) => void;
+  onResumeWork: () => void;
+  onRetry: (taskId: string) => void;
 }) {
   const recovery = blockedPlanRecovery(detail.run, detail.plan_digest);
+  const retryTask = detail.tasks.find((task) => retryableState(task.state));
+  const blocked = blockerStatus(
+    detail.run,
+    retryTask,
+    detail.agents.find((agent) =>
+      ["BLOCKED", "FAILED", "STALLED", "INTERRUPTED"].includes(agent.state),
+    ),
+  );
   const [showRevision, setShowRevision] = useState(false);
   const [revisionRequest, setRevisionRequest] = useState("");
-  if (!recovery) return null;
+  if (!recovery && !blocked) return null;
 
-  const canSubmitRevision = recovery.hasPlan && revisionRequest.trim().length >= 8;
+  const canSubmitRevision = Boolean(detail.plan_digest) && revisionRequest.trim().length >= 8;
   return (
     <section className="blocked-run-recovery" aria-label="Blocked run recovery">
       <header>
@@ -3341,22 +3428,22 @@ function BlockedRunRecoveryPanel({
         <div>
           <div className="eyebrow">Blocked, action available</div>
           <h2>
-            {recovery.kind === "resume_review"
+            {recovery?.kind === "resume_review"
               ? "The final plan review can resume"
-              : "The plan needs your correction"}
+              : "Choose a safe recovery"}
           </h2>
           <p>
-            <strong>Why:</strong> {recovery.reason}
+            <strong>Why:</strong> {recovery?.reason || blocked?.reason || "Harness recorded a blocked condition."}
           </p>
         </div>
         <StatusBadge value="RECOVERY AVAILABLE" />
       </header>
-      {recovery.kind === "resume_review" && (
+      {recovery?.kind === "resume_review" && (
         <p className="blocked-run-recovery-explainer">
           Resume continues the existing read-only reviewer for a bounded verdict-only turn. It does not approve the plan or begin implementation.
         </p>
       )}
-      {!recovery.hasPlan ? (
+      {!detail.plan_digest ? (
         <p className="blocked-run-recovery-unavailable">
           Harness cannot find the retained plan needed for a safe recovery. The recorded evidence is preserved; create a scoped follow-up rather than guessing at a continuation.
         </p>
@@ -3396,7 +3483,7 @@ function BlockedRunRecoveryPanel({
         </div>
       ) : (
         <div className="blocked-run-recovery-actions">
-          {recovery.kind === "resume_review" && (
+          {recovery?.kind === "resume_review" && (
             <button
               className="button primary"
               onClick={onResumeReview}
@@ -3406,11 +3493,19 @@ function BlockedRunRecoveryPanel({
               Resume final review
             </button>
           )}
-          <button
-            className="button subtle"
-            onClick={() => setShowRevision(true)}
-            disabled={!!busy}
-          >
+          {recovery?.kind !== "resume_review" && detail.run.scheduler_paused && (
+            <button className="button primary" onClick={onResumeWork} disabled={!!busy}>
+              <Play size={13} />
+              Resume work
+            </button>
+          )}
+          {recovery?.kind !== "resume_review" && !detail.run.scheduler_paused && retryTask && (
+            <button className="button primary" onClick={() => onRetry(retryTask.id)} disabled={!!busy}>
+              <Play size={13} />
+              Retry affected task
+            </button>
+          )}
+          <button className="button subtle" onClick={() => setShowRevision(true)} disabled={!!busy}>
             Request plan revision
           </button>
         </div>
@@ -4878,7 +4973,7 @@ export function SettingsView({
       | "adaptive_governor_budgets"
       | "automatic_governor_continuation"
       | "automatic_plan_approval"
-      | "supervision_observe_only"
+      | "supervision_enabled"
       | "governor_goal_token_budget"
       | "governor_attempt_token_ceiling",
     value: boolean | number,
@@ -4921,11 +5016,11 @@ export function SettingsView({
       </div>
       <div className="settings-section-title">Supervision</div>
       <SettingToggle
-        title="Observe-only supervision"
-        text="Record bounded, immutable controller snapshots for material run events. On never starts Terra or Sol, changes tasks, or takes automatic actions."
-        enabled={settings?.supervision_observe_only ?? false}
+        title="Human-approved thread supervision"
+        text="On lets Terra analyze durable material blockers in a read-only thread. Harness shows its diagnosis and recovery choices, but never resumes, retries, replans, edits, approves proof, or takes any recommendation automatically."
+        enabled={settings?.supervision_enabled ?? false}
         disabled={settingsUpdateLocked}
-        onChange={(value) => update("supervision_observe_only", value)}
+        onChange={(value) => update("supervision_enabled", value)}
       />
       <div className="settings-section-title">
         Planning and governor autonomy

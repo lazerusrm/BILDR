@@ -83,9 +83,10 @@ cost_when_cache_write_missing = "range"
 mode = "disabled"
 safety_anchor_sha256 = "197cd971adb684a42509253054dc6987910a5b35fceac0d7f208449d42e50d77"
 
-# The supervisor is a separate, read-only control-plane observer. `observe_only`
-# materializes bounded immutable snapshots from material controller events; it
-# does not start Terra or Sol, propose actions, or alter run/task state.
+# The supervisor is a separate, read-only control-plane observer. `advisory`
+# may start a bounded Terra analysis over an immutable snapshot and show its
+# proposals to the operator. It cannot execute a proposal, alter a task, or
+# start Sol; recovery remains an explicit operator action.
 [supervision]
 mode = "disabled"
 event_coalesce_seconds = 2

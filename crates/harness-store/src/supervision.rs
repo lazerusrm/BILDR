@@ -1,6 +1,6 @@
 use harness_domain::{
-    AgentSummary, DomainEvent, RunId, RunPlan, RunSummary, SupervisorSnapshotId, TaskSummary,
-    format_timestamp, now_ms,
+    AgentSessionId, AgentSummary, DomainEvent, RunId, RunPlan, RunSummary, SupervisorDecisionId,
+    SupervisorReviewId, SupervisorSnapshotId, TaskSummary, format_timestamp, now_ms,
 };
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,50 @@ pub struct SupervisorSnapshotRecord {
     pub revision: u64,
     pub event_cursor: i64,
     pub trigger_kind: String,
+    pub payload: Value,
+    pub payload_sha256: String,
+    pub byte_length: u64,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SupervisorReviewRecord {
+    pub id: SupervisorReviewId,
+    pub run_id: RunId,
+    pub snapshot_id: SupervisorSnapshotId,
+    pub agent_session_id: AgentSessionId,
+    pub expected_decision_id: SupervisorDecisionId,
+    pub state: String,
+    pub trigger_kind: String,
+    pub requested_model: String,
+    pub requested_effort: String,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewSupervisorReview {
+    pub id: SupervisorReviewId,
+    pub run_id: RunId,
+    pub snapshot_id: SupervisorSnapshotId,
+    pub agent_session_id: AgentSessionId,
+    pub expected_decision_id: SupervisorDecisionId,
+    pub trigger_kind: String,
+    pub requested_model: String,
+    pub requested_effort: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SupervisorDecisionRecord {
+    pub id: SupervisorDecisionId,
+    pub review_id: SupervisorReviewId,
+    pub run_id: RunId,
+    pub snapshot_id: SupervisorSnapshotId,
+    pub agent_session_id: AgentSessionId,
+    /// `ADVISORY` decisions are display-only suggestions. `STALE` decisions
+    /// remain visible for audit but are never offered for recovery.
+    pub policy_state: String,
     pub payload: Value,
     pub payload_sha256: String,
     pub byte_length: u64,
@@ -258,6 +302,243 @@ impl Store {
             map_supervisor_snapshot,
         ).optional().map_err(Into::into)
     }
+
+    pub fn supervisor_snapshot(
+        &self,
+        snapshot_id: &SupervisorSnapshotId,
+    ) -> Result<Option<SupervisorSnapshotRecord>, StoreError> {
+        self.connection()?.query_row(
+            "SELECT id,run_id,revision,event_cursor,trigger_kind,payload_json,payload_sha256,byte_length,created_at FROM supervisor_snapshots WHERE id=?1",
+            [snapshot_id.as_str()],
+            map_supervisor_snapshot,
+        ).optional().map_err(Into::into)
+    }
+
+    pub fn create_supervisor_review(
+        &self,
+        input: &NewSupervisorReview,
+    ) -> Result<SupervisorReviewRecord, StoreError> {
+        if input.trigger_kind.is_empty()
+            || input.trigger_kind.len() > 128
+            || input.requested_model.is_empty()
+            || input.requested_model.len() > 128
+            || input.requested_effort.is_empty()
+            || input.requested_effort.len() > 32
+        {
+            return Err(StoreError::Validation(
+                "supervisor review metadata is invalid".to_owned(),
+            ));
+        }
+        let now = now_ms();
+        {
+            let connection = self.connection()?;
+            connection.execute(
+                "INSERT INTO supervisor_reviews(id,run_id,snapshot_id,agent_session_id,expected_decision_id,state,trigger_kind,requested_model,requested_effort,created_at) VALUES(?1,?2,?3,?4,?5,'STARTING',?6,?7,?8,?9)",
+                params![
+                    input.id.as_str(),
+                    input.run_id.as_str(),
+                    input.snapshot_id.as_str(),
+                    input.agent_session_id.as_str(),
+                    input.expected_decision_id.as_str(),
+                    input.trigger_kind,
+                    input.requested_model,
+                    input.requested_effort,
+                    now,
+                ],
+            )?;
+        }
+        self.supervisor_review(&input.id)
+    }
+
+    pub fn mark_supervisor_review_running(
+        &self,
+        review_id: &SupervisorReviewId,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection()?.execute(
+            "UPDATE supervisor_reviews SET state='RUNNING' WHERE id=?1 AND state='STARTING'",
+            [review_id.as_str()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "supervisor review {review_id} is not startable"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn fail_supervisor_review(
+        &self,
+        review_id: &SupervisorReviewId,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        let reason = reason.trim();
+        if reason.is_empty() || reason.chars().count() > 4_000 {
+            return Err(StoreError::Validation(
+                "supervisor review failure reason is invalid".to_owned(),
+            ));
+        }
+        let now = now_ms();
+        let changed = self.connection()?.execute(
+            "UPDATE supervisor_reviews SET state='FAILED',completed_at=?2,failure_reason=?3 WHERE id=?1 AND state IN ('STARTING','RUNNING')",
+            params![review_id.as_str(), now, reason],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "supervisor review {review_id} is not active"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Persists the only model output that can influence the advisory surface.
+    /// It binds the preallocated decision id, review, snapshot, and agent in a
+    /// single transaction.  `STALE` is durable audit evidence, never a
+    /// recoverable recommendation.
+    pub fn record_supervisor_decision(
+        &self,
+        review_id: &SupervisorReviewId,
+        policy_state: &str,
+        payload: &Value,
+    ) -> Result<SupervisorDecisionRecord, StoreError> {
+        if !matches!(policy_state, "ADVISORY" | "STALE") {
+            return Err(StoreError::Validation(
+                "supervisor decision policy state is invalid".to_owned(),
+            ));
+        }
+        let raw = serde_json::to_string(payload)?;
+        let byte_length = u64::try_from(raw.len()).map_err(|_| {
+            StoreError::Validation("supervisor decision exceeds supported size".to_owned())
+        })?;
+        if byte_length == 0 || byte_length > 262_144 {
+            return Err(StoreError::Validation(
+                "supervisor decision byte length is invalid".to_owned(),
+            ));
+        }
+        let digest = hex::encode(Sha256::digest(raw.as_bytes()));
+        let now = now_ms();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let review = transaction
+            .query_row(
+                "SELECT id,run_id,snapshot_id,agent_session_id,expected_decision_id,state,trigger_kind,requested_model,requested_effort,created_at,completed_at,failure_reason FROM supervisor_reviews WHERE id=?1",
+                [review_id.as_str()],
+                map_supervisor_review,
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("supervisor review {review_id}")))?;
+        if !matches!(review.state.as_str(), "STARTING" | "RUNNING") {
+            return Err(StoreError::Conflict(format!(
+                "supervisor review {review_id} is not active"
+            )));
+        }
+        let bound = payload.get("schema").and_then(Value::as_str)
+            == Some("harness.supervisor-decision.v1")
+            && payload.get("decision_id").and_then(Value::as_str)
+                == Some(review.expected_decision_id.as_str())
+            && payload.get("snapshot_id").and_then(Value::as_str)
+                == Some(review.snapshot_id.as_str())
+            && payload.get("run_id").and_then(Value::as_str) == Some(review.run_id.as_str());
+        if !bound {
+            return Err(StoreError::Validation(
+                "supervisor decision does not match its immutable review envelope".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO supervisor_decisions(id,review_id,run_id,snapshot_id,agent_session_id,policy_state,payload_json,payload_sha256,byte_length,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                review.expected_decision_id.as_str(),
+                review.id.as_str(),
+                review.run_id.as_str(),
+                review.snapshot_id.as_str(),
+                review.agent_session_id.as_str(),
+                policy_state,
+                raw,
+                digest,
+                i64::try_from(byte_length).map_err(|_| StoreError::Validation("supervisor decision exceeds SQLite limits".to_owned()))?,
+                now,
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE supervisor_reviews SET state=?2,completed_at=?3,failure_reason=NULL WHERE id=?1",
+            params![review.id.as_str(), if policy_state == "STALE" { "STALE" } else { "COMPLETED" }, now],
+        )?;
+        let record = transaction.query_row(
+            "SELECT id,review_id,run_id,snapshot_id,agent_session_id,policy_state,payload_json,payload_sha256,byte_length,created_at FROM supervisor_decisions WHERE review_id=?1",
+            [review.id.as_str()],
+            map_supervisor_decision,
+        )?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    pub fn supervisor_review(
+        &self,
+        review_id: &SupervisorReviewId,
+    ) -> Result<SupervisorReviewRecord, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT id,run_id,snapshot_id,agent_session_id,expected_decision_id,state,trigger_kind,requested_model,requested_effort,created_at,completed_at,failure_reason FROM supervisor_reviews WHERE id=?1",
+                [review_id.as_str()],
+                map_supervisor_review,
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn supervisor_review_for_agent(
+        &self,
+        agent_id: &AgentSessionId,
+    ) -> Result<Option<SupervisorReviewRecord>, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT id,run_id,snapshot_id,agent_session_id,expected_decision_id,state,trigger_kind,requested_model,requested_effort,created_at,completed_at,failure_reason FROM supervisor_reviews WHERE agent_session_id=?1",
+                [agent_id.as_str()],
+                map_supervisor_review,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn latest_supervisor_review(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<SupervisorReviewRecord>, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT id,run_id,snapshot_id,agent_session_id,expected_decision_id,state,trigger_kind,requested_model,requested_effort,created_at,completed_at,failure_reason FROM supervisor_reviews WHERE run_id=?1 ORDER BY created_at DESC,id DESC LIMIT 1",
+                [run_id.as_str()],
+                map_supervisor_review,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn supervisor_review_for_snapshot(
+        &self,
+        snapshot_id: &SupervisorSnapshotId,
+    ) -> Result<Option<SupervisorReviewRecord>, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT id,run_id,snapshot_id,agent_session_id,expected_decision_id,state,trigger_kind,requested_model,requested_effort,created_at,completed_at,failure_reason FROM supervisor_reviews WHERE snapshot_id=?1",
+                [snapshot_id.as_str()],
+                map_supervisor_review,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn latest_supervisor_decision(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<SupervisorDecisionRecord>, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT id,review_id,run_id,snapshot_id,agent_session_id,policy_state,payload_json,payload_sha256,byte_length,created_at FROM supervisor_decisions WHERE run_id=?1 ORDER BY created_at DESC,id DESC LIMIT 1",
+                [run_id.as_str()],
+                map_supervisor_decision,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
 }
 
 fn validate_snapshot_binding(
@@ -332,10 +613,71 @@ fn map_supervisor_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<Supervis
     })
 }
 
+fn map_supervisor_review(row: &rusqlite::Row<'_>) -> rusqlite::Result<SupervisorReviewRecord> {
+    let created_at: i64 = row.get(9)?;
+    let completed_at: Option<i64> = row.get(10)?;
+    Ok(SupervisorReviewRecord {
+        id: SupervisorReviewId::from(row.get::<_, String>(0)?),
+        run_id: RunId::from(row.get::<_, String>(1)?),
+        snapshot_id: SupervisorSnapshotId::from(row.get::<_, String>(2)?),
+        agent_session_id: AgentSessionId::from(row.get::<_, String>(3)?),
+        expected_decision_id: SupervisorDecisionId::from(row.get::<_, String>(4)?),
+        state: row.get(5)?,
+        trigger_kind: row.get(6)?,
+        requested_model: row.get(7)?,
+        requested_effort: row.get(8)?,
+        created_at: format_timestamp(created_at),
+        completed_at: completed_at.map(format_timestamp),
+        failure_reason: row.get(11)?,
+    })
+}
+
+fn map_supervisor_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<SupervisorDecisionRecord> {
+    let raw: String = row.get(6)?;
+    let payload_sha256: String = row.get(7)?;
+    let byte_length = positive_u64(8, row.get(8)?)?;
+    let encoded_length = u64::try_from(raw.len()).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            6,
+            rusqlite::types::Type::Text,
+            "supervisor decision payload exceeds supported size".into(),
+        )
+    })?;
+    let calculated_sha256 = hex::encode(Sha256::digest(raw.as_bytes()));
+    if encoded_length != byte_length || payload_sha256 != calculated_sha256 {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            6,
+            rusqlite::types::Type::Text,
+            "supervisor decision payload integrity check failed".into(),
+        ));
+    }
+    let created_at: i64 = row.get(9)?;
+    Ok(SupervisorDecisionRecord {
+        id: SupervisorDecisionId::from(row.get::<_, String>(0)?),
+        review_id: SupervisorReviewId::from(row.get::<_, String>(1)?),
+        run_id: RunId::from(row.get::<_, String>(2)?),
+        snapshot_id: SupervisorSnapshotId::from(row.get::<_, String>(3)?),
+        agent_session_id: AgentSessionId::from(row.get::<_, String>(4)?),
+        policy_state: row.get(5)?,
+        payload: serde_json::from_str(&raw).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        payload_sha256,
+        byte_length,
+        created_at: format_timestamp(created_at),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NewRepository, NewRun};
+    use crate::{NewAgentSession, NewRepository, NewRun};
+    use harness_domain::{AgentRole, SandboxMode};
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn fixture() -> (TempDir, Store, RunId) {
@@ -412,7 +754,7 @@ mod tests {
             .expect("snapshot persists");
         assert_eq!(first.revision, 1);
         assert_eq!(store.supervisor_observation_cursor(&run).unwrap(), 41);
-        assert_eq!(store.check().unwrap().schema_version, "12");
+        assert_eq!(store.check().unwrap().schema_version, "13");
 
         let duplicate = store
             .record_supervisor_snapshot(&run, 41, "task_stalled", |_, _| {
@@ -467,6 +809,87 @@ mod tests {
         assert!(error.to_string().contains("immutable envelope"));
         assert_eq!(store.supervisor_observation_cursor(&run).unwrap(), 0);
         assert!(store.latest_supervisor_snapshot(&run).unwrap().is_none());
+    }
+
+    #[test]
+    fn advisory_decision_is_hash_bound_immutable_and_single_use() {
+        let (_temp, store, run) = fixture();
+        let snapshot = store
+            .record_supervisor_snapshot(&run, 9, "operator_steered", |id, revision| {
+                Ok(serde_json::json!({
+                    "schema": SUPERVISOR_SNAPSHOT_SCHEMA,
+                    "snapshot_id": id,
+                    "run_id": run,
+                    "revision": revision,
+                    "event_cursor": 9,
+                }))
+            })
+            .expect("snapshot persists");
+        let agent_id = AgentSessionId::from("supervisor-agent");
+        store
+            .create_agent_session(&NewAgentSession {
+                id: agent_id.clone(),
+                run_id: run.clone(),
+                task_attempt_id: None,
+                parent_agent_session_id: None,
+                runtime_kind: "test".to_owned(),
+                codex_account_id: None,
+                role: AgentRole::Supervisor,
+                nickname: Some("supervisor".to_owned()),
+                requested_model: "gpt-5.6-terra".to_owned(),
+                requested_reasoning_effort: "high".to_owned(),
+                sandbox_mode: SandboxMode::ReadOnly,
+                approval_policy: "never".to_owned(),
+                cwd: PathBuf::from("/tmp"),
+                state: "STARTING".to_owned(),
+                current_goal: Some("read-only review".to_owned()),
+                token_budget: Some(24_000),
+            })
+            .expect("agent persists");
+        let review = store
+            .create_supervisor_review(&NewSupervisorReview {
+                id: SupervisorReviewId::from("supervisor-review"),
+                run_id: run.clone(),
+                snapshot_id: snapshot.id.clone(),
+                agent_session_id: agent_id.clone(),
+                expected_decision_id: SupervisorDecisionId::from("supervisor-decision"),
+                trigger_kind: "operator_steered".to_owned(),
+                requested_model: "gpt-5.6-terra".to_owned(),
+                requested_effort: "high".to_owned(),
+            })
+            .expect("review persists");
+        store
+            .mark_supervisor_review_running(&review.id)
+            .expect("review starts");
+        let payload = serde_json::json!({
+            "schema": "harness.supervisor-decision.v1",
+            "decision_id": "supervisor-decision",
+            "snapshot_id": snapshot.id,
+            "run_id": run,
+            "summary": "A human decision is required.",
+        });
+        let decision = store
+            .record_supervisor_decision(&review.id, "ADVISORY", &payload)
+            .expect("decision persists");
+        assert_eq!(decision.policy_state, "ADVISORY");
+        assert_eq!(
+            store.latest_supervisor_decision(&run).unwrap().unwrap().id,
+            decision.id
+        );
+        assert!(
+            store
+                .record_supervisor_decision(&review.id, "ADVISORY", &payload)
+                .is_err()
+        );
+        let connection = store.connection().expect("connection");
+        assert!(
+            connection
+                .execute(
+                    "UPDATE supervisor_decisions SET policy_state='STALE' WHERE id=?1",
+                    [decision.id.as_str()],
+                )
+                .is_err()
+        );
     }
 
     #[test]

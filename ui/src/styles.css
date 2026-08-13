@@ -968,6 +968,46 @@ kbd {
   font-size: 11px;
 }
 
+.supervisor-decision {
+  display: grid;
+  gap: 6px;
+  margin-top: 11px;
+  padding-top: 10px;
+  border-top: 1px solid color-mix(in srgb, var(--cyan) 22%, var(--line));
+  font-size: 12px;
+}
+
+.supervisor-decision > strong {
+  color: var(--soft);
+}
+
+.supervisor-proposals {
+  display: grid;
+  gap: 5px;
+}
+
+.supervisor-proposals span {
+  padding: 7px 8px;
+  border: 1px solid color-mix(in srgb, var(--cyan) 20%, var(--line));
+  border-radius: 6px;
+  color: var(--soft);
+  background: color-mix(in srgb, var(--cyan) 4%, transparent);
+}
+
+.supervisor-observation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-top: 12px;
+}
+
+.supervisor-observation-actions > span {
+  max-width: 580px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .blocked-run-recovery {
   margin-top: 10px;
   border: 1px solid color-mix(in srgb, var(--warn) 54%, var(--line));

@@ -111,7 +111,7 @@ describe("workspace presentation helpers", () => {
     expect(observing).toContain("Event 42");
   });
 
-  it("exposes the observe-only supervisory control in settings", () => {
+  it("exposes the human-approved supervisory control in settings", () => {
     const settings = renderToStaticMarkup(
       createElement(SettingsView, {
         light: false,
@@ -124,8 +124,8 @@ describe("workspace presentation helpers", () => {
         onTheme: () => undefined,
       }),
     );
-    expect(settings).toContain("Observe-only supervision");
-    expect(settings).toContain("never starts Terra or Sol");
+    expect(settings).toContain("Human-approved thread supervision");
+    expect(settings).toContain("never resumes, retries, replans");
   });
 
   it("offers a concrete recovery for an interrupted plan review before tasks exist", () => {

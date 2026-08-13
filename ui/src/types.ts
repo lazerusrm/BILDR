@@ -277,7 +277,7 @@ export interface OperatorSettings {
   adaptive_governor_budgets: boolean;
   automatic_governor_continuation: boolean;
   automatic_plan_approval: boolean;
-  supervision_observe_only: boolean;
+  supervision_enabled: boolean;
   governor_goal_token_budget: number;
   governor_attempt_token_ceiling: number;
   recommended_governor_attempt_tokens: number;
@@ -764,6 +764,8 @@ export interface RunDetail {
   governor_progress?: Record<string, GovernorCheckpoint>;
   supervision_mode?: "disabled" | "observe_only" | "shadow" | "advisory" | "active_low_risk" | "active";
   supervisor_snapshot?: SupervisorSnapshot | null;
+  supervisor_review?: SupervisorReview | null;
+  supervisor_decision?: SupervisorDecision | null;
 }
 
 export interface SupervisorSnapshot {
@@ -772,6 +774,43 @@ export interface SupervisorSnapshot {
   revision: number;
   event_cursor: number;
   trigger_kind: string;
+  payload_sha256: string;
+  byte_length: number;
+  created_at: string;
+}
+
+export interface SupervisorReview {
+  id: string;
+  run_id: string;
+  snapshot_id: string;
+  agent_session_id: string;
+  state: "STARTING" | "RUNNING" | "COMPLETED" | "FAILED" | "STALE" | string;
+  trigger_kind: string;
+  requested_model: string;
+  requested_effort: string;
+  created_at: string;
+  completed_at?: string | null;
+  failure_reason?: string | null;
+}
+
+export interface SupervisorDecision {
+  id: string;
+  review_id: string;
+  run_id: string;
+  snapshot_id: string;
+  agent_session_id: string;
+  policy_state: "ADVISORY" | "STALE" | string;
+  payload: {
+    summary?: string;
+    goal_assessment?: { rationale?: string; critical_path_summary?: string };
+    actions?: Array<{
+      action_id?: string;
+      kind?: string;
+      summary?: string;
+      expected_observable_outcome?: string;
+    }>;
+    uncertainties?: string[];
+  };
   payload_sha256: string;
   byte_length: number;
   created_at: string;

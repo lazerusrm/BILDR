@@ -397,6 +397,82 @@ fn input_text(params: &Value) -> String {
 }
 
 fn scripted_response(input: &str, objective: Option<&str>) -> String {
+    if input.contains("human-approved BILDR thread supervisor") {
+        let line_value = |prefix: &str| {
+            input
+                .lines()
+                .find_map(|line| line.strip_prefix(prefix))
+                .unwrap_or("missing")
+                .trim()
+                .to_owned()
+        };
+        let decision_id = line_value("- decision_id: ");
+        let snapshot_id = line_value("- snapshot_id: ");
+        let run_id = line_value("- run_id: ");
+        let snapshot_revision = line_value("- snapshot_revision: ")
+            .parse::<u64>()
+            .unwrap_or(1);
+        let model = line_value("- requested_model: ");
+        let effort = line_value("- requested_effort: ");
+        let created_at = input
+            .find("\"generated_at\": \"")
+            .and_then(|start| {
+                let value = &input[start + "\"generated_at\": \"".len()..];
+                value.split('"').next()
+            })
+            .unwrap_or("2026-08-13T00:00:00Z");
+        return json!({
+            "schema": "harness.supervisor-decision.v1",
+            "decision_id": decision_id,
+            "snapshot_id": snapshot_id,
+            "run_id": run_id,
+            "snapshot_revision": snapshot_revision,
+            "created_at": created_at,
+            "requested_model": model,
+            "effective_model": model,
+            "requested_effort": effort,
+            "effective_effort": effort,
+            "summary": "The deterministic supervisor found a blocked condition and leaves recovery to the operator.",
+            "goal_assessment": {
+                "status": "blocked",
+                "progress_class": "no_progress",
+                "drift_detected": false,
+                "rationale": "The durable snapshot records a material blocker; no controller state was changed.",
+                "critical_path_summary": "The human selects the next bounded recovery control.",
+                "criteria_proven_ids": [],
+                "criteria_missing_ids": ["controller-objective"],
+                "evidence_refs": []
+            },
+            "task_assessments": [],
+            "agent_assessments": [],
+            "actions": [{
+                "action_id": "fake-wait",
+                "kind": "wait",
+                "target": {"kind": "run", "id": run_id, "task_id": null, "attempt_id": null, "session_id": null},
+                "priority": "next",
+                "impact": "low",
+                "reason_code": "operator_recovery_required",
+                "summary": "Review the recorded blocker and choose an existing recovery control.",
+                "prompt": null,
+                "model_route": null,
+                "expected_observable_outcome": "A human-approved recovery action or fresh material event is recorded.",
+                "preconditions": [],
+                "evidence_refs": [],
+                "dedupe_key": "fake-supervisor-wait",
+                "expires_at": "2026-08-14T00:00:00Z",
+                "expert_brief": null
+            }],
+            "confidence": {
+                "overall": "high",
+                "goal_assessment": "high",
+                "action_plan": "high",
+                "reason_codes": ["deterministic_fixture"]
+            },
+            "uncertainties": [],
+            "next_review": {"mode": "on_event", "at": null, "reason": "Wait for an operator recovery choice or a new material event."}
+        })
+        .to_string();
+    }
     if input.contains("Intent interview for this run.") {
         return json!({
             "schema": "harness.intent-interview-turn.v1",

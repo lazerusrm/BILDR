@@ -28,12 +28,53 @@ pub(crate) fn observe_run(
     max_thread_count: u32,
     run_id: &RunId,
 ) -> Result<Option<SupervisorSnapshotRecord>, StoreError> {
+    observe_run_with_force(store, config, max_thread_count, run_id, false)
+}
+
+/// Capture an operator-requested review snapshot immediately.  This is still
+/// subject to the exact same bounded immutable envelope as scheduled reviews;
+/// `force` only bypasses the short event coalescing delay so a person can
+/// analyze an already-blocked run without waiting for a timer tick.
+pub(crate) fn observe_run_now(
+    store: &Store,
+    config: &SupervisionConfig,
+    max_thread_count: u32,
+    run_id: &RunId,
+) -> Result<Option<SupervisorSnapshotRecord>, StoreError> {
+    observe_run_with_force(store, config, max_thread_count, run_id, true)
+}
+
+/// Checks for a material controller event that arrived after a snapshot but
+/// before its model result is considered.  This is intentionally stricter
+/// than looking only for a later stored snapshot: the two-second coalescing
+/// window must not let a quick model response act on already superseded facts.
+pub(crate) fn has_material_event_after(
+    store: &Store,
+    run_id: &RunId,
+    event_cursor: i64,
+) -> Result<bool, StoreError> {
+    Ok(store
+        .list_domain_events(event_cursor, Some(run_id), MAX_EVENTS_PER_OBSERVATION)?
+        .iter()
+        .any(|event| material_trigger(event).is_some()))
+}
+
+fn observe_run_with_force(
+    store: &Store,
+    config: &SupervisionConfig,
+    max_thread_count: u32,
+    run_id: &RunId,
+    force: bool,
+) -> Result<Option<SupervisorSnapshotRecord>, StoreError> {
     if config.mode == SupervisorMode::Disabled {
         return Ok(None);
     }
-    if config.mode != SupervisorMode::ObserveOnly {
+    if !matches!(
+        config.mode,
+        SupervisorMode::ObserveOnly | SupervisorMode::Advisory
+    ) {
         return Err(StoreError::Validation(
-            "supervision mode is not enabled by the observation-only runtime".to_owned(),
+            "supervision mode is not enabled by the advisory runtime".to_owned(),
         ));
     }
     let observation = store.capture_supervisor_observation(run_id, MAX_EVENTS_PER_OBSERVATION)?;
@@ -52,7 +93,7 @@ pub(crate) fn observe_run(
     let latest_material = material.last().expect("material events are non-empty");
     let coalesce_ms =
         i64::try_from(config.event_coalesce_seconds.saturating_mul(1_000)).unwrap_or(i64::MAX);
-    if now_ms().saturating_sub(latest_material.occurred_at) < coalesce_ms {
+    if !force && now_ms().saturating_sub(latest_material.occurred_at) < coalesce_ms {
         return Ok(None);
     }
     let Some((plan, plan_revision)) = observation.latest_plan else {
@@ -127,9 +168,9 @@ fn material_trigger(event: &DomainEvent) -> Option<&'static str> {
         | "agent.native_subagent.budget_hard_stop"
         | "agent.run_budget.hard_stop"
         | "agent.session_budget.hard_stop" => Some("budget_boundary_crossed"),
-        "run.plan.revision_requested" | "run.plan.review_resume_requested" => {
-            Some("operator_steered")
-        }
+        "run.plan.revision_requested"
+        | "run.plan.review_resume_requested"
+        | "run.supervision.operator_review_requested" => Some("operator_steered"),
         "task.governor.candidate_materialized" | "run.final_audit.accepted" => {
             Some("agent_completed")
         }
@@ -300,7 +341,7 @@ fn build_snapshot(
             "active_thread_count": agents.iter().filter(|agent| agent.active_turn_id.is_some()).count(),
             "max_thread_count": max_thread_count,
         },
-        "allowed_actions": ["wait"],
+        "allowed_actions": allowed_actions(run, tasks, config.mode),
         "evidence_refs": material_events.iter().map(|event| json!({
             "kind": "event",
             "id": format!("event-{}", event.id),
@@ -309,6 +350,48 @@ fn build_snapshot(
         "prior_decision": null,
         "expert_consultations": [],
     })
+}
+
+fn allowed_actions(
+    run: &RunSummary,
+    tasks: &[TaskSummary],
+    mode: SupervisorMode,
+) -> Vec<&'static str> {
+    if mode != SupervisorMode::Advisory {
+        return vec!["wait"];
+    }
+    let mut actions = vec!["wait"];
+    if tasks.iter().any(|task| {
+        matches!(
+            task.state,
+            TaskState::NeedsHelp
+                | TaskState::ChangesRequested
+                | TaskState::Interrupted
+                | TaskState::Stalled
+                | TaskState::Blocked
+                | TaskState::Failed
+        )
+    }) {
+        actions.push("retry_fresh_attempt");
+    }
+    if run.scheduler_paused
+        && !matches!(
+            run.state,
+            RunState::Completed | RunState::Canceled | RunState::Failed | RunState::Archived
+        )
+    {
+        actions.push("continue_attempt");
+    }
+    if matches!(
+        run.state,
+        RunState::Blocked | RunState::PlanRevisionRequired | RunState::PlanReviewRequired
+    ) {
+        actions.push("request_replan");
+    }
+    if run.state == RunState::Blocked && run.phase.starts_with("plan_review_") {
+        actions.push("start_followup_turn");
+    }
+    actions
 }
 
 fn task_snapshot(task: &TaskSummary, completed: bool) -> Value {
@@ -462,9 +545,14 @@ fn parse_timestamp_millis(value: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_EVENTS_PER_OBSERVATION, MAX_MATERIAL_EVENTS_PER_SNAPSHOT, material_trigger};
-    use harness_domain::{DomainEvent, RunId};
+    use super::{
+        MAX_EVENTS_PER_OBSERVATION, MAX_MATERIAL_EVENTS_PER_SNAPSHOT, has_material_event_after,
+        material_trigger,
+    };
+    use harness_domain::{DomainEvent, RepositoryId, RunId};
+    use harness_store::{NewRepository, NewRun, Store};
     use serde_json::json;
+    use tempfile::TempDir;
 
     fn event(event_type: &str, payload: serde_json::Value) -> DomainEvent {
         DomainEvent {
@@ -513,5 +601,75 @@ mod tests {
     fn telemetry_backlog_catch_up_remains_bounded_without_deferring_material_events() {
         assert_eq!(MAX_EVENTS_PER_OBSERVATION, 10_000);
         assert_eq!(MAX_MATERIAL_EVENTS_PER_SNAPSHOT, 100);
+    }
+
+    #[test]
+    fn material_event_after_snapshot_cursor_makes_a_review_stale() {
+        let temp = TempDir::new().expect("temporary store");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store opens");
+        let repository = RepositoryId::from("supervision-repository");
+        let run = RunId::from("supervision-run");
+        store
+            .create_repository(&NewRepository {
+                id: repository.clone(),
+                profile_id: "fixture".to_owned(),
+                profile_version: 1,
+                display_name: "fixture".to_owned(),
+                root_path: temp.path().join("checkout"),
+                origin_url: None,
+                default_branch: "main".to_owned(),
+                expected_coordination_branch: None,
+                state: "READY".to_owned(),
+            })
+            .expect("repository persists");
+        store
+            .create_run(&NewRun {
+                id: run.clone(),
+                repository_id: repository,
+                title: "supervision fixture".to_owned(),
+                objective: "exercise stale-review detection".to_owned(),
+                mode: "plan_and_implement".to_owned(),
+                publication_mode: "none".to_owned(),
+                state: "CREATED".to_owned(),
+                phase: "created".to_owned(),
+                base_ref: "main".to_owned(),
+                base_sha: "a".repeat(40),
+                authority_digest: "b".repeat(64),
+                profile_digest: "c".repeat(64),
+                codex_version: None,
+                protocol_schema_sha256: None,
+                requested_by: "test".to_owned(),
+                token_budget: None,
+            })
+            .expect("run persists");
+        let telemetry = store
+            .emit_domain_event(
+                Some(&run),
+                "agent",
+                "agent-1",
+                "agent.heartbeat",
+                &json!({}),
+                None,
+            )
+            .expect("telemetry persists");
+        assert!(
+            !has_material_event_after(&store, &run, telemetry.id)
+                .expect("telemetry cannot stale a decision")
+        );
+
+        store
+            .emit_domain_event(
+                Some(&run),
+                "task",
+                "task-1",
+                "task.start_failed",
+                &json!({"reason": "fixture failure"}),
+                None,
+            )
+            .expect("material event persists");
+        assert!(
+            has_material_event_after(&store, &run, telemetry.id)
+                .expect("later material event is visible")
+        );
     }
 }

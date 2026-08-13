@@ -23,9 +23,9 @@ use harness_domain::{
     AgentRole, AgentSessionId, AgentSummary, ApprovalId, ApprovalSummary, ArtifactId, AttemptId,
     CodexRuntimeStatus, CommandRunId, ComponentStatus, DiffBudget, EvidenceId, ProofTier,
     RepositoryId, RepositorySummary, ResourceClass, ResultClass, RiskLevel, RunId, RunPlan,
-    RunState, RunSummary, RuntimeStatus, SandboxMode, SchedulerStatus, SupervisorMode, TaskId,
-    TaskPacket, TaskState, TaskSummary, ValidationId, WorktreeId, WorktreeSummary,
-    format_timestamp, now_ms,
+    RunState, RunSummary, RuntimeStatus, SandboxMode, SchedulerStatus, SupervisorDecisionId,
+    SupervisorMode, SupervisorReviewId, TaskId, TaskPacket, TaskState, TaskSummary, ValidationId,
+    WorktreeId, WorktreeSummary, format_timestamp, now_ms,
 };
 use harness_evidence::{EvidenceArtifactInput, EvidenceClaim, EvidenceService};
 use harness_git::{DiffPolicy, GitManager, WorktreeSpec, validate_public_change_metadata};
@@ -37,8 +37,10 @@ use harness_profile::{
 use harness_runner::{CommandOutcome, CommandRunner, CommandSpec, ResourceManager};
 use harness_store::{
     ContextSourceRecord, NewAgentSession, NewApproval, NewArtifact, NewCommandRecord,
-    NewContextPacket, NewRepository, NewRun, NewTaskAttempt, NewValidationRecord, NewWorktree,
-    PriorAttemptContext, ProtocolProjection, RepositoryHealthInput, Store, packet_digest,
+    NewContextPacket, NewRepository, NewRun, NewSupervisorReview, NewTaskAttempt,
+    NewValidationRecord, NewWorktree, PriorAttemptContext, ProtocolProjection,
+    RepositoryHealthInput, Store, SupervisorDecisionRecord, SupervisorReviewRecord,
+    SupervisorSnapshotRecord, packet_digest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -58,6 +60,8 @@ const GOVERNOR_CHECKPOINT_SCHEMA: &str =
     include_str!("../../../schemas/harness.governor-checkpoint.v1.schema.json");
 const INTENT_INTERVIEW_TURN_SCHEMA: &str =
     include_str!("../../../schemas/harness.intent-interview-turn.v1.schema.json");
+const SUPERVISOR_DECISION_SCHEMA: &str =
+    include_str!("../../../schemas/harness.supervisor-decision.v1.schema.json");
 const SETTING_REASONING_SUMMARIES: &str = "settings.store_reasoning_summaries";
 const SETTING_RAW_REASONING: &str = "settings.store_raw_reasoning";
 const SETTING_YOLO_MODE: &str = "settings.yolo_mode";
@@ -66,7 +70,8 @@ const SETTING_AUTOMATIC_ACCOUNT_HANDOFF: &str = "settings.automatic_account_hand
 const SETTING_ADAPTIVE_GOVERNOR_BUDGETS: &str = "settings.adaptive_governor_budgets";
 const SETTING_AUTOMATIC_GOVERNOR_CONTINUATION: &str = "settings.automatic_governor_continuation";
 const SETTING_AUTOMATIC_PLAN_APPROVAL: &str = "settings.automatic_plan_approval";
-const SETTING_SUPERVISION_OBSERVE_ONLY: &str = "settings.supervision_observe_only";
+const SETTING_SUPERVISION_ENABLED: &str = "settings.supervision_enabled";
+const LEGACY_SETTING_SUPERVISION_OBSERVE_ONLY: &str = "settings.supervision_observe_only";
 const SETTING_GOVERNOR_GOAL_TOKEN_BUDGET: &str = "settings.governor_goal_token_budget";
 const SETTING_GOVERNOR_ATTEMPT_TOKEN_CEILING: &str = "settings.governor_attempt_token_ceiling";
 const DEFAULT_GOVERNOR_GOAL_TOKEN_BUDGET: u64 = 5_000_000;
@@ -220,6 +225,166 @@ fn agent_developer_instructions(role: AgentRole, sandbox: SandboxMode) -> String
     )
 }
 
+fn supervisor_review_prompt(
+    review: &SupervisorReviewRecord,
+    snapshot: &SupervisorSnapshotRecord,
+) -> Result<String, OrchestratorError> {
+    let snapshot_json = serde_json::to_string_pretty(&snapshot.payload)?;
+    if snapshot_json.len() > 65_536 {
+        return Err(OrchestratorError::Validation(
+            "supervisor prompt would exceed the snapshot custody bound".to_owned(),
+        ));
+    }
+    Ok(format!(
+        "You are the human-approved BILDR thread supervisor. Analyze only the supplied immutable snapshot. Do not use tools, start child agents, edit files, request approvals, or perform any controller operation. Your output is advisory: the human, never you, chooses whether to apply a recovery control.\n\nThe decision must bind exactly to these controller-owned values:\n- decision_id: {decision_id}\n- snapshot_id: {snapshot_id}\n- run_id: {run_id}\n- snapshot_revision: {snapshot_revision}\n- requested_model: {model}\n- effective_model: {model}\n- requested_effort: {effort}\n- effective_effort: {effort}\n\nChoose only action kinds listed in `allowed_actions`; if the evidence does not justify an intervention, propose a single `wait` action. Do not invent task, attempt, session, evidence, or state identifiers. Explain the concrete blocker, evidence, uncertainty, and the next observable result. The controller will reject a stale or malformed response and will execute nothing automatically. Set `created_at` to the snapshot's `generated_at` value. Return only one JSON object matching the supplied schema.\n\nImmutable snapshot:\n{snapshot_json}",
+        decision_id = review.expected_decision_id,
+        snapshot_id = snapshot.id,
+        run_id = snapshot.run_id,
+        snapshot_revision = snapshot.revision,
+        model = review.requested_model,
+        effort = review.requested_effort,
+    ))
+}
+
+fn validate_supervisor_decision(
+    review: &SupervisorReviewRecord,
+    snapshot: &SupervisorSnapshotRecord,
+    decision: &Value,
+) -> Result<(), OrchestratorError> {
+    let object = decision.as_object().ok_or_else(|| {
+        OrchestratorError::Validation("supervisor decision must be a JSON object".to_owned())
+    })?;
+    let exact =
+        |field: &str, expected: &str| object.get(field).and_then(Value::as_str) == Some(expected);
+    if !exact("schema", "harness.supervisor-decision.v1")
+        || !exact("decision_id", review.expected_decision_id.as_str())
+        || !exact("snapshot_id", snapshot.id.as_str())
+        || !exact("run_id", snapshot.run_id.as_str())
+        || !exact("requested_model", &review.requested_model)
+        || !exact("effective_model", &review.requested_model)
+        || !exact("requested_effort", &review.requested_effort)
+        || !exact("effective_effort", &review.requested_effort)
+        || object.get("snapshot_revision").and_then(Value::as_u64) != Some(snapshot.revision)
+    {
+        return Err(OrchestratorError::Validation(
+            "supervisor decision does not match its immutable review envelope".to_owned(),
+        ));
+    }
+    let nonempty = |field: &str, maximum: usize| {
+        object
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty() && value.chars().count() <= maximum)
+    };
+    if !nonempty("created_at", 128) || !nonempty("summary", 3_000) {
+        return Err(OrchestratorError::Validation(
+            "supervisor decision is missing a bounded created_at or summary".to_owned(),
+        ));
+    }
+    let allowed = snapshot
+        .payload
+        .get("allowed_actions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            OrchestratorError::Protocol(
+                "supervisor snapshot has no controller-generated action allowlist".to_owned(),
+            )
+        })?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    let task_ids = snapshot
+        .payload
+        .get("tasks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|task| task.get("task_id").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    let actions = object
+        .get("actions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            OrchestratorError::Validation("supervisor decision is missing actions".to_owned())
+        })?;
+    if actions.is_empty() || actions.len() > 50 {
+        return Err(OrchestratorError::Validation(
+            "supervisor decision action count is invalid".to_owned(),
+        ));
+    }
+    let mut action_ids = BTreeSet::new();
+    for action in actions {
+        let action = action.as_object().ok_or_else(|| {
+            OrchestratorError::Validation("supervisor action must be an object".to_owned())
+        })?;
+        let action_id = action
+            .get("action_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                OrchestratorError::Validation("supervisor action lacks action_id".to_owned())
+            })?;
+        if action_id.is_empty() || action_id.len() > 128 || !action_ids.insert(action_id) {
+            return Err(OrchestratorError::Validation(
+                "supervisor action ids must be unique and bounded".to_owned(),
+            ));
+        }
+        let kind = action.get("kind").and_then(Value::as_str).ok_or_else(|| {
+            OrchestratorError::Validation("supervisor action lacks kind".to_owned())
+        })?;
+        if !allowed.contains(kind) {
+            return Err(OrchestratorError::Validation(format!(
+                "supervisor proposed action {kind} outside the controller allowlist"
+            )));
+        }
+        let target = action
+            .get("target")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                OrchestratorError::Validation("supervisor action lacks a typed target".to_owned())
+            })?;
+        let target_id = target.get("id").and_then(Value::as_str).unwrap_or_default();
+        let target_kind = target
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let task_id = target.get("task_id").and_then(Value::as_str);
+        let valid_target = match kind {
+            "retry_fresh_attempt" => {
+                target_kind == "task"
+                    && task_id.is_some_and(|id| task_ids.contains(id))
+                    && task_id == Some(target_id)
+            }
+            "wait" | "continue_attempt" | "request_replan" | "start_followup_turn" => {
+                target_kind == "run" && target_id == snapshot.run_id.as_str()
+            }
+            _ => false,
+        };
+        if !valid_target {
+            return Err(OrchestratorError::Validation(format!(
+                "supervisor action {action_id} has an invalid target"
+            )));
+        }
+        for (field, maximum) in [
+            ("summary", 2_000_usize),
+            ("reason_code", 128),
+            ("expected_observable_outcome", 2_000),
+            ("dedupe_key", 256),
+            ("expires_at", 128),
+        ] {
+            if !action
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty() && value.chars().count() <= maximum)
+            {
+                return Err(OrchestratorError::Validation(format!(
+                    "supervisor action {action_id} has an invalid {field}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct GithubCapability {
     ready: bool,
@@ -320,9 +485,9 @@ pub struct OperatorSettings {
     pub adaptive_governor_budgets: bool,
     pub automatic_governor_continuation: bool,
     pub automatic_plan_approval: bool,
-    /// The sole runtime-enabled supervisory mode. It only persists bounded
-    /// controller snapshots and cannot create model turns or actions.
-    pub supervision_observe_only: bool,
+    /// Advisory supervision may start a bounded read-only Terra review, but
+    /// model output cannot execute any controller operation.
+    pub supervision_enabled: bool,
     pub governor_goal_token_budget: u64,
     pub governor_attempt_token_ceiling: u64,
     pub recommended_governor_attempt_tokens: u64,
@@ -340,7 +505,8 @@ pub struct UpdateOperatorSettingsRequest {
     pub adaptive_governor_budgets: Option<bool>,
     pub automatic_governor_continuation: Option<bool>,
     pub automatic_plan_approval: Option<bool>,
-    pub supervision_observe_only: Option<bool>,
+    #[serde(alias = "supervision_observe_only")]
+    pub supervision_enabled: Option<bool>,
     pub governor_goal_token_budget: Option<u64>,
     pub governor_attempt_token_ceiling: Option<u64>,
 }
@@ -507,7 +673,9 @@ pub struct RunDetail {
     pub preferred_codex_account_id: Option<String>,
     pub governor_progress: BTreeMap<String, Value>,
     pub supervision_mode: SupervisorMode,
-    pub supervisor_snapshot: Option<harness_store::SupervisorSnapshotRecord>,
+    pub supervisor_snapshot: Option<SupervisorSnapshotRecord>,
+    pub supervisor_review: Option<SupervisorReviewRecord>,
+    pub supervisor_decision: Option<SupervisorDecisionRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -907,13 +1075,42 @@ impl Orchestrator {
         let runs = self.store.list_runs(None, false)?;
         let supervision = self.effective_supervision_config();
         for run in &runs {
-            if let Err(error) = supervision::observe_run(
+            match supervision::observe_run(
                 &self.store,
                 &supervision,
                 self.config.orchestration.max_total_agent_threads,
                 &run.id,
             ) {
-                warn!(run_id = %run.id, %error, "supervisory observation remains pending");
+                Ok(snapshot) if supervision.mode == SupervisorMode::Advisory => {
+                    // A slot, daemon, or coalescing race must not discard a
+                    // bounded snapshot. If it does not yet have a review,
+                    // retry launch on later maintenance ticks. A newer
+                    // snapshot is similarly picked up after the old turn is
+                    // marked stale.
+                    let snapshot = match snapshot {
+                        Some(snapshot) => Some(snapshot),
+                        None => match self.store.latest_supervisor_snapshot(&run.id)? {
+                            Some(snapshot)
+                                if self
+                                    .store
+                                    .supervisor_review_for_snapshot(&snapshot.id)?
+                                    .is_none() =>
+                            {
+                                Some(snapshot)
+                            }
+                            _ => None,
+                        },
+                    };
+                    if let Some(snapshot) = snapshot
+                        && let Err(error) = self.launch_supervisor_review(&run.id, &snapshot).await
+                    {
+                        warn!(run_id = %run.id, %error, "advisory supervisor review remains pending");
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(run_id = %run.id, %error, "supervisory observation remains pending");
+                }
             }
         }
         for run in &runs {
@@ -1644,7 +1841,7 @@ impl Orchestrator {
             automatic_governor_continuation,
             automatic_plan_approval: self
                 .stored_setting_bool(SETTING_AUTOMATIC_PLAN_APPROVAL, false),
-            supervision_observe_only: self.supervision_observe_only_enabled(),
+            supervision_enabled: self.supervision_enabled(),
             governor_goal_token_budget,
             governor_attempt_token_ceiling,
             recommended_governor_attempt_tokens: 0,
@@ -1732,9 +1929,9 @@ impl Orchestrator {
             SETTING_AUTOMATIC_PLAN_APPROVAL
         );
         apply_setting!(
-            request.supervision_observe_only,
-            supervision_observe_only,
-            SETTING_SUPERVISION_OBSERVE_ONLY
+            request.supervision_enabled,
+            supervision_enabled,
+            SETTING_SUPERVISION_ENABLED
         );
         if request.governor_goal_token_budget.is_some() {
             settings.governor_goal_token_budget = governor_goal_token_budget;
@@ -1791,21 +1988,244 @@ impl Orchestrator {
             .unwrap_or(default)
     }
 
-    fn supervision_observe_only_enabled(&self) -> bool {
-        self.stored_setting_bool(
-            SETTING_SUPERVISION_OBSERVE_ONLY,
-            self.config.supervision.mode == SupervisorMode::ObserveOnly,
-        )
+    fn supervision_enabled(&self) -> bool {
+        self.store
+            .runtime_metadata(SETTING_SUPERVISION_ENABLED)
+            .ok()
+            .flatten()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(self.config.supervision.mode == SupervisorMode::Advisory)
     }
 
     fn effective_supervision_config(&self) -> SupervisionConfig {
         let mut supervision = self.config.supervision.clone();
-        // Runtime settings are deliberately binary. No setting can unlock a
-        // future shadow/advisory/active mode: the only enabled mode compiled
-        // into this release remains bounded, read-only observation.
-        supervision.mode =
-            supervision_mode_for_operator_setting(self.supervision_observe_only_enabled());
+        // The legacy observation switch never implied permission to start a
+        // model.  Keep it as observation-only until an operator explicitly
+        // writes the new advisory setting.  The new binary setting itself is
+        // still deliberately binary and cannot unlock shadow or either
+        // automatic action mode.
+        supervision.mode = match self
+            .store
+            .runtime_metadata(SETTING_SUPERVISION_ENABLED)
+            .ok()
+            .flatten()
+            .and_then(|value| value.as_bool())
+        {
+            Some(enabled) => supervision_mode_for_operator_setting(enabled),
+            None if supervision.mode == SupervisorMode::Advisory => SupervisorMode::Advisory,
+            None if self.stored_setting_bool(
+                LEGACY_SETTING_SUPERVISION_OBSERVE_ONLY,
+                supervision.mode == SupervisorMode::ObserveOnly,
+            ) =>
+            {
+                SupervisorMode::ObserveOnly
+            }
+            None => SupervisorMode::Disabled,
+        };
         supervision
+    }
+
+    /// Explicit human request for a fresh, read-only assessment of a run that
+    /// is already blocked or otherwise needs attention.  The request emits a
+    /// material event, compiles a new immutable snapshot immediately, and only
+    /// then allows Terra to see it.  It never resumes, retries, replans, or
+    /// changes any controller state on the model's behalf.
+    pub async fn request_supervisor_review(
+        &self,
+        run_id: &RunId,
+        actor: &str,
+    ) -> Result<OperationAccepted, OrchestratorError> {
+        let snapshot = {
+            let _guard = self.operation_lock.lock().await;
+            let supervision = self.effective_supervision_config();
+            if supervision.mode != SupervisorMode::Advisory {
+                return Err(OrchestratorError::Conflict(
+                    "human-approved thread supervision is off; enable it in Settings first"
+                        .to_owned(),
+                ));
+            }
+            let run = self.store.run(run_id)?;
+            if matches!(
+                run.state,
+                RunState::Completed | RunState::Canceled | RunState::Failed | RunState::Archived
+            ) {
+                return Err(OrchestratorError::Conflict(format!(
+                    "run {} is terminal and cannot be supervised",
+                    run.id
+                )));
+            }
+            self.store.record_human_action(
+                Some(run_id),
+                None,
+                actor,
+                "request_supervisor_review",
+                "run",
+                run_id.as_str(),
+                &json!({"mode": "advisory", "automatic_action": false}),
+            )?;
+            self.emit_run_event(
+                &run,
+                "run.supervision.operator_review_requested",
+                json!({"actor": actor, "automatic_action": false}),
+            )?;
+            supervision::observe_run_now(
+                &self.store,
+                &supervision,
+                self.config.orchestration.max_total_agent_threads,
+                run_id,
+            )?
+            .ok_or_else(|| {
+                OrchestratorError::Blocked(
+                    "supervision needs an approved plan and a material run event before Terra can analyze this run"
+                        .to_owned(),
+                )
+            })?
+        };
+        self.launch_supervisor_review(run_id, &snapshot).await?;
+        Ok(operation("request_supervisor_review", run_id.as_str()))
+    }
+
+    async fn launch_supervisor_review(
+        &self,
+        run_id: &RunId,
+        snapshot: &SupervisorSnapshotRecord,
+    ) -> Result<(), OrchestratorError> {
+        let _guard = self.operation_lock.lock().await;
+        let supervision = self.effective_supervision_config();
+        if supervision.mode != SupervisorMode::Advisory {
+            return Ok(());
+        }
+        if snapshot.run_id != *run_id {
+            return Err(OrchestratorError::Protocol(
+                "supervisor snapshot belongs to another run".to_owned(),
+            ));
+        }
+        if self
+            .store
+            .latest_supervisor_review(run_id)?
+            .is_some_and(|review| matches!(review.state.as_str(), "STARTING" | "RUNNING"))
+        {
+            return Ok(());
+        }
+        self.require_runtime_ready().await?;
+        self.select_preferred_codex_account_for_run(run_id).await?;
+        let (active_total, _, _) = self.active_agent_counts()?;
+        if active_total >= self.config.orchestration.max_total_agent_threads {
+            return Err(OrchestratorError::Blocked(format!(
+                "all {} Codex thread slots are active; the advisory review remains queued",
+                self.config.orchestration.max_total_agent_threads
+            )));
+        }
+        let run = self.store.run(run_id)?;
+        let inspection = self
+            .store
+            .list_worktrees(Some(run_id))?
+            .into_iter()
+            .find(|worktree| worktree.kind == "inspection" && worktree.state == "READY")
+            .ok_or_else(|| {
+                OrchestratorError::Blocked(
+                    "supervision cannot start because the inspection worktree is unavailable"
+                        .to_owned(),
+                )
+            })?;
+        let route = ModelRoute {
+            model: supervision.supervisor.model.clone(),
+            reasoning_effort: supervision.supervisor.reasoning_effort.clone(),
+            sandbox: supervision.supervisor.sandbox.clone(),
+        };
+        let agent_id = AgentSessionId::new();
+        let review_id = SupervisorReviewId::new();
+        let decision_id = SupervisorDecisionId::new();
+        self.store.create_agent_session(&NewAgentSession {
+            id: agent_id.clone(),
+            run_id: run_id.clone(),
+            task_attempt_id: None,
+            parent_agent_session_id: None,
+            runtime_kind: "codex_controller".to_owned(),
+            codex_account_id: self.selected_codex_account_id(),
+            role: AgentRole::Supervisor,
+            nickname: Some(format!("supervisor-r{}", snapshot.revision)),
+            requested_model: route.model.clone(),
+            requested_reasoning_effort: route.reasoning_effort.clone(),
+            sandbox_mode: SandboxMode::ReadOnly,
+            approval_policy: "never".to_owned(),
+            cwd: PathBuf::from(&inspection.path),
+            state: "STARTING".to_owned(),
+            current_goal: Some("Read-only advisory diagnosis of a durable run snapshot".to_owned()),
+            token_budget: Some(supervision.supervisor.token_budget),
+        })?;
+        let review = match self.store.create_supervisor_review(&NewSupervisorReview {
+            id: review_id.clone(),
+            run_id: run_id.clone(),
+            snapshot_id: snapshot.id.clone(),
+            agent_session_id: agent_id.clone(),
+            expected_decision_id: decision_id.clone(),
+            trigger_kind: snapshot.trigger_kind.clone(),
+            requested_model: route.model.clone(),
+            requested_effort: route.reasoning_effort.clone(),
+        }) {
+            Ok(review) => review,
+            Err(error) => {
+                self.store.update_agent_state(
+                    &agent_id,
+                    "FAILED",
+                    Some("Advisory review custody could not be created"),
+                    None,
+                    None,
+                    Some(("persistence_failure", &error.to_string())),
+                )?;
+                return Err(error.into());
+            }
+        };
+        let prompt = supervisor_review_prompt(&review, snapshot)?;
+        if let Err(error) = self
+            .start_agent(
+                &agent_id,
+                run_id,
+                None,
+                Path::new(&inspection.path),
+                &route,
+                SandboxMode::ReadOnly,
+                false,
+                "Read-only advisory diagnosis of the supplied immutable snapshot",
+                Some(supervision.supervisor.token_budget),
+                prompt,
+                Some(model_output_schema(serde_json::from_str(
+                    SUPERVISOR_DECISION_SCHEMA,
+                )?)),
+            )
+            .await
+        {
+            let _ = self
+                .store
+                .fail_supervisor_review(&review_id, &error.to_string());
+            return Err(error);
+        }
+        self.store.mark_supervisor_review_running(&review_id)?;
+        self.emit_agent_event(
+            run_id,
+            &agent_id,
+            "agent.supervisor.started",
+            json!({
+                "review_id": review_id,
+                "snapshot_id": snapshot.id,
+                "snapshot_revision": snapshot.revision,
+                "model": route.model,
+                "reasoning_effort": route.reasoning_effort,
+                "sandbox": "read-only",
+                "automatic_action": false,
+            }),
+        )?;
+        self.emit_run_event(
+            &run,
+            "run.supervision.review_started",
+            json!({
+                "review_id": review_id,
+                "snapshot_id": snapshot.id,
+                "automatic_action": false,
+            }),
+        )?;
+        Ok(())
     }
 
     fn stored_setting_u64(&self, key: &str, default: u64) -> u64 {
@@ -2602,6 +3022,8 @@ impl Orchestrator {
             governor_progress,
             supervision_mode: self.effective_supervision_config().mode,
             supervisor_snapshot: self.store.latest_supervisor_snapshot(run_id)?,
+            supervisor_review: self.store.latest_supervisor_review(run_id)?,
+            supervisor_decision: self.store.latest_supervisor_decision(run_id)?,
         })
     }
 
@@ -6709,6 +7131,9 @@ impl Orchestrator {
                 self.apply_final_audit_verdict(&run_id, agent_id, verdict)
                     .await?;
             }
+            AgentRole::Supervisor => {
+                self.accept_supervisor_decision(agent_id, text).await?;
+            }
             AgentRole::Governor => {
                 // Governor commentary may produce completed message items too;
                 // only the schema-constrained final checkpoint is controller
@@ -6733,6 +7158,90 @@ impl Orchestrator {
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    async fn accept_supervisor_decision(
+        &self,
+        agent_id: &AgentSessionId,
+        text: &str,
+    ) -> Result<(), OrchestratorError> {
+        let review = self
+            .store
+            .supervisor_review_for_agent(agent_id)?
+            .ok_or_else(|| {
+                OrchestratorError::Protocol(
+                    "supervisor agent is missing its durable review envelope".to_owned(),
+                )
+            })?;
+        if !matches!(review.state.as_str(), "STARTING" | "RUNNING") {
+            // App Server may deliver a duplicate item/completed notification
+            // after the first schema-valid decision was made durable.
+            return Ok(());
+        }
+        let decision: Value = parse_json_text(text)?;
+        let snapshot = self
+            .store
+            .supervisor_snapshot(&review.snapshot_id)?
+            .ok_or_else(|| {
+                OrchestratorError::Protocol(
+                    "the immutable supervisor snapshot disappeared before decision intake"
+                        .to_owned(),
+                )
+            })?;
+        validate_supervisor_decision(&review, &snapshot, &decision)?;
+        let latest_snapshot = self.store.latest_supervisor_snapshot(&review.run_id)?;
+        let policy_state = if latest_snapshot
+            .as_ref()
+            .is_some_and(|latest| latest.id == review.snapshot_id)
+            && !supervision::has_material_event_after(
+                &self.store,
+                &review.run_id,
+                snapshot.event_cursor,
+            )? {
+            "ADVISORY"
+        } else {
+            "STALE"
+        };
+        let record = self
+            .store
+            .record_supervisor_decision(&review.id, policy_state, &decision)?;
+        self.store.clear_agent_active_turn(agent_id)?;
+        self.store.update_agent_state(
+            agent_id,
+            "COMPLETED",
+            Some(if policy_state == "ADVISORY" {
+                "Read-only recovery assessment is ready for operator review"
+            } else {
+                "Read-only assessment is stale; a newer material event requires a fresh review"
+            }),
+            None,
+            None,
+            None,
+        )?;
+        let run = self.store.run(&review.run_id)?;
+        self.emit_agent_event(
+            &review.run_id,
+            agent_id,
+            "agent.supervisor.decision_recorded",
+            json!({
+                "review_id": review.id,
+                "decision_id": record.id,
+                "snapshot_id": review.snapshot_id,
+                "policy_state": policy_state,
+                "automatic_action": false,
+            }),
+        )?;
+        self.emit_run_event(
+            &run,
+            "run.supervision.decision_ready",
+            json!({
+                "review_id": review.id,
+                "decision_id": record.id,
+                "policy_state": policy_state,
+                "automatic_action": false,
+            }),
+        )?;
         Ok(())
     }
 
@@ -7234,6 +7743,52 @@ impl Orchestrator {
                     )?;
                 }
                 Some(IntentInterviewStatus::NotStarted) | None => {}
+            }
+            return Ok(());
+        }
+        if agent.role == AgentRole::Supervisor {
+            let review = self.store.supervisor_review_for_agent(agent_id)?;
+            if status == "completed"
+                && review
+                    .as_ref()
+                    .is_some_and(|review| matches!(review.state.as_str(), "COMPLETED" | "STALE"))
+            {
+                return Ok(());
+            }
+            let reason = if status == "completed" {
+                "supervisor returned no schema-valid advisory decision".to_owned()
+            } else if session_budget_interrupted {
+                "supervisor session token budget exhausted".to_owned()
+            } else {
+                format!("supervisor turn ended with status {status}")
+            };
+            if let Some(review) = review
+                && matches!(review.state.as_str(), "STARTING" | "RUNNING")
+            {
+                self.store.fail_supervisor_review(&review.id, &reason)?;
+            }
+            self.store.clear_agent_active_turn(agent_id)?;
+            self.store.update_agent_state(
+                agent_id,
+                "FAILED",
+                Some("Advisory supervisor review did not produce a usable decision"),
+                None,
+                None,
+                Some((
+                    if status == "completed" {
+                        "protocol_error"
+                    } else {
+                        terminal_failure_class
+                    },
+                    &reason,
+                )),
+            )?;
+            if let Ok(run) = self.store.run(&run_id) {
+                self.emit_run_event(
+                    &run,
+                    "run.supervision.review_failed",
+                    json!({"agent_id": agent_id, "reason": reason, "automatic_action": false}),
+                )?;
             }
             return Ok(());
         }
@@ -14404,7 +14959,7 @@ fn stored_bool(store: &Store, key: &str, default: bool) -> Result<bool, Orchestr
 
 fn supervision_mode_for_operator_setting(enabled: bool) -> SupervisorMode {
     if enabled {
-        SupervisorMode::ObserveOnly
+        SupervisorMode::Advisory
     } else {
         SupervisorMode::Disabled
     }
@@ -14777,7 +15332,7 @@ mod tests {
     }
 
     fn operator_settings_request(
-        supervision_observe_only: Option<bool>,
+        supervision_enabled: Option<bool>,
         automatic_plan_approval: Option<bool>,
     ) -> UpdateOperatorSettingsRequest {
         UpdateOperatorSettingsRequest {
@@ -14788,21 +15343,103 @@ mod tests {
             adaptive_governor_budgets: None,
             automatic_governor_continuation: None,
             automatic_plan_approval,
-            supervision_observe_only,
+            supervision_enabled,
             governor_goal_token_budget: None,
             governor_attempt_token_ceiling: None,
         }
     }
 
     #[test]
-    fn operator_supervision_toggle_can_only_select_observation_or_disabled() {
+    fn operator_supervision_toggle_can_only_select_advisory_or_disabled() {
         assert_eq!(
             supervision_mode_for_operator_setting(false),
             SupervisorMode::Disabled
         );
         assert_eq!(
             supervision_mode_for_operator_setting(true),
-            SupervisorMode::ObserveOnly
+            SupervisorMode::Advisory
+        );
+    }
+
+    #[test]
+    fn supervisor_decision_rejects_actions_outside_snapshot_allowlist() {
+        let run_id = RunId::from("supervisor-run");
+        let snapshot = SupervisorSnapshotRecord {
+            id: harness_domain::SupervisorSnapshotId::from("supervisor-snapshot"),
+            run_id: run_id.clone(),
+            revision: 1,
+            event_cursor: 4,
+            trigger_kind: "operator_steered".to_owned(),
+            payload: json!({"allowed_actions": ["wait"], "tasks": []}),
+            payload_sha256: "a".repeat(64),
+            byte_length: 1,
+            created_at: "2026-08-13T00:00:00Z".to_owned(),
+        };
+        let review = SupervisorReviewRecord {
+            id: SupervisorReviewId::from("supervisor-review"),
+            run_id: run_id.clone(),
+            snapshot_id: snapshot.id.clone(),
+            agent_session_id: AgentSessionId::from("supervisor-agent"),
+            expected_decision_id: SupervisorDecisionId::from("supervisor-decision"),
+            state: "RUNNING".to_owned(),
+            trigger_kind: "operator_steered".to_owned(),
+            requested_model: "gpt-5.6-terra".to_owned(),
+            requested_effort: "high".to_owned(),
+            created_at: "2026-08-13T00:00:00Z".to_owned(),
+            completed_at: None,
+            failure_reason: None,
+        };
+        let decision = json!({
+            "schema": "harness.supervisor-decision.v1",
+            "decision_id": "supervisor-decision",
+            "snapshot_id": "supervisor-snapshot",
+            "run_id": "supervisor-run",
+            "snapshot_revision": 1,
+            "created_at": "2026-08-13T00:00:00Z",
+            "requested_model": "gpt-5.6-terra",
+            "effective_model": "gpt-5.6-terra",
+            "requested_effort": "high",
+            "effective_effort": "high",
+            "summary": "The blocker needs a human recovery decision.",
+            "actions": [{
+                "action_id": "wait",
+                "kind": "wait",
+                "target": {"kind": "run", "id": "supervisor-run", "task_id": null, "attempt_id": null, "session_id": null},
+                "summary": "Wait for the operator to select the safe recovery control.",
+                "reason_code": "operator_recovery_required",
+                "expected_observable_outcome": "A human action is recorded.",
+                "dedupe_key": "wait-supervisor-run",
+                "expires_at": "2026-08-14T00:00:00Z"
+            }]
+        });
+        validate_supervisor_decision(&review, &snapshot, &decision)
+            .expect("allowed advisory decision is accepted");
+        let mut forbidden = decision;
+        forbidden["actions"][0]["kind"] = json!("stop_run");
+        assert!(validate_supervisor_decision(&review, &snapshot, &forbidden).is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_observation_toggle_never_enables_a_model_review() {
+        let (orchestrator, _temp) = operator_settings_test_orchestrator().await;
+        orchestrator
+            .store()
+            .put_runtime_metadata(LEGACY_SETTING_SUPERVISION_OBSERVE_ONLY, &json!(true))
+            .expect("legacy observation setting persists");
+
+        assert!(!orchestrator.operator_settings().supervision_enabled);
+        assert_eq!(
+            orchestrator.effective_supervision_config().mode,
+            SupervisorMode::ObserveOnly,
+            "a legacy observation opt-in must not authorize Terra"
+        );
+
+        orchestrator
+            .update_operator_settings(operator_settings_request(Some(true), None))
+            .expect("fresh advisory opt-in persists");
+        assert_eq!(
+            orchestrator.effective_supervision_config().mode,
+            SupervisorMode::Advisory
         );
     }
 
@@ -14818,7 +15455,7 @@ mod tests {
             adaptive_governor_budgets: false,
             automatic_governor_continuation: true,
             automatic_plan_approval: false,
-            supervision_observe_only: false,
+            supervision_enabled: false,
             governor_goal_token_budget: 5_000_000,
             governor_attempt_token_ceiling: 400_000,
             recommended_governor_attempt_tokens: 1,
@@ -14864,11 +15501,11 @@ mod tests {
         });
 
         let final_settings = orchestrator.operator_settings();
-        assert!(final_settings.supervision_observe_only);
+        assert!(final_settings.supervision_enabled);
         assert!(final_settings.automatic_plan_approval);
         assert!(
-            (first.supervision_observe_only && first.automatic_plan_approval)
-                || (second.supervision_observe_only && second.automatic_plan_approval),
+            (first.supervision_enabled && first.automatic_plan_approval)
+                || (second.supervision_enabled && second.automatic_plan_approval),
             "the last serialized response contains both independently persisted updates"
         );
         let receipts = orchestrator
@@ -15107,6 +15744,8 @@ mod tests {
             AgentRole::Verifier,
             AgentRole::FinalAuditor,
             AgentRole::CiTriage,
+            AgentRole::Supervisor,
+            AgentRole::Expert,
         ] {
             assert!(
                 !role_uses_persistent_goal(role),
@@ -15368,6 +16007,10 @@ mod tests {
             (
                 "governor",
                 model_output_schema(serde_json::from_str(GOVERNOR_CHECKPOINT_SCHEMA).unwrap()),
+            ),
+            (
+                "supervisor",
+                model_output_schema(serde_json::from_str(SUPERVISOR_DECISION_SCHEMA).unwrap()),
             ),
         ] {
             assert_compatible(&schema, name);

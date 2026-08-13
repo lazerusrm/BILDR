@@ -39,8 +39,8 @@ pub struct HarnessConfig {
     #[serde(default)]
     pub self_improvement: SelfImprovementConfig,
     /// Supervisor runtime configuration is intentionally separate from the
-    /// governed self-improvement loop. The only implemented non-disabled mode
-    /// is read-only observation; no model/action route is enabled here.
+    /// governed self-improvement loop. Advisory mode may start a read-only
+    /// Terra analysis, but it never executes a model recommendation.
     #[serde(default)]
     pub supervision: SupervisionConfig,
 }
@@ -551,10 +551,10 @@ impl HarnessConfig {
         let supervision = &self.supervision;
         if !matches!(
             supervision.mode,
-            SupervisorMode::Disabled | SupervisorMode::ObserveOnly
+            SupervisorMode::Disabled | SupervisorMode::ObserveOnly | SupervisorMode::Advisory
         ) {
             return Err(ProfileError::Validation(
-                "supervision modes shadow, advisory, active_low_risk, and active are not compiled into this release"
+                "supervision modes shadow, active_low_risk, and active are not compiled into this release"
                     .to_owned(),
             ));
         }
@@ -1193,6 +1193,12 @@ mod tests {
         let mut config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
         config.supervision.mode = SupervisorMode::Shadow;
         assert!(config.validate().is_err());
+
+        let mut config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
+        config.supervision.mode = SupervisorMode::Advisory;
+        config
+            .validate()
+            .expect("advisory read-only supervision validates");
 
         let mut config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
         config.supervision.mode = SupervisorMode::ObserveOnly;

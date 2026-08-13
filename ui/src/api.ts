@@ -162,13 +162,17 @@ class HarnessApi {
         | "adaptive_governor_budgets"
         | "automatic_governor_continuation"
         | "automatic_plan_approval"
-        | "supervision_observe_only"
+        | "supervision_enabled"
         | "governor_goal_token_budget"
         | "governor_attempt_token_ceiling"
       >
     >,
   ) {
     return this.post<OperatorSettings>("/settings", { ...settings });
+  }
+
+  requestSupervisorReview(runId: string) {
+    return this.post(`/runs/${encodeURIComponent(runId)}/supervision/review`);
   }
 
   selectCodexAccount(accountId: string) {
