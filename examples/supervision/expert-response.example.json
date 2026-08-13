@@ -1,0 +1,14 @@
+{
+  "schema": "harness.expert-response.v1",
+  "response_id": "expert-response-1",
+  "request_id": "expert-request-1",
+  "run_id": "run-1",
+  "snapshot_id": "snapshot-2",
+  "snapshot_revision": 2,
+  "completed_at": "2026-08-13T16:02:00Z",
+  "no_direct_action": true,
+  "verdict": "recommendation",
+  "summary": "The supplied evidence supports one governing invariant, subject to fresh verification on the exact candidate head.",
+  "recommendation": "Return this advisory conclusion to the supervisor, then request the smallest controller-legal remediation and independent verification step.",
+  "evidence_refs": ["finding-1", "validation-7"]
+}
