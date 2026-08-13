@@ -93,7 +93,10 @@ class HarnessApi {
   }
 
   runtime = () => this.get<RuntimeStatus>("/runtime");
-  codexAccounts = () => this.get<CodexAccountsSnapshot>("/codex/accounts");
+  codexAccounts = (force = false) =>
+    this.get<CodexAccountsSnapshot>(
+      `/codex/accounts${force ? "?force=true" : ""}`,
+    );
   repositories = () => this.get<Repository[]>("/repositories");
   discoverRepositories = () =>
     this.get<RepositoryDiscovery[]>("/repositories/discover");

@@ -345,6 +345,7 @@ export interface Run {
   created_at: string;
   started_at?: string;
   completed_at?: string;
+  failure_reason?: string | null;
   scheduler_paused: boolean;
   run_token_budget?: number;
   version: number;
@@ -407,6 +408,7 @@ export interface Task {
   head_sha?: string;
   token_budget?: number;
   dependencies: string[];
+  failure_reason?: string | null;
   version: number;
 }
 
@@ -426,6 +428,9 @@ export interface Agent {
   cwd: string;
   current_goal?: string;
   current_action?: string;
+  failure_reason?: string | null;
+  started_at?: string;
+  completed_at?: string | null;
   token_budget?: number;
   tokens_used: number;
   budget_tokens_used?: number;

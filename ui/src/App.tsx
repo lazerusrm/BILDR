@@ -533,13 +533,13 @@ export default function App() {
             "Codex account selected",
           )
         }
-        onRefresh={async () => {
-          try {
-            setCodexAccounts(await api.codexAccounts());
-          } catch (caught) {
-            setError(message(caught));
-          }
-        }}
+        onRefresh={() =>
+          runAction(
+            "codex-account",
+            async () => setCodexAccounts(await api.codexAccounts(true)),
+            "All detected Codex account limits refreshed",
+          )
+        }
         onAdd={() => {
           setAccountLoginTargetId(undefined);
           setModal("account-login");
@@ -1166,11 +1166,7 @@ function AccountBar({
             )}
             {snapshot.accounts.map((item) => (
               <option value={item.id} key={item.id}>
-                {item.email || item.label}
-                {item.plan_type ? ` · ${item.plan_type}` : ""}
-                {accountCapacity(item) !== undefined
-                  ? ` · ${accountCapacity(item)}% left`
-                  : ""}
+                {accountOptionLabel(item)}
               </option>
             ))}
             <option value="__add__">＋ Add Codex account…</option>
@@ -1206,8 +1202,8 @@ function AccountBar({
           className="account-refresh"
           onClick={onRefresh}
           disabled={busy}
-          title="Refresh account limits"
-          aria-label="Refresh account limits"
+          title="Refresh limits for every detected Codex account"
+          aria-label="Refresh limits for every detected Codex account"
         >
           <RefreshCw size={12} className={busy ? "spin" : ""} />
         </button>
@@ -1277,7 +1273,7 @@ function LimitMeter({
 }
 
 function accountMeters(account?: CodexAccountProfile): AccountMeter[] {
-  if (!account)
+  if (!account || account.state !== "ready" || !account.observed_at)
     return [
       { key: "session", label: "Session" },
       { key: "weekly", label: "Weekly all" },
@@ -1360,6 +1356,7 @@ function accountMeters(account?: CodexAccountProfile): AccountMeter[] {
 }
 
 function accountCapacity(account: CodexAccountProfile) {
+  if (account.state !== "ready" || !account.observed_at) return undefined;
   const general = account.rate_limits.filter(
     (limit) =>
       !/spark|bengalfox/i.test(`${limit.limit_id} ${limit.limit_name || ""}`),
@@ -1410,7 +1407,8 @@ export function recordRateLimitHistory(
   let next = history;
   const cutoff = now - 48 * 60 * 60 * 1_000;
   for (const account of snapshot.accounts) {
-    const observedAt = account.observed_at || now;
+    if (account.state !== "ready" || !account.observed_at) continue;
+    const observedAt = account.observed_at;
     for (const limit of account.rate_limits) {
       for (const window of limit.windows) {
         const key = rateLimitHistoryKey(account.id, limit.limit_id, window);
@@ -1559,11 +1557,25 @@ function formatHours(hours: number) {
   return `${hours.toFixed(hours < 10 ? 1 : 0)}h`;
 }
 
-function relativeObserved(timestamp: number) {
-  const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1_000));
+function relativeObserved(timestamp: number, now = Date.now()) {
+  const seconds = Math.max(0, Math.round((now - timestamp) / 1_000));
   if (seconds < 5) return "now";
   if (seconds < 60) return `${seconds}s ago`;
   return `${Math.round(seconds / 60)}m ago`;
+}
+
+export function accountOptionLabel(
+  account: CodexAccountProfile,
+  now = Date.now(),
+) {
+  const identity = `${account.email || account.label}${account.plan_type ? ` · ${account.plan_type}` : ""}`;
+  const capacity = accountCapacity(account);
+  const telemetry = account.observed_at
+    ? `checked ${relativeObserved(account.observed_at, now)}${now - account.observed_at > 90_000 ? " (stale)" : ""}`
+    : "telemetry pending";
+  if (capacity !== undefined) return `${identity} · ${capacity}% left · ${telemetry}`;
+  if (account.state === "ready") return `${identity} · limits unavailable · ${telemetry}`;
+  return `${identity} · ${roleLabel(account.state)} · ${telemetry}`;
 }
 
 function Rail({
@@ -1674,7 +1686,7 @@ function HomeView({
                   <span>{posture}</span>
                 </div>
                 <div className="home-row-meta">
-                  {elapsed(run.created_at)}
+                  {runLifecycleSummary(run)}
                   <span>Open ›</span>
                 </div>
               </button>
@@ -1921,7 +1933,9 @@ function RunLoading({ run }: { run: Run }) {
       <div className="runtime-spinner" aria-hidden="true" />
       <div>
         <strong>Opening governor session</strong>
-        <span>{run.title}</span>
+        <span title="Run lifecycle times use this browser's local time zone">
+          {run.title} · {runLifecycleSummary(run)}
+        </span>
       </div>
     </div>
   );
@@ -2206,9 +2220,16 @@ function RunWorkspace({
         />
         <Metric
           label="Elapsed"
-          value={elapsed(run.created_at)}
+          value={elapsed(run.started_at || run.created_at)}
           note={run.scheduler_paused ? "scheduler paused" : "active wall time"}
         />
+      </div>
+      <div
+        className="run-lifecycle"
+        title="Run lifecycle times use this browser's local time zone"
+      >
+        <strong>Run lifecycle</strong>
+        <span>{runLifecycleSummary(run)}</span>
       </div>
       {detail.intent_interview && (
         <IntentInterviewPanel
@@ -2279,6 +2300,7 @@ function RunWorkspace({
           {visibleArchitectureAgents.map((agent) => (
             <AgentRow
               key={agent.id}
+              run={run}
               agent={agent}
               selected={selectedAgentId === agent.id}
               onClick={() => onSelect(undefined, agent.id)}
@@ -2294,6 +2316,7 @@ function RunWorkspace({
                 {previousArchitectureAttempts.map((agent) => (
                   <AgentRow
                     key={agent.id}
+                    run={run}
                     agent={agent}
                     selected={selectedAgentId === agent.id}
                     onClick={() => onSelect(undefined, agent.id)}
@@ -2322,6 +2345,7 @@ function RunWorkspace({
           return (
             <AgentRow
               key={task.id}
+              run={run}
               task={task}
               agent={agent}
               selected={selectedTaskId === task.id}
@@ -3551,6 +3575,7 @@ function RunPrimaryAction({
 }
 
 function AgentRow({
+  run,
   task,
   agent,
   selected,
@@ -3559,6 +3584,7 @@ function AgentRow({
   onSelectChild,
   children = [],
 }: {
+  run?: Run;
   task?: Task;
   agent?: Agent;
   selected: boolean;
@@ -3585,6 +3611,7 @@ function AgentRow({
       : task
         ? humanTaskState(state).toUpperCase()
         : state;
+  const blocker = blockerStatus(run, task, displayAgent);
   const currentActivity =
     task?.state === "LEASED"
       ? `Preparing attempt ${task.attempt} · creating isolated workspace`
@@ -3592,7 +3619,8 @@ function AgentRow({
         ? "Agent session is connecting · waiting for turn start"
         : activeTurn
           ? `${displayAgent?.current_action || "Agent turn is active"}${displayAgent?.role === "governor" ? ` · ${children.length} delegated thread${children.length === 1 ? "" : "s"}` : ""}${displayAgent?.context_strategy === "bounded_handoff" ? " · prior handoff loaded" : displayAgent?.context_strategy === "native_thread_reuse" ? " · governor context retained" : ""}`
-          : displayAgent?.current_action ||
+          : blocker?.reason ||
+            displayAgent?.current_action ||
             displayAgent?.current_goal ||
             (task?.dependencies.length
               ? `Waiting on ${task.dependencies.join(", ")}`
@@ -3640,6 +3668,14 @@ function AgentRow({
         <div className="agent-usage">
           <strong>Thread usage / budget · {usage}</strong>
           <span>API cost · {cost}</span>
+          {displayAgent && (
+            <span
+              className="agent-lifecycle"
+              title="Thread lifecycle times use this browser's local time zone"
+            >
+              {threadLifecycleRowSummary(displayAgent)}
+            </span>
+          )}
         </div>
         <div className="agent-state-cell">
           {selected && <span className="selected-marker">Selected</span>}
@@ -3665,9 +3701,13 @@ function AgentRow({
                   <small>
                     {childState === "FINISHING"
                       ? "Finishing background work while the governor waits for you"
-                      : child.current_action ||
+                      : blockerStatus(run, task, child)?.reason ||
+                        child.current_action ||
                         child.current_goal ||
                         "Waiting for activity"}
+                  </small>
+                  <small title="Thread lifecycle times use this browser's local time zone">
+                    {threadLifecycleRowSummary(child)}
                   </small>
                 </span>
                 <span>
@@ -3912,6 +3952,7 @@ function InspectorContent({
     : latestMessage
       ? [latestMessage]
       : [];
+  const blocker = blockerStatus(detail.run, task, agent);
   return (
     <>
       {viewingChild && (
@@ -3925,6 +3966,16 @@ function InspectorContent({
             {governor?.current_action ||
               governorLatestMessage?.text.slice(0, 180) ||
               "no recent action"}
+          </small>
+        </InspectorCard>
+      )}
+      {blocker && (
+        <InspectorCard label="Blocker and next available step">
+          <p>
+            <strong>Why</strong> · {blocker.reason}
+          </p>
+          <small>
+            <strong>Next</strong> · {blocker.nextStep}
           </small>
         </InspectorCard>
       )}
@@ -3980,6 +4031,11 @@ function InspectorContent({
               ? `heartbeat ${timeAgo(agent.heartbeat_at)}`
               : "no heartbeat"}
           </small>
+          {agent && (
+            <small title="Thread lifecycle times use this browser's local time zone">
+              {threadLifecycleSummary(agent)}
+            </small>
+          )}
         </details>
       </InspectorCard>
     </>
@@ -5532,10 +5588,7 @@ function NewRunModal({
               <option value="">Automatic · best available</option>
               {accounts.accounts.map((account) => (
                 <option value={account.id} key={account.id}>
-                  {account.email || account.label}
-                  {accountCapacity(account) !== undefined
-                    ? ` · ${accountCapacity(account)}% left`
-                    : ""}
+                  {accountOptionLabel(account)}
                 </option>
               ))}
             </select>
@@ -6119,6 +6172,56 @@ function humanAgentState(state: string) {
   if (state === "PAUSED") return "Paused";
   return roleLabel(state);
 }
+export function runLifecycleSummary(run: Run) {
+  if (!run.started_at) {
+    return `Local time · created ${formatLocalTimestamp(run.created_at)} · not started`;
+  }
+  return `Local time · started ${formatLocalTimestamp(run.started_at)} · ${run.completed_at ? `completed ${formatLocalTimestamp(run.completed_at)}` : "completion pending"}`;
+}
+export function threadLifecycleSummary(agent: Agent) {
+  if (!agent.started_at) return "Local time · start not recorded";
+  return `Local time · started ${formatLocalTimestamp(agent.started_at)} · ${agent.completed_at ? `completed ${formatLocalTimestamp(agent.completed_at)}` : "completion pending"}`;
+}
+function threadLifecycleRowSummary(agent: Agent) {
+  if (!agent.started_at) return "Local · start not recorded";
+  return `Local · start ${formatLocalClock(agent.started_at)} → ${agent.completed_at ? `done ${formatLocalClock(agent.completed_at)}` : "pending"}`;
+}
+export function blockerStatus(
+  run: Run | undefined,
+  task?: Task,
+  agent?: Agent,
+) {
+  const blockedThread = Boolean(
+    agent &&
+      (["BLOCKED", "FAILED", "STALLED", "INTERRUPTED"].includes(agent.state) ||
+        agent.failure_reason),
+  );
+  const blockedTask = Boolean(
+    task &&
+      (["BLOCKED", "FAILED", "STALLED", "INTERRUPTED", "NEEDS_HELP"].includes(
+        task.state,
+      ) || task.failure_reason),
+  );
+  const blockedRun = Boolean(run && (run.state === "BLOCKED" || run.failure_reason));
+  if (!blockedThread && !blockedTask && !blockedRun) return undefined;
+
+  const reason =
+    agent?.failure_reason ||
+    task?.failure_reason ||
+    run?.failure_reason ||
+    agent?.current_action ||
+    "Harness recorded a blocked state without a more specific runtime reason.";
+  const nextStep = agent?.parent_agent_id
+    ? "This delegated thread is read-only. Return to the governor; only the governor can continue or retry its owning task."
+    : task && retryableState(task.state)
+      ? "Use Continue governor below. You can add a decision or new fact and choose the next attempt budget before continuing."
+      : run?.state === "BLOCKED" && run.phase === "plan_review_deadlocked"
+        ? "Describe one concrete plan defect in Request changes below; Harness will send that bounded correction through the revision loop."
+        : run?.scheduler_paused
+          ? "Select Resume work after confirming the recorded condition is resolved."
+          : "No safe automatic continuation is available at this run phase. Resolve the recorded condition, preserve the current evidence, then start a scoped follow-up if needed.";
+  return { reason, nextStep };
+}
 function workStatusSummary(
   task?: Task,
   worktree?: Worktree,
@@ -6312,6 +6415,17 @@ function formatLocalTimestamp(value?: string) {
     : date.toLocaleString([], {
         month: "short",
         day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+        second: "2-digit",
+      });
+}
+function formatLocalClock(value?: string) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? value
+    : date.toLocaleTimeString([], {
         hour: "numeric",
         minute: "2-digit",
         second: "2-digit",

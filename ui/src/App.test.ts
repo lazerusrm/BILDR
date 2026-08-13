@@ -3,8 +3,10 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   LiveTurnTelemetry,
+  accountOptionLabel,
   agentEffort,
   agentModel,
+  blockerStatus,
   delegatedThreadDisplayState,
   effectiveRunPosture,
   formatCost,
@@ -16,9 +18,11 @@ import {
   rateLimitForecast,
   recordRateLimitHistory,
   roleLabel,
+  runLifecycleSummary,
   shortModel,
   shortSha,
   terminal,
+  threadLifecycleSummary,
   tone,
   workStatusSummary,
 } from "./App";
@@ -36,6 +40,105 @@ describe("workspace presentation helpers", () => {
     expect(tone("WAITING_APPROVAL")).toBe("warning");
     expect(tone("INFRASTRUCTURE_UNAVAILABLE")).toBe("danger");
     expect(tone("IMPLEMENTING")).toBe("active");
+  });
+
+  it("makes blockers actionable and shows durable run and thread times in local time", () => {
+    const run = {
+      id: "run-blocked",
+      state: "BLOCKED",
+      phase: "plan_review_deadlocked",
+      created_at: "2026-08-12T18:00:00Z",
+      started_at: "2026-08-12T18:05:00Z",
+      completed_at: "2026-08-12T18:10:00Z",
+      failure_reason: "plan review exhausted its bounded budget",
+    } as Run;
+    const task = {
+      id: "task-blocked",
+      state: "BLOCKED",
+      failure_reason: "the next repository decision is required",
+    } as Task;
+    const agent = {
+      id: "agent-blocked",
+      state: "BLOCKED",
+      started_at: "2026-08-12T18:05:01Z",
+      completed_at: "2026-08-12T18:09:59Z",
+      failure_reason: "controller token budget exhausted",
+    } as Agent;
+
+    expect(runLifecycleSummary(run)).toContain("Local time · started");
+    expect(runLifecycleSummary(run)).toContain("completed");
+    expect(threadLifecycleSummary(agent)).toContain("Local time · started");
+    expect(threadLifecycleSummary(agent)).toContain("completed");
+    expect(blockerStatus(run, task, agent)).toEqual({
+      reason: "controller token budget exhausted",
+      nextStep:
+        "Use Continue governor below. You can add a decision or new fact and choose the next attempt budget before continuing.",
+    });
+  });
+
+  it("labels non-active account capacity with its observation time", () => {
+    const now = Date.UTC(2026, 7, 12, 18, 0, 0);
+    expect(
+      accountOptionLabel(
+        {
+          id: "other-account",
+          label: "Other account",
+          codex_home: "/tmp/codex-other",
+          selected: false,
+          state: "ready",
+          rate_limits: [
+            {
+              limit_id: "codex",
+              windows: [
+                {
+                  kind: "primary",
+                  used_percent: 24,
+                  remaining_percent: 76,
+                },
+              ],
+            },
+          ],
+          observed_at: now - 20_000,
+        },
+        now,
+      ),
+    ).toContain("76% left · checked 20s ago");
+  });
+
+  it("does not ingest unavailable-account capacity as a fresh forecast sample", () => {
+    const history = {
+      "other-account:codex:primary:60": [
+        { observedAt: 100, remaining: 76, resetsAt: 1_786_630_416 },
+      ],
+    };
+    expect(
+      recordRateLimitHistory(history, {
+        accounts: [
+          {
+            id: "other-account",
+            label: "Other account",
+            codex_home: "/tmp/codex-other",
+            selected: false,
+            state: "unavailable",
+            rate_limits: [
+              {
+                limit_id: "codex",
+                windows: [
+                  {
+                    kind: "primary",
+                    used_percent: 20,
+                    remaining_percent: 80,
+                    window_duration_mins: 60,
+                    resets_at: 1_786_630_416,
+                  },
+                ],
+              },
+            ],
+            observed_at: 200,
+          },
+        ],
+      }),
+    ).toEqual(history);
   });
 
   it("formats custody and usage values compactly", () => {

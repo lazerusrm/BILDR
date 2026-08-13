@@ -1395,6 +1395,8 @@ pub struct RunSummary {
     pub created_at: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+    /// Durable explanation recorded when the run cannot continue automatically.
+    pub failure_reason: Option<String>,
     pub scheduler_paused: bool,
     pub run_token_budget: Option<u64>,
     pub version: u64,
@@ -1416,6 +1418,8 @@ pub struct TaskSummary {
     pub head_sha: Option<String>,
     pub token_budget: Option<u64>,
     pub dependencies: Vec<String>,
+    /// Durable explanation from the current task attempt, when present.
+    pub failure_reason: Option<String>,
     pub version: u64,
 }
 
@@ -1436,6 +1440,12 @@ pub struct AgentSummary {
     pub cwd: String,
     pub current_goal: Option<String>,
     pub current_action: Option<String>,
+    /// Durable terminal or blocking explanation from this thread session.
+    pub failure_reason: Option<String>,
+    /// Time this thread session was created, serialized as RFC 3339 UTC.
+    pub started_at: String,
+    /// Time this thread session finished, if it has reached a terminal state.
+    pub completed_at: Option<String>,
     pub token_budget: Option<u64>,
     pub tokens_used: u64,
     /// Usage charged against the currently displayed bounded allowance. This

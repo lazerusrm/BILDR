@@ -3286,7 +3286,7 @@ impl Store {
 
     pub fn list_tasks(&self, run_id: &RunId) -> Result<Vec<TaskSummary>, StoreError> {
         let connection = self.connection()?;
-        let sql = "SELECT t.id,t.run_id,t.external_task_id,t.title,t.objective,t.state,t.priority,t.owner_profile,t.reviewer_profile,t.current_attempt_number,coalesce(a.base_sha,r.base_sha),coalesce(a.head_sha,tr.verified_commit_sha),a.token_budget,t.version,(SELECT json_group_array(dt.external_task_id) FROM task_dependencies d JOIN tasks dt ON dt.id=d.depends_on_task_id WHERE d.task_id=t.id) FROM tasks t JOIN runs r ON r.id=t.run_id LEFT JOIN task_attempts a ON a.task_id=t.id AND a.attempt_number=t.current_attempt_number LEFT JOIN task_results tr ON tr.task_attempt_id=a.id WHERE t.run_id=?1 ORDER BY CASE t.priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END,t.created_at";
+        let sql = "SELECT t.id,t.run_id,t.external_task_id,t.title,t.objective,t.state,t.priority,t.owner_profile,t.reviewer_profile,t.current_attempt_number,coalesce(a.base_sha,r.base_sha),coalesce(a.head_sha,tr.verified_commit_sha),a.token_budget,t.version,(SELECT json_group_array(dt.external_task_id) FROM task_dependencies d JOIN tasks dt ON dt.id=d.depends_on_task_id WHERE d.task_id=t.id),coalesce(a.failure_reason,t.failure_reason) FROM tasks t JOIN runs r ON r.id=t.run_id LEFT JOIN task_attempts a ON a.task_id=t.id AND a.attempt_number=t.current_attempt_number LEFT JOIN task_results tr ON tr.task_attempt_id=a.id WHERE t.run_id=?1 ORDER BY CASE t.priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END,t.created_at";
         let mut statement = connection.prepare(sql)?;
         let rows = statement.query_map([run_id.as_str()], map_task)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -3294,7 +3294,7 @@ impl Store {
 
     pub fn task(&self, id: &TaskId) -> Result<TaskSummary, StoreError> {
         let connection = self.connection()?;
-        let sql = "SELECT t.id,t.run_id,t.external_task_id,t.title,t.objective,t.state,t.priority,t.owner_profile,t.reviewer_profile,t.current_attempt_number,coalesce(a.base_sha,r.base_sha),coalesce(a.head_sha,tr.verified_commit_sha),a.token_budget,t.version,(SELECT json_group_array(dt.external_task_id) FROM task_dependencies d JOIN tasks dt ON dt.id=d.depends_on_task_id WHERE d.task_id=t.id) FROM tasks t JOIN runs r ON r.id=t.run_id LEFT JOIN task_attempts a ON a.task_id=t.id AND a.attempt_number=t.current_attempt_number LEFT JOIN task_results tr ON tr.task_attempt_id=a.id WHERE t.id=?1";
+        let sql = "SELECT t.id,t.run_id,t.external_task_id,t.title,t.objective,t.state,t.priority,t.owner_profile,t.reviewer_profile,t.current_attempt_number,coalesce(a.base_sha,r.base_sha),coalesce(a.head_sha,tr.verified_commit_sha),a.token_budget,t.version,(SELECT json_group_array(dt.external_task_id) FROM task_dependencies d JOIN tasks dt ON dt.id=d.depends_on_task_id WHERE d.task_id=t.id),coalesce(a.failure_reason,t.failure_reason) FROM tasks t JOIN runs r ON r.id=t.run_id LEFT JOIN task_attempts a ON a.task_id=t.id AND a.attempt_number=t.current_attempt_number LEFT JOIN task_results tr ON tr.task_attempt_id=a.id WHERE t.id=?1";
         connection
             .query_row(sql, [id.as_str()], map_task)
             .optional()?
@@ -3433,7 +3433,7 @@ impl Store {
             params![input.id.as_str(),input.task_id.as_str(),input.attempt_number,input.state,packet_json,input.packet_sha256,input.base_sha,input.requested_model_route,input.packet.token_budget as i64,input.packet.tool_budget.map(|value| value as i64),input.packet.diff_budget.files,input.packet.diff_budget.lines,now],
         )?;
         transaction.execute(
-            "UPDATE tasks SET current_attempt_number=?2,state='LEASED',updated_at=?3,version=version+1 WHERE id=?1",
+            "UPDATE tasks SET current_attempt_number=?2,state='LEASED',failure_reason=NULL,updated_at=?3,version=version+1 WHERE id=?1",
             params![input.task_id.as_str(), input.attempt_number, now],
         )?;
         transaction.execute(
@@ -3497,6 +3497,23 @@ impl Store {
             )));
         }
         self.task(id)
+    }
+
+    /// Stores a failure that prevented task-attempt creation. Once an attempt
+    /// exists, its failure reason takes precedence in the task summary.
+    pub fn set_task_failure_reason(
+        &self,
+        id: &TaskId,
+        failure_reason: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection()?.execute(
+            "UPDATE tasks SET failure_reason=?2,updated_at=?3,version=version+1 WHERE id=?1",
+            params![id.as_str(), failure_reason, now_ms()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::NotFound(format!("task {id}")));
+        }
+        Ok(())
     }
 
     pub fn task_attempt_for_agent(
@@ -4908,7 +4925,7 @@ fn map_repository(row: &Row<'_>) -> rusqlite::Result<RepositorySummary> {
 }
 
 fn run_select() -> &'static str {
-    "SELECT r.id,r.repository_id,r.title,r.requested_objective,r.mode,r.publication_mode,r.state,r.phase,r.base_ref,r.base_sha,r.integration_branch,r.integration_sha,r.authority_digest,r.created_at,r.started_at,r.completed_at,r.scheduler_paused,r.run_token_budget,r.version FROM runs r"
+    "SELECT r.id,r.repository_id,r.title,r.requested_objective,r.mode,r.publication_mode,r.state,r.phase,r.base_ref,r.base_sha,r.integration_branch,r.integration_sha,r.authority_digest,r.created_at,r.started_at,r.completed_at,r.scheduler_paused,r.run_token_budget,r.version,r.failure_reason FROM runs r"
 }
 
 fn map_run(row: &Row<'_>) -> rusqlite::Result<RunSummary> {
@@ -4938,6 +4955,7 @@ fn map_run(row: &Row<'_>) -> rusqlite::Result<RunSummary> {
         created_at: format_timestamp(row.get(13)?),
         started_at: row.get::<_, Option<i64>>(14)?.map(format_timestamp),
         completed_at: row.get::<_, Option<i64>>(15)?.map(format_timestamp),
+        failure_reason: row.get(19)?,
         scheduler_paused: row.get(16)?,
         run_token_budget: row.get::<_, Option<i64>>(17)?.map(|value| value as u64),
         version: row.get::<_, i64>(18)? as u64,
@@ -4945,7 +4963,7 @@ fn map_run(row: &Row<'_>) -> rusqlite::Result<RunSummary> {
 }
 
 fn agent_select() -> &'static str {
-    "SELECT a.id,a.parent_agent_session_id,t.id,a.role,a.codex_account_id,a.nickname,a.state,a.requested_model,a.effective_model,a.requested_reasoning_effort,a.effective_reasoning_effort,a.sandbox_mode,a.cwd,a.current_goal,d.current_action,a.token_budget,coalesce(a.goal_tokens_used,0),coalesce((SELECT sum(c.lower_microusd) FROM codex_threads ct JOIN token_samples ts ON ts.thread_id=ct.thread_id JOIN cost_entries c ON c.token_sample_id=ts.id WHERE ct.agent_session_id=a.id),0),coalesce((SELECT sum(c.upper_microusd) FROM codex_threads ct JOIN token_samples ts ON ts.thread_id=ct.thread_id JOIN cost_entries c ON c.token_sample_id=ts.id WHERE ct.agent_session_id=a.id),0),a.last_heartbeat_at,ct.thread_id,d.active_turn_id,coalesce(d.context_strategy,'fresh_independent'),d.context_source_attempt_id,d.context_reuse_reason,a.version,active_turn.started_at,active_usage.id,active_usage.input_tokens,active_usage.cached_input_tokens,active_usage.cache_write_input_tokens,active_usage.output_tokens,active_usage.reasoning_output_tokens,active_usage.total_tokens,active_usage.model_context_window FROM agent_sessions a LEFT JOIN task_attempts at ON at.id=a.task_attempt_id LEFT JOIN tasks t ON t.id=at.task_id LEFT JOIN agent_runtime_details d ON d.agent_session_id=a.id LEFT JOIN codex_threads ct ON ct.agent_session_id=a.id LEFT JOIN codex_turns active_turn ON active_turn.turn_id=d.active_turn_id LEFT JOIN token_samples active_usage ON active_usage.turn_id=d.active_turn_id AND active_usage.sample_kind='turn_total'"
+    "SELECT a.id,a.parent_agent_session_id,t.id,a.role,a.codex_account_id,a.nickname,a.state,a.requested_model,a.effective_model,a.requested_reasoning_effort,a.effective_reasoning_effort,a.sandbox_mode,a.cwd,a.current_goal,d.current_action,a.token_budget,coalesce(a.goal_tokens_used,0),coalesce((SELECT sum(c.lower_microusd) FROM codex_threads ct JOIN token_samples ts ON ts.thread_id=ct.thread_id JOIN cost_entries c ON c.token_sample_id=ts.id WHERE ct.agent_session_id=a.id),0),coalesce((SELECT sum(c.upper_microusd) FROM codex_threads ct JOIN token_samples ts ON ts.thread_id=ct.thread_id JOIN cost_entries c ON c.token_sample_id=ts.id WHERE ct.agent_session_id=a.id),0),a.last_heartbeat_at,ct.thread_id,d.active_turn_id,coalesce(d.context_strategy,'fresh_independent'),d.context_source_attempt_id,d.context_reuse_reason,a.version,active_turn.started_at,active_usage.id,active_usage.input_tokens,active_usage.cached_input_tokens,active_usage.cache_write_input_tokens,active_usage.output_tokens,active_usage.reasoning_output_tokens,active_usage.total_tokens,active_usage.model_context_window,a.failure_reason,a.started_at,a.completed_at FROM agent_sessions a LEFT JOIN task_attempts at ON at.id=a.task_attempt_id LEFT JOIN tasks t ON t.id=at.task_id LEFT JOIN agent_runtime_details d ON d.agent_session_id=a.id LEFT JOIN codex_threads ct ON ct.agent_session_id=a.id LEFT JOIN codex_turns active_turn ON active_turn.turn_id=d.active_turn_id LEFT JOIN token_samples active_usage ON active_usage.turn_id=d.active_turn_id AND active_usage.sample_kind='turn_total'"
 }
 
 fn map_agent(row: &Row<'_>) -> rusqlite::Result<AgentSummary> {
@@ -4980,6 +4998,9 @@ fn map_agent(row: &Row<'_>) -> rusqlite::Result<AgentSummary> {
         cwd: row.get(12)?,
         current_goal: row.get(13)?,
         current_action: row.get(14)?,
+        failure_reason: row.get(35)?,
+        started_at: format_timestamp(row.get(36)?),
+        completed_at: row.get::<_, Option<i64>>(37)?.map(format_timestamp),
         token_budget: row.get::<_, Option<i64>>(15)?.map(|value| value as u64),
         tokens_used: row.get::<_, i64>(16)? as u64,
         budget_tokens_used: row.get::<_, i64>(16)? as u64,
@@ -5047,6 +5068,7 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<TaskSummary> {
             .as_deref()
             .and_then(|value| serde_json::from_str(value).ok())
             .unwrap_or_default(),
+        failure_reason: row.get(15)?,
     })
 }
 
@@ -7329,6 +7351,7 @@ pub fn operation_payload(kind: &str, target: &str) -> Value {
 mod tests {
     use std::path::PathBuf;
 
+    use harness_domain::{AgentRole, SandboxMode};
     use tempfile::TempDir;
 
     use super::*;
@@ -7373,6 +7396,97 @@ mod tests {
             })
             .unwrap();
         (store, run_id)
+    }
+
+    #[test]
+    fn run_and_thread_summaries_expose_durable_blockers_and_lifecycle_times() {
+        let (store, run_id) = store_with_created_run();
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE runs SET state='BLOCKED',phase='operator_decision',failure_reason='operator decision is required' WHERE id=?1",
+                [run_id.as_str()],
+            )
+            .unwrap();
+        let run = store.run(&run_id).unwrap();
+        assert_eq!(
+            run.failure_reason.as_deref(),
+            Some("operator decision is required")
+        );
+        assert!(run.started_at.is_some());
+
+        let agent_id = AgentSessionId::from("agent-summary-lifecycle");
+        store
+            .create_agent_session(&NewAgentSession {
+                id: agent_id.clone(),
+                run_id: run_id.clone(),
+                task_attempt_id: None,
+                parent_agent_session_id: None,
+                runtime_kind: "codex_controller".to_owned(),
+                codex_account_id: None,
+                role: AgentRole::Architect,
+                nickname: None,
+                requested_model: "gpt-test".to_owned(),
+                requested_reasoning_effort: "high".to_owned(),
+                sandbox_mode: SandboxMode::ReadOnly,
+                approval_policy: "never".to_owned(),
+                cwd: PathBuf::from("/tmp/lifecycle-event-fixture"),
+                state: "RUNNING".to_owned(),
+                current_goal: Some("Verify summary fields".to_owned()),
+                token_budget: Some(1_000),
+            })
+            .unwrap();
+        store
+            .update_agent_state(
+                &agent_id,
+                "FAILED",
+                Some("Thread stopped before completion"),
+                None,
+                None,
+                Some(("budget_exhausted", "session token budget exhausted")),
+            )
+            .unwrap();
+        let agent = store.agent(&agent_id).unwrap();
+        assert!(!agent.started_at.is_empty());
+        assert!(agent.completed_at.is_some());
+        assert_eq!(
+            agent.failure_reason.as_deref(),
+            Some("session token budget exhausted")
+        );
+    }
+
+    #[test]
+    fn task_summary_exposes_a_failure_that_prevented_attempt_creation() {
+        let (store, run_id) = store_with_created_run();
+        let task_id = TaskId::from("task-pre-attempt-failure");
+        {
+            let connection = store.connection().unwrap();
+            connection
+                .pragma_update(None, "foreign_keys", false)
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO tasks(id,run_id,plan_revision_id,external_task_id,title,objective,priority,owner_profile,reviewer_profile,state,created_at,updated_at,version) VALUES(?1,?2,'plan-fixture','pre-attempt','Pre-attempt failure','Keep the durable launch reason','P1','fixture','fixture','NEEDS_HELP',1,1,1)",
+                    params![task_id.as_str(), run_id.as_str()],
+                )
+                .unwrap();
+            connection
+                .pragma_update(None, "foreign_keys", true)
+                .unwrap();
+        }
+
+        store
+            .set_task_failure_reason(
+                &task_id,
+                Some("native multi-agent capability is unavailable"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.task(&task_id).unwrap().failure_reason.as_deref(),
+            Some("native multi-agent capability is unavailable")
+        );
     }
 
     fn operator_outcome(run_id: &RunId, key: &str, code: &str) -> NewOperatorOutcome {

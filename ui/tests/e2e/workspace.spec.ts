@@ -125,6 +125,58 @@ test("makes a prepared task's idle architecture state explicit", async ({
   await expect(deepInterview).toBeChecked();
 });
 
+test("shows a blocked thread's durable reason, recovery step, and local lifecycle times", async ({
+  page,
+}) => {
+  await page.route("**/api/v1/runs/run-01JHARNESS", async (route) => {
+    const response = await route.fetch();
+    const detail = await response.json();
+    detail.run = {
+      ...detail.run,
+      state: "BLOCKED",
+      phase: "task_recovery",
+      failure_reason: "the controller needs an operator decision",
+    };
+    detail.tasks = detail.tasks.map((task: Record<string, unknown>) => ({
+      ...task,
+      state: "BLOCKED",
+      failure_reason: "the owner thread exhausted its bounded budget",
+    }));
+    detail.agents = detail.agents.map((agent: Record<string, unknown>) =>
+      agent.id === "agent-worker"
+        ? {
+            ...agent,
+            state: "BLOCKED",
+            failure_reason: "session token budget exhausted",
+            started_at: "2026-08-12T18:05:01Z",
+            completed_at: "2026-08-12T18:09:59Z",
+          }
+        : agent,
+    );
+    await route.fulfill({ response, json: detail });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Runs" }).click();
+  await page
+    .getByRole("combobox", { name: "Governor session" })
+    .selectOption("run-01JHARNESS");
+  await expect(
+    page.getByText("Blocker and next available step", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Why · session token budget exhausted", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText("Use Continue governor below.")).toBeVisible();
+  await expect(page.locator(".run-lifecycle")).toContainText(
+    "Local time · started",
+  );
+  await expect(page.getByText(/Local · start .* → done/).first()).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Continue governor" }),
+  ).toBeVisible();
+});
+
 test("completes a deep interview and hands the confirmed brief to planning", async ({
   page,
 }) => {

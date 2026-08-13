@@ -6,7 +6,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -32,6 +32,9 @@ const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STDERR_TAIL_BYTES: usize = 64 * 1024;
 const MAX_STDERR_LINE_BYTES: usize = 64 * 1024;
 const MAX_CONSECUTIVE_PROTOCOL_ERRORS: u8 = 3;
+/// Keep passive account telemetry fresh without relaunching an App Server for
+/// every account on every dashboard poll. A manual refresh bypasses this cap.
+const ACCOUNT_TELEMETRY_REFRESH_INTERVAL_MS: i64 = 60_000;
 static NEXT_SCHEMA_PROBE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
@@ -375,7 +378,6 @@ impl CodexSupervisor {
     }
 
     pub async fn account_profile(&self, mut profile: CodexAccountProfile) -> CodexAccountProfile {
-        profile.selected = true;
         let account = self
             .request(
                 "account/read",
@@ -414,12 +416,7 @@ impl CodexSupervisor {
                     "signed_out".to_owned()
                 };
             }
-            Err(error) => {
-                profile.state = "unavailable".to_owned();
-                profile.detail = Some(error.to_string());
-                profile.observed_at = Some(harness_domain::now_ms());
-                return profile;
-            }
+            Err(error) => return account_read_failed(profile, &error.to_string()),
         }
 
         match self.request("account/rateLimits/read", Value::Null).await {
@@ -432,7 +429,7 @@ impl CodexSupervisor {
                         .find_map(|limit| limit.plan_type.clone());
                 }
             }
-            Err(error) => profile.detail = Some(error.to_string()),
+            Err(error) => return rate_limit_refresh_failed(profile, &error.to_string()),
         }
         profile.observed_at = Some(harness_domain::now_ms());
         profile
@@ -523,6 +520,30 @@ impl CodexSupervisor {
     }
 }
 
+fn rate_limit_refresh_failed(
+    mut profile: CodexAccountProfile,
+    detail: &str,
+) -> CodexAccountProfile {
+    // `account/read` may still prove that the identity is signed in, but a
+    // failed limit read must never re-label an older capacity snapshot as new.
+    profile.rate_limits.clear();
+    profile.detail = Some(format!(
+        "account rate-limit telemetry unavailable: {detail}"
+    ));
+    profile.observed_at = Some(harness_domain::now_ms());
+    profile
+}
+
+fn account_read_failed(mut profile: CodexAccountProfile, detail: &str) -> CodexAccountProfile {
+    // A failed identity read also invalidates any capacity inherited from an
+    // older discovery snapshot; it is not a fresh rate-limit observation.
+    profile.state = "unavailable".to_owned();
+    profile.rate_limits.clear();
+    profile.detail = Some(format!("account telemetry unavailable: {detail}"));
+    profile.observed_at = Some(harness_domain::now_ms());
+    profile
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StartThread {
     pub cwd: PathBuf,
@@ -556,6 +577,15 @@ pub trait CodexRuntime: Send + Sync {
             selected_account_id: None,
             accounts: Vec::new(),
         })
+    }
+    /// Refresh all account telemetry. Implementations may coalesce ordinary
+    /// dashboard refreshes; `force` is reserved for an explicit user refresh.
+    async fn refresh_codex_accounts(
+        &self,
+        force: bool,
+    ) -> Result<CodexAccountsSnapshot, CodexError> {
+        let _ = force;
+        self.codex_accounts().await
     }
     async fn select_codex_account(
         &self,
@@ -722,6 +752,7 @@ pub struct CodexRuntimeManager {
     active_account_id: Arc<RwLock<Option<String>>>,
     active: Arc<RwLock<Option<Arc<CodexSupervisor>>>>,
     switch_lock: Arc<Mutex<()>>,
+    account_telemetry_refreshing: Arc<AtomicBool>,
     restart_count: Arc<AtomicU32>,
 }
 
@@ -736,7 +767,7 @@ impl CodexRuntimeManager {
             settings.managed_account_root.as_deref(),
         )
         .await?;
-        let selected = preferred_account_id
+        let mut selected = preferred_account_id
             .and_then(|id| profiles.iter().find(|profile| profile.id == id))
             .or_else(|| {
                 settings.codex_home.as_ref().and_then(|home| {
@@ -748,6 +779,7 @@ impl CodexRuntimeManager {
             .or_else(|| profiles.first())
             .cloned()
             .ok_or(CodexError::NoCodexAccountHomes)?;
+        selected.selected = true;
         let mut selected_settings = settings.clone();
         selected_settings.codex_home = Some(selected.codex_home.clone());
         let supervisor =
@@ -771,6 +803,7 @@ impl CodexRuntimeManager {
             active_account_id: Arc::new(RwLock::new(Some(selected_id))),
             active: Arc::new(RwLock::new(Some(supervisor))),
             switch_lock: Arc::new(Mutex::new(())),
+            account_telemetry_refreshing: Arc::new(AtomicBool::new(false)),
             restart_count: Arc::new(AtomicU32::new(0)),
         })
     }
@@ -871,31 +904,103 @@ impl CodexRuntimeManager {
     }
 
     async fn replace_profile(&self, profile: CodexAccountProfile) {
+        let selected_account_id = self.active_account_id.read().await.clone();
         let mut profiles = self.profiles.write().await;
         for current in profiles.iter_mut() {
-            current.selected = current.id == profile.id;
             if current.id == profile.id {
-                *current = profile.clone();
+                let mut replacement = profile.clone();
+                replacement.selected =
+                    selected_account_id.as_deref() == Some(replacement.id.as_str());
+                *current = replacement;
+            } else {
+                current.selected = selected_account_id.as_deref() == Some(current.id.as_str());
             }
         }
     }
 
-    async fn accounts_snapshot(&self, refresh: bool) -> Result<CodexAccountsSnapshot, CodexError> {
-        self.refresh_discovery().await?;
-        if refresh {
-            let selected_id = self.active_account_id.read().await.clone();
-            let profile = {
-                let profiles = self.profiles.read().await;
-                profiles
-                    .iter()
-                    .find(|profile| Some(profile.id.as_str()) == selected_id.as_deref())
-                    .cloned()
-            };
-            if let Some(profile) = profile {
-                let supervisor = self.active_supervisor().await?;
+    async fn probe_account_profile(&self, profile: CodexAccountProfile) -> CodexAccountProfile {
+        let mut settings = self.settings.as_ref().clone();
+        settings.codex_home = Some(profile.codex_home.clone());
+        // Its only account-specific requests are account/read (without token
+        // refresh) and account/rateLimits/read. It deliberately has no durable
+        // event sink, so observing a non-active account cannot alter run
+        // history or the active account selection.
+        let (sink, mut events) = mpsc::channel(32);
+        let drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
+        let result = match CodexSupervisor::start(settings, sink).await {
+            Ok(supervisor) => {
                 let telemetry = supervisor.account_profile(profile).await;
-                self.replace_profile(telemetry).await;
+                let _ = supervisor.shutdown().await;
+                telemetry
             }
+            Err(error) => CodexAccountProfile {
+                state: "unavailable".to_owned(),
+                rate_limits: Vec::new(),
+                observed_at: Some(harness_domain::now_ms()),
+                detail: Some(format!("account limit telemetry unavailable: {error}")),
+                ..profile
+            },
+        };
+        drain.abort();
+        result
+    }
+
+    async fn refresh_profiles(&self, force: bool) -> Result<(), CodexError> {
+        let selected_id = self.active_account_id.read().await.clone();
+        let now = harness_domain::now_ms();
+        let profiles = self.profiles.read().await.clone();
+        for profile in profiles {
+            let due = force
+                || profile.observed_at.map_or(true, |observed| {
+                    now.saturating_sub(observed) >= ACCOUNT_TELEMETRY_REFRESH_INTERVAL_MS
+                });
+            if !due {
+                continue;
+            }
+            let telemetry = if Some(profile.id.as_str()) == selected_id.as_deref() {
+                self.active_supervisor()
+                    .await?
+                    .account_profile(profile)
+                    .await
+            } else {
+                self.probe_account_profile(profile).await
+            };
+            self.replace_profile(telemetry).await;
+        }
+        Ok(())
+    }
+
+    fn queue_passive_profile_refresh(&self) {
+        if self
+            .account_telemetry_refreshing
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let _guard = manager.switch_lock.lock().await;
+            if let Err(error) = manager.refresh_profiles(false).await {
+                warn!(%error, "passive Codex account telemetry refresh failed");
+            }
+            manager
+                .account_telemetry_refreshing
+                .store(false, Ordering::Release);
+        });
+    }
+
+    async fn accounts_snapshot(
+        &self,
+        refresh: bool,
+        force: bool,
+    ) -> Result<CodexAccountsSnapshot, CodexError> {
+        self.refresh_discovery().await?;
+        if refresh && force {
+            let _guard = self.switch_lock.lock().await;
+            self.refresh_discovery().await?;
+            self.refresh_profiles(true).await?;
+        } else if refresh {
+            self.queue_passive_profile_refresh();
         }
         Ok(CodexAccountsSnapshot {
             selected_account_id: self.active_account_id.read().await.clone(),
@@ -926,7 +1031,7 @@ impl CodexRuntimeManager {
         if let Some(old) = old {
             old.shutdown().await?;
         }
-        self.accounts_snapshot(false).await
+        self.accounts_snapshot(false, false).await
     }
 }
 
@@ -951,7 +1056,14 @@ impl CodexRuntime for CodexRuntimeManager {
     }
 
     async fn codex_accounts(&self) -> Result<CodexAccountsSnapshot, CodexError> {
-        self.accounts_snapshot(true).await
+        self.accounts_snapshot(true, false).await
+    }
+
+    async fn refresh_codex_accounts(
+        &self,
+        force: bool,
+    ) -> Result<CodexAccountsSnapshot, CodexError> {
+        self.accounts_snapshot(true, force).await
     }
 
     async fn select_codex_account(
@@ -1918,6 +2030,23 @@ pub enum CodexError {
 mod tests {
     use super::*;
 
+    fn account_profile(id: &str, selected: bool) -> CodexAccountProfile {
+        CodexAccountProfile {
+            id: id.to_owned(),
+            label: id.to_owned(),
+            codex_home: PathBuf::from(format!("/tmp/{id}")),
+            selected,
+            state: "ready".to_owned(),
+            account_type: None,
+            email: None,
+            plan_type: None,
+            rate_limits: Vec::new(),
+            observed_at: None,
+            detail: None,
+            managed: false,
+        }
+    }
+
     #[test]
     fn request_keys_preserve_string_ids() {
         assert_eq!(request_key(&json!(7)), "7");
@@ -2003,5 +2132,116 @@ mod tests {
         assert_eq!(parsed[0].limit_id, "codex");
         assert_eq!(parsed[0].windows[0].remaining_percent, 96);
         assert_eq!(parsed[0].windows[0].window_duration_mins, Some(10_080));
+    }
+
+    #[test]
+    fn failed_rate_limit_refresh_clears_retained_capacity_before_marking_it_checked() {
+        let mut profile = account_profile("ready", true);
+        profile.rate_limits = vec![CodexRateLimit {
+            limit_id: "codex".to_owned(),
+            limit_name: None,
+            plan_type: Some("pro".to_owned()),
+            windows: vec![CodexRateLimitWindow {
+                kind: "primary".to_owned(),
+                used_percent: 20,
+                remaining_percent: 80,
+                window_duration_mins: None,
+                resets_at: None,
+            }],
+        }];
+
+        let refreshed = rate_limit_refresh_failed(profile, "rate limit RPC timed out");
+
+        assert_eq!(refreshed.state, "ready");
+        assert!(refreshed.rate_limits.is_empty());
+        assert!(refreshed.observed_at.is_some());
+        assert!(
+            refreshed
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("rate limit RPC timed out"))
+        );
+    }
+
+    #[test]
+    fn failed_account_read_clears_retained_capacity_before_marking_it_checked() {
+        let mut profile = account_profile("unavailable", true);
+        profile.rate_limits = vec![CodexRateLimit {
+            limit_id: "codex".to_owned(),
+            limit_name: None,
+            plan_type: Some("pro".to_owned()),
+            windows: vec![CodexRateLimitWindow {
+                kind: "primary".to_owned(),
+                used_percent: 20,
+                remaining_percent: 80,
+                window_duration_mins: None,
+                resets_at: None,
+            }],
+        }];
+
+        let refreshed = account_read_failed(profile, "account RPC timed out");
+
+        assert_eq!(refreshed.state, "unavailable");
+        assert!(refreshed.rate_limits.is_empty());
+        assert!(refreshed.observed_at.is_some());
+        assert!(
+            refreshed
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("account RPC timed out"))
+        );
+    }
+
+    #[tokio::test]
+    async fn refreshing_a_non_active_profile_cannot_change_the_selected_account() {
+        let (durable_sink, _events) = mpsc::channel(1);
+        let manager = CodexRuntimeManager {
+            settings: Arc::new(CodexSettings::default()),
+            durable_sink,
+            profiles: Arc::new(RwLock::new(vec![
+                account_profile("active", true),
+                account_profile("other", false),
+            ])),
+            active_account_id: Arc::new(RwLock::new(Some("active".to_owned()))),
+            active: Arc::new(RwLock::new(None)),
+            switch_lock: Arc::new(Mutex::new(())),
+            account_telemetry_refreshing: Arc::new(AtomicBool::new(false)),
+            restart_count: Arc::new(AtomicU32::new(0)),
+        };
+        let mut refreshed = account_profile("other", true);
+        let observed_at = harness_domain::now_ms();
+        refreshed.observed_at = Some(observed_at);
+        refreshed.rate_limits = vec![CodexRateLimit {
+            limit_id: "codex".to_owned(),
+            limit_name: None,
+            plan_type: Some("pro".to_owned()),
+            windows: Vec::new(),
+        }];
+
+        manager.replace_profile(refreshed).await;
+
+        let profiles = manager.profiles.read().await;
+        assert!(
+            profiles
+                .iter()
+                .find(|profile| profile.id == "active")
+                .unwrap()
+                .selected
+        );
+        assert!(
+            !profiles
+                .iter()
+                .find(|profile| profile.id == "other")
+                .unwrap()
+                .selected
+        );
+        assert_eq!(
+            profiles
+                .iter()
+                .find(|profile| profile.id == "other")
+                .unwrap()
+                .observed_at,
+            Some(observed_at)
+        );
     }
 }

@@ -904,6 +904,22 @@ kbd {
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
 }
+.run-lifecycle {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin-top: 9px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  background: var(--panel);
+  font-size: 10px;
+  line-height: 1.45;
+}
+.run-lifecycle strong {
+  color: var(--soft);
+}
 .improvement-page {
   overflow: auto;
 }
@@ -2034,6 +2050,12 @@ kbd {
 }
 .agent-usage span {
   margin-top: 2px;
+}
+.agent-usage .agent-lifecycle {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  line-height: 1.25;
 }
 .agent-state-cell {
   min-width: 0;

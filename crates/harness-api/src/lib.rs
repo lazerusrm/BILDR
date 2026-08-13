@@ -282,12 +282,24 @@ async fn runtime(
     Ok(Json(state.orchestrator.runtime_status().await))
 }
 
+#[derive(Default, Deserialize)]
+struct CodexAccountsQuery {
+    #[serde(default)]
+    force: bool,
+}
+
 async fn codex_accounts(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    Query(query): Query<CodexAccountsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     authenticate(&state, &headers, false)?;
-    Ok(Json(state.orchestrator.codex_accounts().await?))
+    Ok(Json(
+        state
+            .orchestrator
+            .refresh_codex_accounts(query.force)
+            .await?,
+    ))
 }
 
 async fn select_codex_account(

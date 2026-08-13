@@ -1741,6 +1741,19 @@ impl Orchestrator {
         self.decorate_codex_accounts(snapshot)
     }
 
+    pub async fn refresh_codex_accounts(
+        &self,
+        force: bool,
+    ) -> Result<CodexAccountsSnapshot, OrchestratorError> {
+        let snapshot = self
+            .runtime()
+            .await?
+            .refresh_codex_accounts(force)
+            .await
+            .map_err(OrchestratorError::from)?;
+        self.decorate_codex_accounts(snapshot)
+    }
+
     fn decorate_codex_accounts(
         &self,
         mut snapshot: CodexAccountsSnapshot,
@@ -5295,16 +5308,25 @@ impl Orchestrator {
                 }
                 Err(error) => {
                     warn!(task_id = %task.id, %error, "task start failed");
+                    let reason = bounded_continuity_text(&error.to_string());
                     let current = self.store.task(&task.id)?;
                     if !current.state.is_terminal() {
-                        let _ = self
-                            .store
-                            .transition_task(&task.id, TaskState::NeedsHelp, None);
+                        if let Err(transition_error) =
+                            self.store
+                                .transition_task(&task.id, TaskState::NeedsHelp, None)
+                        {
+                            warn!(task_id = %task.id, %transition_error, "could not mark task needing help after launch failure");
+                        }
+                        if let Err(persist_error) =
+                            self.store.set_task_failure_reason(&task.id, Some(&reason))
+                        {
+                            warn!(task_id = %task.id, %persist_error, "could not persist task launch failure reason");
+                        }
                     }
                     self.emit_run_event(
                         &run,
                         "task.start_failed",
-                        json!({"task_id": task.id, "error": error.to_string()}),
+                        json!({"task_id": task.id, "error": reason}),
                     )?;
                 }
             }
@@ -14581,6 +14603,7 @@ mod tests {
             created_at: "2026-08-11T00:00:00Z".to_owned(),
             started_at: None,
             completed_at: None,
+            failure_reason: None,
             scheduler_paused: false,
             run_token_budget: Some(5_000_000),
             version: 1,

@@ -40,6 +40,8 @@ const ARTIFACT_RUN_CUSTODY_MIGRATION: &str =
     include_str!("../../../migrations/0010_artifact_run_custody.sql");
 const EVALUATION_CUSTODY_REPAIR_MIGRATION: &str =
     include_str!("../../../migrations/0011_evaluation_custody_repair.sql");
+const TASK_FAILURE_REASON_MIGRATION: &str =
+    include_str!("../../../migrations/0012_task_failure_reason.sql");
 
 #[derive(Clone)]
 pub struct Store {
@@ -313,8 +315,13 @@ fn apply_runtime_migrations(connection: &mut Connection) -> Result<(), StoreErro
         transaction.execute_batch(ARTIFACT_RUN_CUSTODY_MIGRATION)?;
         transaction.commit()?;
     }
+    if !table_has_column(connection, "tasks", "failure_reason")? {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(TASK_FAILURE_REASON_MIGRATION)?;
+        transaction.commit()?;
+    }
     connection.execute(
-        "INSERT INTO schema_migrations_meta(key, value) VALUES('runtime_schema_version', '10') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        "INSERT INTO schema_migrations_meta(key, value) VALUES('runtime_schema_version', '11') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         [],
     )?;
     Ok(())
@@ -428,7 +435,7 @@ mod tests {
         assert!(store.check().unwrap().ready);
         drop(store);
         let reopened = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(reopened.migration_version().unwrap(), "10");
+        assert_eq!(reopened.migration_version().unwrap(), "11");
         let has_worktree_fingerprint: bool = reopened
             .connection()
             .unwrap()
@@ -738,7 +745,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let store = Store::open(&database, &temp.path().join("artifacts")).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "10");
+        assert_eq!(store.migration_version().unwrap(), "11");
         for name in [
             "improvement_revisions",
             "improvement_events",
@@ -808,7 +815,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "10");
+        assert_eq!(store.migration_version().unwrap(), "11");
         for name in [
             "failure_occurrences",
             "failure_clusters",
@@ -868,7 +875,7 @@ mod tests {
         );
         drop(store);
         let reopened = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(reopened.migration_version().unwrap(), "10");
+        assert_eq!(reopened.migration_version().unwrap(), "11");
         assert!(
             reopened
                 .backup(&temp.path().join("v6-backup.sqlite3"))
@@ -907,7 +914,7 @@ mod tests {
         drop(connection);
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "10");
+        assert_eq!(store.migration_version().unwrap(), "11");
         for name in [
             "taskset_revision_memberships",
             "evaluation_runs",
@@ -941,7 +948,7 @@ mod tests {
                 .unwrap()
                 .migration_version()
                 .unwrap(),
-            "10"
+            "11"
         );
         assert!(
             Store::open(&backup, &temp.path().join("backup-artifacts"))
@@ -987,7 +994,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "10");
+        assert_eq!(store.migration_version().unwrap(), "11");
         for name in [
             "policy_champion_bindings",
             "policy_current_champions",
@@ -1136,7 +1143,7 @@ mod tests {
                 .unwrap()
                 .migration_version()
                 .unwrap(),
-            "10"
+            "11"
         );
     }
 
@@ -1225,7 +1232,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "10");
+        assert_eq!(store.migration_version().unwrap(), "11");
         for (table, column) in [
             ("evaluation_runs", "controller_run_id"),
             ("evaluation_samples", "controller_evidence_id"),
@@ -1368,7 +1375,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "10");
+        assert_eq!(store.migration_version().unwrap(), "11");
         let backfilled: bool = store
             .connection()
             .unwrap()
@@ -1395,7 +1402,7 @@ mod tests {
                 .unwrap()
                 .migration_version()
                 .unwrap(),
-            "10"
+            "11"
         );
     }
 
