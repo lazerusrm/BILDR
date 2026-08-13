@@ -761,6 +761,19 @@ export interface RunDetail {
   automatic_plan_approval: boolean;
   preferred_codex_account_id?: string;
   governor_progress?: Record<string, GovernorCheckpoint>;
+  supervision_mode?: "disabled" | "observe_only" | "shadow" | "advisory" | "active_low_risk" | "active";
+  supervisor_snapshot?: SupervisorSnapshot | null;
+}
+
+export interface SupervisorSnapshot {
+  id: string;
+  run_id: string;
+  revision: number;
+  event_cursor: number;
+  trigger_kind: string;
+  payload_sha256: string;
+  byte_length: number;
+  created_at: string;
 }
 
 export interface EvidenceSnapshot {

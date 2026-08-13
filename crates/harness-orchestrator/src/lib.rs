@@ -1,5 +1,7 @@
 //! Deterministic orchestration service for controller-owned Codex work.
 
+mod supervision;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -21,8 +23,9 @@ use harness_domain::{
     AgentRole, AgentSessionId, AgentSummary, ApprovalId, ApprovalSummary, ArtifactId, AttemptId,
     CodexRuntimeStatus, CommandRunId, ComponentStatus, DiffBudget, EvidenceId, ProofTier,
     RepositoryId, RepositorySummary, ResourceClass, ResultClass, RiskLevel, RunId, RunPlan,
-    RunState, RunSummary, RuntimeStatus, SandboxMode, SchedulerStatus, TaskId, TaskPacket,
-    TaskState, TaskSummary, ValidationId, WorktreeId, WorktreeSummary, format_timestamp, now_ms,
+    RunState, RunSummary, RuntimeStatus, SandboxMode, SchedulerStatus, SupervisorMode, TaskId,
+    TaskPacket, TaskState, TaskSummary, ValidationId, WorktreeId, WorktreeSummary,
+    format_timestamp, now_ms,
 };
 use harness_evidence::{EvidenceArtifactInput, EvidenceClaim, EvidenceService};
 use harness_git::{DiffPolicy, GitManager, WorktreeSpec, validate_public_change_metadata};
@@ -202,6 +205,12 @@ fn agent_developer_instructions(role: AgentRole, sandbox: SandboxMode) -> String
         }
         AgentRole::CiTriage => {
             "Classify observed CI evidence and identify the smallest credible next proof."
+        }
+        AgentRole::Supervisor => {
+            "This role is reserved for a read-only supervisory decision after a durable snapshot exists. Do not take action or start subordinate work."
+        }
+        AgentRole::Expert => {
+            "This role is reserved for a bounded read-only advisory escalation. Do not take action or start subordinate work."
         }
     };
     format!(
@@ -491,6 +500,8 @@ pub struct RunDetail {
     pub automatic_plan_approval: bool,
     pub preferred_codex_account_id: Option<String>,
     pub governor_progress: BTreeMap<String, Value>,
+    pub supervision_mode: SupervisorMode,
+    pub supervisor_snapshot: Option<harness_store::SupervisorSnapshotRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -886,6 +897,16 @@ impl Orchestrator {
 
     pub async fn maintenance_tick(&self) -> Result<(), OrchestratorError> {
         let runs = self.store.list_runs(None, false)?;
+        for run in &runs {
+            if let Err(error) = supervision::observe_run(
+                &self.store,
+                &self.config.supervision,
+                self.config.orchestration.max_total_agent_threads,
+                run,
+            ) {
+                warn!(run_id = %run.id, %error, "supervisory observation remains pending");
+            }
+        }
         for run in &runs {
             self.store
                 .heartbeat_run_path_leases(&run.id, self.config.orchestration.lease_ttl_seconds)?;
@@ -2514,6 +2535,8 @@ impl Orchestrator {
             automatic_plan_approval,
             preferred_codex_account_id,
             governor_progress,
+            supervision_mode: self.config.supervision.mode,
+            supervisor_snapshot: self.store.latest_supervisor_snapshot(run_id)?,
         })
     }
 

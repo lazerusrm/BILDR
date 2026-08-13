@@ -91,6 +91,12 @@ id_type!(PromotionId);
 id_type!(RollbackId);
 id_type!(KnowledgeId);
 id_type!(ImprovementEventId);
+id_type!(SupervisorReviewId);
+id_type!(SupervisorSnapshotId);
+id_type!(SupervisorDecisionId);
+id_type!(SupervisorActionId);
+id_type!(ExpertRequestId);
+id_type!(ExpertResponseId);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -539,6 +545,106 @@ pub enum AgentRole {
     Verifier,
     FinalAuditor,
     CiTriage,
+    /// Read-only, proposal-only run-wide supervision. This role is disabled by
+    /// default and must never own implementation work.
+    Supervisor,
+    /// Read-only, advisory-only technical consultation. Expert output is never
+    /// sent directly to a controller action executor.
+    Expert,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorMode {
+    #[default]
+    Disabled,
+    ObserveOnly,
+    Shadow,
+    Advisory,
+    ActiveLowRisk,
+    Active,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorTriggerKind {
+    RunExecutionStarted,
+    GoalRevisionChanged,
+    TaskNeedsHelp,
+    TaskStalled,
+    AttemptFailed,
+    AttemptInterrupted,
+    AgentCompleted,
+    CandidateMaterialized,
+    ValidationCompleted,
+    VerifierCompleted,
+    IntegrationConflict,
+    DependencyUnblocked,
+    ExpertCompleted,
+    ExpertFailed,
+    OperatorSteered,
+    BudgetBoundaryCrossed,
+    NoProgressBoundaryCrossed,
+    ScheduledLivenessReview,
+    Recovery,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorActionKind {
+    Wait,
+    ContinueAttempt,
+    SteerActiveTurn,
+    StartFollowupTurn,
+    RetryFreshAttempt,
+    SpawnExplorer,
+    SpawnReviewer,
+    RerouteAttempt,
+    RequestExpert,
+    RequestReplan,
+    RequestVerification,
+    QueueIntegration,
+    CancelAttempt,
+    PauseForHuman,
+    StopRun,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorActionState {
+    Proposed,
+    PolicyAccepted,
+    PolicyRejected,
+    Executing,
+    Succeeded,
+    Failed,
+    Stale,
+    Canceled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpertRequestState {
+    Proposed,
+    PolicyAccepted,
+    PolicyRejected,
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Inconclusive,
+    Canceled,
+    Stale,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EfficiencyClass {
+    Unknown,
+    Healthy,
+    Watch,
+    Degraded,
+    Stalled,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

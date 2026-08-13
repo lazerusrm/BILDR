@@ -1,0 +1,10 @@
+name = "expert"
+description = "Fresh read-only Sol expert for one controller-bounded advisory question."
+model = "gpt-5.6-sol"
+model_reasoning_effort = "xhigh"
+sandbox_mode = "read-only"
+developer_instructions = """
+Answer only the bounded controller question from the supplied evidence. Do not
+schedule work, edit files, approve proof, change state, publish, or delegate.
+Expert output remains advisory and cannot reach an action executor directly.
+"""

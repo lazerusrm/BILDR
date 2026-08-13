@@ -7,7 +7,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use harness_domain::{ImprovementMode, ImprovementRuntimeStatus, PricingSnapshot, ResourceClass};
+use harness_domain::{
+    ImprovementMode, ImprovementRuntimeStatus, PricingSnapshot, ResourceClass, SupervisorMode,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -36,6 +38,11 @@ pub struct HarnessConfig {
     pub pricing: PricingConfig,
     #[serde(default)]
     pub self_improvement: SelfImprovementConfig,
+    /// Supervisor runtime configuration is intentionally separate from the
+    /// governed self-improvement loop. The only implemented non-disabled mode
+    /// is read-only observation; no model/action route is enabled here.
+    #[serde(default)]
+    pub supervision: SupervisionConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -159,6 +166,134 @@ impl Default for SelfImprovementConfig {
             safety_anchor_sha256: default_frozen_safety_anchor_sha256(),
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisionConfig {
+    #[serde(default)]
+    pub mode: SupervisorMode,
+    #[serde(default = "default_supervision_event_coalesce_seconds")]
+    pub event_coalesce_seconds: u64,
+    #[serde(default = "default_supervision_liveness_seconds")]
+    pub liveness_seconds: u64,
+    #[serde(default = "default_supervision_snapshot_bytes")]
+    pub max_snapshot_bytes: u64,
+    #[serde(default)]
+    pub supervisor: SupervisorRouteConfig,
+    #[serde(default)]
+    pub expert: ExpertRouteConfig,
+}
+
+impl Default for SupervisionConfig {
+    fn default() -> Self {
+        Self {
+            mode: SupervisorMode::Disabled,
+            event_coalesce_seconds: default_supervision_event_coalesce_seconds(),
+            liveness_seconds: default_supervision_liveness_seconds(),
+            max_snapshot_bytes: default_supervision_snapshot_bytes(),
+            supervisor: SupervisorRouteConfig::default(),
+            expert: ExpertRouteConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorRouteConfig {
+    #[serde(default = "default_supervisor_model")]
+    pub model: String,
+    #[serde(default = "default_supervisor_effort")]
+    pub reasoning_effort: String,
+    #[serde(default = "default_read_only_sandbox")]
+    pub sandbox: String,
+    #[serde(default = "default_supervisor_token_budget")]
+    pub token_budget: u64,
+    #[serde(default = "default_supervision_uncertainty_retries")]
+    pub uncertainty_retries: u8,
+}
+
+impl Default for SupervisorRouteConfig {
+    fn default() -> Self {
+        Self {
+            model: default_supervisor_model(),
+            reasoning_effort: default_supervisor_effort(),
+            sandbox: default_read_only_sandbox(),
+            token_budget: default_supervisor_token_budget(),
+            uncertainty_retries: default_supervision_uncertainty_retries(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpertRouteConfig {
+    #[serde(default = "default_expert_model")]
+    pub model: String,
+    #[serde(default = "default_expert_effort")]
+    pub reasoning_effort: String,
+    #[serde(default = "default_read_only_sandbox")]
+    pub sandbox: String,
+    #[serde(default = "default_expert_token_budget")]
+    pub token_budget: u64,
+    #[serde(default)]
+    pub max_children: u8,
+}
+
+impl Default for ExpertRouteConfig {
+    fn default() -> Self {
+        Self {
+            model: default_expert_model(),
+            reasoning_effort: default_expert_effort(),
+            sandbox: default_read_only_sandbox(),
+            token_budget: default_expert_token_budget(),
+            max_children: 0,
+        }
+    }
+}
+
+const fn default_supervision_event_coalesce_seconds() -> u64 {
+    2
+}
+
+const fn default_supervision_liveness_seconds() -> u64 {
+    300
+}
+
+const fn default_supervision_snapshot_bytes() -> u64 {
+    65_536
+}
+
+fn default_supervisor_model() -> String {
+    "gpt-5.6-terra".to_owned()
+}
+
+fn default_supervisor_effort() -> String {
+    "high".to_owned()
+}
+
+fn default_read_only_sandbox() -> String {
+    "read-only".to_owned()
+}
+
+const fn default_supervisor_token_budget() -> u64 {
+    24_000
+}
+
+const fn default_supervision_uncertainty_retries() -> u8 {
+    1
+}
+
+fn default_expert_model() -> String {
+    "gpt-5.6-sol".to_owned()
+}
+
+fn default_expert_effort() -> String {
+    "xhigh".to_owned()
+}
+
+const fn default_expert_token_budget() -> u64 {
+    80_000
 }
 
 fn default_frozen_safety_anchor_sha256() -> String {
@@ -392,6 +527,7 @@ impl HarnessConfig {
                 "lease TTL must be greater than the non-zero heartbeat interval".to_owned(),
             ));
         }
+        self.validate_supervision()?;
         for snapshot in &self.pricing.snapshots {
             snapshot.to_domain()?;
         }
@@ -409,6 +545,51 @@ impl HarnessConfig {
             &self.self_improvement.safety_anchor_sha256,
             anchor_match,
         )
+    }
+
+    fn validate_supervision(&self) -> Result<(), ProfileError> {
+        let supervision = &self.supervision;
+        if !matches!(
+            supervision.mode,
+            SupervisorMode::Disabled | SupervisorMode::ObserveOnly
+        ) {
+            return Err(ProfileError::Validation(
+                "supervision modes shadow, advisory, active_low_risk, and active are not compiled into this release"
+                    .to_owned(),
+            ));
+        }
+        if !(1..=60).contains(&supervision.event_coalesce_seconds)
+            || supervision.liveness_seconds < supervision.event_coalesce_seconds
+            || supervision.liveness_seconds > 3_600
+            || !(4_096..=262_144).contains(&supervision.max_snapshot_bytes)
+        {
+            return Err(ProfileError::Validation(
+                "supervision coalescing, liveness, or snapshot bounds are invalid".to_owned(),
+            ));
+        }
+        if supervision.supervisor.model != "gpt-5.6-terra"
+            || supervision.supervisor.reasoning_effort != "high"
+            || supervision.supervisor.sandbox != "read-only"
+            || supervision.supervisor.token_budget == 0
+            || supervision.supervisor.uncertainty_retries != 1
+        {
+            return Err(ProfileError::Validation(
+                "supervisor route must be fixed to gpt-5.6-terra/high/read-only with one uncertainty retry"
+                    .to_owned(),
+            ));
+        }
+        if supervision.expert.model != "gpt-5.6-sol"
+            || supervision.expert.reasoning_effort != "xhigh"
+            || supervision.expert.sandbox != "read-only"
+            || supervision.expert.token_budget == 0
+            || supervision.expert.max_children != 0
+        {
+            return Err(ProfileError::Validation(
+                "expert route must be fixed to gpt-5.6-sol/xhigh/read-only with zero children"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn resolve_paths(&self) -> Result<ResolvedPaths, ProfileError> {
@@ -1001,6 +1182,27 @@ mod tests {
         let unsupported =
             DEFAULT_CONFIG.replace("mode = \"disabled\"", "mode = \"shadow_allowed\"");
         assert!(toml::from_str::<HarnessConfig>(&unsupported).is_err());
+    }
+
+    #[test]
+    fn supervision_defaults_disabled_and_rejects_unimplemented_or_writable_routes() {
+        let config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
+        assert_eq!(config.supervision.mode, SupervisorMode::Disabled);
+        config.validate().expect("disabled supervision validates");
+
+        let mut config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
+        config.supervision.mode = SupervisorMode::Shadow;
+        assert!(config.validate().is_err());
+
+        let mut config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
+        config.supervision.mode = SupervisorMode::ObserveOnly;
+        config.supervision.supervisor.sandbox = "workspace-write".to_owned();
+        assert!(config.validate().is_err());
+
+        let mut config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
+        config.supervision.mode = SupervisorMode::ObserveOnly;
+        config.supervision.expert.max_children = 1;
+        assert!(config.validate().is_err());
     }
 
     #[test]

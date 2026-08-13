@@ -3,6 +3,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   LiveTurnTelemetry,
+  SupervisorObservationPanel,
   accountOptionLabel,
   agentEffort,
   agentModel,
@@ -27,7 +28,7 @@ import {
   tone,
   workStatusSummary,
 } from "./App";
-import type { Agent, Run, Task, Worktree } from "./types";
+import type { Agent, Run, RunDetail, Task, Worktree } from "./types";
 
 describe("workspace presentation helpers", () => {
   it("keeps terminal and active run states distinct", () => {
@@ -75,6 +76,38 @@ describe("workspace presentation helpers", () => {
       nextStep:
         "Use Continue governor below. You can add a decision or new fact and choose the next attempt budget before continuing.",
     });
+  });
+
+  it("states the supervisory safety boundary and displays only a durable snapshot receipt", () => {
+    const disabled = renderToStaticMarkup(
+      createElement(SupervisorObservationPanel, {
+        detail: { supervision_mode: "disabled" } as RunDetail,
+      }),
+    );
+    expect(disabled).toContain("Supervision is disabled");
+    expect(disabled).toContain("no automatic action is available");
+
+    const observing = renderToStaticMarkup(
+      createElement(SupervisorObservationPanel, {
+        detail: {
+          supervision_mode: "observe_only",
+          supervisor_snapshot: {
+            id: "snapshot-1",
+            run_id: "run-1",
+            revision: 3,
+            event_cursor: 42,
+            trigger_kind: "attempt_failed",
+            payload_sha256: "a".repeat(64),
+            byte_length: 512,
+            created_at: "2026-08-13T18:00:00Z",
+          },
+        } as RunDetail,
+      }),
+    );
+    expect(observing).toContain("Observe-only custody");
+    expect(observing).toContain("Terra, Sol, and automatic actions remain off");
+    expect(observing).toContain("Latest snapshot r3");
+    expect(observing).toContain("Event 42");
   });
 
   it("offers a concrete recovery for an interrupted plan review before tasks exist", () => {

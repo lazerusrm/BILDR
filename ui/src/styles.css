@@ -918,6 +918,56 @@ kbd {
   line-height: 1.45;
 }
 
+.supervisor-observation {
+  margin-top: 10px;
+  padding: 13px 14px;
+  border: 1px solid color-mix(in srgb, var(--cyan) 44%, var(--line));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--cyan) 5%, var(--panel));
+}
+
+.supervisor-observation header {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.supervisor-observation header > div:nth-child(2) {
+  flex: 1;
+}
+
+.supervisor-observation h2 {
+  margin: 2px 0 4px;
+  font-size: 15px;
+}
+
+.supervisor-observation p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.supervisor-observation-icon {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  color: var(--cyan);
+  background: color-mix(in srgb, var(--cyan) 14%, transparent);
+}
+
+.supervisor-observation-receipt {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 11px;
+  padding-top: 10px;
+  border-top: 1px solid color-mix(in srgb, var(--cyan) 22%, var(--line));
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .blocked-run-recovery {
   margin-top: 10px;
   border: 1px solid color-mix(in srgb, var(--warn) 54%, var(--line));

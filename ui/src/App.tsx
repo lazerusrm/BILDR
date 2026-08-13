@@ -2243,6 +2243,7 @@ function RunWorkspace({
         <strong>Run lifecycle</strong>
         <span>{runLifecycleSummary(run)}</span>
       </div>
+      <SupervisorObservationPanel detail={detail} />
       <BlockedRunRecoveryPanel
         detail={detail}
         busy={busy}
@@ -3270,6 +3271,46 @@ export function blockedPlanRecovery(run: Run, planDigest?: string) {
     };
   }
   return undefined;
+}
+
+export function SupervisorObservationPanel({ detail }: { detail: RunDetail }) {
+  const mode = detail.supervision_mode || "disabled";
+  const snapshot = detail.supervisor_snapshot;
+  const observing = mode === "observe_only";
+  return (
+    <section className="supervisor-observation" aria-label="Supervisory observation">
+      <header>
+        <div className="supervisor-observation-icon" aria-hidden="true">
+          <Database size={17} />
+        </div>
+        <div>
+          <div className="eyebrow">Supervisory observation</div>
+          <h2>{observing ? "Observe-only custody" : "Supervision is disabled"}</h2>
+          <p>
+            {observing
+              ? "Immutable controller snapshots are being recorded. Terra, Sol, and automatic actions remain off."
+              : "No supervisory model is running, no snapshot is being recorded, and no automatic action is available."}
+          </p>
+        </div>
+        <StatusBadge value={observing ? "OBSERVE ONLY" : "DISABLED"} />
+      </header>
+      {snapshot && (
+        <div className="supervisor-observation-receipt">
+          <span>
+            Latest snapshot r{snapshot.revision} · {formatLocalTimestamp(snapshot.created_at)}
+          </span>
+          <span>Trigger: {humanizeSupervisorTrigger(snapshot.trigger_kind)}</span>
+          <span title={snapshot.payload_sha256}>
+            Event {snapshot.event_cursor} · SHA-256 {snapshot.payload_sha256.slice(0, 12)}…
+          </span>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function humanizeSupervisorTrigger(trigger: string) {
+  return trigger.replaceAll("_", " ");
 }
 
 function BlockedRunRecoveryPanel({

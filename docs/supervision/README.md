@@ -35,6 +35,7 @@ event or scheduled liveness boundary requires judgment.
 - [IMPLEMENTATION_PLAN_1_FOUNDATIONS.md](IMPLEMENTATION_PLAN_1_FOUNDATIONS.md) — SO-001 through SO-003.
 - [IMPLEMENTATION_PLAN_2_RUNTIME.md](IMPLEMENTATION_PLAN_2_RUNTIME.md) — SO-004 through SO-006.
 - [IMPLEMENTATION_PLAN_3_PRODUCTIZATION.md](IMPLEMENTATION_PLAN_3_PRODUCTIZATION.md) — SO-007 through SO-009.
+- [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) — the exact safe foundation delivered now and deferred runtime authority.
 - [RESEARCH.md](RESEARCH.md) — source-backed rationale and open empirical questions.
 
 ## Existing Governor compatibility
