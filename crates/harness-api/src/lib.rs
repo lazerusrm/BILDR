@@ -11,7 +11,9 @@ use axum::{
     routing::{get, post},
 };
 use harness_domain::{
-    AgentRole, AgentSessionId, ApprovalId, RepositoryId, RunId, TaskId, WorktreeId,
+    AgentRole, AgentSessionId, ApprovalId, ArtifactId, OutcomeClassification, OutcomeDimension,
+    OutcomeId, OutcomeSubject, RepositoryId, RunId, TaskId, WorktreeId, is_safe_outcome_identifier,
+    is_safe_outcome_reason_code,
 };
 use harness_orchestrator::{
     ApprovalDecisionRequest, ApproveSignoffRequest, AttestAcceptanceRequest, CreateRunRequest,
@@ -179,6 +181,35 @@ pub fn router(orchestrator: Arc<Orchestrator>) -> Router {
             post(preserve_worktree),
         )
         .route("/api/v1/runs/{run_id}/evidence", get(run_evidence))
+        .route(
+            "/api/v1/improvement/outcomes",
+            get(list_outcomes).post(record_operator_outcome),
+        )
+        .route(
+            "/api/v1/improvement/outcomes/{outcome_id}",
+            get(outcome_history),
+        )
+        .route("/api/v1/improvement/failures", get(list_failure_overview))
+        .route(
+            "/api/v1/improvement/traces/{trace_id}",
+            get(get_failure_trace),
+        )
+        .route(
+            "/api/v1/improvement/evaluations/runs/{evaluation_run_id}",
+            get(get_evaluation_run),
+        )
+        .route(
+            "/api/v1/improvement/evaluations/samples/{sample_id}",
+            get(get_evaluation_sample),
+        )
+        .route(
+            "/api/v1/improvement/evaluations/cases/{case_revision_id}",
+            get(get_evaluation_case),
+        )
+        .route(
+            "/api/v1/improvement/evaluations/occurrences/{occurrence_id}",
+            get(get_evaluation_occurrence_source),
+        )
         .route(
             "/api/v1/runs/{run_id}/evidence/export",
             post(export_evidence),
@@ -1161,6 +1192,709 @@ async fn run_evidence(
     ))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutcomeVectorQuery {
+    run_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FailureOverviewQuery {
+    repository_id: String,
+}
+
+#[derive(Serialize)]
+struct FailureOverviewResponse {
+    taxonomy_version: &'static str,
+    classified_occurrences: u64,
+    unknown_occurrences: u64,
+    clusters: Vec<FailureClusterResponse>,
+}
+
+#[derive(Serialize)]
+struct FailureClusterResponse {
+    id: String,
+    failure_class: String,
+    frequency: u64,
+    severity: String,
+    cost_upper_microusd: Option<u64>,
+    unknown_cost_occurrences: u64,
+    representative_occurrence_id: Option<String>,
+    representative_run_id: Option<String>,
+    representative_trace_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct FailureTraceResponse {
+    trace_id: String,
+    run_id: String,
+    rows: Vec<FailureTraceRowResponse>,
+    outcomes: harness_domain::OutcomeVector,
+}
+
+#[derive(Serialize)]
+struct FailureTraceRowResponse {
+    id: String,
+    kind: String,
+    timestamp_ms: Option<i64>,
+    redaction_class: String,
+    source_receipt_count: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordOperatorOutcomeBody {
+    run_id: String,
+    subject: OutcomeSubject,
+    dimension: OutcomeDimension,
+    classification: OutcomeClassification,
+    code: String,
+    #[serde(default)]
+    reason_code: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    correction_artifact_id: Option<String>,
+    supersedes: Vec<String>,
+    idempotency_key: String,
+}
+
+async fn list_outcomes(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<OutcomeVectorQuery>,
+) -> Result<Json<harness_domain::OutcomeVector>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    validate_outcome_read_identifier(&query.run_id, "run_id")?;
+    let vector = state
+        .orchestrator
+        .store()
+        .outcome_vector(&RunId::from(query.run_id))?;
+    validate_outcome_vector_response(&vector)?;
+    Ok(Json(vector))
+}
+
+async fn list_failure_overview(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<FailureOverviewQuery>,
+) -> Result<Json<FailureOverviewResponse>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    validate_failure_read_identifier(&query.repository_id, "repository_id")?;
+    let clusters = state
+        .orchestrator
+        .store()
+        .failure_cluster_overview(&RepositoryId::from(query.repository_id))?;
+    let mut classified_occurrences = 0;
+    let mut unknown_occurrences = 0;
+    let clusters = clusters
+        .into_iter()
+        .map(|cluster| -> Result<FailureClusterResponse, ApiError> {
+            let failure_class = cluster
+                .effective_class
+                .filter(|value| closed_failure_class(value))
+                .unwrap_or_else(|| "unknown".to_owned());
+            if failure_class == "unknown" {
+                unknown_occurrences += cluster.occurrences;
+            } else {
+                classified_occurrences += cluster.occurrences;
+            }
+            Ok(FailureClusterResponse {
+                id: checked_failure_identifier(cluster.cluster_id, "cluster id")?,
+                failure_class,
+                frequency: cluster.occurrences,
+                severity: cluster
+                    .severity
+                    .filter(|value| closed_severity(value))
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                cost_upper_microusd: (cluster.cost_upper_microusd > 0
+                    || cluster.unknown_cost_occurrences == 0)
+                    .then_some(cluster.cost_upper_microusd),
+                unknown_cost_occurrences: cluster.unknown_cost_occurrences,
+                representative_occurrence_id: cluster
+                    .representative_occurrence_id
+                    .map(|id| checked_failure_identifier(id, "occurrence id"))
+                    .transpose()?,
+                representative_run_id: cluster
+                    .representative_run_id
+                    .map(|id| checked_failure_identifier(id.to_string(), "run id"))
+                    .transpose()?,
+                representative_trace_id: cluster
+                    .representative_trace_id
+                    .map(|id| checked_failure_identifier(id, "trace id"))
+                    .transpose()?,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(Json(FailureOverviewResponse {
+        taxonomy_version: "harness.failure-taxonomy.v1",
+        classified_occurrences,
+        unknown_occurrences,
+        clusters,
+    }))
+}
+
+async fn get_failure_trace(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(trace_id): Path<String>,
+) -> Result<Json<FailureTraceResponse>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    validate_failure_read_identifier(&trace_id, "trace_id")?;
+    let composition = state
+        .orchestrator
+        .store()
+        .failure_trace_composition(&trace_id)?;
+    validate_outcome_vector_response(&composition.outcomes)?;
+    let rows = closed_trace_rows(&composition.trace_manifest)?;
+    Ok(Json(FailureTraceResponse {
+        trace_id: checked_failure_identifier(composition.trace_id, "trace id")?,
+        run_id: checked_failure_identifier(composition.run_id.to_string(), "run id")?,
+        rows,
+        outcomes: composition.outcomes,
+    }))
+}
+
+/// Receipt-only M2 read models.  These intentionally omit fixture locators,
+/// commands, evidence bodies, artifacts, and any executor controls.
+#[derive(Serialize)]
+struct EvaluationRunResponse {
+    id: String,
+    controller_run_id: String,
+    taskset_revision_id: String,
+    grader_bundle_revision_id: String,
+    split: String,
+    status: String,
+    invalidated: bool,
+}
+
+#[derive(Serialize)]
+struct EvaluationSampleResponse {
+    id: String,
+    evaluation_run_id: String,
+    eval_case_revision_id: String,
+    arm: String,
+    seed: u64,
+    classification: String,
+    sample_digest: String,
+    invalidated: bool,
+}
+
+#[derive(Serialize)]
+struct EvaluationCaseResponse {
+    revision_id: String,
+    case_id: String,
+    revision: u64,
+    payload_sha256: String,
+    case_sha256: String,
+    split: String,
+    task_family: String,
+    base_sha: String,
+    setup_digest: String,
+    grader_bundle_id: String,
+    grader_bundle_revision: u64,
+    grader_bundle_digest: String,
+}
+
+#[derive(Serialize)]
+struct EvaluationOccurrenceSourceResponse {
+    occurrence_id: String,
+    repository_id: String,
+    run_id: String,
+    base_sha: String,
+    source_receipt_sha256: String,
+    source_kind: String,
+    trace_revision_id: Option<String>,
+    trace_digest: Option<String>,
+    outcome_revision_id: Option<String>,
+    outcome_digest: Option<String>,
+}
+
+async fn get_evaluation_run(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(evaluation_run_id): Path<String>,
+) -> Result<Json<EvaluationRunResponse>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    validate_failure_read_identifier(&evaluation_run_id, "run id")?;
+    let value = state
+        .orchestrator
+        .store()
+        .evaluation_run(&evaluation_run_id)?;
+    Ok(Json(EvaluationRunResponse {
+        id: checked_failure_identifier(value.id, "evaluation run id")?,
+        controller_run_id: checked_failure_identifier(
+            value.controller_run_id.to_string(),
+            "controller run id",
+        )?,
+        taskset_revision_id: checked_failure_identifier(
+            value.taskset_revision_id,
+            "taskset revision id",
+        )?,
+        grader_bundle_revision_id: checked_failure_identifier(
+            value.grader_bundle_revision_id,
+            "grader revision id",
+        )?,
+        split: closed_eval_split(value.split)?,
+        status: closed_evaluation_run_status(value.status)?,
+        invalidated: value.invalidated,
+    }))
+}
+
+async fn get_evaluation_sample(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(sample_id): Path<String>,
+) -> Result<Json<EvaluationSampleResponse>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    validate_failure_read_identifier(&sample_id, "sample id")?;
+    let value = state.orchestrator.store().evaluation_sample(&sample_id)?;
+    Ok(Json(EvaluationSampleResponse {
+        id: checked_failure_identifier(value.id, "sample id")?,
+        evaluation_run_id: checked_failure_identifier(
+            value.evaluation_run_id,
+            "evaluation run id",
+        )?,
+        eval_case_revision_id: checked_failure_identifier(
+            value.eval_case_revision_id,
+            "case revision id",
+        )?,
+        arm: closed_evaluation_arm(value.arm)?,
+        seed: value.seed,
+        classification: closed_sample_classification(value.classification)?,
+        sample_digest: checked_digest(value.sample_digest, "sample digest")?,
+        invalidated: value.invalidated,
+    }))
+}
+
+async fn get_evaluation_case(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(case_revision_id): Path<String>,
+) -> Result<Json<EvaluationCaseResponse>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    validate_failure_read_identifier(&case_revision_id, "case revision id")?;
+    let value = state
+        .orchestrator
+        .store()
+        .immutable_eval_case_revision(&case_revision_id)?;
+    let wire = value.wire;
+    Ok(Json(EvaluationCaseResponse {
+        revision_id: checked_failure_identifier(value.id, "case revision id")?,
+        case_id: checked_failure_identifier(wire.case_id, "case id")?,
+        revision: wire.revision,
+        payload_sha256: checked_digest(value.payload_sha256, "case payload digest")?,
+        case_sha256: checked_digest(wire.sha256, "case digest")?,
+        split: closed_eval_split(wire.split)?,
+        task_family: checked_failure_identifier(wire.task_family, "task family")?,
+        base_sha: checked_base_sha(wire.runtime.base_sha)?,
+        setup_digest: checked_digest(wire.runtime.setup_digest, "setup digest")?,
+        grader_bundle_id: checked_failure_identifier(wire.grader_bundle_id, "grader bundle id")?,
+        grader_bundle_revision: wire.grader_bundle_revision,
+        grader_bundle_digest: checked_digest(wire.grader_bundle_digest, "grader bundle digest")?,
+    }))
+}
+
+async fn get_evaluation_occurrence_source(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(occurrence_id): Path<String>,
+) -> Result<Json<EvaluationOccurrenceSourceResponse>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    validate_failure_read_identifier(&occurrence_id, "occurrence id")?;
+    let value = state
+        .orchestrator
+        .store()
+        .failure_development_case_source(&occurrence_id)?;
+    Ok(Json(EvaluationOccurrenceSourceResponse {
+        occurrence_id: checked_failure_identifier(value.occurrence_id, "occurrence id")?,
+        repository_id: checked_failure_identifier(
+            value.repository_id.to_string(),
+            "repository id",
+        )?,
+        run_id: checked_failure_identifier(value.run_id.to_string(), "run id")?,
+        base_sha: checked_base_sha(value.base_sha)?,
+        source_receipt_sha256: checked_digest(
+            value.source_receipt_sha256,
+            "source receipt digest",
+        )?,
+        source_kind: closed_failure_source_kind(value.source_kind)?,
+        trace_revision_id: value
+            .trace_revision_id
+            .map(|id| checked_failure_identifier(id, "trace revision id"))
+            .transpose()?,
+        trace_digest: value
+            .trace_digest
+            .map(|digest| checked_digest(digest, "trace digest"))
+            .transpose()?,
+        outcome_revision_id: value
+            .outcome_revision_id
+            .map(|id| checked_failure_identifier(id, "outcome revision id"))
+            .transpose()?,
+        outcome_digest: value
+            .outcome_digest
+            .map(|digest| checked_digest(digest, "outcome digest"))
+            .transpose()?,
+    }))
+}
+
+fn closed_eval_split(value: harness_eval::Split) -> Result<String, ApiError> {
+    Ok(match value {
+        harness_eval::Split::Training => "training",
+        harness_eval::Split::Development => "development",
+        harness_eval::Split::Holdout => "holdout",
+        harness_eval::Split::Canary => "canary",
+        harness_eval::Split::Quarantine => "quarantine",
+    }
+    .to_owned())
+}
+
+fn closed_evaluation_arm(value: harness_store::EvaluationArm) -> Result<String, ApiError> {
+    Ok(match value {
+        harness_store::EvaluationArm::Champion => "champion",
+        harness_store::EvaluationArm::Challenger => "challenger",
+    }
+    .to_owned())
+}
+
+fn closed_evaluation_run_status(
+    value: harness_store::EvaluationRunStatus,
+) -> Result<String, ApiError> {
+    Ok(match value {
+        harness_store::EvaluationRunStatus::Recording => "recording",
+        harness_store::EvaluationRunStatus::Completed => "completed",
+        harness_store::EvaluationRunStatus::InfrastructureUnavailable => {
+            "infrastructure_unavailable"
+        }
+        harness_store::EvaluationRunStatus::Invalidated => "invalidated",
+    }
+    .to_owned())
+}
+
+fn closed_sample_classification(
+    value: harness_eval::SampleClassification,
+) -> Result<String, ApiError> {
+    Ok(match value {
+        harness_eval::SampleClassification::Pass => "pass",
+        harness_eval::SampleClassification::Fail => "fail",
+        harness_eval::SampleClassification::InfrastructureUnavailable => {
+            "infrastructure_unavailable"
+        }
+        harness_eval::SampleClassification::Invalidated => "invalidated",
+    }
+    .to_owned())
+}
+
+fn closed_failure_source_kind(value: String) -> Result<String, ApiError> {
+    matches!(
+        value.as_str(),
+        "attempt_terminal" | "run_terminal" | "typed_outcome"
+    )
+    .then_some(value)
+    .ok_or_else(|| ApiError::internal("persisted failure source kind is invalid"))
+}
+
+fn checked_digest(value: String, field: &str) -> Result<String, ApiError> {
+    (value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+    .then_some(value)
+    .ok_or_else(|| ApiError::internal(&format!("persisted {field} is invalid")))
+}
+
+fn checked_base_sha(value: String) -> Result<String, ApiError> {
+    (value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+    .then_some(value)
+    .ok_or_else(|| ApiError::internal("persisted base SHA is invalid"))
+}
+
+fn closed_trace_rows(manifest: &Value) -> Result<Vec<FailureTraceRowResponse>, ApiError> {
+    let nodes = manifest
+        .get("nodes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::internal("persisted trace nodes are invalid"))?;
+    nodes
+        .iter()
+        .map(|node| {
+            let node = node
+                .as_object()
+                .ok_or_else(|| ApiError::internal("persisted trace node is invalid"))?;
+            let id = node
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| is_safe_failure_identifier(value, 128))
+                .ok_or_else(|| ApiError::internal("persisted trace node id is invalid"))?;
+            let kind = node
+                .get("kind")
+                .and_then(Value::as_str)
+                .filter(|value| closed_trace_kind(value))
+                .ok_or_else(|| ApiError::internal("persisted trace node kind is invalid"))?;
+            let redaction_class = node
+                .get("redaction_class")
+                .and_then(Value::as_str)
+                .filter(|value| closed_redaction_class(value))
+                .ok_or_else(|| ApiError::internal("persisted trace redaction class is invalid"))?;
+            let timestamp_ms = match node.get("timestamp_ms") {
+                Some(Value::Null) => None,
+                Some(value) => Some(value.as_i64().ok_or_else(|| {
+                    ApiError::internal("persisted trace node timestamp is invalid")
+                })?),
+                None => {
+                    return Err(ApiError::internal(
+                        "persisted trace node timestamp is missing",
+                    ));
+                }
+            };
+            let source_receipt_count = node
+                .get("source_receipts")
+                .and_then(Value::as_array)
+                .filter(|receipts| !receipts.is_empty())
+                .ok_or_else(|| ApiError::internal("persisted trace node receipts are invalid"))?
+                .len()
+                .try_into()
+                .map_err(|_| ApiError::internal("persisted trace node receipt count is invalid"))?;
+            Ok(FailureTraceRowResponse {
+                id: id.to_owned(),
+                kind: kind.to_owned(),
+                timestamp_ms,
+                redaction_class: redaction_class.to_owned(),
+                source_receipt_count,
+            })
+        })
+        .collect()
+}
+
+fn closed_failure_class(value: &str) -> bool {
+    matches!(
+        value,
+        "unknown"
+            | "policy_blocked"
+            | "budget_exhausted"
+            | "infrastructure_unavailable"
+            | "protocol_error"
+            | "integration_conflict"
+            | "source_failure"
+            | "inconclusive"
+            | "cancelled_superseded"
+    )
+}
+
+fn closed_severity(value: &str) -> bool {
+    matches!(value, "unknown" | "low" | "medium" | "high" | "critical")
+}
+
+fn closed_redaction_class(value: &str) -> bool {
+    matches!(
+        value,
+        "none"
+            | "secret_removed"
+            | "private_reasoning_removed"
+            | "customer_data_removed"
+            | "content_withheld"
+    )
+}
+
+fn closed_trace_kind(value: &str) -> bool {
+    matches!(
+        value,
+        "system_message"
+            | "developer_message"
+            | "user_message"
+            | "model_message"
+            | "reasoning_summary"
+            | "tool_request"
+            | "tool_result"
+            | "command"
+            | "file_read"
+            | "file_change"
+            | "approval_request"
+            | "approval_decision"
+            | "compaction"
+            | "subagent_spawn"
+            | "subagent_join"
+            | "validation"
+            | "finding"
+            | "operator_feedback"
+            | "outcome"
+            | "unknown_protocol"
+            | "run_lifecycle"
+            | "attempt_boundary"
+            | "runtime_restart"
+    )
+}
+
+fn is_safe_failure_identifier(value: &str, maximum_length: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum_length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+}
+
+fn validate_failure_read_identifier(value: &str, field: &str) -> Result<(), ApiError> {
+    if is_safe_failure_identifier(value, 128) {
+        Ok(())
+    } else {
+        Err(OrchestratorError::Validation(format!("invalid failure {field}")).into())
+    }
+}
+
+fn checked_failure_identifier(value: String, field: &str) -> Result<String, ApiError> {
+    validate_failure_read_identifier(&value, field)?;
+    Ok(value)
+}
+
+async fn outcome_history(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(outcome_id): Path<String>,
+) -> Result<Json<harness_domain::OutcomeHistory>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    validate_outcome_read_identifier(&outcome_id, "outcome_id")?;
+    let history = state
+        .orchestrator
+        .store()
+        .outcome_history(&OutcomeId::from(outcome_id))?;
+    validate_outcome_history_response(&history)?;
+    Ok(Json(history))
+}
+
+async fn record_operator_outcome(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<RecordOperatorOutcomeBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    validate_operator_outcome_request(&body)?;
+    let receipt =
+        state
+            .orchestrator
+            .store()
+            .record_operator_outcome(&harness_store::NewOperatorOutcome {
+                run_id: RunId::from(body.run_id),
+                subject: body.subject,
+                dimension: body.dimension,
+                classification: body.classification,
+                code: body.code,
+                reason_code: body.reason_code,
+                note: body.note,
+                correction_artifact_id: body.correction_artifact_id.map(ArtifactId::from),
+                supersedes: body.supersedes,
+                actor: "local-user".to_owned(),
+                idempotency_key: body.idempotency_key,
+            })?;
+    Ok((StatusCode::CREATED, Json(receipt)))
+}
+
+fn validate_operator_outcome_request(body: &RecordOperatorOutcomeBody) -> Result<(), ApiError> {
+    if !is_safe_outcome_identifier(&body.run_id, 128)
+        || !is_safe_outcome_identifier(&body.subject.id, 128)
+        || body.code.trim().is_empty()
+        || body.code.chars().count() > 80
+        || body
+            .reason_code
+            .as_ref()
+            .is_some_and(|code| !is_safe_outcome_reason_code(code))
+        || body
+            .note
+            .as_ref()
+            .is_some_and(|note| note.chars().count() > 1_000)
+        || !is_safe_outcome_identifier(&body.idempotency_key, 200)
+        || body
+            .supersedes
+            .iter()
+            .any(|id| !is_safe_outcome_identifier(id, 128))
+    {
+        return Err(OrchestratorError::Validation(
+            "invalid bounded operator outcome request".to_owned(),
+        )
+        .into());
+    }
+    if !matches!(
+        body.dimension,
+        OutcomeDimension::OperatorAcceptance
+            | OutcomeDimension::OperatorCorrection
+            | OutcomeDimension::ReviewRegression
+            | OutcomeDimension::PrReopened
+            | OutcomeDimension::Rollback
+            | OutcomeDimension::DownstreamRegression
+    ) {
+        return Err(OrchestratorError::Validation(
+            "clients may record only operator outcome dimensions".to_owned(),
+        )
+        .into());
+    }
+    harness_domain::validate_operator_outcome_label(
+        body.dimension,
+        body.classification,
+        &body.code,
+    )
+    .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
+    Ok(())
+}
+
+fn validate_outcome_vector_response(
+    vector: &harness_domain::OutcomeVector,
+) -> Result<(), ApiError> {
+    if !is_safe_outcome_identifier(vector.run_id.as_str(), 128)
+        || vector.items.iter().any(|item| {
+            !is_safe_outcome_identifier(item.outcome_id.as_str(), 128)
+                || item.revisions.is_empty()
+                || item.revisions.iter().any(|revision| {
+                    revision.revision == 0
+                        || !is_safe_outcome_identifier(&revision.revision_id, 128)
+                        || revision.outcome.outcome_id != item.outcome_id
+                        || revision.outcome.run_id != vector.run_id
+                        || revision.outcome.subject != item.subject
+                        || revision.outcome.dimension != item.dimension
+                        || revision.outcome.validate().is_err()
+                })
+        })
+    {
+        return Err(OrchestratorError::Validation(
+            "stored outcome response violates the closed OutcomeV1 contract".to_owned(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_outcome_read_identifier(value: &str, field: &str) -> Result<(), ApiError> {
+    if is_safe_outcome_identifier(value, 128) {
+        Ok(())
+    } else {
+        Err(OrchestratorError::Validation(format!("invalid outcome {field}")).into())
+    }
+}
+
+fn validate_outcome_history_response(
+    history: &harness_domain::OutcomeHistory,
+) -> Result<(), ApiError> {
+    validate_outcome_vector_response(&harness_domain::OutcomeVector {
+        run_id: history.run_id.clone(),
+        items: vec![harness_domain::OutcomeVectorItem {
+            outcome_id: history.outcome_id.clone(),
+            subject: history
+                .revisions
+                .first()
+                .map(|revision| revision.outcome.subject.clone())
+                .ok_or_else(|| OrchestratorError::Validation("empty outcome history".to_owned()))?,
+            dimension: history
+                .revisions
+                .first()
+                .map(|revision| revision.outcome.dimension)
+                .ok_or_else(|| OrchestratorError::Validation("empty outcome history".to_owned()))?,
+            revisions: history.revisions.clone(),
+            conflicted: history.conflicted,
+        }],
+    })
+}
+
 async fn export_evidence(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1461,5 +2195,151 @@ mod tests {
     fn operator_notes_are_bounded() {
         assert!(reject_long_note(Some(&"x".repeat(4_000))).is_ok());
         assert!(reject_long_note(Some(&"x".repeat(4_001))).is_err());
+    }
+
+    #[test]
+    fn operator_outcomes_are_closed_and_identifier_safe() {
+        let body = RecordOperatorOutcomeBody {
+            run_id: "01JOUTCOME".to_owned(),
+            subject: OutcomeSubject {
+                kind: harness_domain::OutcomeSubjectKind::Run,
+                id: "01JOUTCOME".to_owned(),
+            },
+            dimension: OutcomeDimension::OperatorAcceptance,
+            classification: OutcomeClassification::Positive,
+            code: "accepted_after_correction".to_owned(),
+            reason_code: Some("verification_gap_corrected".to_owned()),
+            note: Some("operator note".to_owned()),
+            correction_artifact_id: None,
+            supersedes: vec!["revision_1".to_owned()],
+            idempotency_key: "outcome-1".to_owned(),
+        };
+        assert!(validate_operator_outcome_request(&body).is_ok());
+
+        let mut automated = body;
+        automated.dimension = OutcomeDimension::CiRequiredChecks;
+        automated.code = "passed".to_owned();
+        assert!(validate_operator_outcome_request(&automated).is_err());
+        automated.dimension = OutcomeDimension::OperatorAcceptance;
+        automated.code = "accepted_after_correction".to_owned();
+        automated.reason_code = Some("free text is unsafe".to_owned());
+        assert!(validate_operator_outcome_request(&automated).is_err());
+
+        assert!(validate_outcome_read_identifier("run_01", "run_id").is_ok());
+        assert!(validate_outcome_read_identifier("run/../01", "run_id").is_err());
+        assert!(validate_outcome_read_identifier("outcome space", "outcome_id").is_err());
+    }
+
+    #[test]
+    fn failure_trace_rows_are_closed_and_payload_free() {
+        let manifest = json!({
+            "nodes": [{
+                "id": "n_01",
+                "kind": "tool_result",
+                "timestamp_ms": 42,
+                "redaction_class": "content_withheld",
+                "source_receipts": ["r_1", "r_2"],
+                "payload": {"token": "not returned"}
+            }]
+        });
+        let rows = closed_trace_rows(&manifest).expect("closed trace rows");
+        let response = serde_json::to_value(rows).expect("serialize rows");
+        assert_eq!(response[0]["source_receipt_count"], 2);
+        assert!(response.to_string().contains("tool_result"));
+        assert!(!response.to_string().contains("not returned"));
+        assert!(
+            closed_trace_rows(
+                &json!({"nodes": [{"id": "n_01", "kind": "untrusted", "redaction_class": "none"}]})
+            )
+            .is_err()
+        );
+        assert!(closed_trace_rows(
+            &json!({"nodes": [{"id": "n_01", "kind": "tool_result", "timestamp_ms": "never", "redaction_class": "none", "source_receipts": ["r_1"]}]})
+        )
+        .is_err());
+        assert!(closed_trace_rows(
+            &json!({"nodes": [{"id": "n_01", "kind": "tool_result", "timestamp_ms": null, "redaction_class": "none", "source_receipts": []}]})
+        )
+        .is_err());
+        assert!(validate_failure_read_identifier("trace:01J", "trace_id").is_ok());
+        assert!(validate_failure_read_identifier("trace/01J", "trace_id").is_err());
+    }
+
+    #[test]
+    fn evaluation_read_models_are_receipt_only_and_closed() {
+        let run = serde_json::to_value(EvaluationRunResponse {
+            id: "evaluation-run-1".into(),
+            controller_run_id: "run-1".into(),
+            taskset_revision_id: "taskset-revision-1".into(),
+            grader_bundle_revision_id: "grader-revision-1".into(),
+            split: "development".into(),
+            status: "completed".into(),
+            invalidated: false,
+        })
+        .unwrap();
+        assert_eq!(run["status"], "completed");
+        assert_eq!(run.as_object().unwrap().len(), 7);
+        let sample = serde_json::to_value(EvaluationSampleResponse {
+            id: "sample-1".into(),
+            evaluation_run_id: "evaluation-run-1".into(),
+            eval_case_revision_id: "case-revision-1".into(),
+            arm: "challenger".into(),
+            seed: 7,
+            classification: "pass".into(),
+            sample_digest: "f".repeat(64),
+            invalidated: false,
+        })
+        .unwrap();
+        assert_eq!(sample["classification"], "pass");
+        assert_eq!(sample.as_object().unwrap().len(), 8);
+        let response = EvaluationCaseResponse {
+            revision_id: "case-revision-1".into(),
+            case_id: "case-1".into(),
+            revision: 1,
+            payload_sha256: "a".repeat(64),
+            case_sha256: "b".repeat(64),
+            split: "development".into(),
+            task_family: "context".into(),
+            base_sha: "c".repeat(40),
+            setup_digest: "d".repeat(64),
+            grader_bundle_id: "grader-1".into(),
+            grader_bundle_revision: 1,
+            grader_bundle_digest: "e".repeat(64),
+        };
+        let value = serde_json::to_value(response).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 12);
+        for forbidden in ["fixture", "command", "evidence", "artifact", "objective"] {
+            assert!(!object.contains_key(forbidden));
+        }
+        let occurrence = serde_json::to_value(EvaluationOccurrenceSourceResponse {
+            occurrence_id: "occurrence-1".into(),
+            repository_id: "repository-1".into(),
+            run_id: "run-1".into(),
+            base_sha: "f".repeat(40),
+            source_receipt_sha256: "a".repeat(64),
+            source_kind: "run_terminal".into(),
+            trace_revision_id: Some("trace-1".into()),
+            trace_digest: Some("b".repeat(64)),
+            outcome_revision_id: None,
+            outcome_digest: None,
+        })
+        .unwrap();
+        let occurrence = occurrence.as_object().unwrap();
+        assert_eq!(occurrence.len(), 10);
+        assert!(!occurrence.contains_key("source_domain_event_id"));
+        assert!(checked_digest("A".repeat(64), "digest").is_err());
+        assert!(checked_base_sha("a".repeat(39)).is_err());
+        assert_eq!(
+            closed_evaluation_run_status(
+                harness_store::EvaluationRunStatus::InfrastructureUnavailable
+            )
+            .unwrap(),
+            "infrastructure_unavailable"
+        );
+        assert_eq!(
+            closed_sample_classification(harness_eval::SampleClassification::Fail).unwrap(),
+            "fail"
+        );
     }
 }

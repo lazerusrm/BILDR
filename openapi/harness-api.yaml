@@ -21,6 +21,7 @@ tags:
   - name: Evidence
   - name: Usage
   - name: Events
+  - name: Improvement
 paths:
   /health:
     get:
@@ -1033,6 +1034,143 @@ paths:
           content:
             text/event-stream:
               schema: {type: string}
+  /improvement/outcomes:
+    get:
+      tags: [Improvement]
+      operationId: listOutcomeVector
+      parameters:
+        - name: run_id
+          in: query
+          required: true
+          schema: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+      responses:
+        '200':
+          description: Redacted current outcome vector; conflicting heads remain visible.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OutcomeVector'}
+    post:
+      tags: [Improvement]
+      operationId: recordOperatorOutcome
+      description: Only an operator assertion may be submitted. Automated sources are resolved server-side from typed records.
+      parameters:
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RecordOperatorOutcomeRequest'}
+      responses:
+        '201':
+          description: Sanitized operator action and append-only outcome revision recorded.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OutcomeRevisionReceipt'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /improvement/outcomes/{outcomeId}:
+    get:
+      tags: [Improvement]
+      operationId: getOutcomeHistory
+      parameters:
+        - name: outcomeId
+          in: path
+          required: true
+          schema: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+      responses:
+        '200':
+          description: Redacted append-only revision history.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OutcomeHistory'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /improvement/failures:
+    get:
+      tags: [Improvement]
+      operationId: listFailureOverview
+      description: Read-only, redacted failure-cluster overview for one repository.
+      parameters:
+        - name: repository_id
+          in: query
+          required: true
+          schema: {type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+      responses:
+        '200':
+          description: Durable failure observations and bounded cluster summaries.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/FailureOverview'}
+  /improvement/traces/{traceId}:
+    get:
+      tags: [Improvement]
+      operationId: getFailureTrace
+      description: Read-only redacted TraceV2 node summaries and linked outcome vector. Raw payloads are never returned.
+      parameters:
+        - name: traceId
+          in: path
+          required: true
+          schema: {type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+      responses:
+        '200':
+          description: Redacted trace summary with outcomes.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/FailureTrace'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /improvement/evaluations/runs/{evaluationRunId}:
+    get:
+      tags: [Improvement]
+      operationId: getEvaluationRun
+      description: Receipt-only evaluation run summary. It never returns executor inputs or evidence payloads.
+      parameters:
+        - name: evaluationRunId
+          in: path
+          required: true
+          schema: {$ref: '#/components/schemas/OpaqueId'}
+      responses:
+        '200': {description: Closed evaluation run receipt., content: {application/json: {schema: {$ref: '#/components/schemas/EvaluationRunSummary'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /improvement/evaluations/samples/{sampleId}:
+    get:
+      tags: [Improvement]
+      operationId: getEvaluationSample
+      description: Receipt-only evaluation sample summary. Evidence and artifact payloads are never returned.
+      parameters:
+        - name: sampleId
+          in: path
+          required: true
+          schema: {$ref: '#/components/schemas/OpaqueId'}
+      responses:
+        '200': {description: Closed evaluation sample receipt., content: {application/json: {schema: {$ref: '#/components/schemas/EvaluationSampleSummary'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /improvement/evaluations/cases/{caseRevisionId}:
+    get:
+      tags: [Improvement]
+      operationId: getEvaluationCase
+      description: Immutable evaluation-case receipt summary; fixture locator, objective, setup and command bodies are excluded.
+      parameters:
+        - name: caseRevisionId
+          in: path
+          required: true
+          schema: {$ref: '#/components/schemas/OpaqueId'}
+      responses:
+        '200': {description: Closed immutable evaluation case receipt., content: {application/json: {schema: {$ref: '#/components/schemas/EvaluationCaseSummary'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /improvement/evaluations/occurrences/{occurrenceId}:
+    get:
+      tags: [Improvement]
+      operationId: getEvaluationOccurrenceSource
+      description: Controller-derived source receipt for a known failure occurrence; this does not materialize or execute a case.
+      parameters:
+        - name: occurrenceId
+          in: path
+          required: true
+          schema: {$ref: '#/components/schemas/OpaqueId'}
+      responses:
+        '200': {description: Closed occurrence source receipt., content: {application/json: {schema: {$ref: '#/components/schemas/EvaluationOccurrenceSource'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
 components:
   securitySchemes:
     LocalSession:
@@ -1102,6 +1240,275 @@ components:
         application/json:
           schema: {$ref: '#/components/schemas/Problem'}
   schemas:
+    OpaqueId:
+      type: string
+      pattern: '^[A-Za-z0-9_.:-]{1,128}$'
+    Digest:
+      type: string
+      pattern: '^[0-9a-f]{64}$'
+    EvaluationRunSummary:
+      type: object
+      additionalProperties: false
+      required: [id, controller_run_id, taskset_revision_id, grader_bundle_revision_id, split, status, invalidated]
+      properties:
+        id: {$ref: '#/components/schemas/OpaqueId'}
+        controller_run_id: {$ref: '#/components/schemas/OpaqueId'}
+        taskset_revision_id: {$ref: '#/components/schemas/OpaqueId'}
+        grader_bundle_revision_id: {$ref: '#/components/schemas/OpaqueId'}
+        split: {enum: [training, development, holdout, canary, quarantine]}
+        status: {enum: [recording, completed, infrastructure_unavailable, invalidated]}
+        invalidated: {type: boolean}
+    EvaluationSampleSummary:
+      type: object
+      additionalProperties: false
+      required: [id, evaluation_run_id, eval_case_revision_id, arm, seed, classification, sample_digest, invalidated]
+      properties:
+        id: {$ref: '#/components/schemas/OpaqueId'}
+        evaluation_run_id: {$ref: '#/components/schemas/OpaqueId'}
+        eval_case_revision_id: {$ref: '#/components/schemas/OpaqueId'}
+        arm: {enum: [champion, challenger]}
+        seed: {type: integer, minimum: 0}
+        classification: {enum: [pass, fail, infrastructure_unavailable, invalidated]}
+        sample_digest: {$ref: '#/components/schemas/Digest'}
+        invalidated: {type: boolean}
+    EvaluationCaseSummary:
+      type: object
+      additionalProperties: false
+      required: [revision_id, case_id, revision, payload_sha256, case_sha256, split, task_family, base_sha, setup_digest, grader_bundle_id, grader_bundle_revision, grader_bundle_digest]
+      properties:
+        revision_id: {$ref: '#/components/schemas/OpaqueId'}
+        case_id: {$ref: '#/components/schemas/OpaqueId'}
+        revision: {type: integer, minimum: 1}
+        payload_sha256: {$ref: '#/components/schemas/Digest'}
+        case_sha256: {$ref: '#/components/schemas/Digest'}
+        split: {enum: [training, development, holdout, canary, quarantine]}
+        task_family: {$ref: '#/components/schemas/OpaqueId'}
+        base_sha: {type: string, pattern: '^[0-9a-f]{40}$'}
+        setup_digest: {$ref: '#/components/schemas/Digest'}
+        grader_bundle_id: {$ref: '#/components/schemas/OpaqueId'}
+        grader_bundle_revision: {type: integer, minimum: 1}
+        grader_bundle_digest: {$ref: '#/components/schemas/Digest'}
+    EvaluationOccurrenceSource:
+      type: object
+      additionalProperties: false
+      required: [occurrence_id, repository_id, run_id, base_sha, source_receipt_sha256, source_kind, trace_revision_id, trace_digest, outcome_revision_id, outcome_digest]
+      properties:
+        occurrence_id: {$ref: '#/components/schemas/OpaqueId'}
+        repository_id: {$ref: '#/components/schemas/OpaqueId'}
+        run_id: {$ref: '#/components/schemas/OpaqueId'}
+        base_sha: {type: string, pattern: '^[0-9a-f]{40}$'}
+        source_receipt_sha256: {$ref: '#/components/schemas/Digest'}
+        source_kind: {enum: [attempt_terminal, run_terminal, typed_outcome]}
+        trace_revision_id: {type: [string, 'null'], pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        trace_digest: {type: [string, 'null'], pattern: '^[0-9a-f]{64}$'}
+        outcome_revision_id: {type: [string, 'null'], pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        outcome_digest: {type: [string, 'null'], pattern: '^[0-9a-f]{64}$'}
+    RecordOperatorOutcomeRequest:
+      type: object
+      additionalProperties: false
+      required: [run_id, subject, dimension, classification, code, supersedes, idempotency_key]
+      properties:
+        run_id: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+        subject: {$ref: '#/components/schemas/OutcomeSubject'}
+        dimension: {enum: [operator_acceptance, operator_correction, review_regression, pr_reopened, rollback, downstream_regression]}
+        classification: {enum: [positive, negative, neutral, unknown]}
+        code: {type: string, minLength: 1, maxLength: 80}
+        reason_code: {type: [string, 'null'], pattern: '^[a-z0-9_]{1,80}$'}
+        note: {type: [string, 'null'], maxLength: 1000}
+        correction_artifact_id: {type: [string, 'null']}
+        supersedes: {type: array, uniqueItems: true, items: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}}
+        idempotency_key: {type: string, pattern: '^[A-Za-z0-9_.-]{1,200}$'}
+      oneOf:
+        - properties: {dimension: {const: operator_acceptance}, classification: {const: positive}, code: {enum: [accepted_without_correction, accepted_after_correction]}}
+        - properties: {dimension: {const: operator_acceptance}, classification: {const: negative}, code: {enum: [changes_requested, abandoned_wrong, abandoned_cost]}}
+        - properties: {dimension: {const: operator_correction}, classification: {const: neutral}, code: {const: correction_recorded}}
+        - properties: {dimension: {const: operator_correction}, classification: {const: unknown}, code: {const: correction_not_available}}
+        - properties: {dimension: {const: review_regression}, classification: {const: negative}, code: {const: review_regression}}
+        - properties: {dimension: {const: review_regression}, classification: {const: positive}, code: {const: review_no_regression}}
+        - properties: {dimension: {const: pr_reopened}, classification: {const: negative}, code: {const: reopened}}
+        - properties: {dimension: {const: pr_reopened}, classification: {const: positive}, code: {const: not_reopened}}
+        - properties: {dimension: {const: rollback}, classification: {const: negative}, code: {const: rollback_recorded}}
+        - properties: {dimension: {const: rollback}, classification: {const: neutral}, code: {const: no_rollback}}
+        - properties: {dimension: {const: downstream_regression}, classification: {const: negative}, code: {const: downstream_regression}}
+        - properties: {dimension: {const: downstream_regression}, classification: {const: positive}, code: {const: no_downstream_regression}}
+    OutcomeSubject:
+      type: object
+      additionalProperties: false
+      required: [kind, id]
+      properties:
+        kind: {enum: [run, task_attempt, publication]}
+        id: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+    OutcomeVector:
+      type: object
+      additionalProperties: false
+      required: [run_id, items]
+      properties:
+        run_id: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+        items: {type: array, items: {$ref: '#/components/schemas/OutcomeVectorItem'}}
+    FailureOverview:
+      type: object
+      additionalProperties: false
+      required: [taxonomy_version, classified_occurrences, unknown_occurrences, clusters]
+      properties:
+        taxonomy_version: {const: harness.failure-taxonomy.v1}
+        classified_occurrences: {type: integer, minimum: 0}
+        unknown_occurrences: {type: integer, minimum: 0}
+        clusters: {type: array, items: {$ref: '#/components/schemas/FailureClusterSummary'}}
+    FailureClusterSummary:
+      type: object
+      additionalProperties: false
+      required: [id, failure_class, frequency, severity, cost_upper_microusd, unknown_cost_occurrences, representative_occurrence_id, representative_run_id, representative_trace_id]
+      properties:
+        id: {type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        failure_class: {enum: [unknown, policy_blocked, budget_exhausted, infrastructure_unavailable, protocol_error, integration_conflict, source_failure, inconclusive, cancelled_superseded]}
+        frequency: {type: integer, minimum: 0}
+        severity: {enum: [unknown, low, medium, high, critical]}
+        cost_upper_microusd: {type: [integer, 'null'], minimum: 0}
+        unknown_cost_occurrences: {type: integer, minimum: 0}
+        representative_occurrence_id: {type: [string, 'null'], pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        representative_run_id: {type: [string, 'null'], pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        representative_trace_id: {type: [string, 'null'], pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+    FailureTrace:
+      type: object
+      additionalProperties: false
+      required: [trace_id, run_id, rows, outcomes]
+      properties:
+        trace_id: {type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        run_id: {type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        rows: {type: array, items: {$ref: '#/components/schemas/FailureTraceRow'}}
+        outcomes: {$ref: '#/components/schemas/OutcomeVector'}
+    FailureTraceRow:
+      type: object
+      additionalProperties: false
+      required: [id, kind, timestamp_ms, redaction_class, source_receipt_count]
+      properties:
+        id: {type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        kind: {enum: [system_message, developer_message, user_message, model_message, reasoning_summary, tool_request, tool_result, command, file_read, file_change, approval_request, approval_decision, compaction, subagent_spawn, subagent_join, validation, finding, operator_feedback, outcome, unknown_protocol, run_lifecycle, attempt_boundary, runtime_restart]}
+        timestamp_ms: {type: [integer, 'null']}
+        redaction_class: {enum: [none, secret_removed, private_reasoning_removed, customer_data_removed, content_withheld]}
+        source_receipt_count: {type: integer, minimum: 1}
+    OutcomeVectorItem:
+      type: object
+      additionalProperties: false
+      required: [outcome_id, subject, dimension, revisions, conflicted]
+      properties:
+        outcome_id: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+        subject: {$ref: '#/components/schemas/OutcomeSubject'}
+        dimension: {$ref: '#/components/schemas/OutcomeDimension'}
+        revisions: {type: array, items: {$ref: '#/components/schemas/OutcomeRevision'}}
+        conflicted: {type: boolean}
+    OutcomeRevision:
+      type: object
+      additionalProperties: false
+      required: [revision_id, revision, outcome, is_head]
+      properties:
+        revision_id: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+        revision: {type: integer, minimum: 1}
+        outcome: {$ref: '#/components/schemas/OutcomeWireV1'}
+        is_head: {type: boolean}
+    OutcomeHistory:
+      type: object
+      additionalProperties: false
+      required: [outcome_id, run_id, revisions, conflicted]
+      properties:
+        outcome_id: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+        run_id: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+        revisions: {type: array, items: {$ref: '#/components/schemas/OutcomeRevision'}}
+        conflicted: {type: boolean}
+    OutcomeRevisionReceipt:
+      type: object
+      additionalProperties: false
+      required: [outcome_id, revision_id, revision, vector]
+      properties:
+        outcome_id: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+        revision_id: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+        revision: {type: integer, minimum: 1}
+        vector: {$ref: '#/components/schemas/OutcomeVector'}
+    OutcomeDimension:
+      type: string
+      enum: [operator_acceptance, operator_correction, validation, evidence, verifier_findings, completion_state, resource_use, ci_required_checks, review_regression, pr_reopened, rollback, downstream_regression]
+    OutcomeClassification:
+      type: string
+      enum: [positive, negative, neutral, unknown]
+    OutcomeLabel:
+      type: object
+      required: [dimension, classification, code]
+      oneOf:
+        - properties: {dimension: {const: operator_acceptance}, classification: {const: positive}, code: {enum: [accepted_without_correction, accepted_after_correction]}}
+        - properties: {dimension: {const: operator_acceptance}, classification: {const: negative}, code: {enum: [changes_requested, abandoned_wrong, abandoned_cost]}}
+        - properties: {dimension: {const: operator_correction}, classification: {const: neutral}, code: {const: correction_recorded}}
+        - properties: {dimension: {const: operator_correction}, classification: {const: unknown}, code: {const: correction_not_available}}
+        - properties: {dimension: {const: validation}, classification: {const: positive}, code: {const: passed}}
+        - properties: {dimension: {const: validation}, classification: {const: negative}, code: {const: failed}}
+        - properties: {dimension: {const: validation}, classification: {const: unknown}, code: {const: unavailable}}
+        - properties: {dimension: {const: evidence}, classification: {const: positive}, code: {const: proved}}
+        - properties: {dimension: {const: evidence}, classification: {const: negative}, code: {const: unproved}}
+        - properties: {dimension: {const: evidence}, classification: {const: unknown}, code: {const: unavailable}}
+        - properties: {dimension: {const: verifier_findings}, classification: {const: positive}, code: {const: none}}
+        - properties: {dimension: {const: verifier_findings}, classification: {const: negative}, code: {enum: [blocking, nonblocking]}}
+        - properties: {dimension: {const: verifier_findings}, classification: {const: unknown}, code: {const: unavailable}}
+        - properties: {dimension: {const: completion_state}, classification: {const: neutral}, code: {enum: [completed, blocked, stopped]}}
+        - properties: {dimension: {const: completion_state}, classification: {const: unknown}, code: {const: unknown}}
+        - properties: {dimension: {const: resource_use}, classification: {const: neutral}, code: {const: within_budget}}
+        - properties: {dimension: {const: resource_use}, classification: {const: negative}, code: {const: budget_exceeded}}
+        - properties: {dimension: {const: resource_use}, classification: {const: unknown}, code: {const: unavailable}}
+        - properties: {dimension: {const: ci_required_checks}, classification: {const: positive}, code: {const: passed}}
+        - properties: {dimension: {const: ci_required_checks}, classification: {const: negative}, code: {enum: [failed, head_mismatch]}}
+        - properties: {dimension: {const: ci_required_checks}, classification: {const: unknown}, code: {const: unavailable}}
+        - properties: {dimension: {const: review_regression}, classification: {const: negative}, code: {const: review_regression}}
+        - properties: {dimension: {const: review_regression}, classification: {const: positive}, code: {const: review_no_regression}}
+        - properties: {dimension: {const: pr_reopened}, classification: {const: negative}, code: {const: reopened}}
+        - properties: {dimension: {const: pr_reopened}, classification: {const: positive}, code: {const: not_reopened}}
+        - properties: {dimension: {const: rollback}, classification: {const: negative}, code: {const: rollback_recorded}}
+        - properties: {dimension: {const: rollback}, classification: {const: neutral}, code: {const: no_rollback}}
+        - properties: {dimension: {const: downstream_regression}, classification: {const: negative}, code: {const: downstream_regression}}
+        - properties: {dimension: {const: downstream_regression}, classification: {const: positive}, code: {const: no_downstream_regression}}
+    OutcomeSource:
+      type: object
+      additionalProperties: false
+      required: [kind, record_id, record_sha256, source_sha, source_domain_event_id]
+      properties:
+        kind: {enum: [human_action, validation, evidence, finding, publication, domain_event]}
+        record_id: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+        record_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        source_sha: {type: [string, 'null'], pattern: '^[0-9a-f]{40}$'}
+        source_domain_event_id: {type: [integer, 'null'], minimum: 1}
+    OutcomeWireV1:
+      type: object
+      additionalProperties: false
+      required: [schema, outcome_id, run_id, subject, dimension, classification, code, observed_at, confidence, source, supersedes, reason_code, correction_artifact_id, redactor_version, free_text_redacted]
+      properties:
+        schema: {const: harness.outcome.v1}
+        outcome_id: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+        run_id: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+        subject: {$ref: '#/components/schemas/OutcomeSubject'}
+        dimension: {$ref: '#/components/schemas/OutcomeDimension'}
+        classification: {$ref: '#/components/schemas/OutcomeClassification'}
+        code: {type: string, pattern: '^[a-z0-9_]{1,80}$'}
+        observed_at: {type: integer, minimum: 0}
+        confidence: {enum: [authoritative, operator_asserted]}
+        source: {$ref: '#/components/schemas/OutcomeSource'}
+        supersedes: {type: array, uniqueItems: true, items: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}}
+        reason_code: {type: [string, 'null'], pattern: '^[a-z0-9_]{1,80}$'}
+        correction_artifact_id: {type: [string, 'null'], pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+        redactor_version: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+        free_text_redacted: {type: boolean}
+      allOf:
+        - $ref: '#/components/schemas/OutcomeLabel'
+        - if: {properties: {dimension: {const: validation}}}
+          then: {properties: {confidence: {const: authoritative}, source: {properties: {kind: {const: validation}}}}}
+        - if: {properties: {dimension: {const: evidence}}}
+          then: {properties: {confidence: {const: authoritative}, source: {properties: {kind: {const: evidence}}}}}
+        - if: {properties: {dimension: {const: verifier_findings}}}
+          then: {properties: {confidence: {const: authoritative}, source: {properties: {kind: {enum: [finding, domain_event]}}}}}
+        - if: {properties: {dimension: {const: completion_state}}}
+          then: {properties: {confidence: {const: authoritative}, source: {properties: {kind: {const: domain_event}}}}}
+        - if: {properties: {dimension: {const: resource_use}}}
+          then: {properties: {confidence: {const: authoritative}, source: {properties: {kind: {const: domain_event}}}}}
+        - if: {properties: {dimension: {const: ci_required_checks}}}
+          then: {properties: {confidence: {const: authoritative}, source: {properties: {kind: {enum: [validation, evidence]}}}}}
+        - if: {properties: {dimension: {enum: [operator_acceptance, operator_correction, review_regression, pr_reopened, rollback, downstream_regression]}}}
+          then: {properties: {confidence: {const: operator_asserted}, source: {properties: {kind: {const: human_action}}}}}
     GitSha:
       type: string
       pattern: '^[0-9a-f]{40}$'
@@ -1124,30 +1531,35 @@ components:
     RuntimeStatus:
       type: object
       additionalProperties: false
-      required: [daemon, codex, database, scheduler]
+      required: [daemon, codex, database, scheduler, self_improvement]
       properties:
         daemon: {$ref: '#/components/schemas/ComponentStatus'}
         codex: {$ref: '#/components/schemas/CodexRuntime'}
         database: {$ref: '#/components/schemas/ComponentStatus'}
         scheduler: {$ref: '#/components/schemas/SchedulerStatus'}
+        self_improvement: {$ref: '#/components/schemas/SelfImprovementRuntimeStatus'}
     ComponentStatus:
       type: object
       additionalProperties: false
-      required: [state]
+      required: [state, detail]
       properties:
         state: {enum: [ready, degraded, unavailable, disabled]}
-        detail: {type: string}
+        detail: {type: [string, 'null']}
     CodexRuntime:
-      allOf:
-        - {$ref: '#/components/schemas/ComponentStatus'}
-        - type: object
-          properties:
-            version: {type: string}
-            required_version: {type: string}
-            protocol_schema_sha256: {type: string}
-            schema_match: {type: boolean}
-            pid: {type: integer}
-            restart_count: {type: integer}
+      type: object
+      additionalProperties: false
+      required: [state, detail, version, required_version, protocol_schema_sha256, schema_match, native_multi_agent, native_multi_agent_feature, pid, restart_count]
+      properties:
+        state: {enum: [ready, degraded, unavailable, disabled, starting]}
+        detail: {type: [string, 'null']}
+        version: {type: [string, 'null']}
+        required_version: {type: [string, 'null']}
+        protocol_schema_sha256: {type: [string, 'null']}
+        schema_match: {type: boolean}
+        native_multi_agent: {type: boolean}
+        native_multi_agent_feature: {type: [string, 'null']}
+        pid: {type: [integer, 'null']}
+        restart_count: {type: integer}
     SchedulerStatus:
       type: object
       additionalProperties: false
@@ -1161,6 +1573,20 @@ components:
         active_verifiers: {type: integer}
         max_verifiers: {type: integer}
         queued_tasks: {type: integer}
+    SelfImprovementRuntimeStatus:
+      type: object
+      additionalProperties: false
+      required: [configured_mode, effective_mode, anchor_sha256, configured_anchor_sha256, anchor_match, observation_enabled, candidate_generation_enabled, candidate_execution_enabled, detail]
+      properties:
+        configured_mode: {enum: [disabled, observe_only]}
+        effective_mode: {enum: [disabled, observe_only]}
+        anchor_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        configured_anchor_sha256: {type: string}
+        anchor_match: {type: boolean}
+        observation_enabled: {type: boolean}
+        candidate_generation_enabled: {type: boolean}
+        candidate_execution_enabled: {type: boolean}
+        detail: {type: [string, 'null']}
     CodexAccountsSnapshot:
       type: object
       additionalProperties: false

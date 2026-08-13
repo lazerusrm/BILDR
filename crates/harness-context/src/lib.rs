@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const MAX_SOURCE_BYTES: u64 = 512 * 1024;
+const MAX_INLINE_SOURCE_BYTES: usize = 64 * 1024;
 const MAX_CONTEXT_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_PROBE_BYTES: usize = 256 * 1024;
 const MAX_PROBE_BYTES: usize = 4 * 1024 * 1024;
@@ -29,6 +30,8 @@ pub struct ContextSource {
     pub sha256: Option<String>,
     pub bytes: u64,
     pub included: bool,
+    #[serde(default)]
+    pub receipt_only: bool,
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
@@ -72,7 +75,11 @@ impl ContextPacket {
             output.push('\n');
         }
         output.push_str("\n<repository_evidence>\n");
-        for source in self.sources.iter().filter(|source| source.included) {
+        for source in self
+            .sources
+            .iter()
+            .filter(|source| source.included && !source.receipt_only)
+        {
             output.push_str("\n<source>\nPath: ");
             output.push_str(&source.path);
             output.push_str("\nKind: ");
@@ -88,7 +95,33 @@ impl ContextPacket {
             }
             output.push_str("</source>\n");
         }
-        output.push_str("</repository_evidence>\n\nContext receipt:\nPacket: ");
+        output.push_str("</repository_evidence>\n");
+        for source in self
+            .sources
+            .iter()
+            .filter(|source| source.included && source.receipt_only)
+        {
+            let mandatory_authority = matches!(
+                source.kind.as_str(),
+                "instruction" | "global_authority" | "task_authority" | "domain_authority"
+            );
+            output.push_str(if mandatory_authority {
+                "\n<mandatory_authority_receipt>\nPath: "
+            } else {
+                "\n<source_receipt>\nPath: "
+            });
+            output.push_str(&source.path);
+            output.push_str("\nSHA-256: ");
+            output.push_str(source.sha256.as_deref().unwrap_or("unavailable"));
+            output.push_str("\nBytes: ");
+            output.push_str(&source.bytes.to_string());
+            if mandatory_authority {
+                output.push_str("\nThis mandatory authority is exact-head-bound and available in the current leased worktree. Before a decision governed by it, use targeted rg and bounded line reads.\n</mandatory_authority_receipt>\n");
+            } else {
+                output.push_str("\nThis exact-head-bound source is available in the current leased worktree. Use targeted rg and bounded line reads before changing behavior it governs.\n</source_receipt>\n");
+            }
+        }
+        output.push_str("\nContext receipt:\nPacket: ");
         output.push_str(&self.digest);
         output.push_str("\nBase SHA: ");
         output.push_str(&self.base_sha);
@@ -148,6 +181,10 @@ impl ContextCompiler {
 
         for (path, kind, explicitly_promoted) in selected {
             let normalized = normalize_relative(&path)?;
+            let profile_receipt_only = profile
+                .receipt_only_authorities
+                .iter()
+                .any(|authority| authority == &normalized);
             if !tracked_set.contains(normalized.as_str()) {
                 sources.push(excluded_source(
                     normalized,
@@ -189,6 +226,7 @@ impl ContextCompiler {
                     sha256: None,
                     bytes: metadata.len(),
                     included: false,
+                    receipt_only: false,
                     reason: "source exceeds per-file context limit".to_owned(),
                     content: None,
                 });
@@ -202,19 +240,8 @@ impl ContextCompiler {
                     sha256: Some(digest(&bytes)),
                     bytes: bytes.len() as u64,
                     included: false,
+                    receipt_only: false,
                     reason: "binary source".to_owned(),
-                    content: None,
-                });
-                continue;
-            }
-            if included_bytes.saturating_add(bytes.len()) > self.max_context_bytes {
-                sources.push(ContextSource {
-                    path: normalized,
-                    kind,
-                    sha256: Some(digest(&bytes)),
-                    bytes: bytes.len() as u64,
-                    included: false,
-                    reason: "context packet byte budget exhausted".to_owned(),
                     content: None,
                 });
                 continue;
@@ -226,6 +253,38 @@ impl ContextCompiler {
                 instruction_hasher.update(sha256.as_bytes());
                 instruction_hasher.update([0]);
             }
+            let receipt_only = profile_receipt_only || bytes.len() > MAX_INLINE_SOURCE_BYTES;
+            if receipt_only {
+                sources.push(ContextSource {
+                    path: normalized,
+                    kind,
+                    sha256: Some(sha256),
+                    bytes: bytes.len() as u64,
+                    included: true,
+                    receipt_only: true,
+                    reason: if profile_receipt_only {
+                        "selected by repository profile; body omitted by receipt-only policy".to_owned()
+                    } else {
+                        "source exceeds inline prompt threshold; body omitted by receipt-only policy"
+                            .to_owned()
+                    },
+                    content: None,
+                });
+                continue;
+            }
+            if included_bytes.saturating_add(bytes.len()) > self.max_context_bytes {
+                sources.push(ContextSource {
+                    path: normalized,
+                    kind,
+                    sha256: Some(sha256),
+                    bytes: bytes.len() as u64,
+                    included: false,
+                    receipt_only: false,
+                    reason: "context packet byte budget exhausted".to_owned(),
+                    content: None,
+                });
+                continue;
+            }
             included_bytes += bytes.len();
             sources.push(ContextSource {
                 path: normalized,
@@ -233,6 +292,7 @@ impl ContextCompiler {
                 sha256: Some(sha256),
                 bytes: bytes.len() as u64,
                 included: true,
+                receipt_only: false,
                 reason: if explicitly_promoted {
                     "explicit task authority".to_owned()
                 } else {
@@ -695,6 +755,7 @@ fn excluded_source(path: String, kind: String, reason: &str) -> ContextSource {
         sha256: None,
         bytes: 0,
         included: false,
+        receipt_only: false,
         reason: reason.to_owned(),
         content: None,
     }
@@ -763,6 +824,57 @@ pub enum ContextError {
 mod tests {
     use super::*;
 
+    fn task_with_file(path: &str) -> TaskPacket {
+        TaskPacket {
+            schema: "harness.orchestration.task.v1".to_owned(),
+            program_id: "test".to_owned(),
+            task_id: "task".to_owned(),
+            title: "test".to_owned(),
+            state: "ready".to_owned(),
+            priority: "P1".to_owned(),
+            execution_mode: "controller".to_owned(),
+            owner_profile: "worker".to_owned(),
+            reviewer_profile: "verifier".to_owned(),
+            checklist_rows: vec![],
+            authority_refs: vec![],
+            base_sha: String::new(),
+            dependency_shas: BTreeMap::new(),
+            depends_on: vec![],
+            owned_paths: vec![path.to_owned()],
+            forbidden_paths: vec![],
+            reserved_serial_paths: vec![],
+            objective: "test context".to_owned(),
+            milestones: vec![],
+            non_goals: vec![],
+            success_criteria: vec![],
+            required_positive_tests: vec![],
+            required_negative_tests: vec![],
+            required_metrics: vec![],
+            required_evidence: vec![],
+            proof_limits: vec![],
+            diff_budget: harness_domain::DiffBudget { files: 0, lines: 0 },
+            token_budget: 1,
+            tool_budget: None,
+            lease_expires_at: "test".to_owned(),
+            stop_conditions: vec![],
+            handoff_path: "controller://test".to_owned(),
+            risk_flags: vec![],
+        }
+    }
+
+    fn git(repository: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(repository)
+            .args(args)
+            .output()
+            .expect("git starts");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn archive_is_not_implicitly_active() {
         assert!(is_archive_path("docs/archive/old-contract.md"));
@@ -811,6 +923,7 @@ mod tests {
                 sha256: Some("source-digest".to_owned()),
                 bytes: 18,
                 included: true,
+                receipt_only: false,
                 reason: "selected".to_owned(),
                 content: Some("stable source text".to_owned()),
             }],
@@ -830,5 +943,100 @@ mod tests {
         assert!(receipt < volatile_digest);
         assert!(prompt.contains("<repository_evidence>"));
         assert!(prompt.contains("Controller-protected semantics:"));
+    }
+
+    #[test]
+    fn receipt_only_authority_keeps_its_digest_without_inlining_the_body() {
+        let packet = ContextPacket {
+            schema: "harness-context/v1".to_owned(),
+            base_sha: "base-sha".to_owned(),
+            task_id: "ARCHITECTURE".to_owned(),
+            profile_id: "bildr".to_owned(),
+            profile_digest: "profile-digest".to_owned(),
+            instruction_digest: "instruction-digest".to_owned(),
+            sources: vec![ContextSource {
+                path: "ARCHITECTURE_AND_IMPLEMENTATION_PLAN.md".to_owned(),
+                kind: "instruction".to_owned(),
+                sha256: Some("source-digest".to_owned()),
+                bytes: 109_444,
+                included: true,
+                receipt_only: true,
+                reason: "receipt-only policy".to_owned(),
+                content: Some("receipt-only body must not appear".to_owned()),
+            }],
+            repository_map: RepositoryMap::default(),
+            protected_semantics: vec![],
+            context_bytes: 0,
+            estimated_tokens: 0,
+            digest: "packet-digest".to_owned(),
+        };
+
+        let prompt = packet.prompt_prefix();
+        assert!(prompt.contains("<mandatory_authority_receipt>"));
+        assert!(prompt.contains("ARCHITECTURE_AND_IMPLEMENTATION_PLAN.md"));
+        assert!(prompt.contains("source-digest"));
+        assert!(prompt.contains("mandatory authority is exact-head-bound"));
+        assert!(prompt.contains("targeted rg and bounded line reads"));
+        assert!(!prompt.contains("receipt-only body must not appear"));
+    }
+
+    #[test]
+    fn large_task_sources_are_receipted_while_short_task_sources_stay_inline() {
+        let repository = tempfile::tempdir().expect("temporary repository");
+        git(repository.path(), &["init", "-q"]);
+        let large = "large-body\n".repeat((MAX_INLINE_SOURCE_BYTES / "large-body\n".len()) + 1);
+        fs::write(repository.path().join("large.txt"), &large).expect("large source");
+        fs::write(repository.path().join("short.txt"), "short-body\n").expect("short source");
+        git(repository.path(), &["add", "."]);
+        git(
+            repository.path(),
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "context fixture",
+            ],
+        );
+        let base_sha = git_text(repository.path(), ["rev-parse", "HEAD"]).expect("base SHA");
+        let profile = harness_profile::load_profile("general", repository.path())
+            .expect("general profile")
+            .profile;
+        let compiler = ContextCompiler::default();
+
+        let large_packet = compiler
+            .compile(
+                repository.path(),
+                &base_sha,
+                &task_with_file("large.txt"),
+                &profile,
+                "profile-digest",
+            )
+            .expect("large context compiles");
+        let large_source = large_packet.sources.first().expect("large source receipt");
+        assert!(large_source.included && large_source.receipt_only);
+        assert!(large_source.sha256.is_some());
+        assert!(large_source.content.is_none());
+        assert_eq!(large_packet.context_bytes, 0);
+        let large_prompt = large_packet.prompt_prefix();
+        assert!(large_prompt.contains("<source_receipt>"));
+        assert!(!large_prompt.contains("<mandatory_authority_receipt>"));
+        assert!(!large_prompt.contains("large-body"));
+
+        let short_packet = compiler
+            .compile(
+                repository.path(),
+                &base_sha,
+                &task_with_file("short.txt"),
+                &profile,
+                "profile-digest",
+            )
+            .expect("short context compiles");
+        let short_source = short_packet.sources.first().expect("short source");
+        assert!(short_source.included && !short_source.receipt_only);
+        assert_eq!(short_source.content.as_deref(), Some("short-body\n"));
+        assert_eq!(short_packet.context_bytes, 11);
     }
 }

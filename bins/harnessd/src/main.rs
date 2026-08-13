@@ -18,12 +18,15 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use clap::{Parser, Subcommand};
+use evaluation::EvaluationService;
 use harness_codex::{
     CodexRuntime, CodexRuntimeManager, CodexSettings, EventKind, probe_compatibility,
 };
 use harness_orchestrator::Orchestrator;
 use harness_profile::{HarnessConfig, ResolvedPaths, load_profile};
+use harness_runner::{CommandRunner, EvaluationIsolationReceipt, EvaluationIsolationRunner};
 use harness_store::Store;
+use observation::ObservationService;
 use rust_embed::RustEmbed;
 use serde_json::json;
 use tokio::{
@@ -67,6 +70,12 @@ enum Command {
         #[arg(long)]
         without_codex: bool,
     },
+    /// Run the single controller-owned observer snapshot regression evaluation.
+    EvaluateObserverSnapshot {
+        /// Repository containing the pinned historical commits.
+        #[arg(long)]
+        repository: PathBuf,
+    },
 }
 
 #[derive(RustEmbed)]
@@ -94,6 +103,25 @@ async fn main() -> Result<()> {
             json,
             without_codex,
         } => doctor(config, &cli.profile, json, without_codex).await,
+        Command::EvaluateObserverSnapshot { repository } => {
+            let improvement = config.self_improvement_runtime_status();
+            if !improvement.observation_enabled {
+                bail!(
+                    "observer snapshot evaluation requires effective observe_only mode with the frozen safety anchor"
+                );
+            }
+            let paths = config.resolve_paths()?;
+            paths.create_securely()?;
+            let receipt = EvaluationService::new(
+                Store::open(&paths.database, &paths.artifact_root)?,
+                paths.worktree_root.clone(),
+                paths.cache_dir.join("evaluation-spool"),
+            )?
+            .run_observer_snapshot_once(repository)
+            .await?;
+            println!("{receipt}");
+            Ok(())
+        }
     }
 }
 
@@ -160,6 +188,7 @@ async fn serve(
     let runtime = runtime_manager
         .as_ref()
         .map(|runtime| Arc::clone(runtime) as Arc<dyn CodexRuntime>);
+    let observation_enabled = config.self_improvement_runtime_status().observation_enabled;
     let orchestrator = Arc::new(
         Orchestrator::new(config, paths, profile, store, runtime)
             .await
@@ -240,6 +269,17 @@ async fn serve(
             }
         }
     });
+    let observation_task = observation_enabled.then(|| {
+        let observer = ObservationService::new(orchestrator.store().clone());
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(15));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                observer.observe_once();
+            }
+        })
+    });
 
     let app = harness_api::router(Arc::clone(&orchestrator))
         .fallback(static_asset)
@@ -283,6 +323,9 @@ async fn serve(
     };
     info!("BILDR stopping");
     shutting_down.store(true, Ordering::Release);
+    if let Some(task) = observation_task {
+        task.abort();
+    }
     signal_task.abort();
     maintenance_task.abort();
     event_pump.abort();
@@ -311,6 +354,17 @@ async fn doctor(
     } else {
         Some(probe_compatibility(&codex_settings(&config, &paths)).await?)
     };
+    let observer_isolation = if config.self_improvement_runtime_status().observation_enabled {
+        let receipt = probe_observer_isolation(&paths).await?;
+        if !receipt.available {
+            bail!(
+                "observe_only mode requires Bubblewrap 0.11.0 with namespace isolation; install the documented prerequisite or disable self-improvement"
+            );
+        }
+        Some(receipt)
+    } else {
+        None
+    };
     let report = json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
@@ -327,6 +381,7 @@ async fn doctor(
         },
         "database": database,
         "codex": compatibility.clone(),
+        "observer_isolation": observer_isolation,
     });
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -353,8 +408,37 @@ async fn doctor(
         } else {
             println!("  codex: skipped");
         }
+        if let Some(receipt) = &observer_isolation {
+            println!(
+                "  observer isolation: {} ({})",
+                receipt.backend, receipt.backend_version
+            );
+        } else {
+            println!("  observer isolation: not required while self-improvement is disabled");
+        }
     }
     Ok(())
+}
+
+async fn probe_observer_isolation(paths: &ResolvedPaths) -> Result<EvaluationIsolationReceipt> {
+    let root = paths.cache_dir.join("doctor-observer-isolation");
+    let worktree = root.join("worktree");
+    let grader = root.join("grader");
+    let holdout = root.join("holdout");
+    let artifacts = root.join("artifacts");
+    for directory in [&worktree, &grader, &holdout, &artifacts] {
+        std::fs::create_dir_all(directory)?;
+    }
+    let commands = CommandRunner::new(root.join("spool"), Default::default()).await?;
+    let runner = EvaluationIsolationRunner::new(
+        commands,
+        &worktree,
+        &grader,
+        &holdout,
+        &artifacts,
+        root.join("staging"),
+    )?;
+    Ok(runner.probe(&worktree).await)
 }
 
 fn codex_settings(config: &HarnessConfig, paths: &ResolvedPaths) -> CodexSettings {
@@ -492,3 +576,5 @@ async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
         }
     }
 }
+mod evaluation;
+mod observation;

@@ -1,0 +1,14 @@
+{
+  "schema": "harness.grader-bundle.v1",
+  "grader_bundle_id": "grader_context_v1",
+  "revision": 1,
+  "signals": [
+    {"id": "required_authority_present", "kind": "deterministic", "direction": "boolean_pass", "weight": 1.0, "required": true, "definition_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "calibration_set_digest": null},
+    {"id": "context_tokens", "kind": "cost", "direction": "minimize", "weight": 0.1, "required": false, "definition_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "calibration_set_digest": null}
+  ],
+  "hard_gates": ["required_authority_present"],
+  "negative_controls": [{"id": "archived_authority_absent", "signal_id": "required_authority_present", "expected_relationship": "must remain true when context cost falls", "failure_action": "block"}],
+  "reward_integrity_required": true,
+  "isolation": {"candidate_write_access": false, "holdout_answer_access": false, "grader_runtime": "separate_process"},
+  "sha256": "5a788b292fc1a5666b7890e13ff1d37416edebf9f434907e77a4f2387ac7527f"
+}

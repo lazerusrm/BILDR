@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -12,6 +12,23 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 const SCHEMA_DIGEST_ENCODING: &str = "normalized-compact-json";
+const JSON_SCHEMA_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
+const IMPROVEMENT_CRATES: &[&str] = &[
+    "harness-trace",
+    "harness-eval",
+    "harness-learning",
+    "harness-promotion",
+];
+// This applies only to the new improvement surfaces.  The legacy orchestrator
+// and App are reviewed exceptions, rather than files subject to a growth cap.
+const IMPROVEMENT_RUST_FILE_LINE_BUDGET: usize = 1_200;
+const IMPROVEMENT_UI_FILE_LINE_BUDGET: usize = 1_200;
+
+#[derive(Clone, Debug)]
+struct SchemaDocument {
+    path: PathBuf,
+    value: Value,
+}
 
 #[derive(Parser)]
 #[command(name = "cargo xtask", version, about = "BILDR build tasks")]
@@ -28,6 +45,7 @@ enum Task {
     },
     UiBuild,
     Check,
+    ArchitecturePolicyCheck,
     OpenapiCheck,
     SchemaCheck,
     AppServerBindingsCheck,
@@ -50,6 +68,7 @@ fn main() -> Result<()> {
         Task::UiInstall { locked } => ui_install(&root, locked),
         Task::UiBuild => ui_build(&root),
         Task::Check => check(&root),
+        Task::ArchitecturePolicyCheck => architecture_policy_check(&root),
         Task::OpenapiCheck => openapi_check(&root),
         Task::SchemaCheck => schema_check(&root),
         Task::AppServerBindingsCheck => app_server_bindings_check(&root),
@@ -91,6 +110,7 @@ fn check(root: &Path) -> Result<()> {
     schema_check(root)?;
     openapi_check(root)?;
     app_server_bindings_check(root)?;
+    architecture_policy_check(root)?;
     ui_build(root)?;
     run(
         Command::new("cargo")
@@ -106,21 +126,130 @@ fn check(root: &Path) -> Result<()> {
     )
 }
 
-fn schema_check(root: &Path) -> Result<()> {
-    let mut checked = 0_usize;
-    for directory in [root.join("schemas"), root.join("examples")] {
-        for entry in WalkDir::new(directory).into_iter().filter_map(Result::ok) {
-            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-            let _: Value = serde_json::from_slice(&fs::read(entry.path())?)
-                .with_context(|| format!("invalid JSON: {}", entry.path().display()))?;
-            checked += 1;
+fn architecture_policy_check(root: &Path) -> Result<()> {
+    let mut violations = Vec::new();
+    let crates_root = root.join("crates");
+    for crate_name in IMPROVEMENT_CRATES {
+        let crate_root = crates_root.join(crate_name);
+        let manifest = crate_root.join("Cargo.toml");
+        if !manifest.exists() {
+            continue;
+        }
+        let value: toml::Value = toml::from_str(&fs::read_to_string(&manifest)?)
+            .with_context(|| format!("invalid manifest: {}", manifest.display()))?;
+        if manifest_depends_on_orchestrator(&value) {
+            violations.push(format!(
+                "{} must not depend on harness-orchestrator",
+                manifest.display()
+            ));
+        }
+        violations.extend(source_line_budget_violations(
+            &crate_root,
+            &["rs"],
+            IMPROVEMENT_RUST_FILE_LINE_BUDGET,
+        )?);
+    }
+    violations.extend(source_line_budget_violations(
+        &root.join("ui/src/improvement"),
+        &["ts", "tsx", "css"],
+        IMPROVEMENT_UI_FILE_LINE_BUDGET,
+    )?);
+    if !violations.is_empty() {
+        bail!(
+            "architecture policy violations:\n- {}",
+            violations.join("\n- ")
+        )
+    }
+    println!(
+        "architecture-policy-check: present improvement crates avoid harness-orchestrator; new improvement source files are within the {IMPROVEMENT_RUST_FILE_LINE_BUDGET}-line budget"
+    );
+    Ok(())
+}
+
+fn manifest_depends_on_orchestrator(manifest: &toml::Value) -> bool {
+    dependency_tables(manifest).any(|dependencies| {
+        dependencies.iter().any(|(name, specification)| {
+            name == "harness-orchestrator"
+                || specification
+                    .as_table()
+                    .and_then(|table| table.get("package"))
+                    .and_then(toml::Value::as_str)
+                    == Some("harness-orchestrator")
+        })
+    })
+}
+
+fn dependency_tables(
+    manifest: &toml::Value,
+) -> impl Iterator<Item = &toml::map::Map<String, toml::Value>> {
+    let root = manifest.as_table();
+    let direct = root.into_iter().flat_map(|table| {
+        ["dependencies", "dev-dependencies", "build-dependencies"]
+            .into_iter()
+            .filter_map(|name| table.get(name).and_then(toml::Value::as_table))
+    });
+    let target = root
+        .and_then(|table| table.get("target"))
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(|targets| targets.values())
+        .filter_map(toml::Value::as_table)
+        .flat_map(|table| {
+            ["dependencies", "dev-dependencies", "build-dependencies"]
+                .into_iter()
+                .filter_map(|name| table.get(name).and_then(toml::Value::as_table))
+        });
+    direct.chain(target)
+}
+
+fn source_line_budget_violations(
+    directory: &Path,
+    extensions: &[&str],
+    maximum_lines: usize,
+) -> Result<Vec<String>> {
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let entries = WalkDir::new(directory)
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("cannot walk source directory: {}", directory.display()))?;
+    let mut paths = entries
+        .into_iter()
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extensions.contains(&extension))
+        })
+        .map(|entry| entry.into_path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut violations = Vec::new();
+    for path in paths {
+        let lines = fs::read_to_string(&path)
+            .with_context(|| format!("cannot read source file: {}", path.display()))?
+            .lines()
+            .count();
+        if lines > maximum_lines {
+            violations.push(format!(
+                "{} has {lines} lines; the new improvement-source budget is {maximum_lines}",
+                path.display()
+            ));
         }
     }
-    if checked < 4 {
-        bail!("expected schemas and examples, found only {checked} JSON files")
+    Ok(violations)
+}
+
+fn schema_check(root: &Path) -> Result<()> {
+    let schemas = load_schema_catalog(&root.join("schemas"))?;
+    let registry = schema_registry(&schemas)?;
+    for schema in schemas.values() {
+        compile_schema(&schema.path, &schema.value, &registry)?;
     }
+    let examples = validate_schema_examples(&root.join("examples"), &schemas, &registry)?;
     let _: toml::Value = toml::from_str(&fs::read_to_string(
         root.join("config/harness.example.toml"),
     )?)?;
@@ -130,8 +259,157 @@ fn schema_check(root: &Path) -> Result<()> {
     let _: toml::Value = toml::from_str(&fs::read_to_string(
         root.join("profiles/general/profile.toml"),
     )?)?;
-    println!("schema-check: {checked} JSON files and both TOML profiles parsed");
+    println!(
+        "schema-check: {} Draft 2020-12 schemas and {examples} examples conform; config and profiles parsed",
+        schemas.len()
+    );
     Ok(())
+}
+
+fn load_schema_catalog(directory: &Path) -> Result<BTreeMap<String, SchemaDocument>> {
+    let mut documents = BTreeMap::new();
+    let mut ids = BTreeMap::<String, PathBuf>::new();
+    for path in json_paths(directory)? {
+        let value = read_json(&path)?;
+        if value.get("$schema").and_then(Value::as_str) != Some(JSON_SCHEMA_2020_12) {
+            bail!(
+                "schema {} must declare {JSON_SCHEMA_2020_12}",
+                path.display()
+            )
+        }
+        let id = required_string(&value, "$id", &path)?;
+        if let Some(first) = ids.insert(id.to_owned(), path.clone()) {
+            bail!(
+                "duplicate schema $id {id} in {} and {}",
+                first.display(),
+                path.display()
+            )
+        }
+        let discriminator = value
+            .pointer("/properties/schema/const")
+            .and_then(Value::as_str)
+            .with_context(|| {
+                format!(
+                    "schema {} has no string properties.schema.const discriminator",
+                    path.display()
+                )
+            })?;
+        let discriminator = discriminator.to_owned();
+        if let Some(first) = documents.insert(
+            discriminator.clone(),
+            SchemaDocument {
+                path: path.clone(),
+                value,
+            },
+        ) {
+            bail!(
+                "duplicate schema discriminator {discriminator} in {} and {}",
+                first.path.display(),
+                path.display()
+            )
+        }
+    }
+    if documents.is_empty() {
+        bail!("no JSON schemas found under {}", directory.display())
+    }
+    Ok(documents)
+}
+
+fn schema_registry(schemas: &BTreeMap<String, SchemaDocument>) -> Result<jsonschema::Registry<'_>> {
+    let mut registry = jsonschema::Registry::new();
+    for schema in schemas.values() {
+        let id = required_string(&schema.value, "$id", &schema.path)?;
+        registry = registry
+            .add(id, &schema.value)
+            .with_context(|| format!("invalid schema $id {id} in {}", schema.path.display()))?;
+    }
+    registry
+        .prepare()
+        .context("failed to prepare local JSON Schema registry")
+}
+
+fn validate_schema_examples(
+    directory: &Path,
+    schemas: &BTreeMap<String, SchemaDocument>,
+    registry: &jsonschema::Registry<'_>,
+) -> Result<usize> {
+    let openapi_examples = directory.join("openapi");
+    let paths = json_paths(directory)?
+        .into_iter()
+        .filter(|path| !path.starts_with(&openapi_examples))
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        bail!("no JSON examples found under {}", directory.display())
+    }
+    for path in &paths {
+        let value = read_json(path)?;
+        validate_schema_example(path, &value, schemas, registry)?;
+    }
+    Ok(paths.len())
+}
+
+fn validate_schema_example(
+    path: &Path,
+    value: &Value,
+    schemas: &BTreeMap<String, SchemaDocument>,
+    registry: &jsonschema::Registry<'_>,
+) -> Result<()> {
+    let discriminator = required_string(value, "schema", path)?;
+    let schema = schemas.get(discriminator).with_context(|| {
+        format!(
+            "example {} names undocumented schema {discriminator}",
+            path.display()
+        )
+    })?;
+    let validator = compile_schema(&schema.path, &schema.value, registry)?;
+    if let Err(error) = validator.validate(value) {
+        bail!(
+            "example {} does not conform to {}: {error}",
+            path.display(),
+            schema.path.display()
+        )
+    }
+    Ok(())
+}
+
+fn compile_schema(
+    path: &Path,
+    value: &Value,
+    registry: &jsonschema::Registry<'_>,
+) -> Result<jsonschema::Validator> {
+    jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .with_registry(registry)
+        .should_validate_formats(true)
+        .build(value)
+        .with_context(|| format!("invalid Draft 2020-12 schema: {}", path.display()))
+}
+
+fn required_string<'a>(value: &'a Value, key: &str, path: &Path) -> Result<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("{} has no non-empty {key}", path.display()))
+}
+
+fn read_json(path: &Path) -> Result<Value> {
+    serde_json::from_slice(&fs::read(path)?)
+        .with_context(|| format!("invalid JSON: {}", path.display()))
+}
+
+fn json_paths(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in WalkDir::new(directory) {
+        let entry = entry.with_context(|| format!("cannot walk {}", directory.display()))?;
+        if entry.file_type().is_file()
+            && entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+        {
+            paths.push(entry.into_path());
+        }
+    }
+    paths.sort();
+    Ok(paths)
 }
 
 fn openapi_check(root: &Path) -> Result<()> {
@@ -151,6 +429,16 @@ fn openapi_check(root: &Path) -> Result<()> {
         if yaml_pointer(&value, pointer).is_none() {
             bail!("unresolved OpenAPI reference #{pointer}")
         }
+    }
+    let runtime_status_schema = runtime_status_schema(&value)?;
+    let runtime_status_fixture =
+        read_json(&root.join("examples/openapi/runtime-status.example.json"))?;
+    let registry = jsonschema::Registry::new()
+        .prepare()
+        .context("failed to prepare OpenAPI JSON Schema registry")?;
+    let runtime_status_validator = compile_schema(&path, &runtime_status_schema, &registry)?;
+    if let Err(error) = runtime_status_validator.validate(&runtime_status_fixture) {
+        bail!("RuntimeStatus fixture does not conform to OpenAPI: {error}")
     }
     let documented_routes = mapping
         .get("paths")
@@ -179,11 +467,28 @@ fn openapi_check(root: &Path) -> Result<()> {
         )
     }
     println!(
-        "openapi-check: {} local references resolved; {} router paths match",
+        "openapi-check: {} local references resolved; RuntimeStatus fixture conforms; {} router paths match",
         pointers.len(),
         documented_routes.len()
     );
     Ok(())
+}
+
+fn runtime_status_schema(openapi: &serde_yaml::Value) -> Result<Value> {
+    let mut schema = serde_json::to_value(openapi)
+        .context("OpenAPI document cannot be represented as JSON Schema input")?;
+    let object = schema
+        .as_object_mut()
+        .context("OpenAPI JSON Schema input must be an object")?;
+    object.insert(
+        "$schema".to_owned(),
+        Value::String(JSON_SCHEMA_2020_12.to_owned()),
+    );
+    object.insert(
+        "$ref".to_owned(),
+        Value::String("#/components/schemas/RuntimeStatus".to_owned()),
+    );
+    Ok(schema)
 }
 
 fn rust_router_paths(source: &str) -> BTreeSet<String> {
@@ -550,6 +855,7 @@ fn normalize_json(value: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn canonical_json_digest_ignores_object_order() {
@@ -560,5 +866,385 @@ mod tests {
             canonical_json_sha256(first).unwrap(),
             canonical_json_sha256(reordered).unwrap()
         );
+    }
+
+    #[test]
+    fn schema_compilation_rejects_malformed_keywords_and_references() {
+        let registry = jsonschema::Registry::new().prepare().unwrap();
+        let malformed = json!({
+            "$schema": JSON_SCHEMA_2020_12,
+            "$id": "urn:harness:malformed",
+            "type": 42
+        });
+        assert!(compile_schema(Path::new("malformed.json"), &malformed, &registry).is_err());
+
+        let unresolved = json!({
+            "$schema": JSON_SCHEMA_2020_12,
+            "$id": "urn:harness:unresolved",
+            "$ref": "#/$defs/missing"
+        });
+        assert!(compile_schema(Path::new("unresolved.json"), &unresolved, &registry).is_err());
+    }
+
+    #[test]
+    fn schema_catalog_rejects_missing_or_duplicate_identity() {
+        let missing_id = tempfile::tempdir().unwrap();
+        fs::write(
+            missing_id.path().join("schema.json"),
+            json!({
+                "$schema": JSON_SCHEMA_2020_12,
+                "properties": {"schema": {"const": "harness.example.v1"}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(load_schema_catalog(missing_id.path()).is_err());
+
+        let missing_discriminator = tempfile::tempdir().unwrap();
+        fs::write(
+            missing_discriminator.path().join("schema.json"),
+            json!({
+                "$schema": JSON_SCHEMA_2020_12,
+                "$id": "urn:harness:missing-discriminator"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(load_schema_catalog(missing_discriminator.path()).is_err());
+
+        let duplicate_id = tempfile::tempdir().unwrap();
+        for (name, discriminator) in [
+            ("first", "harness.first.v1"),
+            ("second", "harness.second.v1"),
+        ] {
+            fs::write(
+                duplicate_id.path().join(format!("{name}.json")),
+                json!({
+                    "$schema": JSON_SCHEMA_2020_12,
+                    "$id": "urn:harness:duplicate",
+                    "properties": {"schema": {"const": discriminator}}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        assert!(load_schema_catalog(duplicate_id.path()).is_err());
+
+        let duplicate_discriminator = tempfile::tempdir().unwrap();
+        for name in ["first", "second"] {
+            fs::write(
+                duplicate_discriminator.path().join(format!("{name}.json")),
+                json!({
+                    "$schema": JSON_SCHEMA_2020_12,
+                    "$id": format!("urn:harness:{name}"),
+                    "properties": {"schema": {"const": "harness.example.v1"}}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        assert!(load_schema_catalog(duplicate_discriminator.path()).is_err());
+    }
+
+    #[test]
+    fn schema_compilation_resolves_catalog_references() {
+        let root = json!({
+            "$schema": JSON_SCHEMA_2020_12,
+            "$id": "urn:harness:root",
+            "type": "object",
+            "properties": {"value": {"$ref": "urn:harness:target"}}
+        });
+        let target =
+            json!({"$schema": JSON_SCHEMA_2020_12, "$id": "urn:harness:target", "type": "string"});
+        let catalog = BTreeMap::from([
+            (
+                "harness.root.v1".to_owned(),
+                SchemaDocument {
+                    path: PathBuf::from("root.json"),
+                    value: root,
+                },
+            ),
+            (
+                "harness.target.v1".to_owned(),
+                SchemaDocument {
+                    path: PathBuf::from("target.json"),
+                    value: target,
+                },
+            ),
+        ]);
+        let registry = schema_registry(&catalog).unwrap();
+        let validator = compile_schema(
+            &catalog["harness.root.v1"].path,
+            &catalog["harness.root.v1"].value,
+            &registry,
+        )
+        .unwrap();
+        assert!(validator.is_valid(&json!({"value": "resolved"})));
+        assert!(!validator.is_valid(&json!({"value": 42})));
+    }
+
+    #[test]
+    fn candidate_schema_enforces_component_risk_pairings() {
+        let registry = jsonschema::Registry::new().prepare().unwrap();
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../schemas/harness.improvement-candidate.v1.schema.json"
+        ))
+        .unwrap();
+        let validator =
+            compile_schema(Path::new("candidate.schema.json"), &schema, &registry).unwrap();
+        let example: Value = serde_json::from_str(include_str!(
+            "../../examples/self-improvement/candidate.example.json"
+        ))
+        .unwrap();
+        assert!(validator.is_valid(&example));
+
+        let mut underclassified = example.clone();
+        underclassified["edit"]["dimension"] = json!("validator_selection");
+        underclassified["edit"]["risk_class"] = json!("green");
+        assert!(!validator.is_valid(&underclassified));
+
+        let mut valid_amber = example.clone();
+        valid_amber["edit"]["dimension"] = json!("validator_selection");
+        valid_amber["edit"]["risk_class"] = json!("amber");
+        assert!(validator.is_valid(&valid_amber));
+
+        let mut duplicate_prediction = example.clone();
+        let first_prediction = duplicate_prediction["predictions"][0].clone();
+        duplicate_prediction["predictions"]
+            .as_array_mut()
+            .unwrap()
+            .push(first_prediction);
+        assert!(!validator.is_valid(&duplicate_prediction));
+
+        for component_id in ["frozen_safety_anchor", "unknown_component"] {
+            let mut forbidden = example.clone();
+            forbidden["edit"]["dimension"] = json!(component_id);
+            assert!(!validator.is_valid(&forbidden));
+        }
+    }
+
+    #[test]
+    fn experiment_schema_requires_evidence_for_passed_stages() {
+        let registry = jsonschema::Registry::new().prepare().unwrap();
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../schemas/harness.experiment.v1.schema.json"
+        ))
+        .unwrap();
+        let validator =
+            compile_schema(Path::new("experiment.schema.json"), &schema, &registry).unwrap();
+        let example: Value = serde_json::from_str(include_str!(
+            "../../examples/self-improvement/experiment.example.json"
+        ))
+        .unwrap();
+        assert!(validator.is_valid(&example));
+
+        let mut missing_passed_evidence = example;
+        let passed_stage = missing_passed_evidence["stages"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|stage| stage["state"] == "passed")
+            .expect("example contains a passed stage");
+        passed_stage["evidence"] = Value::Null;
+        assert!(!validator.is_valid(&missing_passed_evidence));
+    }
+
+    #[test]
+    fn trace_v2_schema_preserves_projection_branch_bounds() {
+        let registry = jsonschema::Registry::new().prepare().unwrap();
+        let schema: Value =
+            serde_json::from_str(include_str!("../../schemas/harness.trace.v2.schema.json"))
+                .unwrap();
+        let validator =
+            compile_schema(Path::new("trace-v2.schema.json"), &schema, &registry).unwrap();
+        let example: Value = serde_json::from_str(include_str!(
+            "../../examples/self-improvement/trace.v2.example.json"
+        ))
+        .unwrap();
+        assert!(validator.is_valid(&example));
+
+        let mut wrong_bound = example;
+        wrong_bound["branches"][0]["metadata"]["path_bound"] = json!(1);
+        assert!(!validator.is_valid(&wrong_bound));
+    }
+
+    #[test]
+    fn knowledge_schema_requires_active_human_review_and_safe_optional_scope_ids() {
+        let registry = jsonschema::Registry::new().prepare().unwrap();
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../schemas/harness.knowledge-item.v1.schema.json"
+        ))
+        .unwrap();
+        let validator =
+            compile_schema(Path::new("knowledge.schema.json"), &schema, &registry).unwrap();
+        let example: Value = serde_json::from_str(include_str!(
+            "../../examples/self-improvement/knowledge-item.example.json"
+        ))
+        .unwrap();
+        assert!(validator.is_valid(&example));
+
+        let mut unreviewed_active = example.clone();
+        unreviewed_active["review"]["state"] = json!("unreviewed");
+        unreviewed_active["review"]["reviewer_id"] = Value::Null;
+        unreviewed_active["review"]["reviewed_at"] = Value::Null;
+        unreviewed_active["review"]["receipt"] = Value::Null;
+        assert!(!validator.is_valid(&unreviewed_active));
+
+        let mut free_text_scope = example.clone();
+        free_text_scope["scope"]["model_family"] = json!("model family with spaces");
+        assert!(!validator.is_valid(&free_text_scope));
+        let mut free_text_reviewer = example;
+        free_text_reviewer["review"]["reviewer_id"] = json!("operator name");
+        assert!(!validator.is_valid(&free_text_reviewer));
+    }
+
+    #[test]
+    fn outcome_schema_enforces_closed_manual_label_pairs() {
+        let registry = jsonschema::Registry::new().prepare().unwrap();
+        let schema: Value =
+            serde_json::from_str(include_str!("../../schemas/harness.outcome.v1.schema.json"))
+                .unwrap();
+        let validator =
+            compile_schema(Path::new("outcome.schema.json"), &schema, &registry).unwrap();
+        let example: Value = serde_json::from_str(include_str!(
+            "../../examples/self-improvement/outcome.example.json"
+        ))
+        .unwrap();
+        assert!(validator.is_valid(&example));
+
+        let mut acceptance_wrong_pair = example.clone();
+        acceptance_wrong_pair["classification"] = json!("negative");
+        acceptance_wrong_pair["code"] = json!("accepted_after_correction");
+        assert!(!validator.is_valid(&acceptance_wrong_pair));
+
+        let mut review_wrong_code = example.clone();
+        review_wrong_code["dimension"] = json!("review_regression");
+        review_wrong_code["classification"] = json!("negative");
+        review_wrong_code["code"] = json!("arbitrary");
+        assert!(!validator.is_valid(&review_wrong_code));
+
+        let mut rollback_wrong_pair = example;
+        rollback_wrong_pair["dimension"] = json!("rollback");
+        rollback_wrong_pair["classification"] = json!("positive");
+        rollback_wrong_pair["code"] = json!("rollback_recorded");
+        assert!(!validator.is_valid(&rollback_wrong_pair));
+
+        let mut automated_wrong_pair = rollback_wrong_pair;
+        automated_wrong_pair["dimension"] = json!("ci_required_checks");
+        automated_wrong_pair["classification"] = json!("positive");
+        automated_wrong_pair["code"] = json!("failed");
+        automated_wrong_pair["confidence"] = json!("authoritative");
+        automated_wrong_pair["source"]["kind"] = json!("validation");
+        assert!(!validator.is_valid(&automated_wrong_pair));
+    }
+
+    #[test]
+    fn taskset_schema_rejects_open_split_and_extra_case_fields() {
+        let registry = jsonschema::Registry::new().prepare().unwrap();
+        let schema: Value =
+            serde_json::from_str(include_str!("../../schemas/harness.taskset.v1.schema.json"))
+                .unwrap();
+        let validator =
+            compile_schema(Path::new("taskset.schema.json"), &schema, &registry).unwrap();
+        let example: Value = serde_json::from_str(include_str!(
+            "../../examples/self-improvement/taskset.example.json"
+        ))
+        .unwrap();
+        assert!(validator.is_valid(&example));
+        let mut split = example.clone();
+        split["cases"][0]["split"] = json!("unreviewed");
+        assert!(!validator.is_valid(&split));
+        let mut open = example;
+        open["cases"][0]["answer"] = json!("secret");
+        assert!(!validator.is_valid(&open));
+    }
+
+    #[test]
+    fn example_validation_rejects_unknown_discriminators_and_extra_fields() {
+        let schema_path = PathBuf::from("shape.schema.json");
+        let schema = json!({
+            "$schema": JSON_SCHEMA_2020_12,
+            "$id": "urn:harness:shape.v1",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["schema", "value"],
+            "properties": {
+                "schema": {"const": "harness.shape.v1"},
+                "value": {"type": "string"}
+            }
+        });
+        let catalog = BTreeMap::from([(
+            "harness.shape.v1".to_owned(),
+            SchemaDocument {
+                path: schema_path,
+                value: schema,
+            },
+        )]);
+        let registry = schema_registry(&catalog).unwrap();
+
+        assert!(
+            validate_schema_example(
+                Path::new("unknown.json"),
+                &json!({"schema": "harness.shape.v2", "value": "ok"}),
+                &catalog,
+                &registry,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_schema_example(
+                Path::new("extra.json"),
+                &json!({"schema": "harness.shape.v1", "value": "ok", "extra": true}),
+                &catalog,
+                &registry,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn architecture_policy_detects_direct_renamed_and_target_orchestrator_dependencies() {
+        let allowed: toml::Value =
+            toml::from_str("[dependencies]\nharness-domain = { path = \"../harness-domain\" }")
+                .unwrap();
+        assert!(!manifest_depends_on_orchestrator(&allowed));
+
+        for manifest in [
+            "[dependencies]\nharness-orchestrator = { path = \"../harness-orchestrator\" }",
+            "[dependencies]\ncontroller = { package = \"harness-orchestrator\", path = \"../harness-orchestrator\" }",
+            "[target.'cfg(unix)'.dev-dependencies]\nharness-orchestrator = { path = \"../harness-orchestrator\" }",
+        ] {
+            let value: toml::Value = toml::from_str(manifest).unwrap();
+            assert!(manifest_depends_on_orchestrator(&value), "{manifest}");
+        }
+    }
+
+    #[test]
+    fn architecture_policy_enforces_only_the_new_source_roots_line_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let trace = root.path().join("crates/harness-trace/src");
+        let improvement = root.path().join("ui/src/improvement");
+        let legacy = root.path().join("crates/harness-orchestrator/src");
+        fs::create_dir_all(&trace).unwrap();
+        fs::create_dir_all(&improvement).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(trace.join("within.rs"), "one\ntwo\n").unwrap();
+        fs::write(trace.join("over.rs"), "one\ntwo\nthree\n").unwrap();
+        fs::write(improvement.join("over.tsx"), "one\ntwo\nthree\n").unwrap();
+        fs::write(legacy.join("legacy.rs"), "one\ntwo\nthree\nfour\n").unwrap();
+
+        let rust =
+            source_line_budget_violations(&root.path().join("crates/harness-trace"), &["rs"], 2)
+                .unwrap();
+        let ui = source_line_budget_violations(
+            &root.path().join("ui/src/improvement"),
+            &["ts", "tsx", "css"],
+            2,
+        )
+        .unwrap();
+        assert_eq!(rust.len(), 1);
+        assert!(rust[0].contains("over.rs"));
+        assert_eq!(ui.len(), 1);
+        assert!(ui[0].contains("over.tsx"));
     }
 }

@@ -1,0 +1,53 @@
+{
+  "schema": "harness.eval-case.v1",
+  "case_id": "case_context_authority",
+  "revision": 1,
+  "title": "Preserve required authority in a bounded context packet",
+  "task_family": "context_compilation",
+  "objective": "Compile the required authority without admitting archived authority.",
+  "source": {
+    "kind": "regression",
+    "locator": "tests/context/authority",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "split": "development",
+  "runtime": {
+    "repository_id": "repository_example",
+    "repository_fixture": "fixture://bildr-context",
+    "base_sha": "1111111111111111111111111111111111111111",
+    "setup_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "resource_class": "control",
+    "timeout_seconds": 120,
+    "token_budget": 100000,
+    "seeds": [
+      1
+    ]
+  },
+  "custody": {
+    "owned_paths": [],
+    "forbidden_paths": [
+      "docs/archive/**"
+    ],
+    "grader_isolated": true
+  },
+  "acceptance": [
+    {
+      "claim_id": "authority.current_only",
+      "kind": "artifact",
+      "required": true,
+      "spec": {
+        "manifest": "context.json"
+      }
+    }
+  ],
+  "grader_bundle_id": "grader_context_v1",
+  "grader_bundle_revision": 1,
+  "grader_bundle_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "privacy": {
+    "classification": "internal",
+    "export_allowed": false,
+    "license": null
+  },
+  "leakage_status": "clean",
+  "sha256": "acc79cee00f650befb7de752d33658bfcbdd64d54ff7d715704c8f98e956989b"
+}

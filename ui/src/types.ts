@@ -27,21 +27,21 @@ export type RunState =
 
 export interface ComponentStatus {
   state: string;
-  detail?: string;
+  detail: string | null;
 }
 
 export interface RuntimeStatus {
   daemon: ComponentStatus;
   codex: {
     state: string;
-    detail?: string;
-    version?: string;
-    required_version?: string;
-    protocol_schema_sha256?: string;
+    detail: string | null;
+    version: string | null;
+    required_version: string | null;
+    protocol_schema_sha256: string | null;
     schema_match: boolean;
     native_multi_agent: boolean;
-    native_multi_agent_feature?: string;
-    pid?: number;
+    native_multi_agent_feature: string | null;
+    pid: number | null;
     restart_count: number;
   };
   database: ComponentStatus;
@@ -55,6 +55,190 @@ export interface RuntimeStatus {
     max_verifiers: number;
     queued_tasks: number;
   };
+  self_improvement: {
+    configured_mode: "disabled" | "observe_only";
+    effective_mode: "disabled" | "observe_only";
+    anchor_sha256: string;
+    configured_anchor_sha256: string;
+    anchor_match: boolean;
+    observation_enabled: boolean;
+    candidate_generation_enabled: boolean;
+    candidate_execution_enabled: boolean;
+    detail: string | null;
+  };
+}
+
+export type OutcomeDimension =
+  | "operator_acceptance"
+  | "operator_correction"
+  | "validation"
+  | "evidence"
+  | "verifier_findings"
+  | "completion_state"
+  | "resource_use"
+  | "ci_required_checks"
+  | "review_regression"
+  | "pr_reopened"
+  | "rollback"
+  | "downstream_regression";
+
+export interface OutcomeVector {
+  run_id: string;
+  items: OutcomeVectorItem[];
+}
+
+export interface OutcomeVectorItem {
+  outcome_id: string;
+  subject: { kind: "run" | "task_attempt" | "publication"; id: string };
+  dimension: OutcomeDimension;
+  revisions: OutcomeRevision[];
+  conflicted: boolean;
+}
+
+export interface FailureOverview {
+  taxonomy_version: "harness.failure-taxonomy.v1";
+  classified_occurrences: number;
+  unknown_occurrences: number;
+  clusters: FailureClusterSummary[];
+}
+
+export type FailureClass =
+  | "unknown"
+  | "policy_blocked"
+  | "budget_exhausted"
+  | "infrastructure_unavailable"
+  | "protocol_error"
+  | "integration_conflict"
+  | "source_failure"
+  | "inconclusive"
+  | "cancelled_superseded";
+
+export type FailureSeverity = "unknown" | "low" | "medium" | "high" | "critical";
+
+export interface FailureClusterSummary {
+  id: string;
+  failure_class: FailureClass;
+  frequency: number;
+  severity: FailureSeverity;
+  cost_upper_microusd: number | null;
+  unknown_cost_occurrences: number;
+  representative_occurrence_id: string | null;
+  representative_run_id: string | null;
+  representative_trace_id: string | null;
+}
+
+export type FailureTraceKind =
+  | "system_message"
+  | "developer_message"
+  | "user_message"
+  | "model_message"
+  | "reasoning_summary"
+  | "tool_request"
+  | "tool_result"
+  | "command"
+  | "file_read"
+  | "file_change"
+  | "approval_request"
+  | "approval_decision"
+  | "compaction"
+  | "subagent_spawn"
+  | "subagent_join"
+  | "validation"
+  | "finding"
+  | "operator_feedback"
+  | "outcome"
+  | "unknown_protocol"
+  | "run_lifecycle"
+  | "attempt_boundary"
+  | "runtime_restart";
+
+export type FailureTraceRedaction =
+  | "none"
+  | "secret_removed"
+  | "private_reasoning_removed"
+  | "customer_data_removed"
+  | "content_withheld";
+
+export interface FailureTraceRow {
+  id: string;
+  kind: FailureTraceKind;
+  timestamp_ms: number | null;
+  redaction_class: FailureTraceRedaction;
+  source_receipt_count: number;
+}
+
+export interface FailureTrace {
+  trace_id: string;
+  run_id: string;
+  rows: FailureTraceRow[];
+  outcomes: OutcomeVector;
+}
+
+export type EvaluationSplit = "training" | "development" | "holdout" | "canary" | "quarantine";
+export type EvaluationArm = "champion" | "challenger";
+export type EvaluationRunStatus = "recording" | "completed" | "infrastructure_unavailable" | "invalidated";
+export type EvaluationSampleClassification = "pass" | "fail" | "infrastructure_unavailable" | "invalidated";
+export type FailureSourceKind = "attempt_terminal" | "run_terminal" | "typed_outcome";
+
+/** Receipt-only M2 records; no fixture, command, evidence, or artifact payloads. */
+export interface EvaluationRunSummary {
+  id: string;
+  controller_run_id: string;
+  taskset_revision_id: string;
+  grader_bundle_revision_id: string;
+  split: EvaluationSplit;
+  status: EvaluationRunStatus;
+  invalidated: boolean;
+}
+
+export interface EvaluationSampleSummary {
+  id: string;
+  evaluation_run_id: string;
+  eval_case_revision_id: string;
+  arm: EvaluationArm;
+  seed: number;
+  classification: EvaluationSampleClassification;
+  sample_digest: string;
+  invalidated: boolean;
+}
+
+export interface EvaluationCaseSummary {
+  revision_id: string;
+  case_id: string;
+  revision: number;
+  payload_sha256: string;
+  case_sha256: string;
+  split: EvaluationSplit;
+  task_family: string;
+  base_sha: string;
+  setup_digest: string;
+  grader_bundle_id: string;
+  grader_bundle_revision: number;
+  grader_bundle_digest: string;
+}
+
+export interface EvaluationOccurrenceSource {
+  occurrence_id: string;
+  repository_id: string;
+  run_id: string;
+  base_sha: string;
+  source_receipt_sha256: string;
+  source_kind: FailureSourceKind;
+  trace_revision_id: string | null;
+  trace_digest: string | null;
+  outcome_revision_id: string | null;
+  outcome_digest: string | null;
+}
+
+export interface OutcomeRevision {
+  revision_id: string;
+  revision: number;
+  outcome: {
+    classification: "positive" | "negative" | "neutral" | "unknown";
+    code: string;
+    supersedes: string[];
+  };
+  is_head: boolean;
 }
 
 export interface Repository {

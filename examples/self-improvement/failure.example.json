@@ -1,0 +1,12 @@
+{
+  "schema": "harness.failure.v1",
+  "id": "failure_example",
+  "repository_id": "repository_example",
+  "source": {"kind": "attempt_terminal", "id": "attempt_example"},
+  "terminal_code": "budget_exhausted",
+  "automatic_class": "budget_exhausted",
+  "severity": "unknown",
+  "taxonomy_version": "harness.failure-taxonomy.v1",
+  "fingerprint_sha256": "5dd090b19657237d406b6ec75a15fcf9f5a51573c18cf44c5ff2cbb25ee4ed67",
+  "cost": {"kind": "unknown"}
+}

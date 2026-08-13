@@ -89,7 +89,7 @@ pub struct VerifiedDiff {
     pub serial_paths: Vec<String>,
     pub diff_check: String,
     pub status_porcelain_v2: String,
-    pub patch: String,
+    pub patch: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -522,7 +522,7 @@ impl GitManager {
             )));
         }
         let diff_check = git_text_allow_failure(&root, ["diff", "--check", base_sha, "--"]).await?;
-        let mut patch = git_text_allow_empty(
+        let mut patch = git_bytes(
             &root,
             ["diff", "--binary", "--find-renames", base_sha, "--"],
         )
@@ -539,7 +539,7 @@ impl GitManager {
                     stderr: safe_stderr(&output.stderr),
                 });
             }
-            patch.push_str(&String::from_utf8_lossy(&output.stdout));
+            patch.extend_from_slice(&output.stdout);
         }
         Ok(VerifiedDiff {
             head_sha,
@@ -554,6 +554,100 @@ impl GitManager {
             status_porcelain_v2,
             patch,
         })
+    }
+
+    /// Apply a previously custody-checked candidate patch to the exact base
+    /// checkout. This deliberately refuses to merge or rebase: recovery is
+    /// only valid when the controller's target is still clean at that base.
+    pub async fn materialize_verified_diff(
+        &self,
+        worktree: &Path,
+        expected_base: &str,
+        verified: &VerifiedDiff,
+    ) -> Result<(), GitError> {
+        const MAX_PATCH_BYTES: usize = 128 * 1024 * 1024;
+
+        ensure_sha(expected_base)?;
+        if !verified.acceptable() {
+            return Err(GitError::Policy(
+                "candidate patch did not pass diff custody checks".to_owned(),
+            ));
+        }
+        if verified.head_sha != expected_base {
+            return Err(GitError::Conflict(format!(
+                "verified candidate head {} differs from expected base {expected_base}",
+                verified.head_sha
+            )));
+        }
+        if verified.patch.is_empty() {
+            return Err(GitError::Policy(
+                "candidate patch is empty and cannot be materialized".to_owned(),
+            ));
+        }
+        if verified.patch.len() > MAX_PATCH_BYTES {
+            return Err(GitError::Policy(
+                "candidate patch exceeds the 128 MiB recovery boundary".to_owned(),
+            ));
+        }
+
+        let root = canonical_repo_root(worktree).await?;
+        if root != fs::canonicalize(worktree)? {
+            return Err(GitError::Policy(
+                "candidate target is not the exact managed worktree root".to_owned(),
+            ));
+        }
+        let lock = self.process_lock(&root).await;
+        let _guard = lock.lock().await;
+        let head = git_text(&root, ["rev-parse", "HEAD"]).await?;
+        if head != expected_base {
+            return Err(GitError::Conflict(format!(
+                "candidate base {expected_base} differs from worktree head {head}"
+            )));
+        }
+        if !git_bytes(&root, ["status", "--porcelain=v2", "-z"])
+            .await?
+            .is_empty()
+        {
+            return Err(GitError::Conflict(
+                "candidate materialization requires a clean managed worktree".to_owned(),
+            ));
+        }
+
+        git_apply_binary_patch(&root, &verified.patch, true).await?;
+        git_apply_binary_patch(&root, &verified.patch, false).await?;
+
+        let observed_head = git_text(&root, ["rev-parse", "HEAD"]).await?;
+        if observed_head != expected_base {
+            return Err(GitError::Conflict(format!(
+                "worktree head changed from expected base {expected_base} to {observed_head} during candidate materialization"
+            )));
+        }
+        if git_bytes(&root, ["status", "--porcelain=v2", "-z"])
+            .await?
+            .is_empty()
+        {
+            return Err(GitError::Protocol(
+                "candidate patch applied without producing a worktree change".to_owned(),
+            ));
+        }
+        let diff_check =
+            git_text_allow_failure(&root, ["diff", "--check", expected_base, "--"]).await?;
+        if !diff_check.trim().is_empty() {
+            return Err(GitError::Protocol(format!(
+                "materialized candidate failed Git diff check: {diff_check}"
+            )));
+        }
+        let materialized = self.diff_summary(&root, expected_base).await?;
+        if materialized.head_sha != expected_base
+            || materialized.changed_paths != verified.changed_paths
+            || materialized.additions != verified.additions
+            || materialized.deletions != verified.deletions
+        {
+            return Err(GitError::Protocol(
+                "materialized candidate does not match the verified diff summary".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Materialize an attested Git tree into a clean controller-owned
@@ -1338,6 +1432,46 @@ where
     }
 }
 
+async fn git_apply_binary_patch(cwd: &Path, patch: &[u8], check: bool) -> Result<(), GitError> {
+    let mut command = Command::new("git");
+    command
+        .current_dir(cwd)
+        .args(["apply", "--index", "--binary", "--whitespace=nowarn"])
+        .arg(if check { "--check" } else { "--apply" })
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .env("SSH_ASKPASS_REQUIRE", "never");
+    debug!(cwd = %cwd.display(), check, "applying verified binary candidate patch");
+    let mut child = command.spawn()?;
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err(GitError::Protocol(
+            "git apply did not expose its input pipe".to_owned(),
+        ));
+    };
+    let result = timeout(Duration::from_secs(300), async {
+        stdin.write_all(patch).await?;
+        drop(stdin);
+        child.wait_with_output().await
+    })
+    .await
+    .map_err(|_| GitError::Timeout {
+        cwd: cwd.to_path_buf(),
+    })??;
+    if result.status.success() {
+        Ok(())
+    } else {
+        Err(GitError::Command {
+            cwd: cwd.to_path_buf(),
+            stderr: safe_stderr(&result.stderr),
+        })
+    }
+}
+
 async fn git_status<I, S>(cwd: &Path, args: I) -> Result<std::process::Output, GitError>
 where
     I: IntoIterator<Item = S>,
@@ -1587,6 +1721,88 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn materializes_verified_patch_and_rejects_dirty_or_wrong_base_targets() {
+        let temp = TempDir::new().unwrap();
+        let repository = temp.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        fixture_git(&repository, &["init", "-b", "main"]);
+        fixture_git(&repository, &["config", "user.name", "Harness Test"]);
+        fixture_git(
+            &repository,
+            &["config", "user.email", "harness@example.invalid"],
+        );
+        fs::write(repository.join("tracked.txt"), b"original\n").unwrap();
+        fixture_git(&repository, &["add", "tracked.txt"]);
+        fixture_git(&repository, &["commit", "-m", "test: initialize fixture"]);
+        let base = git_text(&repository, ["rev-parse", "HEAD"]).await.unwrap();
+        let manager = GitManager::new(&temp.path().join("managed-worktrees")).unwrap();
+
+        fs::write(repository.join("tracked.txt"), b"candidate\n").unwrap();
+        let untracked_bytes = b"untracked \x80 candidate\n";
+        fs::write(repository.join("new.txt"), untracked_bytes).unwrap();
+        let verified = manager
+            .verify_diff(
+                &repository,
+                &base,
+                &DiffPolicy {
+                    owned_paths: vec!["**".to_owned()],
+                    forbidden_paths: Vec::new(),
+                    serial_paths: Vec::new(),
+                    reserved_serial_paths: Vec::new(),
+                    max_files: 2,
+                    max_lines: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(verified.acceptable());
+        fixture_git(
+            &repository,
+            &["restore", "--staged", "--worktree", "tracked.txt"],
+        );
+        fs::remove_file(repository.join("new.txt")).unwrap();
+
+        manager
+            .materialize_verified_diff(&repository, &base, &verified)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(repository.join("tracked.txt")).unwrap(),
+            "candidate\n"
+        );
+        assert_eq!(
+            fs::read(repository.join("new.txt")).unwrap(),
+            untracked_bytes
+        );
+
+        fixture_git(&repository, &["reset", "--hard", &base]);
+        fixture_git(&repository, &["clean", "-fd"]);
+        fs::write(repository.join("dirty.txt"), b"preserve me\n").unwrap();
+        assert!(
+            manager
+                .materialize_verified_diff(&repository, &base, &verified)
+                .await
+                .is_err()
+        );
+        assert!(repository.join("dirty.txt").exists());
+
+        fs::remove_file(repository.join("dirty.txt")).unwrap();
+        fs::write(repository.join("tracked.txt"), b"advanced\n").unwrap();
+        fixture_git(&repository, &["add", "tracked.txt"]);
+        fixture_git(&repository, &["commit", "-m", "test: advance target"]);
+        assert!(
+            manager
+                .materialize_verified_diff(&repository, &base, &verified)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(repository.join("tracked.txt")).unwrap(),
+            "advanced\n"
         );
     }
 

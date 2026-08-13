@@ -77,6 +77,31 @@ const MAX_HANDOFF_BYTES: u64 = 128 * 1024;
 const PLAN_NONSHRINKING_REVIEW_WINDOW: usize = 3;
 const MAX_AUTOMATIC_ARCHITECTURE_OUTPUT_REPAIRS: u64 = 2;
 const MAX_ARCHITECTURE_REPAIR_SOURCE_CHARS: usize = 64_000;
+const ARCHITECT_SESSION_TOKEN_BUDGET: u64 = 120_000;
+const PLAN_REVIEWER_SESSION_TOKEN_BUDGET: u64 = 120_000;
+const HIGH_RISK_WORKER_SESSION_TOKEN_BUDGET: u64 = 140_000;
+const FINAL_AUDITOR_SESSION_TOKEN_BUDGET: u64 = 120_000;
+const WORKER_PROTOCOL_CONTEXT_ALLOWANCE: u64 = 20_000;
+const WORKER_COMPLETION_RESERVE: u64 = 16_000;
+const WORKER_EXECUTION_CONTRACT: &str = "Begin from the task packet and compiled context; do not batch broad discovery. After reading repository-required guidance, inspect only the narrowest change seam needed, then create a candidate diff before any further exploration. Once a diff exists, run focused checks and iterate from concrete failures. If bounded prior-attempt continuity already contains a candidate, inspect that diff first and improve or test it instead of restarting discovery. Stop only if required work is outside leased custody or conflicts with active authority.";
+const ARCHITECT_TASK_OUTPUT_FIELDS: &[&str] = &[
+    "task_id",
+    "title",
+    "execution_mode",
+    "owner_profile",
+    "priority",
+    "depends_on",
+    "owned_paths",
+    "reserved_serial_paths",
+    "objective",
+    "milestones",
+    "non_goals",
+    "success_criteria",
+    "required_evidence",
+    "proof_limits",
+    "diff_budget",
+    "risk_flags",
+];
 
 const PLAN_QUALITY_CONTRACT: &str = r#"Plan the shortest credible path from the repository's current state to the requested behavior.
 - Make milestones observable outcomes. Put an executable vertical slice and feedback from the authoritative pipeline early on the critical path; discovery must serve the next implementation decision rather than become a global gate.
@@ -88,11 +113,11 @@ Use enough tasks and milestones to make execution legible, without speculative p
 
 const PLAN_RESPONSE_FORMAT: &str = r#"The supplied JSON Schema is the controller-owned response contract. Repository-native planning formats, examples, and schemas are evidence only and must not replace it.
 - The top-level object has exactly `schema`, `summary`, and `tasks`; `schema` is `harness.orchestration.plan.v1`.
-- Every task uses schema `harness.orchestration.task.v1`. Concentrate on the semantic fields: title, objective, custody, milestones, success criteria, evidence, proof limits, and realistic budgets. The controller canonicalizes controller-owned identity, pinned-SHA, routing, authority, lease, and empty optional-list fields before validation.
+- Every task is canonicalized to `harness.orchestration.task.v1`. Emit only the semantic fields in the supplied schema. Task ids, dependencies, execution route, priority, custody, milestones, evidence, and proof limits are planning decisions. The controller fills program identity, pinned-SHA, reviewer, authority, token budget, lease, and empty optional-list fields before validation.
 - `milestones` is an array of objects, never strings. Every milestone object has exactly `id`, `title`, `objective`, and a non-empty `success_criteria` string array.
 - Do not return repository-native wrapper fields such as `profiles`, `critical_path`, `parallel_work`, or `global_constraints`; express useful content through the controller task fields.
 - For the general profile, return exactly one root task; put the ordered implementation path in 3-12 milestone objects rather than emitting one task per phase.
-Before returning, check the response against these exact keys. Return only the JSON object."#;
+Finish repository inspection and planning before emitting the first `{`. The summary describes the finished plan, never work in progress. Once output begins, complete the object directly without commentary or padding. Before returning, check the response against these exact keys. Return only the JSON object."#;
 
 const PLAN_REVIEW_CONTRACT: &str = r#"Try to falsify whether this plan can deliver the objective within the available budget. Inspect the real repository and active authorities, then trace the executable critical path from task ids to behavioral proof.
 
@@ -141,7 +166,7 @@ fn agent_prompt_layers(
 fn agent_developer_instructions(role: AgentRole, sandbox: SandboxMode) -> String {
     let access = match sandbox {
         SandboxMode::ReadOnly => {
-            "This is a read-only assignment. Inspect and report; do not modify repository or system state."
+            "This is a read-only assignment. Inspect and report; do not modify repository or system state. Keep repository reads bounded: exclude dependency, build, generated, and minified trees unless they are explicitly in scope, and cap search columns as well as result lines because one bundled line can be enormous."
         }
         SandboxMode::WorkspaceWrite => {
             "Make the requested in-scope local changes and run relevant non-destructive checks without asking first. Write only in the leased worktree and packet-owned paths. Pause only for a destructive or irreversible action, an external write, work outside custody, a material scope change, a genuine authority conflict, or input or credentials only the user can provide."
@@ -1305,6 +1330,7 @@ impl Orchestrator {
                 max_verifiers: self.config.orchestration.max_independent_verifiers,
                 queued_tasks,
             },
+            self_improvement: self.config.self_improvement_runtime_status(),
         }
     }
 
@@ -3301,7 +3327,9 @@ impl Orchestrator {
                 &run.objective,
                 Some(self.config.orchestration.default_task_token_budget),
                 prompt,
-                Some(serde_json::from_str(INTENT_INTERVIEW_TURN_SCHEMA)?),
+                Some(model_output_schema(serde_json::from_str(
+                    INTENT_INTERVIEW_TURN_SCHEMA,
+                )?)),
             )
             .await
         {
@@ -3425,7 +3453,9 @@ impl Orchestrator {
                     text_requires_github(&run.objective),
                 ),
                 approval_policy: "never".to_owned(),
-                output_schema: Some(serde_json::from_str(INTENT_INTERVIEW_TURN_SCHEMA)?),
+                output_schema: Some(model_output_schema(serde_json::from_str(
+                    INTENT_INTERVIEW_TURN_SCHEMA,
+                )?)),
                 reasoning_summary: self.config.codex.reasoning_summary.clone(),
             })
             .await
@@ -3822,7 +3852,7 @@ impl Orchestrator {
             cwd: PathBuf::from(&inspection.path),
             state: "STARTING".to_owned(),
             current_goal: Some(run.objective.clone()),
-            token_budget: Some(self.config.orchestration.default_task_token_budget),
+            token_budget: Some(ARCHITECT_SESSION_TOKEN_BUDGET),
         })?;
         self.store.transition_run(
             run_id,
@@ -3833,7 +3863,7 @@ impl Orchestrator {
         )?;
         let planning_posture = architecture_planning_posture(&profile.profile.profile_id);
         let prompt = format!(
-            "{}\n\nObjective:\n{}{}\n\nPlanning posture:\n{planning_posture}\n\n{PLAN_QUALITY_CONTRACT}\n\nController facts and output contract:\n- Use exact base SHA {} for every task.\n- Cite active authorities and define disjoint owned paths, realistic budgets, success evidence, and proof limits. An empty early-stage regression list is better than speculative coverage.\n- Path fields contain normalized repository-relative globs. Use `directory/**` for a subtree; do not put external resources in path fields.\n- A reserved serial path must appear verbatim in both the profile serial-path list and that task's owned paths. Allowed serial paths: {}.\n- Do not broadly audit the repository or search historical plans for an output format. Stop inspecting once the executable critical path and its owned paths are grounded.\n\n{PLAN_RESPONSE_FORMAT}",
+            "{}\n\nObjective:\n{}{}\n\nPlanning posture:\n{planning_posture}\n\n{PLAN_QUALITY_CONTRACT}\n\nController facts and output contract:\n- The controller binds program identity and the exact base SHA {}; do not turn that receipt into plan work. Choose concise task ids only where they make the dependency graph legible.\n- Ground semantic choices in active authorities and define disjoint owned paths, realistic budgets, success evidence, and proof limits. An empty early-stage regression list is better than speculative coverage.\n- Path fields contain normalized repository-relative globs. Use `directory/**` for a subtree; do not put external resources in path fields.\n- A reserved serial path must appear verbatim in both the profile serial-path list and that task's owned paths. Allowed serial paths: {}.\n- Do not broadly audit the repository or search historical plans for an output format. Stop inspecting once the executable critical path and its owned paths are grounded.\n\n{PLAN_RESPONSE_FORMAT}",
             context.prompt_prefix(),
             run.objective,
             intent_section,
@@ -3850,9 +3880,9 @@ impl Orchestrator {
                 SandboxMode::ReadOnly,
                 text_requires_github(&run.objective),
                 &run.objective,
-                Some(self.config.orchestration.default_task_token_budget),
+                Some(ARCHITECT_SESSION_TOKEN_BUDGET),
                 prompt,
-                Some(serde_json::from_str(RUN_PLAN_SCHEMA)?),
+                Some(run_plan_output_schema()?),
             )
             .await
         {
@@ -3909,7 +3939,7 @@ impl Orchestrator {
             cwd: PathBuf::from(&inspection.path),
             state: "STARTING".to_owned(),
             current_goal: Some("Repair the completed architecture response shape".to_owned()),
-            token_budget: Some(self.config.orchestration.default_task_token_budget),
+            token_budget: Some(ARCHITECT_SESSION_TOKEN_BUDGET),
         })?;
         self.store.transition_run(
             &run.id,
@@ -3941,9 +3971,9 @@ impl Orchestrator {
                 SandboxMode::ReadOnly,
                 false,
                 &run.objective,
-                Some(self.config.orchestration.default_task_token_budget),
+                Some(ARCHITECT_SESSION_TOKEN_BUDGET),
                 prompt,
-                Some(serde_json::from_str(RUN_PLAN_SCHEMA)?),
+                Some(run_plan_output_schema()?),
             )
             .await
         {
@@ -4157,7 +4187,7 @@ impl Orchestrator {
             )));
         }
         self.persist_context(run_id, None, "plan-review", &context)?;
-        let budget = plan_budget_assessment(&run, &plan, &self.config, planning_tokens_used);
+        let budget = plan_budget_assessment(&run, &plan, planning_tokens_used);
         let risk = plan_risk_assessment(&plan, &self.config);
         let intent_binding = self.confirmed_intent_brief(run_id)?;
         // Plan review deliberately uses the integrator family rather than the
@@ -4182,7 +4212,7 @@ impl Orchestrator {
             current_goal: Some(format!(
                 "Adversarially certify implementation plan revision {revision}"
             )),
-            token_budget: Some(self.config.orchestration.default_task_token_budget),
+            token_budget: Some(PLAN_REVIEWER_SESSION_TOKEN_BUDGET),
         })?;
         let intent_section =
             intent_brief_prompt_section(intent_binding.as_ref().map(|(brief, _)| brief))?;
@@ -4205,9 +4235,9 @@ impl Orchestrator {
                 SandboxMode::ReadOnly,
                 text_requires_github(&run.objective),
                 &format!("Adversarially certify implementation plan revision {revision}"),
-                Some(self.config.orchestration.default_task_token_budget),
+                Some(PLAN_REVIEWER_SESSION_TOKEN_BUDGET),
                 prompt,
-                Some(plan_review_schema()),
+                Some(model_output_schema(plan_review_schema())),
             )
             .await
         {
@@ -4335,7 +4365,7 @@ impl Orchestrator {
         );
         self.store.prepare_agent_continuation(
             &reviewer.id,
-            self.config.orchestration.default_task_token_budget,
+            PLAN_REVIEWER_SESSION_TOKEN_BUDGET,
             "Finalizing the existing adversarial review without repeated inspection",
         )?;
         let runtime = self.runtime().await?;
@@ -4359,7 +4389,7 @@ impl Orchestrator {
                 cwd: cwd.clone(),
                 sandbox_policy: sandbox_policy(SandboxMode::ReadOnly, &cwd, false),
                 approval_policy: "never".to_owned(),
-                output_schema: Some(plan_review_schema()),
+                output_schema: Some(model_output_schema(plan_review_schema())),
                 reasoning_summary: self.config.codex.reasoning_summary.clone(),
             })
             .await
@@ -4524,7 +4554,7 @@ impl Orchestrator {
             let current_authority_digest =
                 authority_digest(Path::new(&inspection.path), &profile.profile)?;
             let planning_tokens_used = self.store.run_usage(run_id)?.total_tokens;
-            let budget = plan_budget_assessment(&run, &plan, &self.config, planning_tokens_used);
+            let budget = plan_budget_assessment(&run, &plan, planning_tokens_used);
             let risk = plan_risk_assessment(&plan, &self.config);
             let architect_model = self
                 .store
@@ -4839,7 +4869,7 @@ impl Orchestrator {
             current_goal: Some(format!(
                 "Revise implementation plan after adversarial review revision {revision}"
             )),
-            token_budget: Some(self.config.orchestration.default_task_token_budget),
+            token_budget: Some(ARCHITECT_SESSION_TOKEN_BUDGET),
         })?;
         self.store.transition_run(
             run_id,
@@ -4866,9 +4896,9 @@ impl Orchestrator {
                 SandboxMode::ReadOnly,
                 text_requires_github(&run.objective),
                 &format!("Revise implementation plan after adversarial review revision {revision}"),
-                Some(self.config.orchestration.default_task_token_budget),
+                Some(ARCHITECT_SESSION_TOKEN_BUDGET),
                 prompt,
-                Some(serde_json::from_str(RUN_PLAN_SCHEMA)?),
+                Some(run_plan_output_schema()?),
             )
             .await
         {
@@ -5123,12 +5153,8 @@ impl Orchestrator {
             self.launch_plan_reviewer(run_id, &digest).await?;
             return Ok(operation("re_review_plan", run_id.as_str()));
         }
-        let current_budget = plan_budget_assessment(
-            &run,
-            &plan,
-            &self.config,
-            self.store.run_usage(run_id)?.total_tokens,
-        );
+        let current_budget =
+            plan_budget_assessment(&run, &plan, self.store.run_usage(run_id)?.total_tokens);
         if !current_budget.feasible && !allow_budget_override {
             return Err(OrchestratorError::Blocked(format!(
                 "plan requires an estimated {} execution tokens but only {} remain; increase the run ceiling, request a smaller plan, or explicitly approve the budget override",
@@ -5321,6 +5347,12 @@ impl Orchestrator {
             .map(serde_json::from_value::<RetryContinuityMetadata>)
             .transpose()?;
         let governing = packet_uses_governor(&packet);
+        if !governing {
+            packet.token_budget = controller_task_token_budget(
+                &packet,
+                self.config.orchestration.default_task_token_budget,
+            );
+        }
         if governing {
             let status = self.runtime().await?.runtime_status().await;
             if !status.native_multi_agent {
@@ -5408,12 +5440,6 @@ impl Orchestrator {
         } else {
             None
         };
-        let continuity = build_attempt_continuity(
-            prior_context.as_ref(),
-            retry_metadata.as_ref(),
-            &packet,
-            persisted_handoff.as_deref(),
-        )?;
         let attempt_id = harness_domain::AttemptId::new();
         let governor_route = governing.then(|| self.governor_route(run)).transpose()?;
         let route = if governing {
@@ -5596,6 +5622,25 @@ impl Orchestrator {
                 if governing { "governor" } else { "worker" },
                 &context,
             )?;
+            let diff_policy = task_diff_policy(&packet, &profile.profile);
+            let prior_candidate_copied = if governing {
+                false
+            } else {
+                self.materialize_prior_attempt_candidate(
+                    prior_context.as_ref(),
+                    &worktree.path,
+                    &composed_base,
+                    &diff_policy,
+                )
+                .await?
+            };
+            let continuity = build_attempt_continuity(
+                prior_context.as_ref(),
+                retry_metadata.as_ref(),
+                &packet,
+                persisted_handoff.as_deref(),
+                prior_candidate_copied,
+            )?;
             let role = if governing {
                 AgentRole::Governor
             } else if packet.is_high_risk() || packet.owner_profile == "worker_escalation" {
@@ -5603,6 +5648,29 @@ impl Orchestrator {
             } else {
                 AgentRole::Worker
             };
+            let prompt = worker_prompt(
+                &packet,
+                &context,
+                governing,
+                github_capability.map(|capability| capability.summary.as_str()),
+                continuity.as_ref(),
+                &plan_advisories,
+            )?;
+            if !governing {
+                let developer_instructions =
+                    agent_developer_instructions(role, SandboxMode::WorkspaceWrite);
+                let required_budget = worker_launch_minimum_token_budget(
+                    role,
+                    prompt.len(),
+                    developer_instructions.len(),
+                );
+                if packet.token_budget < required_budget {
+                    return Err(OrchestratorError::Blocked(format!(
+                        "task {} assigns {} tokens, but its assembled prompt requires at least {} for bounded implementation and a final handoff; reduce inline context or revise the certified task budget",
+                        packet.task_id, packet.token_budget, required_budget
+                    )));
+                }
+            }
             if governing {
                 let envelope_key = format!("governor-envelope-baseline:{}", task.id);
                 if self.store.runtime_metadata(&envelope_key)?.is_none() {
@@ -5642,14 +5710,6 @@ impl Orchestrator {
                 .transition_task(&task.id, TaskState::Starting, None)?;
             self.store
                 .transition_task(&task.id, TaskState::Implementing, None)?;
-            let prompt = worker_prompt(
-                &packet,
-                &context,
-                governing,
-                github_capability.map(|capability| capability.summary.as_str()),
-                continuity.as_ref(),
-                &plan_advisories,
-            )?;
             self.start_agent(
                 &agent_id,
                 &run.id,
@@ -5662,31 +5722,49 @@ impl Orchestrator {
                 Some(packet.token_budget),
                 prompt,
                 if governing {
-                    Some(serde_json::from_str(GOVERNOR_CHECKPOINT_SCHEMA)?)
+                    Some(model_output_schema(serde_json::from_str(
+                        GOVERNOR_CHECKPOINT_SCHEMA,
+                    )?))
                 } else {
                     None
                 },
             )
             .await?;
-            Ok::<AgentSessionId, OrchestratorError>(agent_id)
+            Ok::<(AgentSessionId, Option<AttemptContinuity>), OrchestratorError>((
+                agent_id, continuity,
+            ))
         }
         .await;
-        let agent_id = match launch {
-            Ok(agent_id) => agent_id,
+        let (agent_id, continuity) = match launch {
+            Ok(started) => started,
             Err(error) => {
+                let policy_blocked = matches!(
+                    &error,
+                    OrchestratorError::Blocked(_) | OrchestratorError::Validation(_)
+                );
+                let failure_class = if policy_blocked {
+                    "policy_blocked"
+                } else {
+                    "infrastructure_unavailable"
+                };
+                let preservation_reason = if policy_blocked {
+                    "task launch policy check failed"
+                } else {
+                    "task launch failed"
+                };
                 self.store
                     .release_path_leases(&attempt_id, "task launch failed")?;
                 self.store.update_worktree(
                     &worktree_id,
                     "PRESERVED",
                     None,
-                    Some("task launch failed"),
+                    Some(preservation_reason),
                 )?;
                 self.store.set_attempt_result(
                     &attempt_id,
                     "FAILED",
                     None,
-                    Some("infrastructure_unavailable"),
+                    Some(failure_class),
                     Some(&error.to_string()),
                 )?;
                 return Err(error);
@@ -5726,6 +5804,47 @@ impl Orchestrator {
             }
         });
         Ok(())
+    }
+
+    async fn materialize_prior_attempt_candidate(
+        &self,
+        prior: Option<&PriorAttemptContext>,
+        current_worktree: &Path,
+        expected_base: &str,
+        policy: &DiffPolicy,
+    ) -> Result<bool, OrchestratorError> {
+        let Some(prior_worktree) = prior.and_then(|value| value.worktree_path.as_deref()) else {
+            return Ok(false);
+        };
+        if !prior_worktree.exists() {
+            return Ok(false);
+        }
+        let verified = match self
+            .git
+            .verify_diff(prior_worktree, expected_base, policy)
+            .await
+        {
+            Ok(verified)
+                if verified.acceptable()
+                    && verified.head_sha == expected_base
+                    && !verified.changed_paths.is_empty() =>
+            {
+                verified
+            }
+            Ok(_) => return Ok(false),
+            Err(error) => {
+                warn!(
+                    prior_worktree = %prior_worktree.display(),
+                    %error,
+                    "prior attempt candidate was not eligible for retry materialization"
+                );
+                return Ok(false);
+            }
+        };
+        self.git
+            .materialize_verified_diff(current_worktree, expected_base, &verified)
+            .await?;
+        Ok(true)
     }
 
     fn governor_route(&self, run: &RunSummary) -> Result<ModelRoute, OrchestratorError> {
@@ -5937,14 +6056,24 @@ impl Orchestrator {
                 if matches!(event.method.as_str(), "item/started" | "item/completed") {
                     self.project_native_collaboration(payload)?;
                 }
-                if event.method == "thread/tokenUsage/updated"
-                    && let Some(run_id) = run_id.as_ref()
-                {
-                    let run = self.store.run(run_id)?;
-                    if self.enforce_run_budget(&run)?
-                        && let Some(agent_id) = agent_id.as_ref()
-                    {
-                        self.interrupt_agent_at_run_budget(&run, agent_id).await?;
+                if event.method == "thread/tokenUsage/updated" {
+                    let observed_turn_id = value_text(payload, &[&["turnId"]]);
+                    let session_budget_stop = if let Some(agent_id) = agent_id.as_ref() {
+                        self.steer_agent_at_session_budget_checkpoint(agent_id, observed_turn_id)
+                            .await?;
+                        self.interrupt_agent_at_session_budget(agent_id, observed_turn_id)
+                            .await?
+                    } else {
+                        false
+                    };
+                    if let Some(run_id) = run_id.as_ref() {
+                        let run = self.store.run(run_id)?;
+                        if self.enforce_run_budget(&run)?
+                            && !session_budget_stop
+                            && let Some(agent_id) = agent_id.as_ref()
+                        {
+                            self.interrupt_agent_at_run_budget(&run, agent_id).await?;
+                        }
                     }
                 }
             }
@@ -6773,6 +6902,25 @@ impl Orchestrator {
         let status = value_text(payload, &[&["turn", "status"], &["status"]]).unwrap_or("failed");
         let agent = self.store.agent(agent_id)?;
         let (run_id, attempt_id) = self.store.agent_context(agent_id)?;
+        let completed_turn_id = value_text(payload, &[&["turn", "id"], &["turnId"]]);
+        let session_budget_interrupted = if status == "interrupted" {
+            match completed_turn_id {
+                Some(turn_id) => self
+                    .store
+                    .runtime_metadata(&format!("session-budget-hard-stop:{agent_id}:{turn_id}"))?
+                    .is_some(),
+                None => false,
+            }
+        } else {
+            false
+        };
+        let terminal_failure_class =
+            terminal_turn_failure_class(status, session_budget_interrupted);
+        let terminal_failure_reason = if session_budget_interrupted {
+            "session token budget exhausted"
+        } else {
+            status
+        };
         if self.store.run(&run_id)?.state == RunState::Stopping {
             if let Some(attempt_id) = attempt_id.as_ref() {
                 let task_id = self.store.task_for_attempt(attempt_id)?;
@@ -6848,7 +6996,7 @@ impl Orchestrator {
                             if status == "completed" {
                                 "protocol_error"
                             } else {
-                                "infrastructure_unavailable"
+                                terminal_failure_class
                             },
                             reason,
                         )),
@@ -6863,11 +7011,16 @@ impl Orchestrator {
                     )?;
                 }
                 Some(IntentInterviewStatus::Running) => {
+                    let reason = if session_budget_interrupted {
+                        "interviewer session token budget exhausted".to_owned()
+                    } else {
+                        format!("interviewer turn ended with status {status}")
+                    };
                     self.fail_intent_interview_turn(
                         &run_id,
                         agent_id,
-                        "infrastructure_unavailable",
-                        &format!("interviewer turn ended with status {status}"),
+                        terminal_failure_class,
+                        &reason,
                     )?;
                 }
                 Some(
@@ -6900,7 +7053,13 @@ impl Orchestrator {
                 return Ok(());
             }
             if agent.parent_agent_id.is_some() {
-                let (state, action, failure) = if status == "interrupted" {
+                let (state, action, failure) = if session_budget_interrupted {
+                    (
+                        "FAILED",
+                        "Child turn reached its session token ceiling",
+                        Some(("budget_exhausted", "session token budget exhausted")),
+                    )
+                } else if status == "interrupted" {
                     ("INTERRUPTED", "Child turn interrupted by governor", None)
                 } else {
                     (
@@ -6932,10 +7091,14 @@ impl Orchestrator {
             self.store.update_agent_state(
                 agent_id,
                 "FAILED",
-                Some("Codex turn did not complete"),
+                Some(if session_budget_interrupted {
+                    "Session token budget exhausted"
+                } else {
+                    "Codex turn did not complete"
+                }),
                 None,
                 None,
-                Some(("infrastructure_unavailable", status)),
+                Some((terminal_failure_class, terminal_failure_reason)),
             )?;
             if let Some(attempt_id) = attempt_id.as_ref() {
                 let task_id = self.store.task_for_attempt(attempt_id)?;
@@ -6957,8 +7120,8 @@ impl Orchestrator {
                     attempt_id,
                     "FAILED",
                     None,
-                    Some("infrastructure_unavailable"),
-                    Some(status),
+                    Some(terminal_failure_class),
+                    Some(terminal_failure_reason),
                 )?;
                 if agent.role == AgentRole::Governor
                     && let Some((_, packet)) = self.store.task_packet(&task_id)?
@@ -6983,19 +7146,33 @@ impl Orchestrator {
                     self.store.transition_run(
                         &run_id,
                         retry_state,
-                        "architecture_turn_failed",
+                        if session_budget_interrupted {
+                            "architecture_budget_exhausted"
+                        } else {
+                            "architecture_turn_failed"
+                        },
                         Some(run.version),
-                        Some(("infrastructure_unavailable", status)),
+                        Some((terminal_failure_class, terminal_failure_reason)),
                     )?;
                 }
             } else if agent.role == AgentRole::PlanReviewer {
                 let run = self.store.run(&run_id)?;
                 if run.state == RunState::PlanAdversarialReview {
-                    self.emit_run_event(
-                        &run,
-                        "run.plan.review_retry_queued",
-                        json!({"reason": status, "automatic": true}),
-                    )?;
+                    if session_budget_interrupted {
+                        self.store.transition_run(
+                            &run_id,
+                            RunState::Blocked,
+                            "plan_review_budget_exhausted",
+                            Some(run.version),
+                            Some((terminal_failure_class, terminal_failure_reason)),
+                        )?;
+                    } else {
+                        self.emit_run_event(
+                            &run,
+                            "run.plan.review_retry_queued",
+                            json!({"reason": status, "automatic": true}),
+                        )?;
+                    }
                 }
             } else if agent.role == AgentRole::FinalAuditor {
                 let run = self.store.run(&run_id)?;
@@ -7003,9 +7180,13 @@ impl Orchestrator {
                     self.store.transition_run(
                         &run_id,
                         RunState::Blocked,
-                        "final_audit_turn_failed",
+                        if session_budget_interrupted {
+                            "final_audit_budget_exhausted"
+                        } else {
+                            "final_audit_turn_failed"
+                        },
                         Some(run.version),
-                        Some(("infrastructure_unavailable", status)),
+                        Some((terminal_failure_class, terminal_failure_reason)),
                     )?;
                 }
             }
@@ -7603,6 +7784,158 @@ impl Orchestrator {
         Ok(())
     }
 
+    async fn interrupt_agent_at_session_budget(
+        &self,
+        agent_id: &AgentSessionId,
+        observed_turn_id: Option<&str>,
+    ) -> Result<bool, OrchestratorError> {
+        let agent = self.store.agent(agent_id)?;
+        if !session_budget_hard_stop_needed(
+            agent.role,
+            agent.token_budget,
+            agent.tokens_used,
+            agent.active_turn_id.as_deref(),
+            observed_turn_id,
+        ) {
+            return Ok(false);
+        }
+        let (Some(thread_id), Some(turn_id), Some(budget)) = (
+            agent.thread_id.as_deref(),
+            agent.active_turn_id.as_deref(),
+            agent.token_budget,
+        ) else {
+            return Ok(false);
+        };
+        let metadata_key = format!("session-budget-hard-stop:{agent_id}:{turn_id}");
+        if self.store.runtime_metadata(&metadata_key)?.is_some() {
+            return Ok(true);
+        }
+        match self
+            .runtime()
+            .await?
+            .interrupt_turn(thread_id, turn_id)
+            .await
+        {
+            Ok(_) => {
+                self.store.put_runtime_metadata(
+                    &metadata_key,
+                    &json!({
+                        "tokens_used": agent.tokens_used,
+                        "token_budget": budget,
+                        "turn_id": turn_id,
+                        "role": agent.role,
+                    }),
+                )?;
+                self.store.update_agent_state(
+                    agent_id,
+                    "STOPPING",
+                    Some("Session token ceiling reached; stopping the active turn"),
+                    None,
+                    None,
+                    None,
+                )?;
+                self.emit_agent_event(
+                    &self.store.agent_context(agent_id)?.0,
+                    agent_id,
+                    "agent.session_budget.hard_stop",
+                    json!({
+                        "tokens_used": agent.tokens_used,
+                        "token_budget": budget,
+                        "turn_id": turn_id,
+                        "role": agent.role,
+                    }),
+                )?;
+                return Ok(true);
+            }
+            Err(error) => {
+                warn!(
+                    %agent_id,
+                    %error,
+                    "could not interrupt active turn after session token ceiling"
+                );
+            }
+        }
+        Ok(false)
+    }
+
+    async fn steer_agent_at_session_budget_checkpoint(
+        &self,
+        agent_id: &AgentSessionId,
+        observed_turn_id: Option<&str>,
+    ) -> Result<(), OrchestratorError> {
+        let agent = self.store.agent(agent_id)?;
+        if !session_budget_checkpoint_needed(
+            agent.role,
+            &agent.state,
+            agent.token_budget,
+            agent.tokens_used,
+            agent.active_turn_id.as_deref(),
+            observed_turn_id,
+        ) {
+            return Ok(());
+        }
+        let (Some(thread_id), Some(turn_id), Some(budget)) = (
+            agent.thread_id.as_deref(),
+            agent.active_turn_id.as_deref(),
+            agent.token_budget,
+        ) else {
+            return Ok(());
+        };
+        let Some(checkpoint_percent) = session_budget_checkpoint_percent(agent.role) else {
+            return Ok(());
+        };
+        let metadata_key = format!("session-budget-checkpoint:{agent_id}:{turn_id}");
+        if self.store.runtime_metadata(&metadata_key)?.is_some() {
+            return Ok(());
+        }
+        let message = session_budget_checkpoint_message(agent.role);
+        match self
+            .runtime()
+            .await?
+            .steer_turn(thread_id, turn_id, message)
+            .await
+        {
+            Ok(_) => {
+                self.store.put_runtime_metadata(
+                    &metadata_key,
+                    &json!({
+                        "checkpoint_percent": checkpoint_percent,
+                        "tokens_used": agent.tokens_used,
+                        "token_budget": budget,
+                        "turn_id": turn_id,
+                        "role": agent.role,
+                    }),
+                )?;
+                self.store.update_agent_state(
+                    agent_id,
+                    "STEERED",
+                    Some("Session token budget checkpoint delivered"),
+                    None,
+                    None,
+                    None,
+                )?;
+                self.emit_agent_event(
+                    &self.store.agent_context(agent_id)?.0,
+                    agent_id,
+                    "agent.session_budget.checkpoint",
+                    json!({
+                        "checkpoint_percent": checkpoint_percent,
+                        "tokens_used": agent.tokens_used,
+                        "token_budget": budget,
+                        "turn_id": turn_id,
+                        "role": agent.role,
+                    }),
+                )?;
+            }
+            Err(error) => warn!(
+                %agent_id,
+                %error,
+                "could not deliver session token-budget checkpoint"
+            ),
+        }
+        Ok(())
+    }
+
     async fn finalize_worker(&self, agent_id: &AgentSessionId) -> Result<(), OrchestratorError> {
         let (run_id, Some(attempt_id)) = self.store.agent_context(agent_id)? else {
             return Err(OrchestratorError::Protocol(
@@ -7633,19 +7966,7 @@ impl Orchestrator {
             .verify_diff(
                 &worktree,
                 &base_sha,
-                &DiffPolicy {
-                    owned_paths: packet.owned_paths.clone(),
-                    forbidden_paths: packet
-                        .forbidden_paths
-                        .iter()
-                        .chain(profile.profile.forbidden_generated_runtime_paths.iter())
-                        .cloned()
-                        .collect(),
-                    serial_paths: profile.profile.serial_paths.clone(),
-                    reserved_serial_paths: packet.reserved_serial_paths.clone(),
-                    max_files: packet.diff_budget.files,
-                    max_lines: packet.diff_budget.lines,
-                },
+                &task_diff_policy(&packet, &profile.profile),
             )
             .await
         {
@@ -8473,7 +8794,9 @@ impl Orchestrator {
                     packet_requires_github(packet),
                 ),
                 approval_policy,
-                output_schema: Some(serde_json::from_str(GOVERNOR_CHECKPOINT_SCHEMA)?),
+                output_schema: Some(model_output_schema(serde_json::from_str(
+                    GOVERNOR_CHECKPOINT_SCHEMA,
+                )?)),
                 reasoning_summary: self.config.codex.reasoning_summary.clone(),
             })
             .await?;
@@ -8792,7 +9115,7 @@ impl Orchestrator {
                 &format!("Verify {}", packet.objective),
                 Some(packet.token_budget / 2),
                 prompt,
-                Some(verifier_schema()),
+                Some(model_output_schema(verifier_schema())),
             )
             .await
         {
@@ -9932,7 +10255,7 @@ impl Orchestrator {
             cwd: worktree.to_path_buf(),
             state: "STARTING".to_owned(),
             current_goal: Some(packet.objective.clone()),
-            token_budget: Some(self.config.orchestration.default_task_token_budget),
+            token_budget: Some(FINAL_AUDITOR_SESSION_TOKEN_BUDGET),
         })?;
         let plan = self
             .store
@@ -9957,9 +10280,9 @@ impl Orchestrator {
             SandboxMode::ReadOnly,
             text_requires_github(&run.objective),
             &packet.objective,
-            Some(self.config.orchestration.default_task_token_budget),
+            Some(FINAL_AUDITOR_SESSION_TOKEN_BUDGET),
             prompt,
-            Some(verifier_schema()),
+            Some(model_output_schema(verifier_schema())),
         )
         .await?;
         self.emit_agent_event(
@@ -10586,6 +10909,12 @@ impl Orchestrator {
             .task_packet(task_id)?
             .ok_or_else(|| OrchestratorError::Blocked("task has no prior packet".to_owned()))?;
         let governing = packet_uses_governor(&packet);
+        if !governing && request.additional_token_budget > 0 {
+            return Err(OrchestratorError::Validation(
+                "additional token budget is available only for governor retries; worker retries use the controller-assigned role budget"
+                    .to_owned(),
+            ));
+        }
         if governing {
             self.store
                 .delete_runtime_metadata(&format!("governor-continuation-signature:{task_id}"))?;
@@ -10650,6 +10979,12 @@ impl Orchestrator {
         };
         if request.model_route == "escalate_terra" && !governing {
             packet.owner_profile = "worker_escalation".to_owned();
+        }
+        if !governing {
+            packet.token_budget = controller_task_token_budget(
+                &packet,
+                self.config.orchestration.default_task_token_budget,
+            );
         }
         self.store
             .release_path_leases(&attempt_id, "task retry requested")?;
@@ -11975,7 +12310,6 @@ fn validate_execution_review_verdict(
 fn plan_budget_assessment(
     run: &RunSummary,
     plan: &RunPlan,
-    config: &HarnessConfig,
     planning_tokens_used: u64,
 ) -> PlanBudgetAssessment {
     let run_token_ceiling = run
@@ -11999,7 +12333,7 @@ fn plan_budget_assessment(
     let final_audit_reserve_tokens = if run.mode == "plan_only" {
         0
     } else {
-        config.orchestration.default_task_token_budget
+        FINAL_AUDITOR_SESSION_TOKEN_BUDGET
     };
     let direct_execution_tokens = planned_task_tokens
         .saturating_add(verifier_reserve_tokens)
@@ -12202,7 +12536,7 @@ fn worker_prompt(
     let action_contract = if governing {
         "Work the next highest-leverage outcome now. Use direct repository work by default; delegate a bounded read-only investigation or review only when it materially shortens the critical path. Reconcile useful existing delegated work without repeating completed exploration. Materialize any recoverable candidate into this leased worktree before claiming progress."
     } else {
-        "Implement the packet's requested behavior and run the smallest focused checks that provide useful feedback. Stop only if required work is outside leased custody or conflicts with active authority."
+        WORKER_EXECUTION_CONTRACT
     };
     let replan_contract = if governing {
         format!("\n\n{GOVERNOR_REPLAN_CONTRACT}")
@@ -12240,11 +12574,48 @@ fn worker_prompt(
     ))
 }
 
+fn task_diff_policy(packet: &TaskPacket, profile: &RepositoryProfile) -> DiffPolicy {
+    DiffPolicy {
+        owned_paths: packet.owned_paths.clone(),
+        forbidden_paths: packet
+            .forbidden_paths
+            .iter()
+            .chain(profile.forbidden_generated_runtime_paths.iter())
+            .cloned()
+            .collect(),
+        serial_paths: profile.serial_paths.clone(),
+        reserved_serial_paths: packet.reserved_serial_paths.clone(),
+        max_files: packet.diff_budget.files,
+        max_lines: packet.diff_budget.lines,
+    }
+}
+
+fn worker_launch_minimum_token_budget(
+    role: AgentRole,
+    prompt_bytes: usize,
+    developer_instruction_bytes: usize,
+) -> u64 {
+    let visible_bytes =
+        u64::try_from(prompt_bytes.saturating_add(developer_instruction_bytes)).unwrap_or(u64::MAX);
+    let full_context_inference = visible_bytes
+        .div_ceil(4)
+        .saturating_add(WORKER_PROTOCOL_CONTEXT_ALLOWANCE);
+    let bounded_inferences = if role == AgentRole::HighRiskWorker {
+        3
+    } else {
+        2
+    };
+    full_context_inference
+        .saturating_mul(bounded_inferences)
+        .saturating_add(WORKER_COMPLETION_RESERVE)
+}
+
 fn build_attempt_continuity(
     prior: Option<&PriorAttemptContext>,
     retry: Option<&RetryContinuityMetadata>,
     packet: &TaskPacket,
     persisted_handoff: Option<&str>,
+    prior_candidate_copied: bool,
 ) -> Result<Option<AttemptContinuity>, OrchestratorError> {
     let Some(prior) = prior else {
         return Ok(None);
@@ -12307,11 +12678,7 @@ fn build_attempt_continuity(
         "operator_retry_guidance": retry_reason,
         "durable_handoff": durable_handoff,
         "last_agent_message": last_agent_message,
-        "custody": {
-            "prior_worktree_is_read_only_reference": true,
-            "prior_uncommitted_changes_copied": false,
-            "current_worktree_is_only_mutable_root": true,
-        },
+        "custody": retry_custody_receipt(prior_candidate_copied),
     }))?;
     Ok(Some(AttemptContinuity {
         strategy: "bounded_handoff".to_owned(),
@@ -12319,6 +12686,14 @@ fn build_attempt_continuity(
         reason,
         prompt,
     }))
+}
+
+fn retry_custody_receipt(prior_candidate_copied: bool) -> Value {
+    json!({
+        "prior_worktree_is_read_only_reference": true,
+        "prior_uncommitted_changes_copied": prior_candidate_copied,
+        "current_worktree_is_only_mutable_root": true,
+    })
 }
 
 fn read_bounded_handoff(worktree: &Path, handoff_path: &str) -> Option<String> {
@@ -12489,6 +12864,92 @@ fn advance_governor_remediation_state(
 
 fn governor_turn_tokens_used(cumulative: u64, baseline: u64) -> u64 {
     cumulative.saturating_sub(baseline)
+}
+
+fn session_budget_hard_stop_needed(
+    role: AgentRole,
+    token_budget: Option<u64>,
+    tokens_used: u64,
+    active_turn_id: Option<&str>,
+    observed_turn_id: Option<&str>,
+) -> bool {
+    role != AgentRole::Governor
+        && token_budget.is_some_and(|budget| budget > 0 && tokens_used >= budget)
+        && active_turn_id.is_some()
+        && active_turn_id == observed_turn_id
+}
+
+fn session_budget_checkpoint_needed(
+    role: AgentRole,
+    agent_state: &str,
+    token_budget: Option<u64>,
+    tokens_used: u64,
+    active_turn_id: Option<&str>,
+    observed_turn_id: Option<&str>,
+) -> bool {
+    matches!(agent_state, "RUNNING" | "STEERED")
+        && token_budget.is_some_and(|budget| {
+            session_budget_checkpoint_percent(role).is_some_and(|checkpoint_percent| {
+                budget > 0
+                    && tokens_used < budget
+                    && tokens_used.saturating_mul(100) >= budget.saturating_mul(checkpoint_percent)
+            })
+        })
+        && active_turn_id.is_some()
+        && active_turn_id == observed_turn_id
+}
+
+fn session_budget_checkpoint_percent(role: AgentRole) -> Option<u64> {
+    match role {
+        AgentRole::Governor => None,
+        // Mutable workers must pivot before repeated repository reads consume
+        // the calls needed to edit, check, and hand off. The launch preflight
+        // already proves that their initial context fits the session.
+        AgentRole::Worker | AgentRole::HighRiskWorker => Some(20),
+        // Every bounded session needs enough remaining budget to read the
+        // checkpoint and perform another full-context inference. Total-token
+        // accounting includes that repeated input, so a late checkpoint can
+        // be impossible to act on even when output is short. Worker launch
+        // preflight also rejects prompts that cannot fit useful work.
+        _ => Some(40),
+    }
+}
+
+fn session_budget_checkpoint_message(role: AgentRole) -> &'static str {
+    match role {
+        AgentRole::Architect => {
+            "Controller token-budget checkpoint: stop tools and return your best complete schema-valid plan now. Do not begin further repository discovery or implementation."
+        }
+        AgentRole::PlanReviewer => {
+            "Controller token-budget checkpoint: stop tools and return your best complete schema-valid review verdict now. Do not begin further repository discovery."
+        }
+        AgentRole::FinalAuditor => {
+            "Controller token-budget checkpoint: stop tools and return your best complete schema-valid final-audit verdict now. Do not begin further repository discovery."
+        }
+        AgentRole::Verifier => {
+            "Controller token-budget checkpoint: stop tools and return your best complete schema-valid verifier verdict now. Do not begin further repository discovery."
+        }
+        AgentRole::Interviewer => {
+            "Controller token-budget checkpoint: stop tools and return your best complete schema-valid interview turn now. Do not ask additional questions unless required by the response contract."
+        }
+        AgentRole::Worker | AgentRole::HighRiskWorker => {
+            "Controller token-budget checkpoint: broad exploration is over. Your next tool call must create the smallest task-owned diff unless one narrowly targeted source read is strictly necessary; after that read, edit immediately. Do not issue another broad search, status, or discovery command. Run the narrowest useful check, then return a concise handoff. Do not return an empty handoff unless a concrete authority or environment blocker prevents edits."
+        }
+        AgentRole::Integrator | AgentRole::CiTriage => {
+            "Controller token-budget checkpoint: broad exploration is over. Continue using tools to complete the smallest task-owned correction now, run the narrowest useful check, and then return a concise handoff. Do not return an empty handoff unless a concrete authority or environment blocker prevents edits."
+        }
+        _ => {
+            "Controller token-budget checkpoint: stop tools and return your best complete handoff now. Name changes, checks and results, residual risk, anything unproved, and the next action if incomplete."
+        }
+    }
+}
+
+fn terminal_turn_failure_class(status: &str, session_budget_interrupted: bool) -> &'static str {
+    if status == "interrupted" && session_budget_interrupted {
+        "budget_exhausted"
+    } else {
+        "infrastructure_unavailable"
+    }
 }
 
 fn governor_progress_fingerprint(
@@ -13046,7 +13507,21 @@ fn parse_architecture_plan(
     for task in tasks {
         canonicalize_architecture_task(run, profile, default_token_budget, task)?;
     }
-    serde_json::from_value(value).map_err(Into::into)
+    let mut plan: RunPlan = serde_json::from_value(value)?;
+    for task in &mut plan.tasks {
+        task.token_budget = controller_task_token_budget(task, default_token_budget);
+    }
+    Ok(plan)
+}
+
+fn controller_task_token_budget(task: &TaskPacket, default_token_budget: u64) -> u64 {
+    if !packet_uses_governor(task)
+        && (task.is_high_risk() || task.owner_profile == "worker_escalation")
+    {
+        default_token_budget.max(HIGH_RISK_WORKER_SESSION_TOKEN_BUDGET)
+    } else {
+        default_token_budget
+    }
 }
 
 fn canonicalize_architecture_task(
@@ -13092,8 +13567,7 @@ fn canonicalize_architecture_task(
     task.entry("tool_budget".to_owned()).or_insert(Value::Null);
     task.entry("risk_flags".to_owned())
         .or_insert_with(|| json!([]));
-    task.entry("token_budget".to_owned())
-        .or_insert_with(|| json!(default_token_budget));
+    task.insert("token_budget".to_owned(), json!(default_token_budget));
     task.entry("lease_expires_at".to_owned())
         .or_insert_with(|| json!("controller-managed"));
     task.entry("handoff_path".to_owned())
@@ -13458,6 +13932,95 @@ fn plan_review_schema() -> Value {
             }
         }
     })
+}
+
+fn run_plan_output_schema() -> Result<Value, OrchestratorError> {
+    let mut schema = serde_json::from_str::<Value>(RUN_PLAN_SCHEMA)?;
+    let task_properties = schema
+        .pointer_mut("/$defs/task/properties")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            OrchestratorError::Protocol(
+                "embedded run-plan schema has no task properties".to_owned(),
+            )
+        })?;
+
+    // Generate only architectural choices. Program identity, exact-SHA
+    // receipts, reviewer/authority fields, leases, and empty optional
+    // collections are filled deterministically by
+    // `canonicalize_architecture_task`.
+    task_properties.retain(|field, _| ARCHITECT_TASK_OUTPUT_FIELDS.contains(&field.as_str()));
+    Ok(model_output_schema(schema))
+}
+
+fn model_output_schema(mut schema: Value) -> Value {
+    normalize_structured_output_schema(&mut schema);
+    schema
+}
+
+fn normalize_structured_output_schema(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            // The repository contract retains uniqueness constraints for
+            // validation, but the model API does not accept this keyword.
+            object.remove("uniqueItems");
+            if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+                object.insert(
+                    "required".to_owned(),
+                    Value::Array(properties.keys().cloned().map(Value::String).collect()),
+                );
+            }
+            if !object.contains_key("type") {
+                let inferred = object
+                    .get("const")
+                    .map(json_schema_type)
+                    .or_else(|| object.get("enum").and_then(infer_enum_schema_type));
+                if let Some(inferred) = inferred {
+                    object.insert("type".to_owned(), inferred);
+                }
+            }
+            for child in object.values_mut() {
+                normalize_structured_output_schema(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_structured_output_schema(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn infer_enum_schema_type(value: &Value) -> Option<Value> {
+    let values = value.as_array()?;
+    let mut types = Vec::new();
+    for value in values {
+        let candidate = json_schema_type(value);
+        if !types.contains(&candidate) {
+            types.push(candidate);
+        }
+    }
+    match types.as_slice() {
+        [] => None,
+        [single] => Some(single.clone()),
+        _ => Some(Value::Array(types)),
+    }
+}
+
+fn json_schema_type(value: &Value) -> Value {
+    Value::String(
+        match value {
+            Value::Null => "null",
+            Value::Bool(_) => "boolean",
+            Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        }
+        .to_owned(),
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -14032,7 +14595,9 @@ mod tests {
                 "task_id": "ROOT",
                 "title": "Deliver the behavior",
                 "objective": "Implement and prove the requested behavior",
-                "owned_paths": ["src/**"],
+                "priority": "P1",
+                "owned_paths": ["src/**", "Cargo.lock"],
+                "reserved_serial_paths": ["Cargo.lock"],
                 "milestones": [
                     {"id":"M1","title":"Implement slice","objective":"Build the first working slice","success_criteria":["The primary path works"]},
                     {"id":"M2","title":"Exercise pipeline","objective":"Run the authoritative path","success_criteria":["Runtime evidence is recorded"]},
@@ -14042,6 +14607,7 @@ mod tests {
                 "required_evidence": ["Authoritative pipeline result"],
                 "proof_limits": ["Local evidence is not deployment proof"],
                 "diff_budget": {"files": 12, "lines": 1200},
+                "token_budget": 999999,
                 "resources": ["A representative runtime"],
                 "replan_authority": ["Stop only at a genuine external boundary"]
             }]
@@ -14056,6 +14622,9 @@ mod tests {
         assert_eq!(task.base_sha, run.base_sha);
         assert_eq!(task.owner_profile, "governor");
         assert_eq!(task.execution_mode, "controller");
+        assert_eq!(task.priority, "P1");
+        assert_eq!(task.token_budget, 80_000);
+        assert_eq!(task.reserved_serial_paths, ["Cargo.lock"]);
         assert_eq!(task.reviewer_profile, "verifier");
         assert_eq!(task.checklist_rows.len(), 3);
         assert_eq!(task.authority_refs, ["controller://run-objective"]);
@@ -14066,6 +14635,62 @@ mod tests {
         assert_eq!(
             task.stop_conditions,
             ["Stop only at a genuine external boundary"]
+        );
+        let mut high_risk = task.clone();
+        high_risk.owner_profile = "worker_escalation".to_owned();
+        high_risk.execution_mode = "agent".to_owned();
+        high_risk.risk_flags = vec!["canonical_contract".to_owned()];
+        high_risk.token_budget = 12_000;
+        assert_eq!(
+            controller_task_token_budget(&high_risk, 80_000),
+            HIGH_RISK_WORKER_SESSION_TOKEN_BUDGET
+        );
+        let budget = plan_budget_assessment(&run, &plan, 0);
+        assert_eq!(budget.planned_task_tokens, 80_000);
+        assert_eq!(budget.verifier_reserve_tokens, 40_000);
+        assert_eq!(
+            budget.final_audit_reserve_tokens,
+            FINAL_AUDITOR_SESSION_TOKEN_BUDGET
+        );
+        assert_eq!(budget.required_execution_tokens, 288_000);
+    }
+
+    #[test]
+    fn worker_launch_budget_rejects_the_observed_large_prompt_and_admits_bounded_context() {
+        let large = worker_launch_minimum_token_budget(AgentRole::HighRiskWorker, 161_025, 1_600);
+        assert!(large > HIGH_RISK_WORKER_SESSION_TOKEN_BUDGET);
+
+        let bounded_high_risk =
+            worker_launch_minimum_token_budget(AgentRole::HighRiskWorker, 45_000, 1_600);
+        assert!(bounded_high_risk <= HIGH_RISK_WORKER_SESSION_TOKEN_BUDGET);
+        let bounded_worker = worker_launch_minimum_token_budget(AgentRole::Worker, 45_000, 1_600);
+        assert!(bounded_worker <= 80_000);
+    }
+
+    #[test]
+    fn worker_execution_contract_prioritizes_candidate_feedback_over_rediscovery() {
+        assert!(WORKER_EXECUTION_CONTRACT.contains("do not batch broad discovery"));
+        assert!(
+            WORKER_EXECUTION_CONTRACT
+                .contains("create a candidate diff before any further exploration")
+        );
+        assert!(WORKER_EXECUTION_CONTRACT.contains("iterate from concrete failures"));
+        assert!(WORKER_EXECUTION_CONTRACT.contains("inspect that diff first"));
+    }
+
+    #[test]
+    fn retry_custody_receipt_reports_materialized_candidate_truthfully() {
+        assert_eq!(
+            retry_custody_receipt(true)["prior_uncommitted_changes_copied"],
+            json!(true)
+        );
+        assert_eq!(
+            retry_custody_receipt(false)["prior_uncommitted_changes_copied"],
+            json!(false)
+        );
+        assert_eq!(
+            retry_custody_receipt(true)["current_worktree_is_only_mutable_root"],
+            json!(true)
         );
     }
 
@@ -14237,6 +14862,116 @@ mod tests {
                 properties[field].get("type").is_some(),
                 "response-format property {field} needs an explicit JSON Schema type"
             );
+        }
+    }
+
+    #[test]
+    fn model_output_schemas_match_the_strict_api_subset() {
+        fn assert_compatible(value: &Value, path: &str) {
+            match value {
+                Value::Object(object) => {
+                    for unsupported in [
+                        "uniqueItems",
+                        "allOf",
+                        "not",
+                        "dependentRequired",
+                        "dependentSchemas",
+                        "if",
+                        "then",
+                        "else",
+                    ] {
+                        assert!(
+                            !object.contains_key(unsupported),
+                            "unsupported keyword {unsupported} at {path}"
+                        );
+                    }
+                    if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+                        assert_eq!(
+                            object.get("additionalProperties"),
+                            Some(&Value::Bool(false)),
+                            "object must be closed at {path}"
+                        );
+                        let required = object["required"]
+                            .as_array()
+                            .expect("object properties need a required list")
+                            .iter()
+                            .map(|entry| entry.as_str().expect("required entry must be text"))
+                            .collect::<BTreeSet<_>>();
+                        let property_names = properties.keys().map(String::as_str).collect();
+                        assert_eq!(
+                            required, property_names,
+                            "all fields must be required at {path}"
+                        );
+                    }
+                    if object.get("type").and_then(Value::as_str) == Some("object") {
+                        assert_eq!(
+                            object.get("additionalProperties"),
+                            Some(&Value::Bool(false)),
+                            "free-form object is not supported at {path}"
+                        );
+                    }
+                    if object.contains_key("const") || object.contains_key("enum") {
+                        assert!(
+                            object.contains_key("type"),
+                            "const and enum schemas need an explicit type at {path}"
+                        );
+                    }
+                    for (key, child) in object {
+                        assert_compatible(child, &format!("{path}/{key}"));
+                    }
+                }
+                Value::Array(items) => {
+                    for (index, item) in items.iter().enumerate() {
+                        assert_compatible(item, &format!("{path}/{index}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let authoritative: Value = serde_json::from_str(RUN_PLAN_SCHEMA).unwrap();
+        assert!(
+            authoritative
+                .pointer("/$defs/strings/uniqueItems")
+                .is_some(),
+            "the full validation contract should retain uniqueness"
+        );
+
+        let output = run_plan_output_schema().unwrap();
+        assert!(
+            output
+                .pointer("/$defs/task/properties/dependency_shas")
+                .is_none(),
+            "the controller-owned free-form map must not reach Structured Outputs"
+        );
+        let generated_task_fields = output["$defs"]["task"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            generated_task_fields,
+            ARCHITECT_TASK_OUTPUT_FIELDS
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            "architect output must contain semantic choices only"
+        );
+        for (name, schema) in [
+            ("plan", output),
+            (
+                "interview",
+                model_output_schema(serde_json::from_str(INTENT_INTERVIEW_TURN_SCHEMA).unwrap()),
+            ),
+            ("plan-review", model_output_schema(plan_review_schema())),
+            ("verifier", model_output_schema(verifier_schema())),
+            (
+                "governor",
+                model_output_schema(serde_json::from_str(GOVERNOR_CHECKPOINT_SCHEMA).unwrap()),
+            ),
+        ] {
+            assert_compatible(&schema, name);
         }
     }
 
@@ -14503,6 +15238,157 @@ mod tests {
     fn warm_governor_budget_uses_usage_since_turn_baseline() {
         assert_eq!(governor_turn_tokens_used(1_250_000, 1_100_000), 150_000);
         assert_eq!(governor_turn_tokens_used(900_000, 1_100_000), 0);
+    }
+
+    #[test]
+    fn session_budget_hard_stop_requires_current_non_governor_turn_at_ceiling() {
+        assert!(session_budget_hard_stop_needed(
+            AgentRole::Architect,
+            Some(80_000),
+            80_000,
+            Some("turn-current"),
+            Some("turn-current"),
+        ));
+        assert!(!session_budget_hard_stop_needed(
+            AgentRole::Governor,
+            Some(80_000),
+            289_519,
+            Some("turn-current"),
+            Some("turn-current"),
+        ));
+        assert!(!session_budget_hard_stop_needed(
+            AgentRole::Architect,
+            Some(80_000),
+            289_519,
+            Some("turn-current"),
+            Some("turn-prior"),
+        ));
+        assert!(!session_budget_hard_stop_needed(
+            AgentRole::Architect,
+            Some(0),
+            289_519,
+            Some("turn-current"),
+            Some("turn-current"),
+        ));
+    }
+
+    #[test]
+    fn session_budget_checkpoint_requires_current_non_governor_turn_before_ceiling() {
+        assert!(session_budget_checkpoint_needed(
+            AgentRole::Architect,
+            "RUNNING",
+            Some(120_000),
+            48_000,
+            Some("turn-current"),
+            Some("turn-current"),
+        ));
+        assert!(!session_budget_checkpoint_needed(
+            AgentRole::Architect,
+            "RUNNING",
+            Some(120_000),
+            47_999,
+            Some("turn-current"),
+            Some("turn-current"),
+        ));
+        assert!(!session_budget_checkpoint_needed(
+            AgentRole::Architect,
+            "RUNNING",
+            Some(120_000),
+            120_000,
+            Some("turn-current"),
+            Some("turn-current"),
+        ));
+        assert!(session_budget_checkpoint_needed(
+            AgentRole::Worker,
+            "RUNNING",
+            Some(120_000),
+            24_000,
+            Some("turn-current"),
+            Some("turn-current"),
+        ));
+        assert!(!session_budget_checkpoint_needed(
+            AgentRole::Worker,
+            "RUNNING",
+            Some(120_000),
+            23_999,
+            Some("turn-current"),
+            Some("turn-current"),
+        ));
+        assert!(!session_budget_checkpoint_needed(
+            AgentRole::Governor,
+            "RUNNING",
+            Some(120_000),
+            101_000,
+            Some("turn-current"),
+            Some("turn-current"),
+        ));
+        assert!(!session_budget_checkpoint_needed(
+            AgentRole::Architect,
+            "RUNNING",
+            Some(120_000),
+            101_000,
+            Some("turn-current"),
+            Some("turn-prior"),
+        ));
+        for terminal_or_stopping in ["INTERRUPTED", "STOPPING", "WAITING_APPROVAL"] {
+            assert!(!session_budget_checkpoint_needed(
+                AgentRole::Architect,
+                terminal_or_stopping,
+                Some(120_000),
+                101_000,
+                Some("turn-current"),
+                Some("turn-current"),
+            ));
+        }
+    }
+
+    #[test]
+    fn session_budget_checkpoint_messages_preserve_each_role_contract() {
+        for (role, expected) in [
+            (AgentRole::Architect, "schema-valid plan"),
+            (AgentRole::PlanReviewer, "schema-valid review verdict"),
+            (AgentRole::FinalAuditor, "schema-valid final-audit verdict"),
+            (AgentRole::Verifier, "schema-valid verifier verdict"),
+            (AgentRole::Interviewer, "schema-valid interview turn"),
+        ] {
+            let message = session_budget_checkpoint_message(role);
+            assert!(message.contains("stop tools and return your best complete"));
+            assert!(message.contains(expected));
+        }
+        for role in [
+            AgentRole::Worker,
+            AgentRole::HighRiskWorker,
+            AgentRole::Integrator,
+            AgentRole::CiTriage,
+        ] {
+            let message = session_budget_checkpoint_message(role);
+            assert!(message.contains("smallest"));
+            assert!(message.contains("Do not return an empty handoff"));
+            assert!(!message.contains("stop tools"));
+            assert!(!message.contains("schema-valid"));
+        }
+        for role in [AgentRole::Worker, AgentRole::HighRiskWorker] {
+            let worker_message = session_budget_checkpoint_message(role);
+            assert!(worker_message.contains("next tool call must create"));
+            assert!(worker_message.contains("one narrowly targeted source read"));
+            assert!(worker_message.contains("edit immediately"));
+        }
+    }
+
+    #[test]
+    fn terminal_budget_interrupt_is_not_an_infrastructure_failure() {
+        assert_eq!(
+            terminal_turn_failure_class("interrupted", true),
+            "budget_exhausted"
+        );
+        assert_eq!(
+            terminal_turn_failure_class("interrupted", false),
+            "infrastructure_unavailable"
+        );
+        assert_eq!(
+            terminal_turn_failure_class("failed", true),
+            "infrastructure_unavailable"
+        );
     }
 
     #[test]

@@ -38,6 +38,7 @@ import {
   useState,
 } from "react";
 import { api } from "./api";
+import { ImprovementCenter } from "./improvement/ImprovementCenter";
 import type {
   Agent,
   Approval,
@@ -62,7 +63,7 @@ import type {
   WorktreeDiffSummary,
 } from "./types";
 
-type View = "home" | "repositories" | "runs" | "usage" | "host" | "settings";
+type View = "home" | "repositories" | "runs" | "improvement" | "usage" | "host" | "settings";
 type Modal =
   | "register"
   | "prepare-checkout"
@@ -76,6 +77,7 @@ const nav: Array<{ view: View; label: string; icon: typeof Home }> = [
   { view: "home", label: "Home", icon: Home },
   { view: "repositories", label: "Repositories", icon: FolderGit2 },
   { view: "runs", label: "Runs", icon: Activity },
+  { view: "improvement", label: "Improvement", icon: Network },
   { view: "usage", label: "Usage", icon: CircleDollarSign },
 ];
 const systemNav: Array<{ view: View; label: string; icon: typeof Home }> = [
@@ -858,6 +860,12 @@ export default function App() {
           {view === "usage" && (
             <UsageView breakdown={usageBreakdown} accounts={codexAccounts} />
           )}
+          {view === "improvement" && (
+            <ImprovementCenter
+              repositoryId={currentRun?.repository_id || repositories[0]?.id}
+              runtime={runtime}
+            />
+          )}
           {view === "host" && (
             <HostView runtime={runtime} repositories={repositories} />
           )}
@@ -1059,7 +1067,7 @@ function TopBar({
       <div className="top-spacer" />
       <div
         className={`top-pill ${runtime?.codex.state === "ready" ? "healthy" : "unhealthy"}`}
-        title={runtime?.codex.detail}
+        title={runtime?.codex.detail ?? undefined}
       >
         <i className="status-dot" />
         <span>App Server {runtime?.codex.version || "offline"}</span>

@@ -815,10 +815,14 @@ then falls back to a prior final agent message. Operator guidance is optional:
 a blank Continue action means the controller selects the next action from the
 durable milestone ledger without rewriting the goal. Raw reasoning and the full
 conversational transcript are not copied. The prior worktree remains a read-only
-recovery source; uncommitted edits are never implied to exist in the new isolated
-attempt. An attested candidate tree may be materialized into a clean leased
-worktree by the controller, after which normal path, diff-budget, and base-SHA
-custody still applies. The run UI labels cold recovery as `bounded_handoff` and
+recovery source. Before a retry starts, the controller may materialize its
+uncommitted diff into the new clean leased worktree only when the prior HEAD,
+owned paths, forbidden paths, serial-path reservations, diff budget, and patch
+all pass the current task's exact-base custody checks. The continuity receipt
+states whether this occurred; otherwise, it never implies that prior edits are
+present. An attested candidate tree may use the same clean materialization path,
+after which normal path, diff-budget, and base-SHA custody still applies. The run
+UI labels cold recovery as `bounded_handoff` and
 links the source attempt.
 
 Every governor-owned task contains 3-20 human-reviewable milestones. Every
@@ -904,6 +908,13 @@ verifier                 80k tokens
 integrator              160k tokens
 final auditor           120k tokens
 ```
+
+These allocations are controller policy, not planner-authored limits. The
+controller assigns 80k to a bounded worker and 140k to a high-risk worker,
+then includes those amounts in the feasibility check. A plan cannot lower a
+session below the applicable allocation or raise it without operator policy.
+Before launch, the controller also verifies that the assembled prompt leaves
+room for bounded implementation and a final handoff.
 
 The goal API carries the active budget where supported. The controller ledger remains authoritative across turns and subagents.
 

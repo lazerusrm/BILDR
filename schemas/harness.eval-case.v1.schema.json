@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:harness:eval-case.v1",
+  "title": "Harness evaluation case revision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "case_id", "revision", "title", "task_family", "objective", "source", "split", "runtime", "custody", "acceptance", "grader_bundle_id", "grader_bundle_revision", "grader_bundle_digest", "privacy", "sha256"],
+  "properties": {
+    "schema": {"const": "harness.eval-case.v1"},
+    "case_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
+    "revision": {"type": "integer", "minimum": 1},
+    "title": {"type": "string", "minLength": 1},
+    "task_family": {"type": "string", "minLength": 1},
+    "objective": {"type": "string", "minLength": 1},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "locator", "digest"],
+      "properties": {
+        "kind": {"enum": ["curated", "production_failure", "regression", "synthetic", "external"]},
+        "locator": {"type": "string", "minLength": 1},
+        "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "split": {"enum": ["training", "development", "holdout", "canary", "quarantine"]},
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository_id", "repository_fixture", "base_sha", "setup_digest", "resource_class", "timeout_seconds", "token_budget"],
+      "properties": {
+        "repository_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"}, "repository_fixture": {"type": "string", "minLength": 1},
+        "base_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "setup_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "resource_class": {"type": "string", "minLength": 1},
+        "timeout_seconds": {"type": "integer", "minimum": 1},
+        "token_budget": {"type": "integer", "minimum": 1},
+        "seeds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "integer", "minimum": 0}}
+      }
+    },
+    "custody": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owned_paths", "forbidden_paths", "grader_isolated"],
+      "properties": {
+        "owned_paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "forbidden_paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "grader_isolated": {"const": true}
+      }
+    },
+    "acceptance": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["claim_id", "kind", "required"],
+        "properties": {
+          "claim_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
+          "kind": {"enum": ["command", "state", "artifact", "side_effect", "human_rubric", "delayed_outcome"]},
+          "required": {"type": "boolean"},
+          "spec": {"type": "object"}
+        }
+      }
+    },
+    "grader_bundle_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
+    "grader_bundle_revision": {"type": "integer", "minimum": 1},
+    "grader_bundle_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["classification", "export_allowed", "license"],
+      "properties": {
+        "classification": {"enum": ["public", "internal", "confidential", "restricted"]},
+        "export_allowed": {"type": "boolean"},
+        "license": {"type": ["string", "null"]}
+      }
+    },
+    "leakage_status": {"enum": ["clean", "suspected", "confirmed", "not_applicable"]},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

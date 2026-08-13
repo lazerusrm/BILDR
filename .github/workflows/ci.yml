@@ -58,6 +58,22 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: ${{ runner.os }}-cargo-
+      - name: Install pinned Bubblewrap isolation boundary
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes meson ninja-build pkg-config libcap-dev libseccomp-dev
+          curl --fail --location --silent --show-error --output bubblewrap-0.11.0.tar.xz \
+            https://github.com/containers/bubblewrap/releases/download/v0.11.0/bubblewrap-0.11.0.tar.xz
+          printf '%s  %s\n' \
+            988fd6b232dafa04b8b8198723efeaccdb3c6aa9c1c7936219d5791a8b7a8646 \
+            bubblewrap-0.11.0.tar.xz | sha256sum --check --strict
+          tar --extract --file bubblewrap-0.11.0.tar.xz
+          meson setup bubblewrap-0.11.0/build bubblewrap-0.11.0 --prefix /usr
+          meson compile -C bubblewrap-0.11.0/build
+          sudo meson install -C bubblewrap-0.11.0/build
+          sudo chmod 4755 /usr/bin/bwrap
+          test "$(stat --format '%a:%U:%G' /usr/bin/bwrap)" = "4755:root:root"
+          test "$(/usr/bin/bwrap --version)" = "bubblewrap 0.11.0"
       - name: Install browser dependencies
         run: npm --prefix ui ci && npm --prefix ui exec -- playwright install --with-deps chromium
       - name: Validate browser application

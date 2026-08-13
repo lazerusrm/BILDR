@@ -1,0 +1,43 @@
+{
+  "daemon": {
+    "state": "ready",
+    "detail": null
+  },
+  "codex": {
+    "state": "ready",
+    "detail": null,
+    "version": "1.2.3",
+    "required_version": "1.2.3",
+    "protocol_schema_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "schema_match": true,
+    "native_multi_agent": true,
+    "native_multi_agent_feature": "multi_agent",
+    "pid": 4242,
+    "restart_count": 2
+  },
+  "database": {
+    "state": "ready",
+    "detail": null
+  },
+  "scheduler": {
+    "paused": false,
+    "active_total": 1,
+    "max_total": 4,
+    "active_mutable": 1,
+    "max_mutable": 2,
+    "active_verifiers": 0,
+    "max_verifiers": 2,
+    "queued_tasks": 3
+  },
+  "self_improvement": {
+    "configured_mode": "observe_only",
+    "effective_mode": "observe_only",
+    "anchor_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "configured_anchor_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "anchor_match": true,
+    "observation_enabled": true,
+    "candidate_generation_enabled": false,
+    "candidate_execution_enabled": false,
+    "detail": null
+  }
+}

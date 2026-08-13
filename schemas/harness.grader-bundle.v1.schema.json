@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:harness:grader-bundle.v1",
+  "title": "Harness grader bundle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "grader_bundle_id", "revision", "signals", "hard_gates", "negative_controls", "reward_integrity_required", "isolation", "sha256"],
+  "properties": {
+    "schema": {"const": "harness.grader-bundle.v1"},
+    "grader_bundle_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
+    "revision": {"type": "integer", "minimum": 1},
+    "signals": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "direction", "weight", "required", "definition_digest"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
+          "kind": {"enum": ["deterministic", "state_effect", "model_rubric", "human", "delayed", "cost", "latency", "safety"]},
+          "direction": {"enum": ["maximize", "minimize", "boolean_pass"]},
+          "weight": {"type": "number", "minimum": 0},
+          "required": {"type": "boolean"},
+          "definition_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "calibration_set_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "hard_gates": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"}},
+    "negative_controls": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "signal_id", "expected_relationship", "failure_action"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
+          "signal_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
+          "expected_relationship": {"type": "string", "minLength": 1},
+          "failure_action": {"enum": ["block", "invalidate", "adjudicate"]}
+        }
+      }
+    },
+    "reward_integrity_required": {"const": true},
+    "isolation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_write_access", "holdout_answer_access", "grader_runtime"],
+      "properties": {
+        "candidate_write_access": {"const": false},
+        "holdout_answer_access": {"const": false},
+        "grader_runtime": {"enum": ["separate_process", "separate_container", "separate_host"]}
+      }
+    },
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

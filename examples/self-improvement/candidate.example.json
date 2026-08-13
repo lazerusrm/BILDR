@@ -1,0 +1,93 @@
+{
+  "schema": "harness.improvement-candidate.v1",
+  "candidate_id": "candidate-1",
+  "scope": {
+    "repository_id": "repository_example",
+    "task_family": "context_compilation",
+    "model_family": null,
+    "runtime_class": null,
+    "base_sha": "1111111111111111111111111111111111111111"
+  },
+  "parent_bundle": {
+    "kind": "policy_bundle",
+    "revision_id": "bundle-1",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "split": null,
+    "custody": null
+  },
+  "target_failure": {
+    "kind": "failure",
+    "revision_id": "failure-1",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "split": null,
+    "custody": null
+  },
+  "development_case": {
+    "kind": "eval_case",
+    "revision_id": "case-dev-1",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "split": "development",
+    "custody": "clean"
+  },
+  "no_change_control": {
+    "kind": "eval_case",
+    "revision_id": "case-control-1",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "split": "development",
+    "custody": "clean"
+  },
+  "taskset": {
+    "kind": "taskset",
+    "revision_id": "set-dev-1",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "split": null,
+    "custody": null
+  },
+  "grader_bundle": {
+    "kind": "grader_bundle",
+    "revision_id": "grader-1",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "split": null,
+    "custody": null
+  },
+  "runtime": {
+    "kind": "runtime",
+    "revision_id": "runtime-1",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "split": null,
+    "custody": null
+  },
+  "hypothesis": "Narrowly reduce known context pressure.",
+  "edit": {
+    "dimension": "token_budget",
+    "risk_class": "green",
+    "operation": "replace",
+    "before_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "after_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "predictions": [
+    {
+      "signal_id": "quality",
+      "direction": "unchanged",
+      "minimum_delta_milli": 0
+    }
+  ],
+  "evidence": [
+    {
+      "kind": "trace",
+      "revision_id": "trace-1",
+      "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "split": null,
+      "custody": null
+    }
+  ],
+  "rollback_bundle": {
+    "kind": "policy_bundle",
+    "revision_id": "bundle-1",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "split": null,
+    "custody": null
+  },
+  "state": "proposed",
+  "sha256": "a9b2fcf1c817999c7d9848e5ddffb4b7717076c163262af40c03c0d168fc3aff"
+}

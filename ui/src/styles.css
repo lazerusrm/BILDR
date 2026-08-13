@@ -904,6 +904,95 @@ kbd {
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
 }
+.improvement-page {
+  overflow: auto;
+}
+.improvement-section,
+.trace-explorer {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px;
+  background: var(--panel);
+}
+.improvement-section h2,
+.trace-explorer h2 {
+  margin: 0 0 10px;
+  font-size: 14px;
+}
+.improvement-empty {
+  color: var(--muted);
+}
+.improvement-cluster,
+.trace-row {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  gap: 3px;
+  padding: 7px 10px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+}
+.improvement-cluster {
+  cursor: pointer;
+}
+.improvement-cluster:hover,
+.improvement-cluster:focus-visible {
+  border-color: var(--accent);
+  background: var(--panel-2);
+}
+.improvement-cluster span,
+.improvement-cluster small,
+.trace-row span,
+.trace-row small {
+  color: var(--muted);
+  font-size: 11px;
+}
+.trace-explorer header {
+  margin-bottom: 8px;
+}
+.trace-explorer code {
+  color: var(--faint);
+  font-size: 10px;
+}
+.improvement-page [aria-label="Outcome observations"] {
+  display: grid;
+  gap: 9px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px;
+  background: var(--panel);
+}
+.improvement-page [aria-label="Outcome observations"] h3,
+.improvement-page [aria-label="Outcome observations"] ul {
+  margin: 0;
+}
+.improvement-page [aria-label="Outcome observations"] form {
+  display: grid;
+  gap: 8px;
+}
+.improvement-page [aria-label="Outcome observations"] label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.improvement-page [aria-label="Outcome observations"] input,
+.improvement-page [aria-label="Outcome observations"] select,
+.improvement-page [aria-label="Outcome observations"] textarea {
+  min-height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  color: var(--text);
+  background: var(--panel-2);
+}
+.improvement-page [aria-label="Outcome observations"] textarea {
+  min-height: 72px;
+  resize: vertical;
+}
 .usage-metrics {
   grid-template-columns: repeat(6, minmax(0, 1fr));
 }

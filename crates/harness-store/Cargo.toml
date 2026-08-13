@@ -7,6 +7,10 @@ license.workspace = true
 
 [dependencies]
 harness-domain = { path = "../harness-domain" }
+harness-eval = { path = "../harness-eval" }
+harness-learning = { path = "../harness-learning" }
+harness-promotion = { path = "../harness-promotion" }
+harness-trace = { path = "../harness-trace" }
 harness-usage = { path = "../harness-usage" }
 hex.workspace = true
 rusqlite.workspace = true

@@ -9,6 +9,7 @@ the browser/API boundary. It never needs a public listener.
 Required:
 
 - Codex CLI 0.147.0, authenticated through the normal Codex login flow;
+- Bubblewrap exactly 0.11.0 with unprivileged user and network namespaces available when `self_improvement.mode = "observe_only"`; `harnessd doctor` probes this boundary and refuses observe-only startup readiness when it is unavailable;
 - Git, `rg`, Bash, and the build tools required by the target repository;
 - a clean Git coordination clone with `origin` and Git identity;
 - `gh` only for the optional, explicit draft-PR operation.
@@ -73,7 +74,8 @@ harnessd serve --no-browser
 ```
 
 `doctor` validates the safe bind, XDG permissions, migrations/WAL/integrity,
-profile, configured Codex version, and generated protocol digest. Use
+profile, configured Codex version, generated protocol digest, and the exact
+Bubblewrap namespace boundary whenever observe-only improvement is enabled. Use
 `--without-codex` only to inspect storage/profile and run the UI in degraded
 mode.
 
@@ -88,6 +90,23 @@ harnessctl doctor
 harnessctl runtime
 harnessctl runtime codex
 ```
+
+## Explicit observer regression evaluation
+
+The first development evaluation is an operator-invoked, controller-owned
+regression for the historical trace-snapshot bound. It is available only when
+self-improvement is effectively `observe_only` and the configured frozen
+safety anchor matches:
+
+```bash
+harnessd evaluate-observer-snapshot --repository /path/to/registered/bildr
+```
+
+The command checks out the two pinned historical SHAs in managed worktrees,
+uses a lockfile-filtered offline Cargo snapshot and isolated deterministic
+grader, persists only receipt-bearing evaluation evidence, and prints the
+evaluation/sample IDs. It does not accept candidate code, commands, fixtures,
+grader inputs, or holdout data, and it cannot activate or promote a policy.
 
 ## Register a checkout
 
