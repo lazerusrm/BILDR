@@ -2289,6 +2289,32 @@ impl Store {
         Ok(())
     }
 
+    /// Persist an operator settings update and its audit receipt as one
+    /// transaction.  A client must never receive an error while a runtime
+    /// setting has already changed without its corresponding receipt.
+    pub fn update_runtime_metadata_with_settings_receipt(
+        &self,
+        updates: &[(&str, &Value)],
+        settings: &Value,
+    ) -> Result<(), StoreError> {
+        let occurred_at = now_ms();
+        let payload = serde_json::to_string(settings)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        for (key, value) in updates {
+            transaction.execute(
+                "INSERT INTO runtime_metadata(key,value_json,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+                params![key, serde_json::to_string(value)?, occurred_at],
+            )?;
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json,source_raw_event_id) VALUES(NULL,'settings','operator','settings.updated',?1,?2,NULL)",
+            params![occurred_at, payload],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn runtime_metadata(&self, key: &str) -> Result<Option<Value>, StoreError> {
         self.connection()?
             .query_row(

@@ -518,6 +518,40 @@ mod tests {
     }
 
     #[test]
+    fn settings_metadata_and_receipt_roll_back_together_on_event_failure() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(
+            &temp.path().join("harness.sqlite3"),
+            &temp.path().join("artifacts"),
+        )
+        .unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_settings_receipt BEFORE INSERT ON domain_events
+                 WHEN NEW.event_type='settings.updated'
+                 BEGIN SELECT RAISE(FAIL, 'injected settings receipt failure'); END;",
+            )
+            .unwrap();
+
+        let enabled = json!(true);
+        let result = store.update_runtime_metadata_with_settings_receipt(
+            &[("settings.supervision_observe_only", &enabled)],
+            &json!({"supervision_observe_only": true}),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            store
+                .runtime_metadata("settings.supervision_observe_only")
+                .unwrap(),
+            None
+        );
+        assert!(store.list_domain_events(0, None, 10).unwrap().is_empty());
+    }
+
+    #[test]
     fn supervision_schema_and_v12_marker_roll_back_together_on_failure() {
         let temp = TempDir::new().unwrap();
         let store = Store::in_memory(&temp.path().join("artifacts")).unwrap();

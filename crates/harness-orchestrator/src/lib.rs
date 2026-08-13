@@ -1687,62 +1687,82 @@ impl Orchestrator {
                 "governor goal token budget must be at least the attempt ceiling".to_owned(),
             ));
         }
+        let mut settings = current;
+        let mut updates = Vec::new();
+        macro_rules! apply_setting {
+            ($request:expr, $field:ident, $key:expr) => {
+                if let Some(value) = $request {
+                    settings.$field = value;
+                    updates.push(($key, json!(value)));
+                }
+            };
+        }
+        apply_setting!(
+            request.store_reasoning_summaries,
+            store_reasoning_summaries,
+            SETTING_REASONING_SUMMARIES
+        );
+        apply_setting!(
+            request.store_raw_reasoning,
+            store_raw_reasoning,
+            SETTING_RAW_REASONING
+        );
+        apply_setting!(request.yolo_mode, yolo_mode, SETTING_YOLO_MODE);
+        apply_setting!(
+            request.automatic_account_handoff,
+            automatic_account_handoff,
+            SETTING_AUTOMATIC_ACCOUNT_HANDOFF
+        );
+        apply_setting!(
+            request.adaptive_governor_budgets,
+            adaptive_governor_budgets,
+            SETTING_ADAPTIVE_GOVERNOR_BUDGETS
+        );
+        apply_setting!(
+            request.automatic_governor_continuation,
+            automatic_governor_continuation,
+            SETTING_AUTOMATIC_GOVERNOR_CONTINUATION
+        );
+        apply_setting!(
+            request.automatic_plan_approval,
+            automatic_plan_approval,
+            SETTING_AUTOMATIC_PLAN_APPROVAL
+        );
+        apply_setting!(
+            request.supervision_observe_only,
+            supervision_observe_only,
+            SETTING_SUPERVISION_OBSERVE_ONLY
+        );
+        if request.governor_goal_token_budget.is_some() {
+            settings.governor_goal_token_budget = governor_goal_token_budget;
+            updates.push((
+                SETTING_GOVERNOR_GOAL_TOKEN_BUDGET,
+                json!(governor_goal_token_budget),
+            ));
+        }
+        if request.governor_attempt_token_ceiling.is_some() {
+            settings.governor_attempt_token_ceiling = governor_attempt_token_ceiling;
+            updates.push((
+                SETTING_GOVERNOR_ATTEMPT_TOKEN_CEILING,
+                json!(governor_attempt_token_ceiling),
+            ));
+        }
+        let payload = serde_json::to_value(&settings)?;
+        let update_refs = updates
+            .iter()
+            .map(|(key, value)| (*key, value))
+            .collect::<Vec<_>>();
+        self.store
+            .update_runtime_metadata_with_settings_receipt(&update_refs, &payload)?;
         if let Some(value) = request.store_reasoning_summaries {
-            self.store
-                .put_runtime_metadata(SETTING_REASONING_SUMMARIES, &json!(value))?;
             self.projection.set_store_reasoning_summaries(value);
         }
         if let Some(value) = request.store_raw_reasoning {
-            self.store
-                .put_runtime_metadata(SETTING_RAW_REASONING, &json!(value))?;
             self.projection.set_store_raw_reasoning(value);
         }
         if let Some(value) = request.yolo_mode {
-            self.store
-                .put_runtime_metadata(SETTING_YOLO_MODE, &json!(value))?;
             self.yolo_mode.store(value, Ordering::Release);
         }
-        if let Some(value) = request.automatic_account_handoff {
-            self.store
-                .put_runtime_metadata(SETTING_AUTOMATIC_ACCOUNT_HANDOFF, &json!(value))?;
-        }
-        if let Some(value) = request.adaptive_governor_budgets {
-            self.store
-                .put_runtime_metadata(SETTING_ADAPTIVE_GOVERNOR_BUDGETS, &json!(value))?;
-        }
-        if let Some(value) = request.automatic_governor_continuation {
-            self.store
-                .put_runtime_metadata(SETTING_AUTOMATIC_GOVERNOR_CONTINUATION, &json!(value))?;
-        }
-        if let Some(value) = request.automatic_plan_approval {
-            self.store
-                .put_runtime_metadata(SETTING_AUTOMATIC_PLAN_APPROVAL, &json!(value))?;
-        }
-        if let Some(value) = request.supervision_observe_only {
-            self.store
-                .put_runtime_metadata(SETTING_SUPERVISION_OBSERVE_ONLY, &json!(value))?;
-        }
-        if request.governor_goal_token_budget.is_some() {
-            self.store.put_runtime_metadata(
-                SETTING_GOVERNOR_GOAL_TOKEN_BUDGET,
-                &json!(governor_goal_token_budget),
-            )?;
-        }
-        if request.governor_attempt_token_ceiling.is_some() {
-            self.store.put_runtime_metadata(
-                SETTING_GOVERNOR_ATTEMPT_TOKEN_CEILING,
-                &json!(governor_attempt_token_ceiling),
-            )?;
-        }
-        let settings = self.operator_settings();
-        self.store.emit_domain_event(
-            None,
-            "settings",
-            "operator",
-            "settings.updated",
-            &serde_json::to_value(&settings)?,
-            None,
-        )?;
         Ok(settings)
     }
 
