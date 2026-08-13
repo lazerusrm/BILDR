@@ -7,6 +7,7 @@ import {
   agentEffort,
   agentModel,
   blockerStatus,
+  blockedPlanRecovery,
   delegatedThreadDisplayState,
   effectiveRunPosture,
   formatCost,
@@ -73,6 +74,25 @@ describe("workspace presentation helpers", () => {
       reason: "controller token budget exhausted",
       nextStep:
         "Use Continue governor below. You can add a decision or new fact and choose the next attempt budget before continuing.",
+    });
+  });
+
+  it("offers a concrete recovery for an interrupted plan review before tasks exist", () => {
+    const run = {
+      id: "run-blocked-review",
+      state: "BLOCKED",
+      phase: "plan_review_budget_exhausted",
+      failure_reason: "session token budget exhausted",
+    } as Run;
+    expect(blockedPlanRecovery(run, "digest-1")).toEqual({
+      kind: "resume_review",
+      reason: "session token budget exhausted",
+      hasPlan: true,
+    });
+    expect(blockerStatus(run)).toEqual({
+      reason: "session token budget exhausted",
+      nextStep:
+        "Use the recovery panel above to resume the bounded final plan review or give the architect one concrete plan correction.",
     });
   });
 

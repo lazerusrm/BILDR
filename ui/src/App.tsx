@@ -735,6 +735,16 @@ export default function App() {
                   "Plan feedback accepted; revision started",
                 )
               }
+              onResumePlanReview={() =>
+                runAction(
+                  "resume-plan-review",
+                  () =>
+                    api.post(
+                      `/runs/${currentRun.id}/plan/resume-review`,
+                    ),
+                  "Independent final plan review resumed",
+                )
+              }
               onStop={() =>
                 runAction(
                   "stop",
@@ -1981,6 +1991,7 @@ function RunWorkspace({
   onPause,
   onApprove,
   onRequestPlanChanges,
+  onResumePlanReview,
   onApproveIntegration,
   onApproveSignoff,
   onRequestSignoffChanges,
@@ -2007,6 +2018,7 @@ function RunWorkspace({
   onPause: (additionalTokenBudget?: number) => void;
   onApprove: (allowBudgetOverride?: boolean) => void;
   onRequestPlanChanges: (finding: string) => void;
+  onResumePlanReview: () => void;
   onApproveIntegration: () => void;
   onApproveSignoff: () => void;
   onRequestSignoffChanges: (file: string, finding: string) => void;
@@ -2231,6 +2243,12 @@ function RunWorkspace({
         <strong>Run lifecycle</strong>
         <span>{runLifecycleSummary(run)}</span>
       </div>
+      <BlockedRunRecoveryPanel
+        detail={detail}
+        busy={busy}
+        onResumeReview={onResumePlanReview}
+        onRequestChanges={onRequestPlanChanges}
+      />
       {detail.intent_interview && (
         <IntentInterviewPanel
           interview={detail.intent_interview}
@@ -3223,6 +3241,138 @@ function BudgetControl({
       />
       <small>{hint}</small>
     </label>
+  );
+}
+
+export function blockedPlanRecovery(run: Run, planDigest?: string) {
+  if (
+    run.state === "BLOCKED" &&
+    run.phase === "plan_review_budget_exhausted"
+  ) {
+    return {
+      kind: "resume_review" as const,
+      reason:
+        run.failure_reason ||
+        "The independent reviewer reached its bounded session budget before returning a verdict.",
+      hasPlan: Boolean(planDigest),
+    };
+  }
+  if (
+    run.state === "BLOCKED" &&
+    run.phase === "plan_review_deadlocked"
+  ) {
+    return {
+      kind: "revise_plan" as const,
+      reason:
+        run.failure_reason ||
+        "Repeated review findings did not converge without an operator decision.",
+      hasPlan: Boolean(planDigest),
+    };
+  }
+  return undefined;
+}
+
+function BlockedRunRecoveryPanel({
+  detail,
+  busy,
+  onResumeReview,
+  onRequestChanges,
+}: {
+  detail: RunDetail;
+  busy: string;
+  onResumeReview: () => void;
+  onRequestChanges: (finding: string) => void;
+}) {
+  const recovery = blockedPlanRecovery(detail.run, detail.plan_digest);
+  const [showRevision, setShowRevision] = useState(false);
+  const [revisionRequest, setRevisionRequest] = useState("");
+  if (!recovery) return null;
+
+  const canSubmitRevision = recovery.hasPlan && revisionRequest.trim().length >= 8;
+  return (
+    <section className="blocked-run-recovery" aria-label="Blocked run recovery">
+      <header>
+        <div className="blocked-run-recovery-icon" aria-hidden="true">
+          <AlertTriangle size={18} />
+        </div>
+        <div>
+          <div className="eyebrow">Blocked, action available</div>
+          <h2>
+            {recovery.kind === "resume_review"
+              ? "The final plan review can resume"
+              : "The plan needs your correction"}
+          </h2>
+          <p>
+            <strong>Why:</strong> {recovery.reason}
+          </p>
+        </div>
+        <StatusBadge value="RECOVERY AVAILABLE" />
+      </header>
+      {recovery.kind === "resume_review" && (
+        <p className="blocked-run-recovery-explainer">
+          Resume continues the existing read-only reviewer for a bounded verdict-only turn. It does not approve the plan or begin implementation.
+        </p>
+      )}
+      {!recovery.hasPlan ? (
+        <p className="blocked-run-recovery-unavailable">
+          Harness cannot find the retained plan needed for a safe recovery. The recorded evidence is preserved; create a scoped follow-up rather than guessing at a continuation.
+        </p>
+      ) : showRevision ? (
+        <div className="blocked-run-revision">
+          <label htmlFor="blocked-plan-revision">
+            Concrete correction for the architect
+          </label>
+          <textarea
+            id="blocked-plan-revision"
+            value={revisionRequest}
+            onChange={(event) => setRevisionRequest(event.target.value)}
+            placeholder="Describe the plan defect and the specific correction the next revision must make."
+            rows={3}
+            maxLength={8000}
+          />
+          <div>
+            <button
+              className="button subtle"
+              onClick={() => setShowRevision(false)}
+              disabled={!!busy}
+            >
+              Cancel
+            </button>
+            <button
+              className="button primary"
+              onClick={() => {
+                onRequestChanges(revisionRequest.trim());
+                setRevisionRequest("");
+                setShowRevision(false);
+              }}
+              disabled={!!busy || !canSubmitRevision}
+            >
+              Request plan revision
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="blocked-run-recovery-actions">
+          {recovery.kind === "resume_review" && (
+            <button
+              className="button primary"
+              onClick={onResumeReview}
+              disabled={!!busy}
+            >
+              <Play size={13} />
+              Resume final review
+            </button>
+          )}
+          <button
+            className="button subtle"
+            onClick={() => setShowRevision(true)}
+            disabled={!!busy}
+          >
+            Request plan revision
+          </button>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -6217,6 +6367,8 @@ export function blockerStatus(
       ? "Use Continue governor below. You can add a decision or new fact and choose the next attempt budget before continuing."
       : run?.state === "BLOCKED" && run.phase === "plan_review_deadlocked"
         ? "Describe one concrete plan defect in Request changes below; Harness will send that bounded correction through the revision loop."
+        : run?.state === "BLOCKED" && run.phase === "plan_review_budget_exhausted"
+          ? "Use the recovery panel above to resume the bounded final plan review or give the architect one concrete plan correction."
         : run?.scheduler_paused
           ? "Select Resume work after confirming the recorded condition is resolved."
           : "No safe automatic continuation is available at this run phase. Resolve the recorded condition, preserve the current evidence, then start a scoped follow-up if needed.";

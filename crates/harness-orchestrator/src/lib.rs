@@ -4973,7 +4973,8 @@ impl Orchestrator {
         }
         let _guard = self.operation_lock.lock().await;
         let run = self.store.run(run_id)?;
-        if !matches!(run.state, RunState::PlanReviewRequired | RunState::Blocked) {
+        let blocked_plan_review = blocked_plan_review_recovery(&run);
+        if !matches!(run.state, RunState::PlanReviewRequired) && !blocked_plan_review {
             return Err(OrchestratorError::Conflict(format!(
                 "run is {}, not awaiting a plan decision",
                 run.state
@@ -4984,9 +4985,10 @@ impl Orchestrator {
                 "run has no plan to revise".to_owned(),
             ));
         };
-        if (run.state == RunState::PlanReviewRequired && state != "CERTIFIED")
-            || (run.state == RunState::Blocked && state != "REVISION_REQUIRED")
-        {
+        let plan_is_eligible = (run.state == RunState::PlanReviewRequired && state == "CERTIFIED")
+            || (run.phase == "plan_review_deadlocked" && state == "REVISION_REQUIRED")
+            || (run.phase == "plan_review_budget_exhausted" && state == "PROPOSED");
+        if !plan_is_eligible {
             return Err(OrchestratorError::Conflict(format!(
                 "plan is {state}, not eligible for operator revision"
             )));
@@ -5035,7 +5037,11 @@ impl Orchestrator {
                     .collect::<Vec<_>>(),
             }),
         )?;
-        self.store.request_latest_plan_revision(run_id)?;
+        if state == "PROPOSED" {
+            self.store.mark_latest_plan_revision_required(run_id)?;
+        } else {
+            self.store.request_latest_plan_revision(run_id)?;
+        }
         let revision_required = self.store.transition_run(
             run_id,
             RunState::PlanRevisionRequired,
@@ -5066,6 +5072,86 @@ impl Orchestrator {
         drop(_guard);
         self.start_plan_revision(run_id).await?;
         Ok(operation("request_plan_changes", run_id.as_str()))
+    }
+
+    /// Reopens the exact plan review that stopped at its per-thread token ceiling.
+    /// This is an explicit operator action: it cannot approve the plan or create
+    /// implementation tasks, and it only resumes the reviewer for a verdict.
+    pub async fn resume_blocked_plan_review(
+        &self,
+        run_id: &RunId,
+        actor: &str,
+    ) -> Result<OperationAccepted, OrchestratorError> {
+        let guard = self.operation_lock.lock().await;
+        let run = self.store.run(run_id)?;
+        if !blocked_plan_review_budget_exhausted(&run) {
+            return Err(OrchestratorError::Conflict(format!(
+                "run is {} ({}) and is not awaiting a resumable plan review",
+                run.state, run.phase
+            )));
+        }
+        let Some((_, plan, state, revision)) = self.store.latest_plan(run_id)? else {
+            return Err(OrchestratorError::Blocked(
+                "run has no proposed plan to resume reviewing".to_owned(),
+            ));
+        };
+        if state != "PROPOSED" {
+            return Err(OrchestratorError::Conflict(format!(
+                "plan is {state}, not the interrupted proposed review"
+            )));
+        }
+        let digest = packet_digest(&plan)?;
+        let reviewing = self.store.transition_run(
+            run_id,
+            RunState::PlanAdversarialReview,
+            "plan_review_resume_requested",
+            Some(run.version),
+            None,
+        )?;
+        self.store.record_human_action(
+            Some(run_id),
+            None,
+            actor,
+            "resume_blocked_plan_review",
+            "run_plan",
+            &digest,
+            &json!({"revision": revision, "prior_phase": run.phase}),
+        )?;
+        self.emit_run_event(
+            &reviewing,
+            "run.plan.review_resume_requested",
+            json!({"digest": digest, "revision": revision, "actor": actor}),
+        )?;
+        drop(guard);
+
+        if let Err(error) = self.launch_plan_reviewer(run_id, &digest).await {
+            if matches!(error, OrchestratorError::Blocked(_)) {
+                let queued = self.store.run(run_id)?;
+                self.emit_run_event(
+                    &queued,
+                    "run.plan.review_resume_queued",
+                    json!({"digest": digest, "revision": revision, "reason": error.to_string()}),
+                )?;
+                return Ok(operation("resume_blocked_plan_review", run_id.as_str()));
+            }
+            let current = self.store.run(run_id)?;
+            if current.state == RunState::PlanAdversarialReview {
+                let blocked = self.store.transition_run(
+                    run_id,
+                    RunState::Blocked,
+                    "plan_review_budget_exhausted",
+                    Some(current.version),
+                    Some(("review_resume_unavailable", &error.to_string())),
+                )?;
+                self.emit_run_event(
+                    &blocked,
+                    "run.plan.review_resume_unavailable",
+                    json!({"digest": digest, "revision": revision, "reason": error.to_string()}),
+                )?;
+            }
+            return Err(error);
+        }
+        Ok(operation("resume_blocked_plan_review", run_id.as_str()))
     }
 
     pub async fn approve_plan(
@@ -14275,6 +14361,14 @@ fn operation(kind: &str, target: &str) -> OperationAccepted {
     }
 }
 
+fn blocked_plan_review_budget_exhausted(run: &RunSummary) -> bool {
+    run.state == RunState::Blocked && run.phase == "plan_review_budget_exhausted"
+}
+
+fn blocked_plan_review_recovery(run: &RunSummary) -> bool {
+    blocked_plan_review_budget_exhausted(run) || run.phase == "plan_review_deadlocked"
+}
+
 fn nonempty(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.to_owned())
 }
@@ -14676,6 +14770,42 @@ mod tests {
             FINAL_AUDITOR_SESSION_TOKEN_BUDGET
         );
         assert_eq!(budget.required_execution_tokens, 288_000);
+    }
+
+    #[test]
+    fn only_the_interrupted_plan_review_phase_can_resume_without_a_revision() {
+        let blocked = RunSummary {
+            id: RunId::from("run-review"),
+            repository_id: RepositoryId::from("repository-1"),
+            title: "Review".to_owned(),
+            objective: "Review a plan".to_owned(),
+            mode: "plan_and_implement".to_owned(),
+            publication_mode: "local_only".to_owned(),
+            state: RunState::Blocked,
+            phase: "plan_review_budget_exhausted".to_owned(),
+            base_ref: "main".to_owned(),
+            base_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            integration_branch: None,
+            integration_sha: None,
+            authority_digest: "authority".to_owned(),
+            created_at: "2026-08-13T00:00:00Z".to_owned(),
+            started_at: Some("2026-08-13T00:00:01Z".to_owned()),
+            completed_at: None,
+            failure_reason: Some("session token budget exhausted".to_owned()),
+            scheduler_paused: false,
+            run_token_budget: None,
+            version: 3,
+        };
+        assert!(blocked_plan_review_budget_exhausted(&blocked));
+        assert!(blocked_plan_review_recovery(&blocked));
+        assert!(!blocked_plan_review_budget_exhausted(&RunSummary {
+            phase: "plan_review_deadlocked".to_owned(),
+            ..blocked.clone()
+        }));
+        assert!(blocked_plan_review_recovery(&RunSummary {
+            phase: "plan_review_deadlocked".to_owned(),
+            ..blocked
+        }));
     }
 
     #[test]

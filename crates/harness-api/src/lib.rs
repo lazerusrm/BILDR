@@ -121,6 +121,10 @@ pub fn router(orchestrator: Arc<Orchestrator>) -> Router {
             post(request_plan_changes),
         )
         .route(
+            "/api/v1/runs/{run_id}/plan/resume-review",
+            post(resume_blocked_plan_review),
+        )
+        .route(
             "/api/v1/runs/{run_id}/scheduler/pause",
             post(pause_scheduler),
         )
@@ -675,6 +679,23 @@ async fn request_plan_changes(
                     body.findings,
                     "local-user",
                 )
+                .await?,
+        ),
+    ))
+}
+
+async fn resume_blocked_plan_review(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            state
+                .orchestrator
+                .resume_blocked_plan_review(&RunId::from(run_id), "local-user")
                 .await?,
         ),
     ))

@@ -177,6 +177,59 @@ test("shows a blocked thread's durable reason, recovery step, and local lifecycl
   ).toBeVisible();
 });
 
+test("offers run-level recovery when final plan review stopped before task creation", async ({
+  page,
+}) => {
+  let resumeRequested = false;
+  await page.route("**/api/v1/runs/run-01JHARNESS", async (route) => {
+    const response = await route.fetch();
+    const detail = await response.json();
+    detail.run = {
+      ...detail.run,
+      state: "BLOCKED",
+      phase: "plan_review_budget_exhausted",
+      failure_reason: "session token budget exhausted",
+    };
+    detail.tasks = [];
+    await route.fulfill({ response, json: detail });
+  });
+  await page.route(
+    "**/api/v1/runs/run-01JHARNESS/plan/resume-review",
+    async (route) => {
+      resumeRequested = true;
+      await route.fulfill({
+        status: 202,
+        contentType: "application/json",
+        body: JSON.stringify({ state: "accepted" }),
+      });
+    },
+  );
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Runs" }).click();
+  await page
+    .getByRole("combobox", { name: "Governor session" })
+    .selectOption("run-01JHARNESS");
+
+  const recovery = page.getByRole("region", { name: "Blocked run recovery" });
+  await expect(recovery).toContainText("The final plan review can resume");
+  await expect(recovery).toContainText("session token budget exhausted");
+  await expect(recovery).toContainText(
+    "does not approve the plan or begin implementation",
+  );
+  await page.getByRole("button", { name: "Resume final review" }).click();
+  await expect.poll(() => resumeRequested).toBe(true);
+
+  await page.getByRole("button", { name: "Request plan revision" }).click();
+  const correction = page.getByRole("textbox", {
+    name: "Concrete correction for the architect",
+  });
+  await correction.fill("Keep the existing evidence but shorten the final review.");
+  await expect(
+    page.getByRole("button", { name: "Request plan revision" }),
+  ).toBeEnabled();
+});
+
 test("completes a deep interview and hands the confirmed brief to planning", async ({
   page,
 }) => {
