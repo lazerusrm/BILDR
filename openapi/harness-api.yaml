@@ -479,6 +479,20 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/OperationAccepted'}
         '409': {$ref: '#/components/responses/Conflict'}
+  /runs/{runId}/plan/resume-review:
+    post:
+      tags: [Runs]
+      operationId: resumeBlockedPlanReview
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      responses:
+        '202':
+          description: A bounded, read-only final plan-review turn was resumed or queued from the retained proposed plan.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+        '409': {$ref: '#/components/responses/Conflict'}
   /runs/{runId}/scheduler/pause:
     post:
       tags: [Runs]
