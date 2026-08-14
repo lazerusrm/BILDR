@@ -7,7 +7,7 @@
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use super::{ApiClient, AttentionCommand, ConditionCommand, InvestigationCommand};
+use super::{ApiClient, AttentionCommand, ConditionCommand, InvestigationCommand, RecoveryCommand};
 
 pub(super) async fn return_view(api: &ApiClient, operator_id: String) -> Result<Value> {
     let operator_id: String =
@@ -108,4 +108,38 @@ pub(super) async fn condition(api: &ApiClient, command: ConditionCommand) -> Res
             .await
         }
     }
+}
+
+pub(super) async fn progress(api: &ApiClient, run_id: Option<String>) -> Result<Value> {
+    api.get(&bounded_run_query("/api/v1/material-progress", run_id))
+        .await
+}
+
+pub(super) async fn liveness(api: &ApiClient, run_id: Option<String>) -> Result<Value> {
+    api.get(&bounded_run_query("/api/v1/liveness", run_id))
+        .await
+}
+
+pub(super) async fn recovery(api: &ApiClient, command: RecoveryCommand) -> Result<Value> {
+    match command {
+        RecoveryCommand::List { run_id } => {
+            api.get(&bounded_run_query("/api/v1/reconciliations", run_id))
+                .await
+        }
+        RecoveryCommand::Show { episode_id } => {
+            let episode_id: String =
+                url::form_urlencoded::byte_serialize(episode_id.as_bytes()).collect();
+            api.get(&format!("/api/v1/reconciliations/{episode_id}"))
+                .await
+        }
+    }
+}
+
+fn bounded_run_query(path: &str, run_id: Option<String>) -> String {
+    let mut query = vec!["limit=50".to_owned()];
+    if let Some(run_id) = run_id {
+        let run_id: String = url::form_urlencoded::byte_serialize(run_id.as_bytes()).collect();
+        query.push(format!("run_id={run_id}"));
+    }
+    format!("{path}?{}", query.join("&"))
 }

@@ -1,6 +1,7 @@
 # Operator control plane
 
-**Status:** implementation-ready architecture; runtime not implemented
+**Status:** partial runtime implementation; observe-only control projections are
+available, while activation and the remaining rollout slices stay gated
 **Prepared:** 2026-08-13
 **Stack position:** extends the event-driven supervisor design
 
@@ -89,6 +90,19 @@ typed attention event
 Then add investigation artifacts, liveness episodes, ownership-safe
 reconciliation, presence-aware digests, return-to-work views, topology, and
 controlled activation.
+
+## Current implementation boundary
+
+The current branch implements durable attention, investigation and external
+condition records, immutable snapshots/return views, deterministic material
+progress, observe-only liveness episodes, and reconciliation/ownership evidence
+records. The browser and CLI can read these projections without acquiring work
+or changing controller state.
+
+Notification delivery, topology, active intervention execution, adaptive
+supervisor behavior, empirical evaluation, and rollout activation remain
+explicitly disabled until their own evidence gates pass. Do not interpret an
+empty observe-only section as a healthy or automatically recovered run.
 
 ## Critical implementation rules
 

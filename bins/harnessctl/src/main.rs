@@ -73,6 +73,32 @@ enum Command {
         #[command(subcommand)]
         command: ConditionCommand,
     },
+    /// List deterministic controller-classified material progress; routine output and tokens are excluded.
+    Progress {
+        #[arg(long)]
+        run_id: Option<String>,
+    },
+    /// Inspect observe-only liveness episode records.
+    Liveness {
+        #[arg(long)]
+        run_id: Option<String>,
+    },
+    /// Inspect reconciliation inventory records. These commands cannot apply recovery actions.
+    Recovery {
+        #[command(subcommand)]
+        command: RecoveryCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecoveryCommand {
+    List {
+        #[arg(long)]
+        run_id: Option<String>,
+    },
+    Show {
+        episode_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -703,6 +729,9 @@ async fn execute(api: &ApiClient, command: Command) -> Result<Value> {
         Command::Attention { command } => operator_control::attention(api, command).await,
         Command::Investigation { command } => operator_control::investigation(api, command).await,
         Command::Condition { command } => operator_control::condition(api, command).await,
+        Command::Progress { run_id } => operator_control::progress(api, run_id).await,
+        Command::Liveness { run_id } => operator_control::liveness(api, run_id).await,
+        Command::Recovery { command } => operator_control::recovery(api, command).await,
         Command::Worktree { command } => match command {
             WorktreeCommand::List { run } => {
                 let path = run.map_or_else(
