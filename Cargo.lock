@@ -1021,6 +1021,7 @@ dependencies = [
  "harness-store",
  "harness-usage",
  "hex",
+ "jsonschema",
  "serde",
  "serde_json",
  "sha2",

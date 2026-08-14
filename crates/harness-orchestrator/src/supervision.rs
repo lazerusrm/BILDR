@@ -12,6 +12,7 @@ use harness_domain::{
 use harness_profile::SupervisionConfig;
 use harness_store::{Store, StoreError, SupervisorSnapshotRecord, packet_digest};
 use serde_json::{Value, json};
+use std::sync::LazyLock;
 
 // A 10k telemetry backlog must not postpone a later material event for hours
 // at the normal maintenance cadence. The snapshot itself still includes at
@@ -21,6 +22,18 @@ const MAX_MATERIAL_EVENTS_PER_SNAPSHOT: usize = 100;
 const MAX_TASKS_PER_SNAPSHOT: usize = 50;
 const MAX_AGENTS_PER_SNAPSHOT: usize = 50;
 const EFFICIENCY_POLICY_VERSION: &str = "supervision-efficiency.v1";
+const SUPERVISOR_SNAPSHOT_SCHEMA: &str =
+    include_str!("../../../schemas/harness.supervisor-snapshot.v1.schema.json");
+
+static SUPERVISOR_SNAPSHOT_VALIDATOR: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
+    let schema = serde_json::from_str(SUPERVISOR_SNAPSHOT_SCHEMA)
+        .expect("checked-in supervisor snapshot schema parses");
+    jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .should_validate_formats(true)
+        .build(&schema)
+        .expect("checked-in supervisor snapshot schema compiles")
+});
 
 pub(crate) fn observe_run(
     store: &Store,
@@ -118,6 +131,7 @@ fn observe_run_with_force(
                 config,
                 max_thread_count,
             );
+            validate_snapshot_contract(&payload)?;
             let bytes = serde_json::to_vec(&payload)?;
             if bytes.len() > usize::try_from(config.max_snapshot_bytes).unwrap_or(usize::MAX) {
                 return Err(StoreError::Validation(format!(
@@ -157,7 +171,8 @@ pub(crate) fn material_trigger(event: &DomainEvent) -> Option<&'static str> {
         "run.plan.revision_requested"
         | "run.plan.review_resume_requested"
         | "run.supervision.operator_review_requested" => Some("operator_steered"),
-        "run.supervision.expert_completed" => Some("expert_consultation_completed"),
+        "run.supervision.expert_completed" => Some("expert_completed"),
+        "run.supervision.expert_failed" => Some("expert_failed"),
         "task.governor.candidate_materialized" | "run.final_audit.accepted" => {
             Some("agent_completed")
         }
@@ -221,6 +236,22 @@ fn build_snapshot(
         .take(MAX_AGENTS_PER_SNAPSHOT)
         .map(|agent| agent_snapshot(agent, &run.objective))
         .collect::<Vec<_>>();
+    let supervisor_tokens_used = agents
+        .iter()
+        .filter(|agent| agent.role == harness_domain::AgentRole::Supervisor)
+        .fold(0_u64, |total, agent| {
+            total.saturating_add(agent.tokens_used)
+        });
+    let expert_tokens_used = agents
+        .iter()
+        .filter(|agent| agent.role == harness_domain::AgentRole::Expert)
+        .fold(0_u64, |total, agent| {
+            total.saturating_add(agent.tokens_used)
+        });
+    let active_expert_requests = expert_consultations
+        .iter()
+        .filter(|consultation| matches!(consultation.request.state.as_str(), "QUEUED" | "RUNNING"))
+        .count();
     let critical_path_task_ids = plan
         .tasks
         .iter()
@@ -327,11 +358,12 @@ fn build_snapshot(
         "budgets": {
             "run_tokens_used": run_tokens_used,
             "run_tokens_remaining": run.run_token_budget.unwrap_or(run_tokens_used).saturating_sub(run_tokens_used),
-            "supervisor_tokens_used": 0,
-            "supervisor_tokens_remaining": config.supervisor.token_budget,
-            "expert_tokens_used": 0,
-            "expert_tokens_remaining": config.expert.token_budget,
-            "expert_requests_remaining": 0,
+            "supervisor_tokens_used": supervisor_tokens_used,
+            "supervisor_token_budget_per_request": config.supervisor.token_budget,
+            "expert_tokens_used": expert_tokens_used,
+            "expert_token_budget_per_request": config.expert.token_budget,
+            "expert_completed_cap_per_signature": config.expert.max_completed_per_signature,
+            "active_expert_requests": active_expert_requests,
             "active_thread_count": agents.iter().filter(|agent| agent.active_turn_id.is_some()).count(),
             "max_thread_count": max_thread_count,
         },
@@ -352,6 +384,7 @@ fn build_snapshot(
                 "category": request.payload.get("category").and_then(Value::as_str).unwrap_or("other"),
                 "requested_model": request.requested_model,
                 "requested_effort": request.requested_effort,
+                "escalation_signature": request.signature,
                 "response": response.map(|response| json!({
                     "id": response.id,
                     "payload_sha256": response.payload_sha256,
@@ -363,6 +396,16 @@ fn build_snapshot(
             })
         }).collect::<Vec<_>>(),
     })
+}
+
+fn validate_snapshot_contract(payload: &Value) -> Result<(), StoreError> {
+    SUPERVISOR_SNAPSHOT_VALIDATOR
+        .validate(payload)
+        .map_err(|error| {
+            StoreError::Validation(format!(
+                "generated supervisor snapshot does not conform to its strict contract: {error}"
+            ))
+        })
 }
 
 fn allowed_actions(
@@ -585,8 +628,18 @@ pub(crate) fn parse_timestamp_millis(value: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_EVENTS_PER_OBSERVATION, MAX_MATERIAL_EVENTS_PER_SNAPSHOT, material_trigger};
-    use harness_domain::{DomainEvent, RunId};
+    use super::{
+        MAX_EVENTS_PER_OBSERVATION, MAX_MATERIAL_EVENTS_PER_SNAPSHOT, build_snapshot,
+        material_trigger, validate_snapshot_contract,
+    };
+    use harness_domain::{
+        AgentRole, AgentSessionId, AgentSummary, DiffBudget, DomainEvent, ExpertRequestId,
+        ExpertResponseId, RepositoryId, RunId, RunPlan, RunState, RunSummary, SandboxMode,
+        SupervisorActionId, SupervisorDecisionId, SupervisorSnapshotId, TaskId, TaskMilestone,
+        TaskPacket, TaskState, TaskSummary,
+    };
+    use harness_profile::SupervisionConfig;
+    use harness_store::{ExpertConsultationObservation, ExpertRequestRecord, ExpertResponseRecord};
     use serde_json::json;
 
     fn event(event_type: &str, payload: serde_json::Value) -> DomainEvent {
@@ -629,6 +682,206 @@ mod tests {
         assert_eq!(
             material_trigger(&event("task.verified", json!({}))),
             Some("verifier_completed")
+        );
+        assert_eq!(
+            material_trigger(&event("run.supervision.expert_completed", json!({}))),
+            Some("expert_completed")
+        );
+        assert_eq!(
+            material_trigger(&event("run.supervision.expert_failed", json!({}))),
+            Some("expert_failed")
+        );
+    }
+
+    #[test]
+    fn post_consultation_snapshot_is_schema_valid_and_reports_real_expert_usage() {
+        let run_id = RunId::from("run-1");
+        let task_id = TaskId::from("task-1");
+        let run = RunSummary {
+            id: run_id.clone(),
+            repository_id: RepositoryId::from("repository-1"),
+            title: "Expert snapshot fixture".to_owned(),
+            objective: "Preserve a bounded expert consultation in the next review.".to_owned(),
+            mode: "plan_and_implement".to_owned(),
+            publication_mode: "local_only".to_owned(),
+            state: RunState::Blocked,
+            phase: "integration_conflict".to_owned(),
+            base_ref: "main".to_owned(),
+            base_sha: "a".repeat(40),
+            integration_branch: None,
+            integration_sha: None,
+            authority_digest: "fixture".to_owned(),
+            created_at: "2026-08-14T00:00:00Z".to_owned(),
+            started_at: Some("2026-08-14T00:00:00Z".to_owned()),
+            completed_at: None,
+            failure_reason: Some("The integration contract remains disputed.".to_owned()),
+            scheduler_paused: false,
+            run_token_budget: Some(1_000_000),
+            version: 1,
+        };
+        let plan = RunPlan {
+            schema: "harness.orchestration.plan.v1".to_owned(),
+            summary: "Resolve the blocked high-impact integration contract.".to_owned(),
+            tasks: vec![TaskPacket {
+                schema: "harness.orchestration.task.v1".to_owned(),
+                program_id: "SUPERVISION".to_owned(),
+                task_id: "task-1".to_owned(),
+                title: "Resolve integration contract".to_owned(),
+                state: "blocked".to_owned(),
+                priority: "P1".to_owned(),
+                execution_mode: "controller_governed".to_owned(),
+                owner_profile: "general".to_owned(),
+                reviewer_profile: "general".to_owned(),
+                checklist_rows: vec!["Keep the consultation advisory.".to_owned()],
+                authority_refs: vec!["CONTRIBUTING.md".to_owned()],
+                base_sha: "a".repeat(40),
+                dependency_shas: Default::default(),
+                depends_on: Vec::new(),
+                owned_paths: vec!["crates/example.rs".to_owned()],
+                forbidden_paths: Vec::new(),
+                reserved_serial_paths: Vec::new(),
+                objective: "Resolve the conflicting integration contract.".to_owned(),
+                milestones: vec![TaskMilestone {
+                    id: "integration-contract".to_owned(),
+                    title: "Resolve the integration contract".to_owned(),
+                    objective: "Record a verified compatibility decision.".to_owned(),
+                    success_criteria: vec!["A human can inspect the expert advice.".to_owned()],
+                }],
+                non_goals: vec!["Do not automatically execute advice.".to_owned()],
+                success_criteria: vec!["The integration blocker is explicit.".to_owned()],
+                required_positive_tests: Vec::new(),
+                required_negative_tests: Vec::new(),
+                required_metrics: Vec::new(),
+                required_evidence: vec!["CONTRIBUTING.md".to_owned()],
+                proof_limits: vec!["Fixture only.".to_owned()],
+                diff_budget: DiffBudget { files: 1, lines: 1 },
+                token_budget: 80_000,
+                tool_budget: Some(1),
+                lease_expires_at: "controller-managed".to_owned(),
+                stop_conditions: vec!["A human must apply any recovery.".to_owned()],
+                handoff_path: "CONTRIBUTING.md".to_owned(),
+                risk_flags: vec!["canonical_contract".to_owned()],
+            }],
+        };
+        let task = TaskSummary {
+            id: task_id,
+            run_id: run_id.clone(),
+            external_task_id: "task-1".to_owned(),
+            title: "Resolve integration contract".to_owned(),
+            objective: "Resolve the conflicting integration contract.".to_owned(),
+            state: TaskState::Blocked,
+            priority: "P1".to_owned(),
+            owner_profile: "general".to_owned(),
+            reviewer_profile: "general".to_owned(),
+            attempt: 1,
+            base_sha: "a".repeat(40),
+            head_sha: None,
+            token_budget: Some(80_000),
+            dependencies: Vec::new(),
+            failure_reason: Some("The canonical integration contract is disputed.".to_owned()),
+            version: 1,
+        };
+        let expert_agent = AgentSummary {
+            id: AgentSessionId::from("expert-1"),
+            parent_agent_id: None,
+            task_id: None,
+            role: AgentRole::Expert,
+            codex_account_id: None,
+            nickname: Some("expert".to_owned()),
+            state: "COMPLETED".to_owned(),
+            requested_model: "gpt-5.6-sol".to_owned(),
+            effective_model: Some("gpt-5.6-sol".to_owned()),
+            requested_reasoning_effort: "xhigh".to_owned(),
+            effective_reasoning_effort: Some("xhigh".to_owned()),
+            sandbox_mode: SandboxMode::ReadOnly,
+            cwd: "/tmp/expert-snapshot".to_owned(),
+            current_goal: Some("Provide advisory analysis only.".to_owned()),
+            current_action: None,
+            failure_reason: None,
+            started_at: "2026-08-14T00:00:00Z".to_owned(),
+            completed_at: Some("2026-08-14T00:01:00Z".to_owned()),
+            token_budget: Some(80_000),
+            tokens_used: 12_345,
+            budget_tokens_used: 12_345,
+            estimated_cost_lower: "0".to_owned(),
+            estimated_cost_upper: "0".to_owned(),
+            heartbeat_at: None,
+            thread_id: Some("thread-1".to_owned()),
+            active_turn_id: None,
+            active_turn_started_at: None,
+            active_turn_usage: None,
+            context_strategy: "fresh_independent".to_owned(),
+            context_source_attempt_id: None,
+            context_reuse_reason: None,
+            version: 1,
+        };
+        let consultation = ExpertConsultationObservation {
+            request: ExpertRequestRecord {
+                id: ExpertRequestId::from("expert-request-1"),
+                action_id: SupervisorActionId::from("expert-action-1"),
+                decision_id: SupervisorDecisionId::from("expert-decision-1"),
+                run_id: run_id.clone(),
+                snapshot_id: SupervisorSnapshotId::from("expert-source-snapshot"),
+                signature: "e".repeat(64),
+                state: "COMPLETED".to_owned(),
+                payload: json!({"category": "integration"}),
+                payload_sha256: "f".repeat(64),
+                requested_model: "gpt-5.6-sol".to_owned(),
+                requested_effort: "xhigh".to_owned(),
+                expires_at: "2026-08-14T01:00:00Z".to_owned(),
+                created_at: "2026-08-14T00:00:00Z".to_owned(),
+                started_at: Some("2026-08-14T00:00:01Z".to_owned()),
+                completed_at: Some("2026-08-14T00:01:00Z".to_owned()),
+                failure_reason: None,
+                agent_session_id: Some(AgentSessionId::from("expert-1")),
+            },
+            response: Some(ExpertResponseRecord {
+                id: ExpertResponseId::from("expert-response-1"),
+                request_id: ExpertRequestId::from("expert-request-1"),
+                run_id: run_id.clone(),
+                snapshot_id: SupervisorSnapshotId::from("expert-source-snapshot"),
+                payload: json!({
+                    "verdict": "recommendation",
+                    "summary": "The invariant must be preserved.",
+                    "recommendation": "Require an exact compatibility validation before continuing.",
+                    "evidence_refs": ["event-7"],
+                }),
+                payload_sha256: "d".repeat(64),
+                byte_length: 1,
+                created_at: "2026-08-14T00:01:00Z".to_owned(),
+            }),
+        };
+        let mut config = SupervisionConfig::default();
+        config.mode = harness_domain::SupervisorMode::Advisory;
+        let snapshot = build_snapshot(
+            &SupervisorSnapshotId::from("snapshot-1"),
+            1,
+            &run,
+            &plan,
+            1,
+            &[task],
+            &[expert_agent],
+            &[consultation],
+            12_345,
+            "general",
+            &[event("run.supervision.expert_completed", json!({}))],
+            7,
+            &config,
+            4,
+        );
+
+        validate_snapshot_contract(&snapshot).expect("post-consultation snapshot is schema valid");
+        assert_eq!(snapshot["trigger"]["kind"], "expert_completed");
+        assert_eq!(snapshot["budgets"]["expert_tokens_used"], 12_345);
+        assert_eq!(
+            snapshot["budgets"]["expert_token_budget_per_request"],
+            80_000
+        );
+        assert_eq!(snapshot["budgets"]["expert_completed_cap_per_signature"], 2);
+        assert_eq!(snapshot["budgets"]["active_expert_requests"], 0);
+        assert_eq!(
+            snapshot["expert_consultations"][0]["response"]["verdict"],
+            "recommendation"
         );
     }
 

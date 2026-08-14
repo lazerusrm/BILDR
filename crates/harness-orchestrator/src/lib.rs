@@ -17652,6 +17652,16 @@ mod tests {
                 .state,
             "SUCCEEDED"
         );
+        let followup_deferred = orchestrator
+            .store()
+            .list_domain_events(0, Some(&run_id), 10_000)
+            .expect("expert lifecycle events read")
+            .into_iter()
+            .find(|event| event.event_type == "run.supervision.expert_followup_deferred");
+        assert!(
+            followup_deferred.is_none(),
+            "expert follow-up snapshot must remain schema-valid: {followup_deferred:?}"
+        );
         assert_eq!(
             runtime.started_threads.lock().unwrap().len(),
             2,
