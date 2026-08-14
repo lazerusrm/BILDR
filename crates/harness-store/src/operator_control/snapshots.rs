@@ -33,6 +33,7 @@ impl Store {
     pub fn control_plane_snapshot(&self) -> Result<ControlPlaneSnapshot, StoreError> {
         self.classify_material_progress()?;
         self.refresh_approval_attention()?;
+        self.refresh_notification_mirror()?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let event_cursor = non_negative(
@@ -91,6 +92,18 @@ impl Store {
             })?,
             "reconciliation cursor",
         )?;
+        let notification_cursor = non_negative(
+            transaction.query_row("SELECT count(*) FROM notification_deliveries", [], |row| {
+                row.get::<_, i64>(0)
+            })?,
+            "notification cursor",
+        )?;
+        let presence_cursor = non_negative(
+            transaction.query_row("SELECT count(*) FROM operator_presence", [], |row| {
+                row.get::<_, i64>(0)
+            })?,
+            "operator presence cursor",
+        )?;
         let mut source_cursors = BTreeMap::new();
         source_cursors.insert("domain_events".to_owned(), event_cursor);
         source_cursors.insert("attention_events".to_owned(), attention_cursor);
@@ -110,6 +123,8 @@ impl Store {
             liveness_observation_cursor,
         );
         source_cursors.insert("reconciliation_episodes".to_owned(), reconciliation_cursor);
+        source_cursors.insert("notification_deliveries".to_owned(), notification_cursor);
+        source_cursors.insert("operator_presence".to_owned(), presence_cursor);
         let source_cursors_sha256 = digest(&serde_json::to_string(&source_cursors)?);
 
         if let Some(existing) = transaction
@@ -140,6 +155,7 @@ impl Store {
         let (progress_rows, progress_truncation) = material_progress_rows(&transaction)?;
         let (liveness_rows, liveness_truncation) = liveness_rows(&transaction)?;
         let (reconciliation_rows, reconciliation_truncation) = reconciliation_rows(&transaction)?;
+        let (notification_rows, notification_truncation) = notification_rows(&transaction)?;
         let active_agents: i64 = transaction.query_row(
             "SELECT count(*) FROM agent_sessions WHERE state NOT IN ('COMPLETED','FAILED','CANCELED')",
             [],
@@ -180,6 +196,7 @@ impl Store {
             ("progress", progress_truncation),
             ("liveness", liveness_truncation),
             ("reconciliation", reconciliation_truncation),
+            ("notifications", notification_truncation),
         ] {
             if let Some(omitted_rows) = omitted {
                 truncation.push(SnapshotTruncation {
@@ -272,9 +289,15 @@ impl Store {
                 section
             },
             cost: unavailable("Cost projection is not wired into this deterministic slice."),
-            notifications: unavailable(
-                "Notification delivery projection is not wired into this deterministic slice.",
-            ),
+            notifications: {
+                let mut section = current(notification_rows, notification_cursor);
+                section.truncated = notification_truncation.is_some();
+                section.detail = Some(
+                    "In-product notification mirror only. Presence is stored separately and does not suppress, batch, send, or resolve any source item."
+                        .to_owned(),
+                );
+                section
+            },
             limits: unavailable(
                 "Rate-limit observation is not wired into this deterministic slice.",
             ),
@@ -709,6 +732,31 @@ fn reconciliation_rows(
             let episode =
                 super::reconciliation::checked_reconciliation_row(row.get(0)?, row.get(1)?)?;
             serde_json::to_value(episode)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((
+        rows,
+        (count > SECTION_ROW_LIMIT as u64).then(|| count - SECTION_ROW_LIMIT as u64),
+    ))
+}
+
+fn notification_rows(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(Vec<Value>, Option<u64>), StoreError> {
+    let count = non_negative(
+        transaction.query_row("SELECT count(*) FROM notification_deliveries", [], |row| {
+            row.get::<_, i64>(0)
+        })?,
+        "notification count",
+    )?;
+    let mut statement = transaction.prepare(
+        "SELECT payload_json,payload_sha256 FROM notification_deliveries ORDER BY created_at DESC,id DESC LIMIT ?1",
+    )?;
+    let rows = statement
+        .query_map([SECTION_ROW_LIMIT], |row| {
+            let delivery = super::notifications::checked_delivery_row(row.get(0)?, row.get(1)?)?;
+            serde_json::to_value(delivery)
                 .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
         })?
         .collect::<Result<Vec<_>, _>>()?;

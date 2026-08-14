@@ -10,6 +10,7 @@ mod correlation;
 mod external_conditions;
 mod investigations;
 mod liveness;
+mod notifications;
 mod progress;
 mod reconciliation;
 mod snapshots;

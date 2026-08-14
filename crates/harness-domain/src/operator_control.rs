@@ -1631,6 +1631,97 @@ pub enum NotificationState {
     Failed,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPresence {
+    pub schema: String,
+    pub operator_id: String,
+    pub mode: OperatorPresenceMode,
+    pub version: u64,
+    pub updated_at_ms: i64,
+    pub sha256: String,
+}
+
+impl OperatorPresence {
+    pub fn digest(&self) -> Result<String, OperatorControlError> {
+        let mut unsigned = self.clone();
+        unsigned.sha256.clear();
+        digest_json(&unsigned)
+    }
+
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.schema != "harness.operator-presence.v1"
+            || self.version == 0
+            || self.updated_at_ms < 0
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "operator presence",
+                reason: "must use the v1 schema with a positive version and non-negative timestamp",
+            });
+        }
+        validate_identifier(&self.operator_id, "operator presence id")?;
+        validate_lower_hex(&self.sha256, "operator presence sha256", SHA256_HEX_LEN)?;
+        if self.digest()? != self.sha256 {
+            return Err(OperatorControlError::InvalidField {
+                field: "operator presence sha256",
+                reason: "does not match the canonical payload",
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationDelivery {
+    pub schema: String,
+    pub delivery_id: NotificationDeliveryId,
+    pub attention_id: Option<AttentionItemId>,
+    pub class: NotificationClass,
+    pub state: NotificationState,
+    pub channel: String,
+    pub source_event_id: String,
+    pub created_at_ms: i64,
+    pub payload_sha256: String,
+    pub sha256: String,
+}
+
+impl NotificationDelivery {
+    pub fn digest(&self) -> Result<String, OperatorControlError> {
+        let mut unsigned = self.clone();
+        unsigned.sha256.clear();
+        digest_json(&unsigned)
+    }
+
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.schema != "harness.notification-delivery.v1" || self.created_at_ms < 0 {
+            return Err(OperatorControlError::InvalidField {
+                field: "notification delivery",
+                reason: "must use the v1 schema with a non-negative timestamp",
+            });
+        }
+        validate_identifier(self.delivery_id.as_str(), "notification delivery id")?;
+        if let Some(attention_id) = &self.attention_id {
+            validate_identifier(attention_id.as_str(), "notification attention id")?;
+        }
+        validate_identifier(&self.channel, "notification channel")?;
+        validate_identifier(&self.source_event_id, "notification source event id")?;
+        validate_lower_hex(
+            &self.payload_sha256,
+            "notification payload sha256",
+            SHA256_HEX_LEN,
+        )?;
+        validate_lower_hex(&self.sha256, "notification delivery sha256", SHA256_HEX_LEN)?;
+        if self.digest()? != self.sha256 {
+            return Err(OperatorControlError::InvalidField {
+                field: "notification delivery sha256",
+                reason: "does not match the canonical payload",
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotSectionState {
