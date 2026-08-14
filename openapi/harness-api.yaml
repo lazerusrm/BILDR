@@ -532,6 +532,21 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Run'}
+  /runs/{runId}/supervision/review:
+    post:
+      tags: [Runs]
+      operationId: requestSupervisorReview
+      description: Starts one bounded Terra read-only analysis over a fresh immutable blocker snapshot. The returned advisory can never execute a controller operation.
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      responses:
+        '202':
+          description: The human-requested advisory review was accepted; recovery remains an explicit operator action.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+        '409': {$ref: '#/components/responses/Conflict'}
   /runs/{runId}/stop:
     post:
       tags: [Runs]
@@ -1704,7 +1719,7 @@ components:
     OperatorSettings:
       type: object
       additionalProperties: false
-      required: [store_reasoning_summaries, store_raw_reasoning, yolo_mode, allow_automatic_external_writes, automatic_external_writes_locked, automatic_account_handoff, adaptive_governor_budgets, automatic_governor_continuation, automatic_plan_approval, supervision_observe_only, governor_goal_token_budget, governor_attempt_token_ceiling, recommended_governor_attempt_tokens, governor_budget_sample_count, governor_budget_reason]
+      required: [store_reasoning_summaries, store_raw_reasoning, yolo_mode, allow_automatic_external_writes, automatic_external_writes_locked, automatic_account_handoff, adaptive_governor_budgets, automatic_governor_continuation, automatic_plan_approval, supervision_enabled, governor_goal_token_budget, governor_attempt_token_ceiling, recommended_governor_attempt_tokens, governor_budget_sample_count, governor_budget_reason]
       properties:
         store_reasoning_summaries: {type: boolean}
         store_raw_reasoning: {type: boolean}
@@ -1715,7 +1730,7 @@ components:
         adaptive_governor_budgets: {type: boolean}
         automatic_governor_continuation: {type: boolean}
         automatic_plan_approval: {type: boolean}
-        supervision_observe_only: {type: boolean}
+        supervision_enabled: {type: boolean, description: Explicit opt-in to bounded, human-approved read-only Terra advice. It never grants automatic controller actions.}
         governor_goal_token_budget: {type: integer, minimum: 500000, maximum: 1000000000}
         governor_attempt_token_ceiling: {type: integer, minimum: 400000, maximum: 100000000}
         recommended_governor_attempt_tokens: {type: integer, minimum: 400000}
@@ -1732,7 +1747,7 @@ components:
         adaptive_governor_budgets: {type: boolean}
         automatic_governor_continuation: {type: boolean}
         automatic_plan_approval: {type: boolean}
-        supervision_observe_only: {type: boolean}
+        supervision_enabled: {type: boolean, description: The only request field that can opt in to advisory Terra analysis. Legacy observe-only fields are rejected.}
         governor_goal_token_budget: {type: integer, minimum: 500000, maximum: 1000000000}
         governor_attempt_token_ceiling: {type: integer, minimum: 400000, maximum: 100000000}
     Repository:
@@ -1991,10 +2006,42 @@ components:
         payload_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
         byte_length: {type: integer, minimum: 1}
         created_at: {type: string, format: date-time}
+    SupervisorReview:
+      type: object
+      additionalProperties: false
+      required: [id, run_id, snapshot_id, agent_session_id, expected_decision_id, state, trigger_kind, requested_model, requested_effort, created_at, completed_at, failure_reason]
+      properties:
+        id: {type: string}
+        run_id: {type: string}
+        snapshot_id: {type: string}
+        agent_session_id: {type: string}
+        expected_decision_id: {type: string}
+        state: {enum: [STARTING, RUNNING, COMPLETED, FAILED, STALE]}
+        trigger_kind: {type: string}
+        requested_model: {type: string, const: gpt-5.6-terra}
+        requested_effort: {type: string, const: high}
+        created_at: {type: string, format: date-time}
+        completed_at: {type: [string, 'null'], format: date-time}
+        failure_reason: {type: [string, 'null']}
+    SupervisorDecision:
+      type: object
+      additionalProperties: false
+      required: [id, review_id, run_id, snapshot_id, agent_session_id, policy_state, payload, payload_sha256, byte_length, created_at]
+      properties:
+        id: {type: string}
+        review_id: {type: string}
+        run_id: {type: string}
+        snapshot_id: {type: string}
+        agent_session_id: {type: string}
+        policy_state: {enum: [ADVISORY, STALE]}
+        payload: {type: object}
+        payload_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        byte_length: {type: integer, minimum: 1}
+        created_at: {type: string, format: date-time}
     RunDetail:
       type: object
       additionalProperties: false
-      required: [run, intent_interview, tasks, agents, worktrees, approvals, plan_review_history, planning_tokens_used, signoff_packet, draft_pr_ci, automatic_plan_approval, governor_progress, supervision_mode, supervisor_snapshot]
+      required: [run, intent_interview, tasks, agents, worktrees, approvals, plan_review_history, planning_tokens_used, signoff_packet, draft_pr_ci, automatic_plan_approval, governor_progress, supervision_mode, supervisor_snapshot, supervisor_review, supervisor_decision]
       properties:
         run: {$ref: '#/components/schemas/Run'}
         intent_interview:
@@ -2027,6 +2074,14 @@ components:
         supervisor_snapshot:
           anyOf:
             - {$ref: '#/components/schemas/SupervisorSnapshot'}
+            - {type: 'null'}
+        supervisor_review:
+          anyOf:
+            - {$ref: '#/components/schemas/SupervisorReview'}
+            - {type: 'null'}
+        supervisor_decision:
+          anyOf:
+            - {$ref: '#/components/schemas/SupervisorDecision'}
             - {type: 'null'}
     RunPage:
       type: object

@@ -400,6 +400,49 @@ impl Store {
         policy_state: &str,
         payload: &Value,
     ) -> Result<SupervisorDecisionRecord, StoreError> {
+        self.record_supervisor_decision_with_freshness(
+            review_id,
+            policy_state,
+            None,
+            payload,
+            |_| false,
+        )
+    }
+
+    /// Atomically records a model decision only if no later material event
+    /// exists for the immutable source cursor.  The material-event predicate
+    /// is controller-owned, while this transaction owns the race-free
+    /// boundary between that check and the immutable decision receipt.
+    pub fn record_current_supervisor_decision<F>(
+        &self,
+        review_id: &SupervisorReviewId,
+        event_cursor: i64,
+        payload: &Value,
+        is_material_event: F,
+    ) -> Result<SupervisorDecisionRecord, StoreError>
+    where
+        F: Fn(&DomainEvent) -> bool,
+    {
+        self.record_supervisor_decision_with_freshness(
+            review_id,
+            "ADVISORY",
+            Some(event_cursor),
+            payload,
+            is_material_event,
+        )
+    }
+
+    fn record_supervisor_decision_with_freshness<F>(
+        &self,
+        review_id: &SupervisorReviewId,
+        policy_state: &str,
+        event_cursor: Option<i64>,
+        payload: &Value,
+        is_material_event: F,
+    ) -> Result<SupervisorDecisionRecord, StoreError>
+    where
+        F: Fn(&DomainEvent) -> bool,
+    {
         if !matches!(policy_state, "ADVISORY" | "STALE") {
             return Err(StoreError::Validation(
                 "supervisor decision policy state is invalid".to_owned(),
@@ -443,6 +486,52 @@ impl Store {
                 "supervisor decision does not match its immutable review envelope".to_owned(),
             ));
         }
+        let policy_state = if let Some(event_cursor) = event_cursor {
+            // Filter in SQLite first so an arbitrary telemetry backlog cannot
+            // turn this strict receipt into an unbounded read. The controller
+            // still evaluates the small allowlisted candidate set, including
+            // payload-sensitive lifecycle transitions.
+            let mut statement = transaction.prepare(
+                "SELECT id,run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json
+                 FROM domain_events
+                 WHERE run_id=?1 AND id>?2 AND event_type IN (
+                    'run.lifecycle.transitioned',
+                    'task.start_failed',
+                    'agent.governor.warm_continuation_failed',
+                    'task.governor.candidate_recovery_deferred',
+                    'agent.native_subagent.terminal',
+                    'task.verified',
+                    'run.integration.prepared',
+                    'run.final_audit.rejected',
+                    'task.github_resource_recovered',
+                    'run.token_budget.reached',
+                    'agent.governor.budget_hard_stop',
+                    'agent.native_subagent.budget_hard_stop',
+                    'agent.run_budget.hard_stop',
+                    'agent.session_budget.hard_stop',
+                    'run.plan.revision_requested',
+                    'run.plan.review_resume_requested',
+                    'run.supervision.operator_review_requested',
+                    'task.governor.candidate_materialized',
+                    'run.final_audit.accepted'
+                 ) ORDER BY id",
+            )?;
+            let events = statement.query_map(
+                params![review.run_id.as_str(), event_cursor],
+                queries::map_domain_event,
+            )?;
+            if events
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .any(is_material_event)
+            {
+                "STALE"
+            } else {
+                policy_state
+            }
+        } else {
+            policy_state
+        };
         transaction.execute(
             "INSERT INTO supervisor_decisions(id,review_id,run_id,snapshot_id,agent_session_id,policy_state,payload_json,payload_sha256,byte_length,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
@@ -890,6 +979,92 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn material_event_committed_before_decision_receipt_forces_stale_policy() {
+        let (_temp, store, run) = fixture();
+        let baseline = store
+            .emit_domain_event(
+                Some(&run),
+                "agent",
+                "agent-1",
+                "agent.heartbeat",
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("baseline telemetry persists");
+        let snapshot = store
+            .record_supervisor_snapshot(&run, baseline.id, "operator_steered", |id, revision| {
+                Ok(serde_json::json!({
+                    "schema": SUPERVISOR_SNAPSHOT_SCHEMA,
+                    "snapshot_id": id,
+                    "run_id": run,
+                    "revision": revision,
+                    "event_cursor": baseline.id,
+                }))
+            })
+            .expect("snapshot persists");
+        let agent_id = AgentSessionId::from("stale-supervisor-agent");
+        store
+            .create_agent_session(&NewAgentSession {
+                id: agent_id.clone(),
+                run_id: run.clone(),
+                task_attempt_id: None,
+                parent_agent_session_id: None,
+                runtime_kind: "test".to_owned(),
+                codex_account_id: None,
+                role: AgentRole::Supervisor,
+                nickname: Some("stale-supervisor".to_owned()),
+                requested_model: "gpt-5.6-terra".to_owned(),
+                requested_reasoning_effort: "high".to_owned(),
+                sandbox_mode: SandboxMode::ReadOnly,
+                approval_policy: "never".to_owned(),
+                cwd: PathBuf::from("/tmp"),
+                state: "STARTING".to_owned(),
+                current_goal: Some("read-only review".to_owned()),
+                token_budget: Some(24_000),
+            })
+            .expect("agent persists");
+        let review = store
+            .create_supervisor_review(&NewSupervisorReview {
+                id: SupervisorReviewId::from("stale-supervisor-review"),
+                run_id: run.clone(),
+                snapshot_id: snapshot.id.clone(),
+                agent_session_id: agent_id,
+                expected_decision_id: SupervisorDecisionId::from("stale-supervisor-decision"),
+                trigger_kind: "operator_steered".to_owned(),
+                requested_model: "gpt-5.6-terra".to_owned(),
+                requested_effort: "high".to_owned(),
+            })
+            .expect("review persists");
+        store
+            .mark_supervisor_review_running(&review.id)
+            .expect("review starts");
+        store
+            .emit_domain_event(
+                Some(&run),
+                "task",
+                "task-1",
+                "task.start_failed",
+                &serde_json::json!({"reason": "fixture failure"}),
+                None,
+            )
+            .expect("later material event persists");
+        let payload = serde_json::json!({
+            "schema": "harness.supervisor-decision.v1",
+            "decision_id": "stale-supervisor-decision",
+            "snapshot_id": snapshot.id,
+            "run_id": run,
+            "summary": "The earlier snapshot cannot authorize a current recommendation.",
+        });
+        let decision = store
+            .record_current_supervisor_decision(&review.id, baseline.id, &payload, |event| {
+                event.event_type == "task.start_failed"
+            })
+            .expect("stale receipt persists");
+        assert_eq!(decision.policy_state, "STALE");
+        assert_eq!(store.supervisor_review(&review.id).unwrap().state, "STALE");
     }
 
     #[test]

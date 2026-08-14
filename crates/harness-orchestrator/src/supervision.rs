@@ -44,21 +44,6 @@ pub(crate) fn observe_run_now(
     observe_run_with_force(store, config, max_thread_count, run_id, true)
 }
 
-/// Checks for a material controller event that arrived after a snapshot but
-/// before its model result is considered.  This is intentionally stricter
-/// than looking only for a later stored snapshot: the two-second coalescing
-/// window must not let a quick model response act on already superseded facts.
-pub(crate) fn has_material_event_after(
-    store: &Store,
-    run_id: &RunId,
-    event_cursor: i64,
-) -> Result<bool, StoreError> {
-    Ok(store
-        .list_domain_events(event_cursor, Some(run_id), MAX_EVENTS_PER_OBSERVATION)?
-        .iter()
-        .any(|event| material_trigger(event).is_some()))
-}
-
 fn observe_run_with_force(
     store: &Store,
     config: &SupervisionConfig,
@@ -146,7 +131,7 @@ fn observe_run_with_force(
     Ok(Some(snapshot))
 }
 
-fn material_trigger(event: &DomainEvent) -> Option<&'static str> {
+pub(crate) fn material_trigger(event: &DomainEvent) -> Option<&'static str> {
     // This deliberately is an allow-list.  Observe-only mode must not wake
     // on a new telemetry event simply because its spelling happens to include
     // a word such as "failed" or "budget".
@@ -545,14 +530,9 @@ fn parse_timestamp_millis(value: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MAX_EVENTS_PER_OBSERVATION, MAX_MATERIAL_EVENTS_PER_SNAPSHOT, has_material_event_after,
-        material_trigger,
-    };
-    use harness_domain::{DomainEvent, RepositoryId, RunId};
-    use harness_store::{NewRepository, NewRun, Store};
+    use super::{MAX_EVENTS_PER_OBSERVATION, MAX_MATERIAL_EVENTS_PER_SNAPSHOT, material_trigger};
+    use harness_domain::{DomainEvent, RunId};
     use serde_json::json;
-    use tempfile::TempDir;
 
     fn event(event_type: &str, payload: serde_json::Value) -> DomainEvent {
         DomainEvent {
@@ -601,75 +581,5 @@ mod tests {
     fn telemetry_backlog_catch_up_remains_bounded_without_deferring_material_events() {
         assert_eq!(MAX_EVENTS_PER_OBSERVATION, 10_000);
         assert_eq!(MAX_MATERIAL_EVENTS_PER_SNAPSHOT, 100);
-    }
-
-    #[test]
-    fn material_event_after_snapshot_cursor_makes_a_review_stale() {
-        let temp = TempDir::new().expect("temporary store");
-        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store opens");
-        let repository = RepositoryId::from("supervision-repository");
-        let run = RunId::from("supervision-run");
-        store
-            .create_repository(&NewRepository {
-                id: repository.clone(),
-                profile_id: "fixture".to_owned(),
-                profile_version: 1,
-                display_name: "fixture".to_owned(),
-                root_path: temp.path().join("checkout"),
-                origin_url: None,
-                default_branch: "main".to_owned(),
-                expected_coordination_branch: None,
-                state: "READY".to_owned(),
-            })
-            .expect("repository persists");
-        store
-            .create_run(&NewRun {
-                id: run.clone(),
-                repository_id: repository,
-                title: "supervision fixture".to_owned(),
-                objective: "exercise stale-review detection".to_owned(),
-                mode: "plan_and_implement".to_owned(),
-                publication_mode: "none".to_owned(),
-                state: "CREATED".to_owned(),
-                phase: "created".to_owned(),
-                base_ref: "main".to_owned(),
-                base_sha: "a".repeat(40),
-                authority_digest: "b".repeat(64),
-                profile_digest: "c".repeat(64),
-                codex_version: None,
-                protocol_schema_sha256: None,
-                requested_by: "test".to_owned(),
-                token_budget: None,
-            })
-            .expect("run persists");
-        let telemetry = store
-            .emit_domain_event(
-                Some(&run),
-                "agent",
-                "agent-1",
-                "agent.heartbeat",
-                &json!({}),
-                None,
-            )
-            .expect("telemetry persists");
-        assert!(
-            !has_material_event_after(&store, &run, telemetry.id)
-                .expect("telemetry cannot stale a decision")
-        );
-
-        store
-            .emit_domain_event(
-                Some(&run),
-                "task",
-                "task-1",
-                "task.start_failed",
-                &json!({"reason": "fixture failure"}),
-                None,
-            )
-            .expect("material event persists");
-        assert!(
-            has_material_event_after(&store, &run, telemetry.id)
-                .expect("later material event is visible")
-        );
     }
 }

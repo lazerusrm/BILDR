@@ -505,7 +505,6 @@ pub struct UpdateOperatorSettingsRequest {
     pub adaptive_governor_budgets: Option<bool>,
     pub automatic_governor_continuation: Option<bool>,
     pub automatic_plan_approval: Option<bool>,
-    #[serde(alias = "supervision_observe_only")]
     pub supervision_enabled: Option<bool>,
     pub governor_goal_token_budget: Option<u64>,
     pub governor_attempt_token_ceiling: Option<u64>,
@@ -7190,22 +7189,13 @@ impl Orchestrator {
                 )
             })?;
         validate_supervisor_decision(&review, &snapshot, &decision)?;
-        let latest_snapshot = self.store.latest_supervisor_snapshot(&review.run_id)?;
-        let policy_state = if latest_snapshot
-            .as_ref()
-            .is_some_and(|latest| latest.id == review.snapshot_id)
-            && !supervision::has_material_event_after(
-                &self.store,
-                &review.run_id,
-                snapshot.event_cursor,
-            )? {
-            "ADVISORY"
-        } else {
-            "STALE"
-        };
-        let record = self
-            .store
-            .record_supervisor_decision(&review.id, policy_state, &decision)?;
+        let record = self.store.record_current_supervisor_decision(
+            &review.id,
+            snapshot.event_cursor,
+            &decision,
+            |event| supervision::material_trigger(event).is_some(),
+        )?;
+        let policy_state = record.policy_state.as_str();
         self.store.clear_agent_active_turn(agent_id)?;
         self.store.update_agent_state(
             agent_id,
@@ -15440,6 +15430,17 @@ mod tests {
         assert_eq!(
             orchestrator.effective_supervision_config().mode,
             SupervisorMode::Advisory
+        );
+    }
+
+    #[test]
+    fn legacy_observation_request_field_is_rejected_not_reinterpreted_as_advisory() {
+        assert!(
+            serde_json::from_value::<UpdateOperatorSettingsRequest>(json!({
+                "supervision_observe_only": true
+            }))
+            .is_err(),
+            "a cached observe-only request must never authorize a Terra review"
         );
     }
 

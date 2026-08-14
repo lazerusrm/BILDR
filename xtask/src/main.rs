@@ -483,7 +483,12 @@ fn validate_run_detail_supervision_contract(openapi: &serde_yaml::Value) -> Resu
     let required = yaml_pointer(openapi, "/components/schemas/RunDetail/required")
         .and_then(serde_yaml::Value::as_sequence)
         .context("RunDetail required fields are missing from OpenAPI")?;
-    for field in ["supervision_mode", "supervisor_snapshot"] {
+    for field in [
+        "supervision_mode",
+        "supervisor_snapshot",
+        "supervisor_review",
+        "supervisor_decision",
+    ] {
         let field_key = serde_yaml::Value::String(field.to_owned());
         if !properties.contains_key(&field_key)
             || !required.iter().any(|value| value.as_str() == Some(field))
@@ -491,20 +496,27 @@ fn validate_run_detail_supervision_contract(openapi: &serde_yaml::Value) -> Resu
             bail!("RunDetail must declare required {field} output")
         }
     }
-    let snapshot = properties
-        .get(serde_yaml::Value::String("supervisor_snapshot".to_owned()))
-        .context("RunDetail supervisor_snapshot schema is missing")?;
-    let has_snapshot_ref = snapshot
-        .get("anyOf")
-        .and_then(serde_yaml::Value::as_sequence)
-        .is_some_and(|variants| {
-            variants.iter().any(|variant| {
-                variant.get("$ref").and_then(serde_yaml::Value::as_str)
-                    == Some("#/components/schemas/SupervisorSnapshot")
-            })
-        });
-    if !has_snapshot_ref {
-        bail!("RunDetail supervisor_snapshot must reference SupervisorSnapshot")
+    for (field, schema) in [
+        ("supervisor_snapshot", "SupervisorSnapshot"),
+        ("supervisor_review", "SupervisorReview"),
+        ("supervisor_decision", "SupervisorDecision"),
+    ] {
+        let value = properties
+            .get(serde_yaml::Value::String(field.to_owned()))
+            .with_context(|| format!("RunDetail {field} schema is missing"))?;
+        let expected = format!("#/components/schemas/{schema}");
+        let has_ref = value
+            .get("anyOf")
+            .and_then(serde_yaml::Value::as_sequence)
+            .is_some_and(|variants| {
+                variants.iter().any(|variant| {
+                    variant.get("$ref").and_then(serde_yaml::Value::as_str)
+                        == Some(expected.as_str())
+                })
+            });
+        if !has_ref {
+            bail!("RunDetail {field} must reference {schema}")
+        }
     }
     Ok(())
 }
@@ -517,9 +529,9 @@ fn validate_operator_settings_supervision_contract(openapi: &serde_yaml::Value) 
         let properties = yaml_pointer(openapi, pointer)
             .and_then(serde_yaml::Value::as_mapping)
             .with_context(|| format!("operator settings properties are missing at {pointer}"))?;
-        let key = serde_yaml::Value::String("supervision_observe_only".to_owned());
+        let key = serde_yaml::Value::String("supervision_enabled".to_owned());
         if !properties.contains_key(&key) {
-            bail!("operator settings must declare supervision_observe_only at {pointer}")
+            bail!("operator settings must declare supervision_enabled at {pointer}")
         }
     }
     let required = yaml_pointer(openapi, "/components/schemas/OperatorSettings/required")
@@ -527,9 +539,9 @@ fn validate_operator_settings_supervision_contract(openapi: &serde_yaml::Value) 
         .context("OperatorSettings required fields are missing from OpenAPI")?;
     if !required
         .iter()
-        .any(|value| value.as_str() == Some("supervision_observe_only"))
+        .any(|value| value.as_str() == Some("supervision_enabled"))
     {
-        bail!("OperatorSettings must require supervision_observe_only")
+        bail!("OperatorSettings must require supervision_enabled")
     }
     Ok(())
 }
