@@ -360,14 +360,22 @@ fn validate_supervisor_decision(
             .and_then(Value::as_str)
             .unwrap_or_default();
         let task_id = target.get("task_id").and_then(Value::as_str);
+        let fields_are_null = |fields: &[&str]| {
+            fields
+                .iter()
+                .all(|field| target.get(*field) == Some(&Value::Null))
+        };
         let valid_target = match kind {
             "retry_fresh_attempt" => {
                 target_kind == "task"
                     && task_id.is_some_and(|id| task_ids.contains(id))
                     && task_id == Some(target_id)
+                    && fields_are_null(&["attempt_id", "session_id"])
             }
             "wait" | "continue_attempt" | "request_replan" | "start_followup_turn" => {
-                target_kind == "run" && target_id == snapshot.run_id.as_str()
+                target_kind == "run"
+                    && target_id == snapshot.run_id.as_str()
+                    && fields_are_null(&["task_id", "attempt_id", "session_id"])
             }
             _ => false,
         };
@@ -15382,6 +15390,185 @@ mod tests {
         );
     }
 
+    async fn supervisor_rejection_fixture(
+        orchestrator: &Orchestrator,
+    ) -> (RunId, AgentSessionId, SupervisorReviewId) {
+        let repository_id = RepositoryId::from("supervisor-rejection-repository");
+        orchestrator
+            .store()
+            .create_repository(&NewRepository {
+                id: repository_id.clone(),
+                profile_id: "general".to_owned(),
+                profile_version: 1,
+                display_name: "Supervisor rejection fixture".to_owned(),
+                root_path: PathBuf::from("/tmp/supervisor-rejection-fixture"),
+                origin_url: None,
+                default_branch: "main".to_owned(),
+                expected_coordination_branch: None,
+                state: "READY".to_owned(),
+            })
+            .expect("fixture repository persists");
+        let run_id = RunId::from("supervisor-rejection-run");
+        orchestrator
+            .store()
+            .create_run(&NewRun {
+                id: run_id.clone(),
+                repository_id,
+                title: "Supervisor rejection fixture".to_owned(),
+                objective: "Persist a rejected advisory decision precisely".to_owned(),
+                mode: "plan_and_implement".to_owned(),
+                publication_mode: "local_only".to_owned(),
+                state: RunState::Blocked.to_string(),
+                phase: "plan_review_budget_exhausted".to_owned(),
+                base_ref: "main".to_owned(),
+                base_sha: "a".repeat(40),
+                authority_digest: "fixture".to_owned(),
+                profile_digest: "fixture".to_owned(),
+                codex_version: None,
+                protocol_schema_sha256: None,
+                requested_by: "test".to_owned(),
+                token_budget: Some(1_000_000),
+            })
+            .expect("fixture run persists");
+        let snapshot = orchestrator
+            .store()
+            .record_supervisor_snapshot(&run_id, 1, "operator_steered", |id, revision| {
+                Ok(json!({
+                    "schema": "harness.supervisor-snapshot.v1",
+                    "snapshot_id": id,
+                    "run_id": run_id,
+                    "revision": revision,
+                    "event_cursor": 1,
+                    "generated_at": "2026-08-14T00:00:00Z",
+                    "allowed_actions": ["request_replan"],
+                    "tasks": [{"task_id": "task-1"}]
+                }))
+            })
+            .expect("fixture snapshot persists");
+        let agent_id = AgentSessionId::from("supervisor-rejection-agent");
+        orchestrator
+            .store()
+            .create_agent_session(&NewAgentSession {
+                id: agent_id.clone(),
+                run_id: run_id.clone(),
+                task_attempt_id: None,
+                parent_agent_session_id: None,
+                runtime_kind: "test".to_owned(),
+                codex_account_id: None,
+                role: AgentRole::Supervisor,
+                nickname: Some("supervisor".to_owned()),
+                requested_model: "gpt-5.6-terra".to_owned(),
+                requested_reasoning_effort: "high".to_owned(),
+                sandbox_mode: SandboxMode::ReadOnly,
+                approval_policy: "never".to_owned(),
+                cwd: PathBuf::from("/tmp/supervisor-rejection-fixture"),
+                state: "STARTING".to_owned(),
+                current_goal: Some("fixture advisory review".to_owned()),
+                token_budget: Some(48_000),
+            })
+            .expect("fixture supervisor persists");
+        let review_id = SupervisorReviewId::from("supervisor-rejection-review");
+        orchestrator
+            .store()
+            .create_supervisor_review(&NewSupervisorReview {
+                id: review_id.clone(),
+                run_id: run_id.clone(),
+                snapshot_id: snapshot.id,
+                agent_session_id: agent_id.clone(),
+                expected_decision_id: SupervisorDecisionId::from("supervisor-rejection-decision"),
+                trigger_kind: "operator_steered".to_owned(),
+                requested_model: "gpt-5.6-terra".to_owned(),
+                requested_effort: "high".to_owned(),
+            })
+            .expect("fixture review persists");
+        orchestrator
+            .store()
+            .mark_supervisor_review_running(&review_id)
+            .expect("fixture review starts");
+        (run_id, agent_id, review_id)
+    }
+
+    #[tokio::test]
+    async fn rejected_supervisor_decision_keeps_its_durable_reason_after_turn_completion() {
+        let (orchestrator, _temp) = operator_settings_test_orchestrator().await;
+        let (run_id, agent_id, review_id) = supervisor_rejection_fixture(&orchestrator).await;
+        let invalid = json!({
+            "schema": "harness.supervisor-decision.v1",
+            "decision_id": "supervisor-rejection-decision",
+            "snapshot_id": orchestrator.store().supervisor_review(&review_id).unwrap().snapshot_id,
+            "run_id": run_id,
+            "snapshot_revision": 1,
+            "created_at": "2026-08-14T00:00:00Z",
+            "requested_model": "gpt-5.6-terra",
+            "effective_model": "gpt-5.6-terra",
+            "requested_effort": "high",
+            "effective_effort": "high",
+            "summary": "The run requires a fresh plan.",
+            "actions": [{
+                "action_id": "replan",
+                "kind": "request_replan",
+                "target": {"kind": "task", "id": "task-1", "task_id": "task-1", "attempt_id": null, "session_id": null},
+                "summary": "Request a fresh plan from the operator.",
+                "reason_code": "plan_review_budget_exhausted",
+                "expected_observable_outcome": "A fresh plan is available for human review.",
+                "dedupe_key": "replan-fixture",
+                "expires_at": "2026-08-14T01:00:00Z"
+            }]
+        });
+        let text = serde_json::to_string(&invalid).expect("fixture serializes");
+        let error = orchestrator
+            .accept_supervisor_decision(&agent_id, &text)
+            .await
+            .expect_err("task-targeted replan is rejected");
+        let reason = format!("supervisor decision rejected: {error}");
+        let review = orchestrator
+            .store()
+            .supervisor_review(&review_id)
+            .expect("review remains readable");
+        assert_eq!(review.state, "FAILED");
+        assert_eq!(review.failure_reason.as_deref(), Some(reason.as_str()));
+        let agent = orchestrator
+            .store()
+            .agent(&agent_id)
+            .expect("agent remains readable");
+        assert_eq!(agent.state, "FAILED");
+        assert_eq!(agent.failure_reason.as_deref(), Some(reason.as_str()));
+        let events = orchestrator
+            .store()
+            .list_domain_events(0, Some(&run_id), 100)
+            .expect("failure event is durable");
+        assert!(events.iter().any(|event| {
+            event.event_type == "run.supervision.review_failed"
+                && event.payload.get("reason").and_then(Value::as_str) == Some(reason.as_str())
+        }));
+
+        orchestrator
+            .handle_turn_completed(
+                &agent_id,
+                &json!({"turn": {"id": "fixture-turn", "status": "completed"}}),
+            )
+            .await
+            .expect("completion must preserve an already rejected review");
+        let review_after_completion = orchestrator
+            .store()
+            .supervisor_review(&review_id)
+            .expect("review remains readable after completion");
+        assert_eq!(review_after_completion.state, "FAILED");
+        assert_eq!(
+            review_after_completion.failure_reason.as_deref(),
+            Some(reason.as_str())
+        );
+        let agent_after_completion = orchestrator
+            .store()
+            .agent(&agent_id)
+            .expect("agent remains readable after completion");
+        assert_eq!(agent_after_completion.state, "FAILED");
+        assert_eq!(
+            agent_after_completion.failure_reason.as_deref(),
+            Some(reason.as_str())
+        );
+    }
+
     #[test]
     fn supervisor_decision_rejects_actions_outside_snapshot_allowlist() {
         let run_id = RunId::from("supervisor-run");
@@ -15394,7 +15581,7 @@ mod tests {
             payload: json!({
                 "generated_at": "2026-08-13T00:00:00Z",
                 "allowed_actions": ["wait"],
-                "tasks": []
+                "tasks": [{"task_id": "task-1"}]
             }),
             payload_sha256: "a".repeat(64),
             byte_length: 1,
@@ -15443,7 +15630,7 @@ mod tests {
         forbidden["actions"][0]["kind"] = json!("stop_run");
         assert!(validate_supervisor_decision(&review, &snapshot, &forbidden).is_err());
 
-        let mut invalid_target = decision;
+        let mut invalid_target = decision.clone();
         invalid_target["actions"][0]["kind"] = json!("request_replan");
         invalid_target["actions"][0]["target"] = json!({
             "kind": "task",
@@ -15456,6 +15643,36 @@ mod tests {
         assert!(
             validate_supervisor_decision(&review, &snapshot, &invalid_target)
                 .expect_err("replan must target the run")
+                .to_string()
+                .contains("invalid target")
+        );
+
+        snapshot.payload["allowed_actions"] = json!(["wait"]);
+        let mut contaminated_run_target = decision.clone();
+        contaminated_run_target["actions"][0]["target"]["task_id"] = json!("task-1");
+        assert!(
+            validate_supervisor_decision(&review, &snapshot, &contaminated_run_target)
+                .expect_err("run targets must not carry task scope")
+                .to_string()
+                .contains("invalid target")
+        );
+
+        snapshot.payload["allowed_actions"] = json!(["retry_fresh_attempt"]);
+        let mut retry = decision;
+        retry["actions"][0]["kind"] = json!("retry_fresh_attempt");
+        retry["actions"][0]["target"] = json!({
+            "kind": "task",
+            "id": "task-1",
+            "task_id": "task-1",
+            "attempt_id": null,
+            "session_id": null
+        });
+        validate_supervisor_decision(&review, &snapshot, &retry)
+            .expect("retry target with exactly task scope is accepted");
+        retry["actions"][0]["target"]["session_id"] = json!("supervisor-agent");
+        assert!(
+            validate_supervisor_decision(&review, &snapshot, &retry)
+                .expect_err("retry targets must not carry session scope")
                 .to_string()
                 .contains("invalid target")
         );
