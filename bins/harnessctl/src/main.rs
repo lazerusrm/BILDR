@@ -68,7 +68,7 @@ enum Command {
         #[command(subcommand)]
         command: InvestigationCommand,
     },
-    /// Inspect passive source-owned external conditions and their observations.
+    /// Inspect source-owned external conditions and their observations.
     Condition {
         #[command(subcommand)]
         command: ConditionCommand,
@@ -110,6 +110,15 @@ enum RecoveryCommand {
         run_id: Option<String>,
     },
     Show {
+        episode_id: String,
+    },
+    /// List immutable inventory findings for one reconciliation episode.
+    Findings {
+        episode_id: String,
+    },
+    /// List immutable receipts for controller actions already performed.
+    /// This command cannot apply a recovery action.
+    Actions {
         episode_id: String,
     },
 }
@@ -324,12 +333,12 @@ enum InvestigationCommand {
 
 #[derive(Subcommand)]
 enum ConditionCommand {
-    /// List passive source-owned conditions. This cannot poll or wake work.
+    /// List source-owned conditions. This cannot wake work or execute a result.
     List {
         #[arg(long)]
         include_terminal: bool,
     },
-    /// Show one passive condition.
+    /// Show one source-owned condition.
     Show { condition_id: String },
     /// Show immutable observations captured for one condition.
     Observations { condition_id: String },

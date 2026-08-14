@@ -1,14 +1,17 @@
-//! Source-owned passive external-condition registry.
+//! Source-owned external-condition registry.
 //!
-//! This repository captures observations and exposes read models only. It does
-//! not schedule adapters, poll a provider, wake work, or execute any result.
+//! This repository captures observations and exposes read models. It does not
+//! schedule adapters, poll a provider, wake work, or execute any result. A
+//! controller may atomically pair one already-evaluated local fact with a
+//! material event through the explicit custody method below.
 
 use harness_domain::{
-    ConditionObservation, ExternalCondition, ExternalConditionId, ExternalConditionState,
-    ExternalConditionSummary,
+    ConditionObservation, ExternalCondition, ExternalConditionAdapter, ExternalConditionId,
+    ExternalConditionOwnerType, ExternalConditionState, ExternalConditionSummary, RunId,
 };
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{Store, StoreError};
@@ -87,6 +90,53 @@ impl Store {
         expected_version: u64,
         observation: &ConditionObservation,
     ) -> Result<ExternalCondition, StoreError> {
+        self.record_external_condition_observation_inner(
+            condition_id,
+            expected_version,
+            observation,
+            None,
+        )
+    }
+
+    /// Records a controller-observed external fact and its material event in
+    /// one transaction. The caller supplies an exact owning run, while this
+    /// method re-derives that ownership from the condition before accepting
+    /// it. A successful observation therefore cannot survive without its
+    /// scheduler-visible controller event.
+    pub fn record_external_condition_observation_and_emit(
+        &self,
+        condition_id: &ExternalConditionId,
+        expected_version: u64,
+        observation: &ConditionObservation,
+        run_id: &RunId,
+        event_type: &str,
+        event_payload: &Value,
+    ) -> Result<ExternalCondition, StoreError> {
+        validate_domain_event_type(event_type)?;
+        if !event_payload.is_object() {
+            return Err(StoreError::Validation(
+                "external condition event payload must be an object".to_owned(),
+            ));
+        }
+        self.record_external_condition_observation_inner(
+            condition_id,
+            expected_version,
+            observation,
+            Some(ConditionMaterialEvent {
+                run_id,
+                event_type,
+                payload: event_payload,
+            }),
+        )
+    }
+
+    fn record_external_condition_observation_inner(
+        &self,
+        condition_id: &ExternalConditionId,
+        expected_version: u64,
+        observation: &ConditionObservation,
+        material_event: Option<ConditionMaterialEvent<'_>>,
+    ) -> Result<ExternalCondition, StoreError> {
         observation
             .validate()
             .map_err(|error| StoreError::Validation(error.to_string()))?;
@@ -115,6 +165,25 @@ impl Store {
                     [condition_id.as_str()],
                     |row| checked_condition_row(row.get(0)?, row.get(1)?),
                 )?;
+                if let Some(event) = material_event {
+                    ensure_material_event_binding(&transaction, &current, observation, &event)?;
+                    let present: i64 = transaction.query_row(
+                        "SELECT count(*) FROM domain_events WHERE run_id=?1 AND aggregate_type='external_condition' AND aggregate_id=?2 AND event_type=?3 AND json_extract(payload_json,'$.source_event_id')=?4",
+                        params![
+                            event.run_id.as_str(),
+                            condition_id.as_str(),
+                            event.event_type,
+                            observation.source_event_id,
+                        ],
+                        |row| row.get(0),
+                    )?;
+                    if present != 1 {
+                        return Err(StoreError::Conflict(
+                            "an existing external-condition observation is missing its material event"
+                                .to_owned(),
+                        ));
+                    }
+                }
                 transaction.commit()?;
                 return Ok(current);
             }
@@ -134,6 +203,9 @@ impl Store {
         condition
             .validate()
             .map_err(|error| StoreError::Validation(error.to_string()))?;
+        if let Some(event) = material_event.as_ref() {
+            ensure_material_event_binding(&transaction, &condition, observation, event)?;
+        }
         if to_i64(condition.version, "external condition version")? != expected_version {
             return Err(StoreError::Conflict(format!(
                 "external condition {condition_id} has version {}, expected {expected_version}",
@@ -197,6 +269,46 @@ impl Store {
                 observation_digest,
             ],
         )?;
+        if let Some(event) = material_event {
+            let mut payload = event.payload.as_object().cloned().ok_or_else(|| {
+                StoreError::Validation(
+                    "external condition event payload must be an object".to_owned(),
+                )
+            })?;
+            // These fields are controller-owned joins, not adapter-provided
+            // text. They let a replayed event prove the exact observation and
+            // resulting immutable condition revision that it represents.
+            payload.insert(
+                "source_event_id".to_owned(),
+                Value::String(observation.source_event_id.clone()),
+            );
+            payload.insert(
+                "condition_id".to_owned(),
+                Value::String(condition.condition_id.to_string()),
+            );
+            payload.insert(
+                "condition_version".to_owned(),
+                Value::from(condition.version),
+            );
+            payload.insert(
+                "condition_sha256".to_owned(),
+                Value::String(condition.sha256.clone()),
+            );
+            payload.insert(
+                "observation_id".to_owned(),
+                Value::String(observation.observation_id.to_string()),
+            );
+            transaction.execute(
+                "INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json,source_raw_event_id) VALUES(?1,'external_condition',?2,?3,?4,?5,NULL)",
+                params![
+                    event.run_id.as_str(),
+                    condition.condition_id.as_str(),
+                    event.event_type,
+                    harness_domain::now_ms(),
+                    serde_json::to_string(&Value::Object(payload))?,
+                ],
+            )?;
+        }
         transaction.commit()?;
         Ok(condition)
     }
@@ -241,6 +353,67 @@ impl Store {
         Ok(rows)
     }
 
+    /// Lists open conditions only after applying the durable owner and adapter
+    /// predicates. Applying a global page limit before those predicates can
+    /// leave an older due condition unobserved forever.
+    pub fn list_open_external_conditions_for_owner_adapter(
+        &self,
+        owner_type: ExternalConditionOwnerType,
+        owner_id: &str,
+        adapter: ExternalConditionAdapter,
+        limit: u32,
+    ) -> Result<Vec<ExternalCondition>, StoreError> {
+        self.list_open_external_conditions_for_owner_adapter_before(
+            owner_type, owner_id, adapter, None, limit,
+        )
+    }
+
+    /// Lists one stable newest-first page of an owner's open conditions. The
+    /// cursor is the final `(updated_at_ms, condition_id)` tuple from the
+    /// preceding page. It makes reconciliation exhaustive even when an owner
+    /// has more than the page-size ceiling.
+    pub fn list_open_external_conditions_for_owner_adapter_before(
+        &self,
+        owner_type: ExternalConditionOwnerType,
+        owner_id: &str,
+        adapter: ExternalConditionAdapter,
+        before: Option<(i64, &ExternalConditionId)>,
+        limit: u32,
+    ) -> Result<Vec<ExternalCondition>, StoreError> {
+        if limit == 0 || limit > MAX_EXTERNAL_CONDITION_PAGE_SIZE {
+            return Err(StoreError::Validation(format!(
+                "external condition page limit must be 1..={MAX_EXTERNAL_CONDITION_PAGE_SIZE}"
+            )));
+        }
+        let owner_type = enum_name(&owner_type)?;
+        let adapter = enum_name(&adapter)?;
+        let before_updated_at = before.map(|(updated_at_ms, _)| updated_at_ms);
+        let before_id = before.map(|(_, condition_id)| condition_id.as_str());
+        let connection = self.connection()?;
+        connection
+            .prepare(
+                "SELECT current_payload_json,current_payload_sha256 FROM external_conditions \
+                 WHERE adapter=?1 AND state='open' \
+                   AND json_extract(current_payload_json, '$.owner_type')=?2 \
+                   AND json_extract(current_payload_json, '$.owner_id')=?3 \
+                   AND (?4 IS NULL OR updated_at < ?4 OR (updated_at = ?4 AND id < ?5)) \
+                 ORDER BY updated_at DESC,id DESC LIMIT ?6",
+            )?
+            .query_map(
+                params![
+                    adapter,
+                    owner_type,
+                    owner_id,
+                    before_updated_at,
+                    before_id,
+                    i64::from(limit)
+                ],
+                |row| checked_condition_row(row.get(0)?, row.get(1)?),
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     /// Lists compact, integrity-checked summaries for browser and snapshot
     /// projections. Adapter specifications and observation payloads require an
     /// explicit read of the selected condition or its observation history.
@@ -279,6 +452,82 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
+}
+
+struct ConditionMaterialEvent<'a> {
+    run_id: &'a RunId,
+    event_type: &'a str,
+    payload: &'a Value,
+}
+
+fn ensure_material_event_binding(
+    transaction: &rusqlite::Transaction<'_>,
+    condition: &ExternalCondition,
+    observation: &ConditionObservation,
+    event: &ConditionMaterialEvent<'_>,
+) -> Result<(), StoreError> {
+    if observation.condition_id != condition.condition_id {
+        return Err(StoreError::Validation(
+            "external condition event observation must bind the current condition".to_owned(),
+        ));
+    }
+    let owner_run_id = condition_owner_run_id(transaction, condition)?;
+    if owner_run_id != *event.run_id {
+        return Err(StoreError::Conflict(
+            "external condition event run does not match the condition owner".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn condition_owner_run_id(
+    transaction: &rusqlite::Transaction<'_>,
+    condition: &ExternalCondition,
+) -> Result<RunId, StoreError> {
+    let run_id = match condition.owner_type {
+        ExternalConditionOwnerType::Run => transaction
+            .query_row(
+                "SELECT id FROM runs WHERE id=?1",
+                [condition.owner_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?,
+        ExternalConditionOwnerType::Task => transaction
+            .query_row(
+                "SELECT run_id FROM tasks WHERE id=?1",
+                [condition.owner_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?,
+        ExternalConditionOwnerType::Attempt => transaction
+            .query_row(
+                "SELECT t.run_id FROM task_attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=?1",
+                [condition.owner_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?,
+    }
+    .ok_or_else(|| {
+        StoreError::NotFound(format!(
+            "external condition owner {} is not present",
+            condition.owner_id
+        ))
+    })?;
+    Ok(RunId::from(run_id))
+}
+
+fn validate_domain_event_type(value: &str) -> Result<(), StoreError> {
+    if value.is_empty()
+        || value.len() > 160
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(StoreError::Validation(
+            "external condition event type must be a bounded controller identifier".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn checked_condition_row(
@@ -488,6 +737,114 @@ mod tests {
                 )
                 .is_err(),
             "condition observations must remain append-only"
+        );
+    }
+
+    #[test]
+    fn owner_filtered_open_page_cannot_starve_an_older_condition() {
+        let temp = TempDir::new().expect("temp");
+        let store =
+            Store::in_memory(Path::new(temp.path()).join("artifacts").as_path()).expect("store");
+        let mut target = condition();
+        target.owner_type = ExternalConditionOwnerType::Run;
+        target.owner_id = "run-target".to_owned();
+        target.adapter = ExternalConditionAdapter::TimeGate;
+        target.source_id = "time-gate:target".to_owned();
+        target.sha256 = target.digest().expect("target digest");
+        store
+            .register_external_condition(&target)
+            .expect("older target registers");
+
+        for index in 0..MAX_EXTERNAL_CONDITION_PAGE_SIZE {
+            let mut unrelated = target.clone();
+            unrelated.condition_id = ExternalConditionId::new();
+            unrelated.owner_id = "run-other".to_owned();
+            unrelated.source_id = format!("time-gate:other:{index}");
+            unrelated.opened_at_ms = i64::from(index) + 2;
+            unrelated.updated_at_ms = unrelated.opened_at_ms;
+            unrelated.sha256 = unrelated.digest().expect("unrelated digest");
+            store
+                .register_external_condition(&unrelated)
+                .expect("newer unrelated condition registers");
+        }
+
+        assert!(
+            !store
+                .list_external_conditions(false, MAX_EXTERNAL_CONDITION_PAGE_SIZE)
+                .expect("global page reads")
+                .iter()
+                .any(|condition| condition.condition_id == target.condition_id),
+            "the legacy global page demonstrates the starvation boundary"
+        );
+        assert_eq!(
+            store
+                .list_open_external_conditions_for_owner_adapter(
+                    ExternalConditionOwnerType::Run,
+                    "run-target",
+                    ExternalConditionAdapter::TimeGate,
+                    1,
+                )
+                .expect("owner page reads"),
+            vec![target],
+            "owner and adapter predicates must apply before LIMIT"
+        );
+    }
+
+    #[test]
+    fn owner_adapter_cursor_reaches_the_201st_open_condition() {
+        let temp = TempDir::new().expect("temp");
+        let store =
+            Store::in_memory(Path::new(temp.path()).join("artifacts").as_path()).expect("store");
+        let mut oldest = condition();
+        oldest.owner_type = ExternalConditionOwnerType::Run;
+        oldest.owner_id = "run-target".to_owned();
+        oldest.adapter = ExternalConditionAdapter::TimeGate;
+        oldest.source_id = "time-gate:oldest".to_owned();
+        oldest.sha256 = oldest.digest().expect("oldest digest");
+        store
+            .register_external_condition(&oldest)
+            .expect("oldest condition registers");
+
+        for index in 0..MAX_EXTERNAL_CONDITION_PAGE_SIZE {
+            let mut newer = oldest.clone();
+            newer.condition_id = ExternalConditionId::new();
+            newer.source_id = format!("time-gate:newer:{index}");
+            newer.opened_at_ms = i64::from(index) + 2;
+            newer.updated_at_ms = newer.opened_at_ms;
+            newer.sha256 = newer.digest().expect("newer digest");
+            store
+                .register_external_condition(&newer)
+                .expect("newer same-owner condition registers");
+        }
+
+        let first = store
+            .list_open_external_conditions_for_owner_adapter(
+                ExternalConditionOwnerType::Run,
+                "run-target",
+                ExternalConditionAdapter::TimeGate,
+                MAX_EXTERNAL_CONDITION_PAGE_SIZE,
+            )
+            .expect("first page reads");
+        assert_eq!(first.len(), MAX_EXTERNAL_CONDITION_PAGE_SIZE as usize);
+        assert!(
+            first
+                .iter()
+                .all(|condition| condition.condition_id != oldest.condition_id),
+            "the oldest record is beyond the first same-owner page"
+        );
+        let cursor = first.last().expect("full page has a final cursor");
+        assert_eq!(
+            store
+                .list_open_external_conditions_for_owner_adapter_before(
+                    ExternalConditionOwnerType::Run,
+                    "run-target",
+                    ExternalConditionAdapter::TimeGate,
+                    Some((cursor.updated_at_ms, &cursor.condition_id)),
+                    MAX_EXTERNAL_CONDITION_PAGE_SIZE,
+                )
+                .expect("second page reads"),
+            vec![oldest],
+            "the stable cursor reaches the 201st same-owner condition"
         );
     }
 }

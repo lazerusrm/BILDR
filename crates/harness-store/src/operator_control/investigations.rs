@@ -22,7 +22,7 @@ impl Store {
         artifact: &InvestigationArtifact,
     ) -> Result<InvestigationArtifact, StoreError> {
         artifact
-            .validate()
+            .validate_new_record()
             .map_err(|error| StoreError::Validation(error.to_string()))?;
         let raw = serde_json::to_string(artifact)?;
         let payload_sha256 = digest(&raw);
@@ -186,13 +186,13 @@ mod tests {
             base_sha: "a".repeat(40),
             repository_state_digest: "b".repeat(64),
             methods: vec!["read source and focused tests".to_owned()],
-            sources: vec!["validation:fixture".to_owned()],
+            sources: vec![format!("context:{}", "b".repeat(64))],
             findings: vec![InvestigationFinding {
                 finding_id: "finding_a".to_owned(),
                 classification: InvestigationFindingClassification::Confirmed,
                 summary: "The source and schema use different revisions.".to_owned(),
                 confidence_milli: 950,
-                evidence_refs: vec!["validation:fixture".to_owned()],
+                evidence_refs: vec![format!("context:{}", "b".repeat(64))],
                 affected_refs: vec!["task:task_a".to_owned()],
                 risk: AttentionSeverity::High,
                 limitations: vec![],
@@ -201,7 +201,7 @@ mod tests {
                 recommendation_id: "recommendation_a".to_owned(),
                 summary: "Use the controller-owned schema revision.".to_owned(),
                 required_authority: "controller".to_owned(),
-                evidence_refs: vec!["validation:fixture".to_owned()],
+                evidence_refs: vec![format!("context:{}", "b".repeat(64))],
                 alternatives: vec!["Preserve the rejected revision".to_owned()],
                 risk: AttentionSeverity::High,
                 next_verification: "Run the exact schema check.".to_owned(),
@@ -211,7 +211,7 @@ mod tests {
                 question: "Which revision is authoritative?".to_owned(),
                 state: "open".to_owned(),
                 options: vec!["controller".to_owned(), "legacy".to_owned()],
-                evidence_refs: vec!["validation:fixture".to_owned()],
+                evidence_refs: vec![format!("context:{}", "b".repeat(64))],
                 impact: "Blocks schema publication.".to_owned(),
                 recommended_option: Some("controller".to_owned()),
                 required_actor: "operator".to_owned(),
@@ -221,7 +221,7 @@ mod tests {
             limitations: vec!["No hosted replay was available.".to_owned()],
             rejected_hypotheses: vec!["The diff changed the schema.".to_owned()],
             sensitivity: InvestigationSensitivity::Internal,
-            artifact_refs: vec!["artifact:source-snapshot".to_owned()],
+            artifact_refs: vec![],
             created_at_ms: 1,
             sha256: String::new(),
         };
@@ -279,5 +279,50 @@ mod tests {
         );
         assert!(snapshot.investigations.rows[0].get("findings").is_none());
         assert_eq!(snapshot.source_cursors["investigation_artifacts"], 1);
+    }
+
+    #[test]
+    fn v1_artifact_reads_preserve_pre_ceiling_scope_and_empty_evidence() {
+        let temp = TempDir::new().expect("temp");
+        let store =
+            Store::in_memory(Path::new(temp.path()).join("artifacts").as_path()).expect("store");
+        let mut artifact = artifact();
+        artifact.scope.time_budget_ms = 48 * 60 * 60 * 1_000;
+        artifact.scope.token_budget = 200_000_000;
+        artifact.findings[0].evidence_refs.clear();
+        artifact.recommendations[0].evidence_refs.clear();
+        artifact.decision_inventory[0].evidence_refs.clear();
+        artifact.sha256 = artifact.digest().expect("legacy artifact digest");
+
+        assert!(
+            store.record_investigation_artifact(&artifact).is_err(),
+            "new artifact intake must not weaken its current evidence/scope contract"
+        );
+        let raw = serde_json::to_string(&artifact).expect("legacy artifact serializes");
+        let raw_digest = digest(&raw);
+        store
+            .connection()
+            .expect("connection")
+            .execute(
+                "INSERT INTO investigation_artifacts(id,run_id,task_id,base_sha,repository_state_digest,payload_json,payload_sha256,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    artifact.artifact_id.as_str(),
+                    artifact.run_id,
+                    artifact.task_id,
+                    artifact.base_sha,
+                    artifact.repository_state_digest,
+                    raw,
+                    raw_digest,
+                    artifact.created_at_ms,
+                ],
+            )
+            .expect("immutable legacy migration row inserts");
+        assert_eq!(
+            store
+                .investigation_artifact(&artifact.artifact_id)
+                .expect("artifact rereads"),
+            Some(artifact),
+            "integrity-checked immutable reads retain the v1 contract"
+        );
     }
 }

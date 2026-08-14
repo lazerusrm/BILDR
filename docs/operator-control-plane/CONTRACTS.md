@@ -106,8 +106,11 @@ Compatibility:
   `implementation`;
 - schema writers emit the explicit field after migration;
 - unknown values fail closed;
-- `investigation` requires read-only sandbox, no mutable path lease, and an
-  investigation-artifact completion contract;
+- `investigation` requires an enforceable per-path read sandbox, no mutable
+  path lease, and an investigation-artifact completion contract. A generic
+  global read-only sandbox and prompt-only scope are insufficient; absent a
+  readable-root allowlist plus controller-visible read-event custody, dispatch
+  fails closed;
 - only implementation tasks may produce a mutable candidate;
 - verification/review/integration retain existing specialized authority.
 
@@ -672,7 +675,9 @@ GET /api/v1/attention
 GET /api/v1/attention/{id}
 GET /api/v1/runs/{run_id}/topology
 GET /api/v1/runs/{run_id}/liveness
-GET /api/v1/reconciliation/{id}
+GET /api/v1/reconciliations/{id}
+GET /api/v1/reconciliations/{id}/findings
+GET /api/v1/reconciliations/{id}/actions
 GET /api/v1/investigations/{id}
 GET /api/v1/external-conditions
 GET /api/v1/traces/{trace_id}
@@ -721,7 +726,7 @@ harnessctl status [--json]
 harnessctl return [--since <cursor>] [--json]
 harnessctl attention list|show|acknowledge
 harnessctl decision answer
-harnessctl recovery list|show|apply
+harnessctl recovery list|show|findings|actions
 harnessctl investigation create|show|export
 harnessctl condition list|show|cancel
 harnessctl presence get|set

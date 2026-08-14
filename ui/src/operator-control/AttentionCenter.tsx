@@ -160,7 +160,7 @@ export function AttentionCenter() {
     } catch (cause) {
       if (conditionDetailRequest.current === request) {
         setConditionDetail({ conditionId, state: "error" });
-        setError(displayError(cause, "Could not load passive condition detail."));
+        setError(displayError(cause, "Could not load condition detail."));
       }
     }
   }, []);

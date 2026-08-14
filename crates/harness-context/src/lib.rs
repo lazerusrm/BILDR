@@ -327,12 +327,34 @@ fn select_sources(
 ) -> Result<Vec<(String, String, bool)>, ContextError> {
     let mut selected = Vec::new();
     let mut seen = BTreeSet::new();
+    let investigation_scope = task.investigation_scope.as_ref();
+    let investigation_matcher = investigation_scope
+        .map(|scope| compile_globs(&scope.owned_read_paths))
+        .transpose()?;
+    // An investigation can only receive controller-admitted repository sources
+    // that are inside its declared read scope. The packet validator also
+    // rejects task authority refs outside that scope; filtering profile hints
+    // here protects this boundary even if a malformed packet reaches the
+    // compiler directly.
+    let source_is_admitted = |path: &str| match investigation_scope {
+        Some(scope) => {
+            !contains_glob(path)
+                && investigation_matcher
+                    .as_ref()
+                    .is_some_and(|matcher| matcher.is_match(path))
+                && !scope
+                    .forbidden_paths
+                    .iter()
+                    .any(|forbidden| forbidden == path)
+        }
+        None => true,
+    };
     let push = |path: &str,
                 kind: &str,
                 promoted: bool,
                 selected: &mut Vec<(String, String, bool)>,
                 seen: &mut BTreeSet<String>| {
-        if seen.insert(path.to_owned()) {
+        if source_is_admitted(path) && seen.insert(path.to_owned()) {
             selected.push((path.to_owned(), kind.to_owned(), promoted));
         }
     };
@@ -345,9 +367,12 @@ fn select_sources(
     for authority in &task.authority_refs {
         push(authority, "task_authority", true, &mut selected, &mut seen);
     }
+    let scoped_paths = investigation_scope.map_or(task.owned_paths.as_slice(), |scope| {
+        scope.owned_read_paths.as_slice()
+    });
     for domain in &profile.domains {
         let matcher = compile_globs(&domain.globs)?;
-        if task.owned_paths.iter().any(|path| matcher.is_match(path)) {
+        if scoped_paths.iter().any(|path| matcher.is_match(path)) {
             for authority in &domain.authority_hints {
                 push(
                     authority,
@@ -359,7 +384,7 @@ fn select_sources(
             }
         }
     }
-    for path in &task.owned_paths {
+    for path in scoped_paths {
         if !contains_glob(path) {
             push(path, "task_file", true, &mut selected, &mut seen);
         }
@@ -834,6 +859,7 @@ mod tests {
             priority: "P1".to_owned(),
             execution_mode: "controller".to_owned(),
             execution_kind: harness_domain::TaskExecutionKind::Implementation,
+            investigation_scope: None,
             owner_profile: "worker".to_owned(),
             reviewer_profile: "verifier".to_owned(),
             checklist_rows: vec![],

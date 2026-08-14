@@ -8,13 +8,17 @@ capability boundary, not release evidence.
 
 - durable source-owned attention, canonical control-plane snapshots, and return
   cursor acknowledgement;
-- immutable investigation artifacts and passive external-condition observations;
+- immutable investigation artifact contracts/reducer and passive
+  external-condition observations; production scoped investigation dispatch is
+  fail-closed until the App Server supports readable-root enforcement plus a
+  controller-visible read-event stream;
 - deterministic allow-list material-progress classification;
 - liveness episodes with immutable observations; ordinary activity cannot clear
   degraded/stalled state, plus exact-revision immutable receipts for completed
   controller-path interventions; the reducer and UI execute no intervention;
-- reconciliation episode and exclusive-ownership proof custody; records cannot
-  reset work, release leases, or authorize a replacement attempt;
+- reconciliation episode, immutable inventory finding/action-receipt, and
+  exclusive-ownership proof custody; records cannot reset work, release leases,
+  or authorize a replacement attempt;
 - bounded run topology table over durable run/task/attempt/agent/worktree and
   dependency facts; no graph layout or inferred links;
 - versioned local presence and deterministic, retry-safe in-product
@@ -27,7 +31,9 @@ capability boundary, not release evidence.
 
 ## Explicitly not activated or complete
 
-- controller-owned reconciliation actions and proof consumption;
+- controller-owned reconciliation actions and proof consumption; restart loss
+  currently records preservation receipts and retains leases/approvals, rather
+  than claiming proof for a release or replacement attempt;
 - typed intervention execution;
 - external-condition polling/wake adapters;
 - notification batching, desktop delivery, and delivery-health rollout;

@@ -61,6 +61,14 @@ pub(super) fn routes() -> Router<ApiState> {
         .route("/api/v1/runs/{run_id}/topology", get(run_topology))
         .route("/api/v1/reconciliations", get(list_reconciliations))
         .route(
+            "/api/v1/reconciliations/{episode_id}/findings",
+            get(list_reconciliation_findings),
+        )
+        .route(
+            "/api/v1/reconciliations/{episode_id}/actions",
+            get(list_reconciliation_action_receipts),
+        )
+        .route(
             "/api/v1/reconciliations/{episode_id}",
             get(get_reconciliation),
         )
@@ -444,6 +452,47 @@ async fn get_reconciliation(
                 "reconciliation episode {episode_id}"
             )))
         })
+}
+
+/// Immutable reconciliation inventory facts. This route only exposes what the
+/// controller recorded; it cannot apply, retry, release, or reset anything.
+async fn list_reconciliation_findings(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(episode_id): Path<String>,
+    Query(query): Query<BoundedReadQuery>,
+) -> Result<Json<Vec<harness_domain::ReconciliationFinding>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    let episode_id = reconciliation_episode_id(episode_id)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .store()
+            .list_reconciliation_findings(&episode_id, query.limit.unwrap_or(50))?,
+    ))
+}
+
+/// Immutable receipts for controller actions already performed while
+/// reconciling. The route has no action or recovery side effect.
+async fn list_reconciliation_action_receipts(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(episode_id): Path<String>,
+    Query(query): Query<BoundedReadQuery>,
+) -> Result<Json<Vec<harness_domain::ReconciliationActionReceipt>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    let episode_id = reconciliation_episode_id(episode_id)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .store()
+            .list_reconciliation_action_receipts(&episode_id, query.limit.unwrap_or(50))?,
+    ))
+}
+
+fn reconciliation_episode_id(episode_id: String) -> Result<ReconciliationEpisodeId, ApiError> {
+    ReconciliationEpisodeId::parse(episode_id)
+        .map_err(|error| ApiError::from(harness_store::StoreError::Validation(error.to_string())))
 }
 
 #[derive(Debug, Deserialize)]

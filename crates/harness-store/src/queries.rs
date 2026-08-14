@@ -3130,6 +3130,19 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(format!("agent {id}")))
     }
 
+    /// Approval policy is a launch-custody field rather than a display field.
+    /// Read-only artifact intake re-reads it before accepting model output.
+    pub fn agent_approval_policy(&self, id: &AgentSessionId) -> Result<String, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT approval_policy FROM agent_sessions WHERE id=?1",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("agent {id}")))
+    }
+
     pub fn list_agents(&self, run_id: &RunId) -> Result<Vec<AgentSummary>, StoreError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(&format!(
@@ -3343,6 +3356,24 @@ impl Store {
                     })?;
                     Ok((AttemptId::from(row.get::<_, String>(0)?), packet))
                 },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Returns the immutable context receipt that was compiled for one exact
+    /// attempt and role. Investigation artifacts bind to this digest instead
+    /// of accepting a model-supplied repository observation.
+    pub fn context_packet_digest_for_attempt(
+        &self,
+        attempt_id: &AttemptId,
+        role: &str,
+    ) -> Result<Option<String>, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT packet_sha256 FROM context_packets WHERE task_attempt_id=?1 AND role=?2 ORDER BY created_at DESC,id DESC LIMIT 1",
+                params![attempt_id.as_str(), role],
+                |row| row.get(0),
             )
             .optional()
             .map_err(Into::into)

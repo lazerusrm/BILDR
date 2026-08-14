@@ -175,6 +175,12 @@ fn classify_source_event(event: &SourceEvent) -> Option<(MaterialProgressKind, &
             MaterialProgressKind::EvidenceRecorded,
             "Controller prepared an exact integration candidate with custody evidence.",
         )),
+        "external_condition.time_gate_satisfied"
+        | "external_condition.time_gate_deadline_elapsed"
+        | "external_condition.time_gate_invalid_spec" => Some((
+            MaterialProgressKind::ExternalConditionChanged,
+            "Controller recorded a terminal or unknown time-gate observation without changing execution authority.",
+        )),
         "task.governor.progress_updated"
             if event
                 .payload

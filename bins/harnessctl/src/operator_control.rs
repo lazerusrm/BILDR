@@ -189,6 +189,22 @@ pub(super) async fn recovery(api: &ApiClient, command: RecoveryCommand) -> Resul
             api.get(&format!("/api/v1/reconciliations/{episode_id}"))
                 .await
         }
+        RecoveryCommand::Findings { episode_id } => {
+            let episode_id: String =
+                url::form_urlencoded::byte_serialize(episode_id.as_bytes()).collect();
+            api.get(&format!(
+                "/api/v1/reconciliations/{episode_id}/findings?limit=50"
+            ))
+            .await
+        }
+        RecoveryCommand::Actions { episode_id } => {
+            let episode_id: String =
+                url::form_urlencoded::byte_serialize(episode_id.as_bytes()).collect();
+            api.get(&format!(
+                "/api/v1/reconciliations/{episode_id}/actions?limit=50"
+            ))
+            .await
+        }
     }
 }
 

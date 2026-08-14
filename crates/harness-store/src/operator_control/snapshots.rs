@@ -370,7 +370,7 @@ impl Store {
                 );
                 section.truncated = external_condition_truncation.is_some();
                 section.detail = Some(
-                    "Passive source-owned condition records only; this slice does not poll, wake work, or execute a result."
+                    "Source-owned conditions plus deterministic local time gates. This view never wakes work or executes a result."
                         .to_owned(),
                 );
                 section

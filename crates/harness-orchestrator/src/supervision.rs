@@ -599,19 +599,9 @@ fn allowed_actions(
         actions.push("pause_for_human");
         return actions;
     }
-    if tasks.iter().any(|task| {
-        matches!(
-            task.state,
-            TaskState::NeedsHelp
-                | TaskState::ChangesRequested
-                | TaskState::Interrupted
-                | TaskState::Stalled
-                | TaskState::Blocked
-                | TaskState::Failed
-        )
-    }) {
-        actions.push("retry_fresh_attempt");
-    }
+    // A supervisor snapshot is advisory evidence, not exclusive ownership
+    // proof. It must not propose a fresh attempt until a transactional
+    // proof-consuming recovery controller exists.
     if run.scheduler_paused
         && !matches!(
             run.state,
@@ -779,6 +769,7 @@ fn agent_role_name(role: harness_domain::AgentRole) -> &'static str {
         AgentRole::CiTriage => "ci_triage",
         AgentRole::Supervisor => "supervisor",
         AgentRole::Expert => "expert",
+        AgentRole::Investigator => "investigator",
     }
 }
 
@@ -912,6 +903,7 @@ mod tests {
                 priority: "P1".to_owned(),
                 execution_mode: "controller_governed".to_owned(),
                 execution_kind: harness_domain::TaskExecutionKind::Implementation,
+                investigation_scope: None,
                 owner_profile: "general".to_owned(),
                 reviewer_profile: "general".to_owned(),
                 checklist_rows: vec!["Keep the consultation advisory.".to_owned()],

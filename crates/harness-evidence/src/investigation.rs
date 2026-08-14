@@ -24,7 +24,7 @@ impl InvestigationEvidenceService {
         artifact: &InvestigationArtifact,
     ) -> Result<InvestigationArtifact, EvidenceError> {
         artifact
-            .validate()
+            .validate_new_record()
             .map_err(|error| EvidenceError::Invalid(error.to_string()))?;
         Ok(self.store.record_investigation_artifact(artifact)?)
     }

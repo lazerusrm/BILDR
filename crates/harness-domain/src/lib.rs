@@ -473,6 +473,10 @@ impl TaskState {
                 | (S::Leased, S::Starting)
                 | (S::Starting, S::Implementing)
                 | (S::Implementing, S::ReviewReady)
+                // A read-only investigation has no mutable candidate to
+                // review. Its controller-validated immutable artifact is
+                // the terminal task result.
+                | (S::Implementing, S::Closed)
                 | (S::ReviewReady, S::Verifying)
                 | (S::Verifying, S::ChangesRequested | S::Verified)
                 | (S::ChangesRequested, S::Ready | S::Superseded)
@@ -555,6 +559,9 @@ pub enum AgentRole {
     /// Read-only, advisory-only technical consultation. Expert output is never
     /// sent directly to a controller action executor.
     Expert,
+    /// Bounded, read-only task execution which must return a controller-bound
+    /// immutable investigation artifact. It has no write or lease authority.
+    Investigator,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -725,6 +732,11 @@ pub struct TaskPacket {
     pub execution_mode: String,
     #[serde(default)]
     pub execution_kind: TaskExecutionKind,
+    /// Required only for a read-only investigation.  It is deliberately
+    /// separate from `owned_paths`: an investigation receives no mutable
+    /// path custody.
+    #[serde(default)]
+    pub investigation_scope: Option<InvestigationScope>,
     pub owner_profile: String,
     pub reviewer_profile: String,
     pub checklist_rows: Vec<String>,
@@ -1729,6 +1741,7 @@ mod tests {
     #[test]
     fn workers_cannot_self_verify_by_transition() {
         assert!(!TaskState::Implementing.can_transition_to(TaskState::Verified));
+        assert!(TaskState::Implementing.can_transition_to(TaskState::Closed));
         assert!(TaskState::Verifying.can_transition_to(TaskState::Verified));
         assert!(TaskState::Integrated.can_transition_to(TaskState::ChangesRequested));
         assert!(TaskState::Integrated.can_transition_to(TaskState::Verified));

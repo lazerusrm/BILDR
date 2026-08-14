@@ -24,6 +24,11 @@ const MAX_INVESTIGATION_RECOMMENDATIONS: usize = 100;
 const MAX_INVESTIGATION_DECISIONS: usize = 100;
 const MAX_INVESTIGATION_REFS: usize = 1_000;
 const MAX_INVESTIGATION_LIST_ITEM_LEN: usize = 4_000;
+// An investigation is a short, bounded evidence-gathering lane. These
+// ceilings deliberately sit below a normal long-lived run budget: it must not
+// become a substitute for an unbounded worker session.
+const MAX_INVESTIGATION_TIME_BUDGET_MS: u64 = 24 * 60 * 60 * 1_000;
+const MAX_INVESTIGATION_TOKEN_BUDGET: u64 = 100_000_000;
 const MAX_CONDITION_PAYLOAD_BYTES: usize = 256 * 1024;
 const MAX_CONDITION_SPEC_BYTES: usize = 64 * 1024;
 
@@ -240,13 +245,45 @@ impl crate::TaskPacket {
     /// Scheduling still owns sandbox and lease creation; this packet-level
     /// check rejects an investigation before it can request mutable custody.
     pub fn validate_execution_contract(&self) -> Result<(), OperatorControlError> {
-        if self.execution_kind == TaskExecutionKind::Investigation
-            && (!self.owned_paths.is_empty() || !self.reserved_serial_paths.is_empty())
-        {
-            return Err(OperatorControlError::InvalidField {
-                field: "investigation task custody",
-                reason: "investigations cannot request mutable path ownership or serial leases",
-            });
+        match (self.execution_kind, self.investigation_scope.as_ref()) {
+            (TaskExecutionKind::Investigation, Some(scope)) => {
+                scope.validate()?;
+                if !self.owned_paths.is_empty() || !self.reserved_serial_paths.is_empty() {
+                    return Err(OperatorControlError::InvalidField {
+                        field: "investigation task custody",
+                        reason: "investigations cannot request mutable path ownership or serial leases",
+                    });
+                }
+                if !self.depends_on.is_empty() || !self.dependency_shas.is_empty() {
+                    return Err(OperatorControlError::InvalidField {
+                        field: "investigation task dependencies",
+                        reason: "investigations must bind directly to the pinned run base",
+                    });
+                }
+                if self
+                    .authority_refs
+                    .iter()
+                    .any(|authority| !scope.owned_read_paths.contains(authority))
+                {
+                    return Err(OperatorControlError::InvalidField {
+                        field: "investigation task authority refs",
+                        reason: "investigation authority files must be declared in the read scope",
+                    });
+                }
+            }
+            (TaskExecutionKind::Investigation, None) => {
+                return Err(OperatorControlError::InvalidField {
+                    field: "investigation scope",
+                    reason: "investigations require a bounded read-only scope",
+                });
+            }
+            (_, Some(_)) => {
+                return Err(OperatorControlError::InvalidField {
+                    field: "investigation scope",
+                    reason: "only investigation tasks may declare an investigation scope",
+                });
+            }
+            (_, None) => {}
         }
         Ok(())
     }
@@ -479,6 +516,40 @@ pub struct InvestigationScope {
 
 impl InvestigationScope {
     pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.owned_read_paths.is_empty()
+            || self.owned_read_paths.len() > MAX_INVESTIGATION_REFS
+            || self.forbidden_paths.len() > MAX_INVESTIGATION_REFS
+            || self.time_budget_ms == 0
+            || self.time_budget_ms > MAX_INVESTIGATION_TIME_BUDGET_MS
+            || self.token_budget == 0
+            || self.token_budget > MAX_INVESTIGATION_TOKEN_BUDGET
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "investigation scope",
+                reason: "must have bounded read paths plus time and token budgets within controller ceilings",
+            });
+        }
+        for path in self.owned_read_paths.iter().chain(&self.forbidden_paths) {
+            validate_relative_repo_path(path, "investigation scope path")?;
+        }
+        if self
+            .owned_read_paths
+            .iter()
+            .any(|path| self.forbidden_paths.contains(path))
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "investigation scope path",
+                reason: "a path cannot be both readable and forbidden",
+            });
+        }
+        Ok(())
+    }
+
+    /// v1 artifacts are immutable evidence rows. Their historical scope
+    /// contract pre-dates the current operational time/token ceilings, so
+    /// reads preserve that compatibility while still checking the original
+    /// bounded paths, positive budgets, and path syntax.
+    fn validate_persisted_artifact_scope(&self) -> Result<(), OperatorControlError> {
         if self.owned_read_paths.is_empty()
             || self.owned_read_paths.len() > MAX_INVESTIGATION_REFS
             || self.forbidden_paths.len() > MAX_INVESTIGATION_REFS
@@ -732,7 +803,7 @@ impl InvestigationArtifact {
             validate_identifier(value, field)?;
         }
         validate_text(&self.question, "investigation question", MAX_SUMMARY_LEN)?;
-        self.scope.validate()?;
+        self.scope.validate_persisted_artifact_scope()?;
         validate_lower_hex(&self.base_sha, "investigation base SHA", 40)?;
         validate_lower_hex(
             &self.repository_state_digest,
@@ -813,6 +884,58 @@ impl InvestigationArtifact {
                 field: "investigation artifact sha256",
                 reason: "does not match the canonical artifact payload",
             });
+        }
+        Ok(())
+    }
+
+    /// Admission rules for a newly recorded investigation result. The base
+    /// validator deliberately remains compatible with immutable v1 rows on
+    /// read; new controller evidence must additionally meet the current
+    /// bounded-scope and conclusion-evidence contract.
+    pub fn validate_new_record(&self) -> Result<(), OperatorControlError> {
+        self.validate()?;
+        self.scope.validate()?;
+        let expected_context_source = format!("context:{}", self.repository_state_digest);
+        if self.sources != vec![expected_context_source.clone()] || !self.artifact_refs.is_empty() {
+            return Err(OperatorControlError::InvalidField {
+                field: "investigation artifact evidence custody",
+                reason: "new records must cite only their controller-admitted immutable context and no external artifacts",
+            });
+        }
+        if self.findings.is_empty()
+            && self.recommendations.is_empty()
+            && self.decision_inventory.is_empty()
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "investigation artifact conclusions",
+                reason: "must contain at least one evidence-backed finding, recommendation, or decision",
+            });
+        }
+        for evidence_refs in self
+            .findings
+            .iter()
+            .map(|finding| &finding.evidence_refs)
+            .chain(
+                self.recommendations
+                    .iter()
+                    .map(|recommendation| &recommendation.evidence_refs),
+            )
+            .chain(
+                self.decision_inventory
+                    .iter()
+                    .map(|decision| &decision.evidence_refs),
+            )
+        {
+            if evidence_refs.is_empty()
+                || evidence_refs
+                    .iter()
+                    .any(|evidence_ref| evidence_ref != &expected_context_source)
+            {
+                return Err(OperatorControlError::InvalidField {
+                    field: "investigation artifact conclusion evidence refs",
+                    reason: "each conclusion must cite only its controller-admitted immutable context evidence",
+                });
+            }
         }
         Ok(())
     }
@@ -1291,6 +1414,188 @@ impl ReconciliationEpisode {
         if self.digest()? != self.sha256 {
             return Err(OperatorControlError::InvalidField {
                 field: "reconciliation sha256",
+                reason: "does not match the canonical payload",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One immutable controller-observed fact from a reconciliation inventory.
+///
+/// Findings are evidence only. In particular, a finding that a process is
+/// missing or a lease is old does not authorize a replacement attempt; that
+/// decision needs an exclusive ownership proof and a transactional controller
+/// consumer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationFinding {
+    pub schema: String,
+    pub episode_id: ReconciliationEpisodeId,
+    pub kind: ReconciliationFindingKind,
+    pub source_event_id: String,
+    pub observed_at_ms: i64,
+    pub payload: Value,
+    pub sha256: String,
+}
+
+impl ReconciliationFinding {
+    pub fn digest(&self) -> Result<String, OperatorControlError> {
+        let mut unsigned = self.clone();
+        unsigned.sha256.clear();
+        digest_json(&unsigned)
+    }
+
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.schema != "harness.reconciliation-finding.v1" {
+            return Err(OperatorControlError::InvalidField {
+                field: "reconciliation finding schema",
+                reason: "must be harness.reconciliation-finding.v1",
+            });
+        }
+        validate_identifier(
+            self.episode_id.as_str(),
+            "reconciliation finding episode id",
+        )?;
+        validate_identifier(
+            &self.source_event_id,
+            "reconciliation finding source event id",
+        )?;
+        if self.observed_at_ms < 0 {
+            return Err(OperatorControlError::InvalidField {
+                field: "reconciliation finding observed at",
+                reason: "must be a UTC epoch millisecond timestamp",
+            });
+        }
+        if !self.payload.is_object() {
+            return Err(OperatorControlError::InvalidField {
+                field: "reconciliation finding payload",
+                reason: "must be a JSON object",
+            });
+        }
+        if serde_json::to_vec(&self.payload)
+            .map_err(|_| OperatorControlError::InvalidField {
+                field: "reconciliation finding payload",
+                reason: "must serialize as JSON",
+            })?
+            .len()
+            > MAX_CONDITION_PAYLOAD_BYTES
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "reconciliation finding payload",
+                reason: "exceeds the bounded payload limit",
+            });
+        }
+        validate_lower_hex(
+            &self.sha256,
+            "reconciliation finding sha256",
+            SHA256_HEX_LEN,
+        )?;
+        if self.digest()? != self.sha256 {
+            return Err(OperatorControlError::InvalidField {
+                field: "reconciliation finding sha256",
+                reason: "does not match the canonical payload",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Immutable authorization/receipt for one controller reconciliation action.
+///
+/// This record is deliberately not an action executor. A preservation path may
+/// record it before its authority-neutral state change so a crash cannot leave
+/// an unrecorded mutation; the durable target state remains the effect proof.
+/// Any action that can resume, invalidate, release, or replace custody also
+/// requires a separate authority event and transactional source-specific
+/// consumer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationActionReceipt {
+    pub schema: String,
+    pub episode_id: ReconciliationEpisodeId,
+    pub kind: ReconciliationActionKind,
+    pub source_event_id: String,
+    pub authority_event_id: Option<String>,
+    pub created_at_ms: i64,
+    pub payload: Value,
+    pub sha256: String,
+}
+
+impl ReconciliationActionReceipt {
+    pub fn digest(&self) -> Result<String, OperatorControlError> {
+        let mut unsigned = self.clone();
+        unsigned.sha256.clear();
+        digest_json(&unsigned)
+    }
+
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.schema != "harness.reconciliation-action-receipt.v1" {
+            return Err(OperatorControlError::InvalidField {
+                field: "reconciliation action receipt schema",
+                reason: "must be harness.reconciliation-action-receipt.v1",
+            });
+        }
+        validate_identifier(
+            self.episode_id.as_str(),
+            "reconciliation action receipt episode id",
+        )?;
+        validate_identifier(
+            &self.source_event_id,
+            "reconciliation action receipt source event id",
+        )?;
+        if let Some(authority_event_id) = &self.authority_event_id {
+            validate_identifier(
+                authority_event_id,
+                "reconciliation action receipt authority event id",
+            )?;
+        }
+        if matches!(
+            self.kind,
+            ReconciliationActionKind::ResumeProvenOwner
+                | ReconciliationActionKind::InvalidateStaleApproval
+                | ReconciliationActionKind::ReleaseProvenDeadLease
+                | ReconciliationActionKind::AuthorizeFreshAttempt
+        ) && self.authority_event_id.is_none()
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "reconciliation action receipt authority event id",
+                reason: "is required for a state-changing reconciliation action",
+            });
+        }
+        if self.created_at_ms < 0 {
+            return Err(OperatorControlError::InvalidField {
+                field: "reconciliation action receipt created at",
+                reason: "must be a UTC epoch millisecond timestamp",
+            });
+        }
+        if !self.payload.is_object() {
+            return Err(OperatorControlError::InvalidField {
+                field: "reconciliation action receipt payload",
+                reason: "must be a JSON object",
+            });
+        }
+        if serde_json::to_vec(&self.payload)
+            .map_err(|_| OperatorControlError::InvalidField {
+                field: "reconciliation action receipt payload",
+                reason: "must serialize as JSON",
+            })?
+            .len()
+            > MAX_CONDITION_PAYLOAD_BYTES
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "reconciliation action receipt payload",
+                reason: "exceeds the bounded payload limit",
+            });
+        }
+        validate_lower_hex(
+            &self.sha256,
+            "reconciliation action receipt sha256",
+            SHA256_HEX_LEN,
+        )?;
+        if self.digest()? != self.sha256 {
+            return Err(OperatorControlError::InvalidField {
+                field: "reconciliation action receipt sha256",
                 reason: "does not match the canonical payload",
             });
         }
@@ -2137,6 +2442,12 @@ mod tests {
             "priority": "P1",
             "execution_mode": "controller",
             "execution_kind": "investigation",
+            "investigation_scope": {
+                "owned_read_paths": ["src/lib.rs"],
+                "forbidden_paths": [],
+                "time_budget_ms": 1000,
+                "token_budget": 1000
+            },
             "owner_profile": "general",
             "reviewer_profile": "general",
             "checklist_rows": [],
@@ -2162,6 +2473,70 @@ mod tests {
             "handoff_path": "controller://investigation"
         }))
         .expect("packet deserializes");
+        assert!(packet.validate_execution_contract().is_err());
+    }
+
+    #[test]
+    fn investigation_packets_require_a_bounded_scope_and_direct_base() {
+        let mut packet: crate::TaskPacket = serde_json::from_value(serde_json::json!({
+            "schema": "harness.orchestration.task.v1",
+            "program_id": "program",
+            "task_id": "task",
+            "title": "Investigation",
+            "state": "ready",
+            "priority": "P1",
+            "execution_mode": "controller",
+            "execution_kind": "investigation",
+            "investigation_scope": {
+                "owned_read_paths": ["src/lib.rs"],
+                "forbidden_paths": [],
+                "time_budget_ms": 1000,
+                "token_budget": 1000
+            },
+            "owner_profile": "general",
+            "reviewer_profile": "general",
+            "checklist_rows": [],
+            "authority_refs": [],
+            "base_sha": "",
+            "depends_on": [],
+            "owned_paths": [],
+            "forbidden_paths": [],
+            "reserved_serial_paths": [],
+            "objective": "Gather facts",
+            "milestones": [],
+            "non_goals": [],
+            "success_criteria": [],
+            "required_positive_tests": [],
+            "required_negative_tests": [],
+            "required_metrics": [],
+            "required_evidence": [],
+            "proof_limits": [],
+            "diff_budget": {"files": 1, "lines": 1},
+            "token_budget": 1000,
+            "lease_expires_at": "controller-managed",
+            "stop_conditions": [],
+            "handoff_path": "controller://investigation"
+        }))
+        .expect("packet deserializes");
+        assert!(packet.validate_execution_contract().is_ok());
+        packet
+            .investigation_scope
+            .as_mut()
+            .expect("scope exists")
+            .time_budget_ms = MAX_INVESTIGATION_TIME_BUDGET_MS.saturating_add(1);
+        assert!(packet.validate_execution_contract().is_err());
+        packet
+            .investigation_scope
+            .as_mut()
+            .expect("scope exists")
+            .time_budget_ms = 1_000;
+        packet.authority_refs.push("README.md".to_owned());
+        assert!(packet.validate_execution_contract().is_err());
+        packet.authority_refs.clear();
+        packet.depends_on.push("other".to_owned());
+        assert!(packet.validate_execution_contract().is_err());
+        packet.depends_on.clear();
+        packet.investigation_scope = None;
         assert!(packet.validate_execution_contract().is_err());
     }
 
