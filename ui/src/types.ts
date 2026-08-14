@@ -831,6 +831,29 @@ export interface LivenessEpisode {
   sha256: string;
 }
 
+export interface TopologyNode {
+  id: string;
+  kind: string;
+  source_ref: string;
+}
+
+export interface TopologyEdge {
+  from: string;
+  to: string;
+  kind: string;
+  source_ref: string;
+}
+
+export interface TopologySnapshot {
+  schema: "harness.run-topology.v1";
+  snapshot_id: string;
+  run_id: string;
+  nodes: TopologyNode[];
+  edges: TopologyEdge[];
+  source_cursor: number;
+  sha256: string;
+}
+
 export interface AttentionSourceRef {
   source_type:
     | "approval"

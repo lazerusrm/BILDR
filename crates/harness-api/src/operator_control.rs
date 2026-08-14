@@ -51,6 +51,7 @@ pub(super) fn routes() -> Router<ApiState> {
         .route("/api/v1/material-progress", get(list_material_progress))
         .route("/api/v1/liveness", get(list_liveness))
         .route("/api/v1/runs/{run_id}/liveness", get(list_run_liveness))
+        .route("/api/v1/runs/{run_id}/topology", get(run_topology))
         .route("/api/v1/reconciliations", get(list_reconciliations))
         .route(
             "/api/v1/reconciliations/{episode_id}",
@@ -339,6 +340,15 @@ async fn list_run_liveness(
         Some(&run_id),
         query.limit.unwrap_or(50),
     )?))
+}
+
+async fn run_topology(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<Json<harness_domain::TopologySnapshot>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(state.orchestrator.store().run_topology(&run_id)?))
 }
 
 async fn list_reconciliations(

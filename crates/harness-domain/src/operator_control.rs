@@ -1777,6 +1777,71 @@ pub struct TopologySnapshot {
     pub sha256: String,
 }
 
+impl TopologySnapshot {
+    pub fn digest(&self) -> Result<String, OperatorControlError> {
+        let mut unsigned = self.clone();
+        unsigned.sha256.clear();
+        digest_json(&unsigned)
+    }
+
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.schema != "harness.run-topology.v1" {
+            return Err(OperatorControlError::InvalidField {
+                field: "topology schema",
+                reason: "must be harness.run-topology.v1",
+            });
+        }
+        validate_identifier(self.snapshot_id.as_str(), "topology snapshot id")?;
+        validate_identifier(&self.run_id, "topology run id")?;
+        if self.nodes.len() > MAX_SECTION_ROWS || self.edges.len() > MAX_SECTION_ROWS * 4 {
+            return Err(OperatorControlError::InvalidField {
+                field: "topology size",
+                reason: "exceeds the bounded node or edge limit",
+            });
+        }
+        let mut node_ids = std::collections::BTreeSet::new();
+        for node in &self.nodes {
+            validate_identifier(&node.id, "topology node id")?;
+            validate_identifier(&node.kind, "topology node kind")?;
+            validate_text(
+                &node.source_ref,
+                "topology node source ref",
+                MAX_IDENTIFIER_LEN,
+            )?;
+            if !node_ids.insert(&node.id) {
+                return Err(OperatorControlError::InvalidField {
+                    field: "topology nodes",
+                    reason: "contains a duplicate node id",
+                });
+            }
+        }
+        for edge in &self.edges {
+            validate_identifier(&edge.from, "topology edge source")?;
+            validate_identifier(&edge.to, "topology edge destination")?;
+            validate_identifier(&edge.kind, "topology edge kind")?;
+            validate_text(
+                &edge.source_ref,
+                "topology edge source ref",
+                MAX_IDENTIFIER_LEN,
+            )?;
+            if !node_ids.contains(&edge.from) || !node_ids.contains(&edge.to) {
+                return Err(OperatorControlError::InvalidField {
+                    field: "topology edge endpoints",
+                    reason: "must refer to included nodes",
+                });
+            }
+        }
+        validate_lower_hex(&self.sha256, "topology sha256", SHA256_HEX_LEN)?;
+        if self.digest()? != self.sha256 {
+            return Err(OperatorControlError::InvalidField {
+                field: "topology sha256",
+                reason: "does not match the canonical payload",
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TraceContext {

@@ -15,6 +15,7 @@ import type {
   MaterialProgressEvent,
   ReturnView,
   SnapshotSection,
+  TopologySnapshot,
 } from "../types";
 
 export function AttentionCenter() {
@@ -25,6 +26,8 @@ export function AttentionCenter() {
   const [conditions, setConditions] = useState<ExternalConditionSummary[]>([]);
   const [progress, setProgress] = useState<MaterialProgressEvent[]>([]);
   const [liveness, setLiveness] = useState<LivenessEpisode[]>([]);
+  const [topology, setTopology] = useState<TopologySnapshot>();
+  const [topologyRunId, setTopologyRunId] = useState<string>();
   const [selectedInvestigationId, setSelectedInvestigationId] = useState<string>();
   const [selectedConditionId, setSelectedConditionId] = useState<string>();
   const [conditionHistory, setConditionHistory] = useState<ConditionHistory>({
@@ -66,6 +69,11 @@ export function AttentionCenter() {
       setConditions(nextConditions);
       setProgress(nextProgress);
       setLiveness(nextLiveness);
+      const runIds = nextSnapshot.runs.rows
+        .map((row) => typeof row.run_id === "string" ? row.run_id : undefined)
+        .filter((value): value is string => Boolean(value));
+      setTopologyRunId((current) => current && runIds.includes(current) ? current : runIds[0]);
+      setTopology(undefined);
       conditionHistoryRequest.current += 1;
       setConditionHistory({ conditionId: undefined, state: "idle", observations: [] });
       conditionDetailRequest.current += 1;
@@ -206,6 +214,16 @@ export function AttentionCenter() {
     }
   };
 
+  const loadTopology = useCallback(async (runId: string) => {
+    setTopologyRunId(runId);
+    setTopology(undefined);
+    try {
+      setTopology(await api.topology(runId));
+    } catch (cause) {
+      setError(displayError(cause, "Could not load the bounded run topology."));
+    }
+  }, []);
+
   return (
     <div className="page control-plane-page">
       <header className="page-title">
@@ -262,6 +280,12 @@ export function AttentionCenter() {
       <section className="control-plane-support" aria-label="Operator control records">
         <MaterialProgressTimeline events={progress} />
         <LivenessEpisodes episodes={liveness} />
+        <RunTopology
+          runIds={snapshot?.runs.rows.map((row) => text(row.run_id)).filter((id) => id !== "unknown") ?? []}
+          selectedRunId={topologyRunId}
+          topology={topology}
+          onSelect={(runId) => void loadTopology(runId)}
+        />
         <InvestigationArtifacts
           artifacts={investigations}
           selectedId={selectedInvestigationId}
@@ -367,6 +391,47 @@ function LivenessEpisodes({ episodes }: { episodes: LivenessEpisode[] }) {
         </ul>
       )}
       <p className="control-plane-note">This is a deterministic observation projection. It does not resume, retry, clear, or execute work.</p>
+    </section>
+  );
+}
+
+function RunTopology({
+  runIds,
+  selectedRunId,
+  topology,
+  onSelect,
+}: {
+  runIds: string[];
+  selectedRunId?: string;
+  topology?: TopologySnapshot;
+  onSelect: (runId: string) => void;
+}) {
+  return (
+    <section className="control-plane-support-card" aria-labelledby="topology-heading">
+      <span className="eyebrow">Bounded table</span>
+      <h2 id="topology-heading">Run topology</h2>
+      {runIds.length === 0 ? (
+        <p className="empty-state">No current run is available for topology inspection.</p>
+      ) : (
+        <>
+          <div className="control-plane-run-picker" aria-label="Select run topology">
+            {runIds.map((runId) => (
+              <button key={runId} className={`button secondary ${selectedRunId === runId ? "selected" : ""}`} type="button" onClick={() => onSelect(runId)}>
+                {runId}
+              </button>
+            ))}
+          </div>
+          {!topology ? <p className="control-plane-note">Select a run to load its factual ownership and dependency table.</p> : (
+            <>
+              <p className="control-plane-note">Cursor {topology.source_cursor} · {topology.nodes.length} nodes · {topology.edges.length} edges</p>
+              <ul className="control-plane-support-list">
+                {topology.nodes.map((node) => <li key={node.id}><div className="control-plane-static-record"><strong>{node.kind}</strong><span className="mono">{node.source_ref}</span></div></li>)}
+              </ul>
+            </>
+          )}
+        </>
+      )}
+      <p className="control-plane-note">This table is a read-only projection. Layout, inferred links, and controller actions are intentionally absent.</p>
     </section>
   );
 }

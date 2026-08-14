@@ -83,6 +83,8 @@ enum Command {
         #[arg(long)]
         run_id: Option<String>,
     },
+    /// Show the bounded factual topology for one run.
+    Topology { run_id: String },
     /// Inspect reconciliation inventory records. These commands cannot apply recovery actions.
     Recovery {
         #[command(subcommand)]
@@ -731,6 +733,7 @@ async fn execute(api: &ApiClient, command: Command) -> Result<Value> {
         Command::Condition { command } => operator_control::condition(api, command).await,
         Command::Progress { run_id } => operator_control::progress(api, run_id).await,
         Command::Liveness { run_id } => operator_control::liveness(api, run_id).await,
+        Command::Topology { run_id } => operator_control::topology(api, run_id).await,
         Command::Recovery { command } => operator_control::recovery(api, command).await,
         Command::Worktree { command } => match command {
             WorktreeCommand::List { run } => {

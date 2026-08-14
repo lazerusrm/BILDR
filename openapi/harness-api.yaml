@@ -376,6 +376,20 @@ paths:
           content:
             application/json:
               schema: {type: array, items: {$ref: '#/components/schemas/LivenessEpisode'}}
+  /runs/{runId}/topology:
+    get:
+      tags: [ControlPlane]
+      operationId: getRunTopology
+      description: Bounded factual run/task/attempt/agent/worktree ownership and dependency table. Graph layout and controller actions are deliberately absent.
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+      responses:
+        '200':
+          description: Immutable digest-checked topology compiled at one run event cursor.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TopologySnapshot'}
+        '404': {$ref: '#/components/responses/NotFound'}
   /reconciliations:
     get:
       tags: [Reconciliation]
@@ -1673,6 +1687,35 @@ components:
         finding_count: {type: integer, minimum: 0}
         action_count: {type: integer, minimum: 0}
         report: {type: [string, 'null'], maxLength: 4000}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    TopologyNode:
+      type: object
+      additionalProperties: false
+      required: [id, kind, source_ref]
+      properties:
+        id: {type: string, maxLength: 176}
+        kind: {type: string, maxLength: 160}
+        source_ref: {type: string, maxLength: 160}
+    TopologyEdge:
+      type: object
+      additionalProperties: false
+      required: [from, to, kind, source_ref]
+      properties:
+        from: {type: string, maxLength: 176}
+        to: {type: string, maxLength: 176}
+        kind: {type: string, maxLength: 160}
+        source_ref: {type: string, maxLength: 160}
+    TopologySnapshot:
+      type: object
+      additionalProperties: false
+      required: [schema, snapshot_id, run_id, nodes, edges, source_cursor, sha256]
+      properties:
+        schema: {const: harness.run-topology.v1}
+        snapshot_id: {type: string, maxLength: 160}
+        run_id: {type: string, maxLength: 160}
+        nodes: {type: array, maxItems: 1000, items: {$ref: '#/components/schemas/TopologyNode'}}
+        edges: {type: array, maxItems: 4000, items: {$ref: '#/components/schemas/TopologyEdge'}}
+        source_cursor: {type: integer, minimum: 0}
         sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
     AttentionSourceRef:
       type: object

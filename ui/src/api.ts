@@ -29,6 +29,7 @@ import type {
   RunDetail,
   RuntimeStatus,
   SupervisorAction,
+  TopologySnapshot,
   ReturnView,
   Task,
   Usage,
@@ -209,6 +210,10 @@ class HarnessApi {
   runLiveness = (runId: string) =>
     this.get<LivenessEpisode[]>(
       `/runs/${encodeURIComponent(runId)}/liveness?limit=50`,
+    );
+  topology = (runId: string) =>
+    this.get<TopologySnapshot>(
+      `/runs/${encodeURIComponent(runId)}/topology`,
     );
   attention = (cursor?: string, includeTerminal = false) => {
     const params = new URLSearchParams({ limit: "50" });

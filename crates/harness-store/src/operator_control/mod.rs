@@ -13,6 +13,7 @@ mod liveness;
 mod progress;
 mod reconciliation;
 mod snapshots;
+mod topology;
 
 pub use attention::*;
 pub use snapshots::*;

@@ -320,6 +320,16 @@ select:focus-visible {
   color: var(--muted);
   font-size: 11px;
 }
+.control-plane-run-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.control-plane-run-picker .button.selected {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
 .control-plane-support-list span,
 .control-plane-support-list small {
   color: var(--muted);

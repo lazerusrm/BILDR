@@ -99,6 +99,7 @@ describe("AttentionCenter", () => {
     expect(markup).toContain("does not poll a provider, wake work, or execute a result");
     expect(markup).toContain("Material progress");
     expect(markup).toContain("Liveness episodes");
+    expect(markup).toContain("Run topology");
   });
 
   it("renders bounded evidence and explicit condition history without an action control", () => {

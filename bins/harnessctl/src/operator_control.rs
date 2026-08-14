@@ -120,6 +120,11 @@ pub(super) async fn liveness(api: &ApiClient, run_id: Option<String>) -> Result<
         .await
 }
 
+pub(super) async fn topology(api: &ApiClient, run_id: String) -> Result<Value> {
+    let run_id: String = url::form_urlencoded::byte_serialize(run_id.as_bytes()).collect();
+    api.get(&format!("/api/v1/runs/{run_id}/topology")).await
+}
+
 pub(super) async fn recovery(api: &ApiClient, command: RecoveryCommand) -> Result<Value> {
     match command {
         RecoveryCommand::List { run_id } => {
