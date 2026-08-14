@@ -3303,6 +3303,7 @@ export function SupervisorObservationPanel({
   const snapshot = detail.supervisor_snapshot;
   const review = detail.supervisor_review;
   const decision = detail.supervisor_decision;
+  const actionReceipts = detail.supervisor_actions || [];
   const observing = mode === "observe_only";
   const advisory = mode === "advisory";
   const reviewRunning = ["STARTING", "RUNNING"].includes(review?.state || "");
@@ -3371,6 +3372,18 @@ export function SupervisorObservationPanel({
           {decision.payload.uncertainties?.length ? (
             <p className="muted">Uncertainty: {decision.payload.uncertainties[0]}</p>
           ) : null}
+        </div>
+      )}
+      {actionReceipts.length > 0 && (
+        <div className="supervisor-action-receipts" aria-label="Supervisor action receipts">
+          <strong>Controller action policy</strong>
+          {actionReceipts.slice(0, 6).map((action) => (
+            <span key={action.id} title={action.proposal_sha256}>
+              {action.kind.replaceAll("_", " ")} · {humanAgentState(action.state)}
+              {action.policy_reason ? ` — ${action.policy_reason}` : " — awaiting controller policy"}
+            </span>
+          ))}
+          <p className="muted">These receipts explain proposed actions. They do not apply, resume, retry, or alter work.</p>
         </div>
       )}
       {canRequest && (

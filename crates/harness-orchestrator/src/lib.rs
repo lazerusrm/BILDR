@@ -39,8 +39,8 @@ use harness_store::{
     ContextSourceRecord, NewAgentSession, NewApproval, NewArtifact, NewCommandRecord,
     NewContextPacket, NewRepository, NewRun, NewSupervisorReview, NewTaskAttempt,
     NewValidationRecord, NewWorktree, PriorAttemptContext, ProtocolProjection,
-    RepositoryHealthInput, Store, SupervisorDecisionRecord, SupervisorReviewRecord,
-    SupervisorSnapshotRecord, packet_digest,
+    RepositoryHealthInput, Store, SupervisorActionRecord, SupervisorDecisionRecord,
+    SupervisorReviewRecord, SupervisorSnapshotRecord, packet_digest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -695,6 +695,9 @@ pub struct RunDetail {
     pub supervisor_snapshot: Option<SupervisorSnapshotRecord>,
     pub supervisor_review: Option<SupervisorReviewRecord>,
     pub supervisor_decision: Option<SupervisorDecisionRecord>,
+    /// Bounded lifecycle receipts, separate from the immutable model decision.
+    /// Read visibility does not grant application authority.
+    pub supervisor_actions: Vec<SupervisorActionRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -3047,6 +3050,7 @@ impl Orchestrator {
             supervisor_snapshot: self.store.latest_supervisor_snapshot(run_id)?,
             supervisor_review: self.store.latest_supervisor_review(run_id)?,
             supervisor_decision: self.store.latest_supervisor_decision(run_id)?,
+            supervisor_actions: self.store.supervisor_actions_for_run(run_id)?,
         })
     }
 

@@ -766,6 +766,7 @@ export interface RunDetail {
   supervisor_snapshot?: SupervisorSnapshot | null;
   supervisor_review?: SupervisorReview | null;
   supervisor_decision?: SupervisorDecision | null;
+  supervisor_actions?: SupervisorAction[];
 }
 
 export interface SupervisorSnapshot {
@@ -814,6 +815,36 @@ export interface SupervisorDecision {
   payload_sha256: string;
   byte_length: number;
   created_at: string;
+}
+
+export interface SupervisorAction {
+  id: string;
+  decision_id: string;
+  run_id: string;
+  snapshot_id: string;
+  proposal_action_id: string;
+  kind: string;
+  target: Record<string, unknown>;
+  proposal: Record<string, unknown>;
+  proposal_sha256: string;
+  dedupe_key: string;
+  state:
+    | "PROPOSED"
+    | "POLICY_ACCEPTED"
+    | "POLICY_REJECTED"
+    | "EXECUTING"
+    | "SUCCEEDED"
+    | "FAILED"
+    | "STALE"
+    | "CANCELED"
+    | string;
+  policy_reason?: string | null;
+  execution_receipt?: Record<string, unknown> | null;
+  execution_receipt_sha256?: string | null;
+  created_at: string;
+  evaluated_at?: string | null;
+  execution_started_at?: string | null;
+  completed_at?: string | null;
 }
 
 export interface EvidenceSnapshot {

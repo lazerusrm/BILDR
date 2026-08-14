@@ -696,6 +696,20 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn supervisor_actions_for_run(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Vec<SupervisorActionRecord>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id,decision_id,run_id,snapshot_id,proposal_action_id,kind,target_json,proposal_json,proposal_sha256,dedupe_key,state,policy_reason,execution_receipt_json,execution_receipt_sha256,created_at,evaluated_at,execution_started_at,completed_at FROM supervisor_actions WHERE run_id=?1 ORDER BY created_at DESC,id DESC LIMIT 100",
+        )?;
+        statement
+            .query_map([run_id.as_str()], map_supervisor_action)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     pub fn supervisor_action(
         &self,
         action_id: &SupervisorActionId,

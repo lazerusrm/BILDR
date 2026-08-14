@@ -2038,10 +2038,34 @@ components:
         payload_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
         byte_length: {type: integer, minimum: 1}
         created_at: {type: string, format: date-time}
+    SupervisorAction:
+      type: object
+      additionalProperties: false
+      description: A hash-bound action proposal and its controller-owned lifecycle. Read visibility never applies the action.
+      required: [id, decision_id, run_id, snapshot_id, proposal_action_id, kind, target, proposal, proposal_sha256, dedupe_key, state, policy_reason, execution_receipt, execution_receipt_sha256, created_at, evaluated_at, execution_started_at, completed_at]
+      properties:
+        id: {type: string}
+        decision_id: {type: string}
+        run_id: {type: string}
+        snapshot_id: {type: string}
+        proposal_action_id: {type: string}
+        kind: {enum: [wait, continue_attempt, steer_active_turn, start_followup_turn, retry_fresh_attempt, spawn_explorer, spawn_reviewer, reroute_attempt, request_expert, request_replan, request_verification, queue_integration, cancel_attempt, pause_for_human, stop_run]}
+        target: {type: object}
+        proposal: {type: object}
+        proposal_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        dedupe_key: {type: string}
+        state: {enum: [PROPOSED, POLICY_ACCEPTED, POLICY_REJECTED, EXECUTING, SUCCEEDED, FAILED, STALE, CANCELED]}
+        policy_reason: {type: [string, 'null']}
+        execution_receipt: {type: [object, 'null']}
+        execution_receipt_sha256: {type: [string, 'null'], pattern: '^[0-9a-f]{64}$'}
+        created_at: {type: string, format: date-time}
+        evaluated_at: {type: [string, 'null'], format: date-time}
+        execution_started_at: {type: [string, 'null'], format: date-time}
+        completed_at: {type: [string, 'null'], format: date-time}
     RunDetail:
       type: object
       additionalProperties: false
-      required: [run, intent_interview, tasks, agents, worktrees, approvals, plan_review_history, planning_tokens_used, signoff_packet, draft_pr_ci, automatic_plan_approval, governor_progress, supervision_mode, supervisor_snapshot, supervisor_review, supervisor_decision]
+      required: [run, intent_interview, tasks, agents, worktrees, approvals, plan_review_history, planning_tokens_used, signoff_packet, draft_pr_ci, automatic_plan_approval, governor_progress, supervision_mode, supervisor_snapshot, supervisor_review, supervisor_decision, supervisor_actions]
       properties:
         run: {$ref: '#/components/schemas/Run'}
         intent_interview:
@@ -2083,6 +2107,7 @@ components:
           anyOf:
             - {$ref: '#/components/schemas/SupervisorDecision'}
             - {type: 'null'}
+        supervisor_actions: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/SupervisorAction'}}
     RunPage:
       type: object
       additionalProperties: false

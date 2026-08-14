@@ -977,6 +977,21 @@ kbd {
   font-size: 12px;
 }
 
+.supervisor-action-receipts {
+  display: grid;
+  gap: 0.3rem;
+  margin-top: 0.7rem;
+  padding: 0.7rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.5rem;
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+}
+
+.supervisor-action-receipts strong {
+  color: var(--text-primary);
+}
+
 .supervisor-decision > strong {
   color: var(--soft);
 }
