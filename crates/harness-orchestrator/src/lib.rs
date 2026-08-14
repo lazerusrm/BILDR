@@ -17998,10 +17998,6 @@ mod tests {
             .latest_supervisor_review(&run_id)
             .expect("fixture review reads")
             .expect("fixture review exists");
-        orchestrator
-            .store()
-            .fail_supervisor_review(&existing_review.id, "fixture review is no longer active")
-            .expect("fixture review ends");
 
         let readiness_entered = runtime.runtime_status_entered.notified();
         runtime
@@ -18009,9 +18005,10 @@ mod tests {
             .store(true, Ordering::Release);
         let launching = tokio::spawn({
             let orchestrator = orchestrator.clone();
+            let launch_run_id = run_id.clone();
             async move {
                 orchestrator
-                    .launch_supervisor_review(&run_id, &snapshot)
+                    .launch_supervisor_review(&launch_run_id, &snapshot)
                     .await
             }
         });
@@ -18036,8 +18033,9 @@ mod tests {
                 .latest_supervisor_review(&run_id)
                 .unwrap()
                 .expect("the original review remains the newest record")
-                .state,
-            "FAILED"
+                .id,
+            existing_review.id,
+            "no new Terra review is persisted after the disable"
         );
     }
 
