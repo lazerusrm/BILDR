@@ -390,25 +390,6 @@ impl Store {
         Ok(())
     }
 
-    /// Persists the only model output that can influence the advisory surface.
-    /// It binds the preallocated decision id, review, snapshot, and agent in a
-    /// single transaction.  `STALE` is durable audit evidence, never a
-    /// recoverable recommendation.
-    pub fn record_supervisor_decision(
-        &self,
-        review_id: &SupervisorReviewId,
-        policy_state: &str,
-        payload: &Value,
-    ) -> Result<SupervisorDecisionRecord, StoreError> {
-        self.record_supervisor_decision_with_freshness(
-            review_id,
-            policy_state,
-            None,
-            payload,
-            |_| false,
-        )
-    }
-
     /// Atomically records a model decision only if no later material event
     /// exists for the immutable source cursor.  The material-event predicate
     /// is controller-owned, while this transaction owns the race-free
@@ -425,8 +406,7 @@ impl Store {
     {
         self.record_supervisor_decision_with_freshness(
             review_id,
-            "ADVISORY",
-            Some(event_cursor),
+            event_cursor,
             payload,
             is_material_event,
         )
@@ -435,19 +415,13 @@ impl Store {
     fn record_supervisor_decision_with_freshness<F>(
         &self,
         review_id: &SupervisorReviewId,
-        policy_state: &str,
-        event_cursor: Option<i64>,
+        event_cursor: i64,
         payload: &Value,
         is_material_event: F,
     ) -> Result<SupervisorDecisionRecord, StoreError>
     where
         F: Fn(&DomainEvent) -> bool,
     {
-        if !matches!(policy_state, "ADVISORY" | "STALE") {
-            return Err(StoreError::Validation(
-                "supervisor decision policy state is invalid".to_owned(),
-            ));
-        }
         let raw = serde_json::to_string(payload)?;
         let byte_length = u64::try_from(raw.len()).map_err(|_| {
             StoreError::Validation("supervisor decision exceeds supported size".to_owned())
@@ -486,11 +460,11 @@ impl Store {
                 "supervisor decision does not match its immutable review envelope".to_owned(),
             ));
         }
-        let policy_state = if let Some(event_cursor) = event_cursor {
-            // Filter in SQLite first so an arbitrary telemetry backlog cannot
-            // turn this strict receipt into an unbounded read. The controller
-            // still evaluates the small allowlisted candidate set, including
-            // payload-sensitive lifecycle transitions.
+        // Filter in SQLite first so an arbitrary telemetry backlog cannot
+        // turn this strict receipt into an unbounded read. The controller
+        // still evaluates the small allowlisted candidate set, including
+        // payload-sensitive lifecycle transitions.
+        let policy_state = {
             let mut statement = transaction.prepare(
                 "SELECT id,run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json
                  FROM domain_events
@@ -527,10 +501,8 @@ impl Store {
             {
                 "STALE"
             } else {
-                policy_state
+                "ADVISORY"
             }
-        } else {
-            policy_state
         };
         transaction.execute(
             "INSERT INTO supervisor_decisions(id,review_id,run_id,snapshot_id,agent_session_id,policy_state,payload_json,payload_sha256,byte_length,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
@@ -958,7 +930,7 @@ mod tests {
             "summary": "A human decision is required.",
         });
         let decision = store
-            .record_supervisor_decision(&review.id, "ADVISORY", &payload)
+            .record_current_supervisor_decision(&review.id, 9, &payload, |_| false)
             .expect("decision persists");
         assert_eq!(decision.policy_state, "ADVISORY");
         assert_eq!(
@@ -967,7 +939,7 @@ mod tests {
         );
         assert!(
             store
-                .record_supervisor_decision(&review.id, "ADVISORY", &payload)
+                .record_current_supervisor_decision(&review.id, 9, &payload, |_| false)
                 .is_err()
         );
         let connection = store.connection().expect("connection");

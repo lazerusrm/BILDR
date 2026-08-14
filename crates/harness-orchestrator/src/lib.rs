@@ -276,9 +276,21 @@ fn validate_supervisor_decision(
             .and_then(Value::as_str)
             .is_some_and(|value| !value.trim().is_empty() && value.chars().count() <= maximum)
     };
-    if !nonempty("created_at", 128) || !nonempty("summary", 3_000) {
+    let snapshot_created_at = snapshot
+        .payload
+        .get("generated_at")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            OrchestratorError::Protocol(
+                "supervisor snapshot has no controller-generated timestamp".to_owned(),
+            )
+        })?;
+    if !nonempty("created_at", 128)
+        || !exact("created_at", snapshot_created_at)
+        || !nonempty("summary", 3_000)
+    {
         return Err(OrchestratorError::Validation(
-            "supervisor decision is missing a bounded created_at or summary".to_owned(),
+            "supervisor decision has an invalid created_at or summary".to_owned(),
         ));
     }
     let allowed = snapshot
@@ -15360,7 +15372,11 @@ mod tests {
             revision: 1,
             event_cursor: 4,
             trigger_kind: "operator_steered".to_owned(),
-            payload: json!({"allowed_actions": ["wait"], "tasks": []}),
+            payload: json!({
+                "generated_at": "2026-08-13T00:00:00Z",
+                "allowed_actions": ["wait"],
+                "tasks": []
+            }),
             payload_sha256: "a".repeat(64),
             byte_length: 1,
             created_at: "2026-08-13T00:00:00Z".to_owned(),
