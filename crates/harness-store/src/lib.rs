@@ -2,6 +2,7 @@
 
 mod artifacts;
 mod models;
+mod operator_control;
 mod projection;
 mod queries;
 mod supervision;
@@ -16,6 +17,7 @@ use std::{
 pub use artifacts::ArtifactStore;
 use harness_domain::now_ms;
 pub use models::*;
+pub use operator_control::*;
 pub use projection::{ProjectionContext, ProtocolProjection};
 pub use queries::*;
 use rusqlite::{Connection, OptionalExtension};
@@ -52,6 +54,8 @@ const SUPERVISION_ACTIONS_MIGRATION: &str =
     include_str!("../../../migrations/0015_supervision_actions.sql");
 const SUPERVISION_EXPERT_RUNTIME_MIGRATION: &str =
     include_str!("../../../migrations/0016_supervision_expert_runtime.sql");
+const OPERATOR_CONTROL_MIGRATION: &str =
+    include_str!("../../../migrations/0017_operator_control_plane.sql");
 
 #[derive(Clone)]
 pub struct Store {
@@ -363,6 +367,16 @@ fn apply_runtime_migrations(connection: &mut Connection) -> Result<(), StoreErro
     } else {
         set_runtime_schema_version(connection, "15")?;
     }
+    let has_attention_items: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='attention_items')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_attention_items {
+        apply_operator_control_migration(connection, || Ok(()))?;
+    } else {
+        set_runtime_schema_version(connection, "16")?;
+    }
     Ok(())
 }
 
@@ -435,6 +449,24 @@ where
     transaction.execute_batch(SUPERVISION_EXPERT_RUNTIME_MIGRATION)?;
     after_schema()?;
     set_runtime_schema_version(&transaction, "15")?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Install the complete operator-control schema and v16 marker atomically.
+/// Partial foundations are unsafe because a snapshot could otherwise claim
+/// current state while the source-owned event histories do not exist.
+fn apply_operator_control_migration<F>(
+    connection: &mut Connection,
+    after_schema: F,
+) -> Result<(), StoreError>
+where
+    F: FnOnce() -> Result<(), StoreError>,
+{
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(OPERATOR_CONTROL_MIGRATION)?;
+    after_schema()?;
+    set_runtime_schema_version(&transaction, "16")?;
     transaction.commit()?;
     Ok(())
 }
@@ -596,6 +628,46 @@ mod tests {
             )
             .unwrap();
         assert!(has_failure_observations);
+        let has_operator_control: bool = reopened
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='attention_items')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_operator_control);
+    }
+
+    #[test]
+    fn operator_control_schema_and_v15_marker_roll_back_together_on_failure() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(INITIAL_MIGRATION).unwrap();
+        connection.execute_batch(RUNTIME_MIGRATION).unwrap();
+        let error = apply_operator_control_migration(&mut connection, || {
+            Err(StoreError::Migration(
+                "injected failure after operator-control DDL".to_owned(),
+            ))
+        })
+        .expect_err("a migration failure must roll back its schema marker");
+        assert!(error.to_string().contains("injected failure"));
+        let attention_table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='attention_items')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let version: String = connection
+            .query_row(
+                "SELECT value FROM schema_migrations_meta WHERE key='runtime_schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!attention_table_exists);
+        assert_ne!(version, "15");
     }
 
     #[test]

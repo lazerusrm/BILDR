@@ -11,6 +11,10 @@ use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use ulid::Ulid;
 
+pub mod operator_control;
+
+pub use operator_control::*;
+
 macro_rules! id_type {
     ($name:ident) => {
         #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -719,6 +723,8 @@ pub struct TaskPacket {
     pub state: String,
     pub priority: String,
     pub execution_mode: String,
+    #[serde(default)]
+    pub execution_kind: TaskExecutionKind,
     pub owner_profile: String,
     pub reviewer_profile: String,
     pub checklist_rows: Vec<String>,

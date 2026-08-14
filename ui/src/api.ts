@@ -1,9 +1,12 @@
 import type {
   ActivityPage,
   Agent,
+  AttentionItem,
+  AttentionPage,
   Approval,
   CodexAccountLoginStatus,
   CodexAccountsSnapshot,
+  ControlPlaneSnapshot,
   EvidenceSnapshot,
   EvaluationCaseSummary,
   EvaluationOccurrenceSource,
@@ -19,6 +22,7 @@ import type {
   RunDetail,
   RuntimeStatus,
   SupervisorAction,
+  ReturnView,
   Task,
   Usage,
   UsageBreakdown,
@@ -181,6 +185,30 @@ class HarnessApi {
       `/supervisor-actions/${encodeURIComponent(actionId)}/apply`,
     );
   }
+  controlPlaneSnapshot = () =>
+    this.get<ControlPlaneSnapshot>("/control-plane/snapshot");
+  controlPlaneReturnView = () =>
+    this.get<ReturnView>("/control-plane/return-view");
+  attention = (cursor?: string, includeTerminal = false) => {
+    const params = new URLSearchParams({ limit: "50" });
+    if (cursor) params.set("cursor", cursor);
+    if (includeTerminal) params.set("include_terminal", "true");
+    return this.get<AttentionPage>(`/attention?${params}`);
+  };
+  acknowledgeAttention = (attentionId: string, expectedVersion: number) =>
+    this.post<AttentionItem>(
+      `/attention/${encodeURIComponent(attentionId)}/acknowledge`,
+      { expected_version: expectedVersion },
+    );
+  acknowledgeReturnView = (
+    expectedSnapshotRevision: number,
+    acknowledgedCursor: number,
+  ) =>
+    this.post("/control-plane/return-view/cursor", {
+      operator_id: "local_operator",
+      expected_snapshot_revision: expectedSnapshotRevision,
+      acknowledged_cursor: acknowledgedCursor,
+    });
 
   selectCodexAccount(accountId: string) {
     return this.post<CodexAccountsSnapshot>(

@@ -453,8 +453,7 @@ fn openapi_check(root: &Path) -> Result<()> {
                 .context("OpenAPI path keys must be strings")
         })
         .collect::<Result<BTreeSet<_>>>()?;
-    let router_source = fs::read_to_string(root.join("crates/harness-api/src/lib.rs"))?;
-    let implemented_routes = rust_router_paths(&router_source);
+    let implemented_routes = api_router_paths(&root.join("crates/harness-api/src"))?;
     let missing = documented_routes
         .difference(&implemented_routes)
         .cloned()
@@ -575,6 +574,23 @@ fn rust_router_paths(source: &str) -> BTreeSet<String> {
         })
         .filter(|path| path.starts_with("/api/v1/"))
         .collect()
+}
+
+fn api_router_paths(directory: &Path) -> Result<BTreeSet<String>> {
+    let mut paths = BTreeSet::new();
+    for entry in WalkDir::new(directory) {
+        let entry = entry?;
+        if entry.file_type().is_file()
+            && entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("rs")
+        {
+            paths.extend(rust_router_paths(&fs::read_to_string(entry.path())?));
+        }
+    }
+    Ok(paths)
 }
 
 fn normalize_path_parameters(path: &str) -> String {

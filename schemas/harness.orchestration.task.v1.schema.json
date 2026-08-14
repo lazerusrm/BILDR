@@ -28,6 +28,10 @@
     },
     "priority": { "enum": ["P0", "P1", "P2", "P3"] },
     "execution_mode": { "enum": ["controller", "agent", "subagent_required", "manual_operator"] },
+    "execution_kind": {
+      "default": "implementation",
+      "enum": ["implementation", "investigation", "verification", "review", "integration"]
+    },
     "owner_profile": { "$ref": "#/$defs/id" },
     "reviewer_profile": { "$ref": "#/$defs/id" },
     "checklist_rows": { "$ref": "#/$defs/nonEmptyStrings" },

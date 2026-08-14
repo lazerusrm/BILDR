@@ -39,6 +39,7 @@ import {
 } from "react";
 import { api } from "./api";
 import { ImprovementCenter } from "./improvement/ImprovementCenter";
+import { AttentionCenter } from "./operator-control/AttentionCenter";
 import type {
   Agent,
   Approval,
@@ -63,7 +64,7 @@ import type {
   WorktreeDiffSummary,
 } from "./types";
 
-type View = "home" | "repositories" | "runs" | "improvement" | "usage" | "host" | "settings";
+type View = "home" | "repositories" | "runs" | "control" | "improvement" | "usage" | "host" | "settings";
 type Modal =
   | "register"
   | "prepare-checkout"
@@ -77,6 +78,7 @@ const nav: Array<{ view: View; label: string; icon: typeof Home }> = [
   { view: "home", label: "Home", icon: Home },
   { view: "repositories", label: "Repositories", icon: FolderGit2 },
   { view: "runs", label: "Runs", icon: Activity },
+  { view: "control", label: "Control", icon: AlertTriangle },
   { view: "improvement", label: "Improvement", icon: Network },
   { view: "usage", label: "Usage", icon: CircleDollarSign },
 ];
@@ -890,6 +892,7 @@ export default function App() {
               runtime={runtime}
             />
           )}
+          {view === "control" && <AttentionCenter />}
           {view === "host" && (
             <HostView runtime={runtime} repositories={repositories} />
           )}

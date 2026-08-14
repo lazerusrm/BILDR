@@ -833,6 +833,7 @@ mod tests {
             state: "ready".to_owned(),
             priority: "P1".to_owned(),
             execution_mode: "controller".to_owned(),
+            execution_kind: harness_domain::TaskExecutionKind::Implementation,
             owner_profile: "worker".to_owned(),
             reviewer_profile: "verifier".to_owned(),
             checklist_rows: vec![],

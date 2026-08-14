@@ -5,11 +5,16 @@
 //! manifest through their own envelope store.
 
 mod canonical;
+mod correlation;
 mod model;
 mod project;
 mod redaction;
 mod validate;
 
+pub use correlation::{
+    CorrelationError, CorrelationPolicy, accept_inbound_traceparent, child_context,
+    parse_traceparent, validate_causal_links,
+};
 pub use model::{
     DomainEventReceipt, ProjectionDiagnostic, ProjectionError, RawEventReceipt, RelationInput,
     SourceReceipt, StructuralReceipt, TraceInput, TraceManifest, TraceNode, TraceRelationKind,

@@ -23,10 +23,10 @@ use harness_domain::{
     AgentRole, AgentSessionId, AgentSummary, ApprovalId, ApprovalSummary, ArtifactId, AttemptId,
     CodexRuntimeStatus, CommandRunId, ComponentStatus, DiffBudget, EvidenceId, ExpertRequestId,
     ExpertResponseId, ProofTier, RepositoryId, RepositorySummary, ResourceClass, ResultClass,
-    RiskLevel, RunId, RunPlan, RunState, RunSummary, RuntimeStatus, SandboxMode, SchedulerStatus,
-    SupervisorActionId, SupervisorDecisionId, SupervisorMode, SupervisorReviewId, TaskId,
-    TaskPacket, TaskState, TaskSummary, ValidationId, WorktreeId, WorktreeSummary,
-    format_timestamp, now_ms,
+    RiskLevel, RunId, RunPlan, RunState, RunSummary, RuntimeStatus, SandboxMode,
+    SchedulerStatus, SupervisorActionId, SupervisorDecisionId, SupervisorMode,
+    SupervisorReviewId, TaskExecutionKind, TaskId, TaskPacket, TaskState, TaskSummary,
+    ValidationId, WorktreeId, WorktreeSummary, format_timestamp, now_ms,
 };
 use harness_evidence::{EvidenceArtifactInput, EvidenceClaim, EvidenceService};
 use harness_git::{DiffPolicy, GitManager, WorktreeSpec, validate_public_change_metadata};
@@ -105,6 +105,7 @@ const ARCHITECT_TASK_OUTPUT_FIELDS: &[&str] = &[
     "owner_profile",
     "priority",
     "depends_on",
+    "execution_kind",
     "owned_paths",
     "reserved_serial_paths",
     "objective",
@@ -14756,6 +14757,7 @@ fn architecture_packet(
         state: "ready".to_owned(),
         priority: "P0".to_owned(),
         execution_mode: "controller".to_owned(),
+        execution_kind: TaskExecutionKind::Review,
         owner_profile: "architect".to_owned(),
         reviewer_profile: "human".to_owned(),
         checklist_rows: vec![],
@@ -15772,6 +15774,8 @@ fn parse_architecture_plan(
     let mut plan: RunPlan = serde_json::from_value(value)?;
     for task in &mut plan.tasks {
         task.token_budget = controller_task_token_budget(task, default_token_budget);
+        task.validate_execution_contract()
+            .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
     }
     Ok(plan)
 }
@@ -15810,6 +15814,8 @@ fn canonicalize_architecture_task(
         .or_insert_with(|| json!("verifier"));
     task.entry("state".to_owned())
         .or_insert_with(|| json!("proposed"));
+    task.entry("execution_kind".to_owned())
+        .or_insert_with(|| json!("implementation"));
     task.entry("priority".to_owned())
         .or_insert_with(|| json!("P0"));
     task.entry("dependency_shas".to_owned())
@@ -17097,6 +17103,7 @@ mod tests {
                 state: "proposed".to_owned(),
                 priority: "P1".to_owned(),
                 execution_mode: "controller_governed".to_owned(),
+                execution_kind: TaskExecutionKind::Implementation,
                 owner_profile: "general".to_owned(),
                 reviewer_profile: "general".to_owned(),
                 checklist_rows: vec!["Keep recovery human controlled".to_owned()],
@@ -18430,6 +18437,18 @@ mod tests {
             task.stop_conditions,
             ["Stop only at a genuine external boundary"]
         );
+        let mut investigation_with_mutable_custody: Value = serde_json::from_str(&raw).unwrap();
+        investigation_with_mutable_custody["tasks"][0]["execution_kind"] = json!("investigation");
+        assert!(matches!(
+            parse_architecture_plan(
+                &run,
+                &profile,
+                80_000,
+                &investigation_with_mutable_custody.to_string(),
+            ),
+            Err(OrchestratorError::Validation(message))
+                if message.contains("investigations cannot request mutable path ownership")
+        ));
         let mut high_risk = task.clone();
         high_risk.owner_profile = "worker_escalation".to_owned();
         high_risk.execution_mode = "agent".to_owned();

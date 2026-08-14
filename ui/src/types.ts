@@ -739,6 +739,122 @@ export interface GovernorCheckpoint {
   workspace_state: string;
 }
 
+export type SnapshotSectionState = "current" | "stale" | "unknown" | "error";
+
+export interface SnapshotSection {
+  state: SnapshotSectionState;
+  rows: Array<Record<string, unknown>>;
+  source_cursor: number;
+  truncated: boolean;
+  detail: string | null;
+}
+
+export interface SnapshotTruncation {
+  section: string;
+  omitted_rows: number;
+  limit: number;
+}
+
+export interface ControlPlaneSnapshot {
+  schema: "harness.control-plane-snapshot.v1";
+  snapshot_id: string;
+  revision: number;
+  compiled_at_ms: number;
+  event_cursor: number;
+  consistency: string;
+  system: SnapshotSection;
+  accounts: SnapshotSection;
+  scheduler: SnapshotSection;
+  runs: SnapshotSection;
+  attention: SnapshotSection;
+  attempts: SnapshotSection;
+  progress: SnapshotSection;
+  liveness: SnapshotSection;
+  reconciliation: SnapshotSection;
+  external_conditions: SnapshotSection;
+  cost: SnapshotSection;
+  notifications: SnapshotSection;
+  limits: SnapshotSection;
+  truncation: SnapshotTruncation[];
+  source_cursors: Record<string, number>;
+  sha256: string;
+}
+
+export interface AttentionSourceRef {
+  source_type:
+    | "approval"
+    | "decision"
+    | "credential_requirement"
+    | "publication"
+    | "policy_decision"
+    | "evidence_gap"
+    | "external_condition"
+    | "reconciliation"
+    | "infrastructure";
+  source_id: string;
+  source_revision: number;
+}
+
+export interface AttentionResolution {
+  outcome: string;
+  actor_type: string;
+  actor_id: string;
+  resolved_at_ms: number;
+  authority_event_id: string;
+  bound_head_sha: string | null;
+  worktree_fingerprint: string | null;
+  receipt_sha256: string;
+}
+
+export interface AttentionItem {
+  schema: "harness.attention-item.v1";
+  attention_id: string;
+  repository_id: string | null;
+  run_id: string | null;
+  task_id: string | null;
+  source: AttentionSourceRef;
+  category: string;
+  severity: "info" | "normal" | "high" | "critical";
+  state:
+    | "open"
+    | "acknowledged"
+    | "waiting_external"
+    | "resolved"
+    | "declined"
+    | "superseded"
+    | "invalidated";
+  title: string;
+  summary: string;
+  option_refs: string[];
+  evidence_refs: string[];
+  blocked_refs: string[];
+  dedupe_key: string;
+  opened_event_id: string;
+  opened_at_ms: number;
+  acknowledged_at_ms: number | null;
+  due_at_ms: number | null;
+  resurfacing: { policy: string; maximum_defer_ms: number };
+  resolution: AttentionResolution | null;
+  version: number;
+}
+
+export interface AttentionPage {
+  items: AttentionItem[];
+  includes_terminal: boolean;
+  next_cursor: string | null;
+}
+
+export interface ReturnView {
+  schema: "harness.return-view.v1";
+  return_view_id: string;
+  snapshot_id: string;
+  snapshot_revision: number;
+  event_cursor: number;
+  acknowledged_cursor: number;
+  sections: Record<string, SnapshotSection>;
+  sha256: string;
+}
+
 export interface RunDetail {
   run: Run;
   intent_interview?: IntentInterviewSnapshot | null;

@@ -22,6 +22,8 @@ tags:
   - name: Usage
   - name: Events
   - name: Improvement
+  - name: ControlPlane
+  - name: Attention
 paths:
   /health:
     get:
@@ -273,6 +275,102 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Repository'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /control-plane/snapshot:
+    get:
+      tags: [ControlPlane]
+      operationId: getControlPlaneSnapshot
+      responses:
+        '200':
+          description: An immutable snapshot compiled from exact bounded source cursors.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ControlPlaneSnapshot'}
+  /control-plane/return-view:
+    get:
+      tags: [ControlPlane]
+      operationId: getControlPlaneReturnView
+      parameters:
+        - name: operator_id
+          in: query
+          schema: {type: string, maxLength: 160}
+      responses:
+        '200':
+          description: Return-focused presentation from one immutable snapshot.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ReturnView'}
+  /control-plane/return-view/cursor:
+    post:
+      tags: [ControlPlane]
+      operationId: advanceReturnViewCursor
+      parameters:
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AdvanceReturnViewCursorRequest'}
+      responses:
+        '200':
+          description: Presentation acknowledgement cursor advanced without resolving any source item.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ReturnViewCursor'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /attention:
+    get:
+      tags: [Attention]
+      operationId: listAttention
+      parameters:
+        - name: include_terminal
+          in: query
+          schema: {type: boolean, default: false}
+        - name: cursor
+          in: query
+          schema: {type: string, maxLength: 240}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Source-owned attention items in stable server ordering.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AttentionPage'}
+  /attention/{attentionId}:
+    get:
+      tags: [Attention]
+      operationId: getAttention
+      parameters:
+        - {$ref: '#/components/parameters/AttentionId'}
+      responses:
+        '200':
+          description: One source-owned attention item.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AttentionItem'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /attention/{attentionId}/acknowledge:
+    post:
+      tags: [Attention]
+      operationId: acknowledgeAttention
+      description: Acknowledgement changes only presentation state. It cannot resolve or satisfy the source item.
+      parameters:
+        - {$ref: '#/components/parameters/AttentionId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AcknowledgeAttentionRequest'}
+      responses:
+        '200':
+          description: Version-checked acknowledgement.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AttentionItem'}
         '409': {$ref: '#/components/responses/Conflict'}
         '422': {$ref: '#/components/responses/ValidationError'}
   /runs:
@@ -1265,6 +1363,11 @@ components:
       in: path
       required: true
       schema: {type: string}
+    AttentionId:
+      name: attentionId
+      in: path
+      required: true
+      schema: {type: string, maxLength: 160}
     AccountId:
       name: accountId
       in: path
@@ -1287,6 +1390,153 @@ components:
         application/json:
           schema: {$ref: '#/components/schemas/Problem'}
   schemas:
+    SnapshotSection:
+      type: object
+      additionalProperties: false
+      required: [state, rows, source_cursor, truncated, detail]
+      properties:
+        state: {enum: [current, stale, unknown, error]}
+        rows: {type: array, maxItems: 1000, items: {}}
+        source_cursor: {type: integer, minimum: 0}
+        truncated: {type: boolean}
+        detail: {type: [string, 'null']}
+    SnapshotTruncation:
+      type: object
+      additionalProperties: false
+      required: [section, omitted_rows, limit]
+      properties:
+        section: {type: string}
+        omitted_rows: {type: integer, minimum: 0}
+        limit: {type: integer, minimum: 0}
+    ControlPlaneSnapshot:
+      type: object
+      additionalProperties: false
+      required: [schema, snapshot_id, revision, compiled_at_ms, event_cursor, consistency, system, accounts, scheduler, runs, attention, attempts, progress, liveness, reconciliation, external_conditions, cost, notifications, limits, truncation, source_cursors, sha256]
+      properties:
+        schema: {const: harness.control-plane-snapshot.v1}
+        snapshot_id: {type: string}
+        revision: {type: integer, minimum: 1}
+        compiled_at_ms: {type: integer}
+        event_cursor: {type: integer, minimum: 0}
+        consistency: {type: string}
+        system: {$ref: '#/components/schemas/SnapshotSection'}
+        accounts: {$ref: '#/components/schemas/SnapshotSection'}
+        scheduler: {$ref: '#/components/schemas/SnapshotSection'}
+        runs: {$ref: '#/components/schemas/SnapshotSection'}
+        attention: {$ref: '#/components/schemas/SnapshotSection'}
+        attempts: {$ref: '#/components/schemas/SnapshotSection'}
+        progress: {$ref: '#/components/schemas/SnapshotSection'}
+        liveness: {$ref: '#/components/schemas/SnapshotSection'}
+        reconciliation: {$ref: '#/components/schemas/SnapshotSection'}
+        external_conditions: {$ref: '#/components/schemas/SnapshotSection'}
+        cost: {$ref: '#/components/schemas/SnapshotSection'}
+        notifications: {$ref: '#/components/schemas/SnapshotSection'}
+        limits: {$ref: '#/components/schemas/SnapshotSection'}
+        truncation: {type: array, items: {$ref: '#/components/schemas/SnapshotTruncation'}}
+        source_cursors: {type: object, additionalProperties: {type: integer, minimum: 0}}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    AttentionSourceRef:
+      type: object
+      additionalProperties: false
+      required: [source_type, source_id, source_revision]
+      properties:
+        source_type: {enum: [approval, decision, credential_requirement, publication, policy_decision, evidence_gap, external_condition, reconciliation, infrastructure]}
+        source_id: {type: string, maxLength: 160}
+        source_revision: {type: integer, minimum: 0}
+    AttentionResurfacingPolicy:
+      type: object
+      additionalProperties: false
+      required: [policy, maximum_defer_ms]
+      properties:
+        policy: {type: string}
+        maximum_defer_ms: {type: integer, minimum: 0}
+    AttentionResolution:
+      type: object
+      additionalProperties: false
+      required: [outcome, actor_type, actor_id, resolved_at_ms, authority_event_id, bound_head_sha, worktree_fingerprint, receipt_sha256]
+      properties:
+        outcome: {type: string}
+        actor_type: {type: string}
+        actor_id: {type: string}
+        resolved_at_ms: {type: integer}
+        authority_event_id: {type: string}
+        bound_head_sha: {type: [string, 'null'], pattern: '^[0-9a-f]{40}$'}
+        worktree_fingerprint: {type: [string, 'null'], pattern: '^[0-9a-f]{64}$'}
+        receipt_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    AttentionItem:
+      type: object
+      additionalProperties: false
+      required: [schema, attention_id, repository_id, run_id, task_id, source, category, severity, state, title, summary, option_refs, evidence_refs, blocked_refs, dedupe_key, opened_event_id, opened_at_ms, acknowledged_at_ms, due_at_ms, resurfacing, resolution, version]
+      properties:
+        schema: {const: harness.attention-item.v1}
+        attention_id: {type: string}
+        repository_id: {type: [string, 'null']}
+        run_id: {type: [string, 'null']}
+        task_id: {type: [string, 'null']}
+        source: {$ref: '#/components/schemas/AttentionSourceRef'}
+        category: {enum: [decision, approval, credential, policy_exception, destructive_action, publication, missing_evidence, external_dependency, recovery_conflict, infrastructure]}
+        severity: {enum: [info, normal, high, critical]}
+        state: {enum: [open, acknowledged, waiting_external, resolved, declined, superseded, invalidated]}
+        title: {type: string, maxLength: 240}
+        summary: {type: string, maxLength: 4000}
+        option_refs: {type: array, items: {type: string}}
+        evidence_refs: {type: array, items: {type: string}}
+        blocked_refs: {type: array, items: {type: string}}
+        dedupe_key: {type: string}
+        opened_event_id: {type: string}
+        opened_at_ms: {type: integer}
+        acknowledged_at_ms: {type: [integer, 'null']}
+        due_at_ms: {type: [integer, 'null']}
+        resurfacing: {$ref: '#/components/schemas/AttentionResurfacingPolicy'}
+        resolution:
+          oneOf:
+            - {$ref: '#/components/schemas/AttentionResolution'}
+            - {type: 'null'}
+        version: {type: integer, minimum: 1}
+    AttentionPage:
+      type: object
+      additionalProperties: false
+      required: [items, includes_terminal, next_cursor]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/AttentionItem'}}
+        includes_terminal: {type: boolean}
+        next_cursor: {type: [string, 'null']}
+    AcknowledgeAttentionRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_version]
+      properties:
+        expected_version: {type: integer, minimum: 1}
+        acknowledged_at_ms: {type: [integer, 'null']}
+    ReturnView:
+      type: object
+      additionalProperties: false
+      required: [schema, return_view_id, snapshot_id, snapshot_revision, event_cursor, acknowledged_cursor, sections, sha256]
+      properties:
+        schema: {const: harness.return-view.v1}
+        return_view_id: {type: string}
+        snapshot_id: {type: string}
+        snapshot_revision: {type: integer, minimum: 1}
+        event_cursor: {type: integer, minimum: 0}
+        acknowledged_cursor: {type: integer, minimum: 0}
+        sections: {type: object, additionalProperties: {$ref: '#/components/schemas/SnapshotSection'}}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    AdvanceReturnViewCursorRequest:
+      type: object
+      additionalProperties: false
+      required: [operator_id, expected_snapshot_revision, acknowledged_cursor]
+      properties:
+        operator_id: {type: string, maxLength: 160}
+        expected_snapshot_revision: {type: integer, minimum: 1}
+        acknowledged_cursor: {type: integer, minimum: 0}
+    ReturnViewCursor:
+      type: object
+      additionalProperties: false
+      required: [operator_id, acknowledged_cursor, expected_snapshot_revision]
+      properties:
+        operator_id: {type: string}
+        acknowledged_cursor: {type: integer, minimum: 0}
+        expected_snapshot_revision: {type: integer, minimum: 1}
     OpaqueId:
       type: string
       pattern: '^[A-Za-z0-9_.:-]{1,128}$'

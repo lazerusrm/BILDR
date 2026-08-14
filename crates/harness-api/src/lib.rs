@@ -1,5 +1,7 @@
 //! Same-origin localhost REST API and durable SSE stream.
 
+mod operator_control;
+
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use async_stream::stream;
@@ -233,6 +235,7 @@ pub fn router(orchestrator: Arc<Orchestrator>) -> Router {
             "/api/v1/settings",
             get(operator_settings).post(update_operator_settings),
         )
+        .merge(operator_control::routes())
         .with_state(state)
 }
 

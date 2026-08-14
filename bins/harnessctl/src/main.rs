@@ -6,6 +6,8 @@ use reqwest::{Client, Method, header};
 use serde_json::{Value, json};
 use url::Url;
 
+mod operator_control;
+
 #[derive(Parser)]
 #[command(name = "harnessctl", version, about = "Operator CLI for BILDR")]
 struct Cli {
@@ -51,6 +53,15 @@ enum Command {
     Improvement {
         #[command(subcommand)]
         command: ImprovementCommand,
+    },
+    /// Show the bounded operator return view from an immutable control-plane snapshot.
+    Return {
+        #[arg(long, default_value = "local_operator")]
+        operator_id: String,
+    },
+    Attention {
+        #[command(subcommand)]
+        command: AttentionCommand,
     },
 }
 
@@ -211,6 +222,25 @@ enum ImprovementCommand {
     Evaluation {
         #[command(subcommand)]
         command: EvaluationCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AttentionCommand {
+    /// List source-owned attention in stable server ordering.
+    List {
+        #[arg(long)]
+        include_terminal: bool,
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Show one source-owned attention item.
+    Show { attention_id: String },
+    /// Record presentation acknowledgement only; this cannot resolve or resume work.
+    Acknowledge {
+        attention_id: String,
+        #[arg(long)]
+        expected_version: u64,
     },
 }
 
@@ -633,6 +663,8 @@ async fn execute(api: &ApiClient, command: Command) -> Result<Value> {
                 }
             },
         },
+        Command::Return { operator_id } => operator_control::return_view(api, operator_id).await,
+        Command::Attention { command } => operator_control::attention(api, command).await,
         Command::Worktree { command } => match command {
             WorktreeCommand::List { run } => {
                 let path = run.map_or_else(
