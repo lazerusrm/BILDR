@@ -29,6 +29,7 @@ tags:
   - name: Progress
   - name: Liveness
   - name: Reconciliation
+  - name: Notifications
 paths:
   /health:
     get:
@@ -424,6 +425,52 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/ReconciliationEpisode'}
         '404': {$ref: '#/components/responses/NotFound'}
+  /operator-presence:
+    get:
+      tags: [Notifications]
+      operationId: getOperatorPresence
+      parameters:
+        - name: operator_id
+          in: query
+          schema: {type: string, maxLength: 160}
+      responses:
+        '200':
+          description: Local presentation preference; it does not change controller authority or notification delivery.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperatorPresence'}
+    post:
+      tags: [Notifications]
+      operationId: setOperatorPresence
+      parameters:
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SetOperatorPresenceRequest'}
+      responses:
+        '200':
+          description: Version-checked presentation preference update; delivery remains mirror-only.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperatorPresence'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /notification-deliveries:
+    get:
+      tags: [Notifications]
+      operationId: listNotificationDeliveries
+      description: Append-only in-product mirror receipts. These records never resolve or suppress their source attention item.
+      parameters:
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Bounded newest-first delivery mirror receipts.
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/NotificationDelivery'}}
   /attention:
     get:
       tags: [Attention]
@@ -1716,6 +1763,40 @@ components:
         nodes: {type: array, maxItems: 1000, items: {$ref: '#/components/schemas/TopologyNode'}}
         edges: {type: array, maxItems: 4000, items: {$ref: '#/components/schemas/TopologyEdge'}}
         source_cursor: {type: integer, minimum: 0}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    OperatorPresence:
+      type: object
+      additionalProperties: false
+      required: [schema, operator_id, mode, version, updated_at_ms, sha256]
+      properties:
+        schema: {const: harness.operator-presence.v1}
+        operator_id: {type: string, maxLength: 160}
+        mode: {enum: [interactive, focus, unattended]}
+        version: {type: integer, minimum: 1}
+        updated_at_ms: {type: integer, minimum: 0}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    SetOperatorPresenceRequest:
+      type: object
+      additionalProperties: false
+      required: [operator_id, mode, expected_version]
+      properties:
+        operator_id: {type: string, maxLength: 160}
+        mode: {enum: [interactive, focus, unattended]}
+        expected_version: {type: integer, minimum: 1}
+    NotificationDelivery:
+      type: object
+      additionalProperties: false
+      required: [schema, delivery_id, attention_id, class, state, channel, source_event_id, created_at_ms, payload_sha256, sha256]
+      properties:
+        schema: {const: harness.notification-delivery.v1}
+        delivery_id: {type: string, maxLength: 160}
+        attention_id: {type: [string, 'null'], maxLength: 160}
+        class: {enum: [critical, action_required, routine]}
+        state: {enum: [pending, deferred, delivered, failed]}
+        channel: {const: in_product_mirror}
+        source_event_id: {type: string, maxLength: 160}
+        created_at_ms: {type: integer, minimum: 0}
+        payload_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
         sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
     AttentionSourceRef:
       type: object

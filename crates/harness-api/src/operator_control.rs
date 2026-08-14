@@ -11,7 +11,8 @@ use axum::{
     routing::{get, post},
 };
 use harness_domain::{
-    AttentionItemId, ExternalConditionId, InvestigationArtifactId, ReconciliationEpisodeId,
+    AttentionItemId, ExternalConditionId, InvestigationArtifactId, OperatorPresenceMode,
+    ReconciliationEpisodeId,
 };
 use serde::Deserialize;
 
@@ -56,6 +57,14 @@ pub(super) fn routes() -> Router<ApiState> {
         .route(
             "/api/v1/reconciliations/{episode_id}",
             get(get_reconciliation),
+        )
+        .route(
+            "/api/v1/operator-presence",
+            get(get_operator_presence).post(set_operator_presence),
+        )
+        .route(
+            "/api/v1/notification-deliveries",
+            get(list_notification_deliveries),
         )
 }
 
@@ -384,4 +393,59 @@ async fn get_reconciliation(
                 "reconciliation episode {episode_id}"
             )))
         })
+}
+
+#[derive(Debug, Deserialize)]
+struct PresenceQuery {
+    operator_id: Option<String>,
+}
+
+async fn get_operator_presence(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<PresenceQuery>,
+) -> Result<Json<harness_domain::OperatorPresence>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(state.orchestrator.store().operator_presence(
+        query.operator_id.as_deref().unwrap_or("local_operator"),
+    )?))
+}
+
+#[derive(Debug, Deserialize)]
+struct SetPresenceRequest {
+    operator_id: String,
+    mode: OperatorPresenceMode,
+    expected_version: u64,
+}
+
+async fn set_operator_presence(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<SetPresenceRequest>,
+) -> Result<Json<harness_domain::OperatorPresence>, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok(Json(state.orchestrator.store().set_operator_presence(
+        &request.operator_id,
+        request.mode,
+        request.expected_version,
+    )?))
+}
+
+#[derive(Debug, Deserialize)]
+struct NotificationQuery {
+    limit: Option<u32>,
+}
+
+async fn list_notification_deliveries(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<NotificationQuery>,
+) -> Result<Json<Vec<harness_domain::NotificationDelivery>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .store()
+            .list_notification_deliveries(query.limit.unwrap_or(50))?,
+    ))
 }
