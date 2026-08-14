@@ -5,13 +5,16 @@
 //! notifications, or update a source-owned lifecycle.
 
 use harness_domain::{
-    AttentionItem, AttentionSeverity, NotificationClass, NotificationDelivery,
-    NotificationDeliveryId, NotificationState, OperatorPresence, OperatorPresenceMode, now_ms,
+    AttentionItem, AttentionSeverity, CorrelationLink, CorrelationLinkId, NotificationClass,
+    NotificationDelivery, NotificationDeliveryId, NotificationState, OperatorPresence,
+    OperatorPresenceMode, TraceContext, now_ms,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 use crate::{Store, StoreError};
+
+use super::correlation::record_correlation_link_in_transaction;
 
 const MAX_NOTIFICATION_PAGE_SIZE: u32 = 200;
 
@@ -112,6 +115,7 @@ impl Store {
         delivery.validate().map_err(control_error)?;
         let raw = serde_json::to_string(delivery)?;
         let payload_sha256 = digest(&raw);
+        let correlation = notification_correlation_link(delivery)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         if let Some((existing_raw, existing_digest)) = transaction.query_row(
@@ -120,10 +124,15 @@ impl Store {
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         ).optional()? {
             let existing = checked_delivery_row(existing_raw, existing_digest)?;
-            if existing == *delivery { transaction.commit()?; return Ok(existing); }
+            if existing == *delivery {
+                record_correlation_link_in_transaction(&transaction, &correlation)?;
+                transaction.commit()?;
+                return Ok(existing);
+            }
             return Err(StoreError::Conflict("notification source event already has different content".to_owned()));
         }
         transaction.execute("INSERT INTO notification_deliveries(id,attention_id,class,state,source_event_id,payload_json,payload_sha256,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![delivery.delivery_id.as_str(), delivery.attention_id.as_ref().map(|id| id.as_str()), class_name(delivery.class), state_name(delivery.state), delivery.source_event_id, raw, payload_sha256, delivery.created_at_ms])?;
+        record_correlation_link_in_transaction(&transaction, &correlation)?;
         transaction.commit()?;
         Ok(delivery.clone())
     }
@@ -189,6 +198,55 @@ fn notification_from_attention(item: &AttentionItem) -> Result<NotificationDeliv
     delivery.sha256 = delivery.digest().map_err(control_error)?;
     delivery.validate().map_err(control_error)?;
     Ok(delivery)
+}
+
+/// Derives a controller-owned correlation root from the immutable receipt ID.
+/// No request/client-provided trace context crosses this local projection
+/// boundary. The deterministic IDs make a retry repair a missing link without
+/// creating a second causal claim.
+fn notification_correlation_link(
+    delivery: &NotificationDelivery,
+) -> Result<CorrelationLink, StoreError> {
+    let trace_id = digest(&format!(
+        "harness.notification-delivery.trace.v1:{}",
+        delivery.delivery_id
+    ));
+    let span_id = digest(&format!(
+        "harness.notification-delivery.span.v1:{}",
+        delivery.delivery_id
+    ));
+    let link_id = CorrelationLinkId::parse(format!(
+        "correlation-{}",
+        &digest(&format!(
+            "harness.notification-delivery.link.v1:{}",
+            delivery.delivery_id
+        ))[..48]
+    ))
+    .map_err(control_error)?;
+    let (from_kind, from_id) = delivery.attention_id.as_ref().map_or_else(
+        || {
+            (
+                "notification_source".to_owned(),
+                delivery.source_event_id.clone(),
+            )
+        },
+        |attention_id| ("attention".to_owned(), attention_id.to_string()),
+    );
+    Ok(CorrelationLink {
+        schema: "harness.correlation-link.v1".to_owned(),
+        link_id,
+        trace: TraceContext {
+            trace_id: trace_id[..32].to_owned(),
+            span_id: span_id[..16].to_owned(),
+            parent_span_id: None,
+        },
+        from_kind,
+        from_id,
+        to_kind: "notification_delivery".to_owned(),
+        to_id: delivery.delivery_id.to_string(),
+        relation: "presented_as".to_owned(),
+        created_at_ms: delivery.created_at_ms,
+    })
 }
 pub(crate) fn checked_delivery_row(
     raw: String,
@@ -374,9 +432,74 @@ mod tests {
         assert_eq!(first, replay);
         assert_eq!(store.list_notification_deliveries(10).unwrap(), first);
         assert_eq!(first[0].created_at_ms, attention.opened_at_ms);
+        let correlation = notification_correlation_link(&first[0]).expect("correlation");
+        assert_eq!(
+            store
+                .correlation_links(&correlation.trace.trace_id, 10)
+                .expect("stored correlation"),
+            vec![correlation]
+        );
         assert_eq!(
             store.list_attention(false, 10).unwrap().items,
             vec![attention]
         );
+    }
+
+    #[test]
+    fn delivery_and_correlation_commit_together() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let attention = test_attention();
+        store
+            .upsert_source_attention(&attention)
+            .expect("open attention");
+        let delivery = notification_from_attention(&attention).expect("delivery");
+        let mut conflicting = notification_correlation_link(&delivery).expect("link");
+        conflicting.relation = "different_relation".to_owned();
+        store
+            .record_correlation_link(&conflicting)
+            .expect("preexisting incompatible immutable link");
+
+        assert!(matches!(
+            store.refresh_notification_mirror(),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(store.list_notification_deliveries(10).unwrap().is_empty());
+    }
+
+    fn test_attention() -> AttentionItem {
+        let attention = AttentionItem {
+            schema: "harness.attention-item.v1".to_owned(),
+            attention_id: AttentionItemId::new(),
+            repository_id: Some("repo-a".to_owned()),
+            run_id: Some("run-a".to_owned()),
+            task_id: Some("task-a".to_owned()),
+            source: AttentionSourceRef {
+                source_type: AttentionSourceType::Approval,
+                source_id: "approval-a".to_owned(),
+                source_revision: 1,
+            },
+            category: AttentionCategory::Approval,
+            severity: AttentionSeverity::High,
+            state: AttentionState::Open,
+            title: "Approval required".to_owned(),
+            summary: "A bound approval is required before execution.".to_owned(),
+            option_refs: vec![],
+            evidence_refs: vec![],
+            blocked_refs: vec!["task-a".to_owned()],
+            dedupe_key: "approval-task-a".to_owned(),
+            opened_event_id: "event-a".to_owned(),
+            opened_at_ms: 1_000,
+            acknowledged_at_ms: None,
+            due_at_ms: None,
+            resurfacing: AttentionResurfacingPolicy {
+                policy: "until_authority_receipt".to_owned(),
+                maximum_defer_ms: 60_000,
+            },
+            resolution: None,
+            version: 1,
+        };
+        attention.validate().expect("valid attention");
+        attention
     }
 }

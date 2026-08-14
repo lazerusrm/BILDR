@@ -1,6 +1,6 @@
 use harness_domain::CorrelationLink;
 use harness_trace::validate_causal_links;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 
 use crate::{Store, StoreError};
@@ -15,48 +15,11 @@ impl Store {
     ) -> Result<CorrelationLink, StoreError> {
         link.validate()
             .map_err(|error| StoreError::Validation(error.to_string()))?;
-        let raw = serde_json::to_string(link)?;
-        let payload_sha256 = digest(&raw);
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        if let Some(existing_raw) = transaction
-            .query_row(
-                "SELECT payload_json FROM correlation_links WHERE id=?1",
-                [link.link_id.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-        {
-            if existing_raw == raw {
-                transaction.commit()?;
-                return Ok(link.clone());
-            }
-            return Err(StoreError::Conflict(
-                "correlation link id already has a different immutable payload".to_owned(),
-            ));
-        }
-        let mut links = {
-            let mut statement = transaction.prepare(
-                "SELECT payload_json,payload_sha256 FROM correlation_links WHERE trace_id=?1 ORDER BY created_at,id LIMIT 8192",
-            )?;
-            let rows = statement.query_map([link.trace.trace_id.as_str()], |row| {
-                checked_link_row(row.get(0)?, row.get(1)?)
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        links.push(link.clone());
-        validate_causal_links(&links).map_err(|error| StoreError::Validation(error.to_string()))?;
-        let relation = safe_enum_name(&link.relation)?;
-        transaction.execute(
-            "INSERT INTO correlation_links(id,trace_id,span_id,parent_span_id,from_kind,from_id,to_kind,to_id,relation,payload_json,payload_sha256,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-            params![
-                link.link_id.as_str(), link.trace.trace_id, link.trace.span_id,
-                link.trace.parent_span_id, link.from_kind, link.from_id, link.to_kind,
-                link.to_id, relation, raw, payload_sha256, link.created_at_ms,
-            ],
-        )?;
+        let recorded = record_correlation_link_in_transaction(&transaction, link)?;
         transaction.commit()?;
-        Ok(link.clone())
+        Ok(recorded)
     }
 
     pub fn correlation_links(
@@ -80,6 +43,55 @@ impl Store {
         validate_causal_links(&links).map_err(|error| StoreError::Validation(error.to_string()))?;
         Ok(links)
     }
+}
+
+/// Records an immutable link in a caller-owned transaction. This lets an
+/// existing controller receipt and its causal link commit together: a visible
+/// delivery must never claim a trace that failed to persist, nor vice versa.
+pub(crate) fn record_correlation_link_in_transaction(
+    transaction: &Transaction<'_>,
+    link: &CorrelationLink,
+) -> Result<CorrelationLink, StoreError> {
+    link.validate()
+        .map_err(|error| StoreError::Validation(error.to_string()))?;
+    let raw = serde_json::to_string(link)?;
+    let payload_sha256 = digest(&raw);
+    if let Some(existing_raw) = transaction
+        .query_row(
+            "SELECT payload_json FROM correlation_links WHERE id=?1",
+            [link.link_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        if existing_raw == raw {
+            return Ok(link.clone());
+        }
+        return Err(StoreError::Conflict(
+            "correlation link id already has a different immutable payload".to_owned(),
+        ));
+    }
+    let mut links = {
+        let mut statement = transaction.prepare(
+            "SELECT payload_json,payload_sha256 FROM correlation_links WHERE trace_id=?1 ORDER BY created_at,id LIMIT 8192",
+        )?;
+        let rows = statement.query_map([link.trace.trace_id.as_str()], |row| {
+            checked_link_row(row.get(0)?, row.get(1)?)
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    links.push(link.clone());
+    validate_causal_links(&links).map_err(|error| StoreError::Validation(error.to_string()))?;
+    let relation = safe_enum_name(&link.relation)?;
+    transaction.execute(
+        "INSERT INTO correlation_links(id,trace_id,span_id,parent_span_id,from_kind,from_id,to_kind,to_id,relation,payload_json,payload_sha256,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![
+            link.link_id.as_str(), link.trace.trace_id, link.trace.span_id,
+            link.trace.parent_span_id, link.from_kind, link.from_id, link.to_kind,
+            link.to_id, relation, raw, payload_sha256, link.created_at_ms,
+        ],
+    )?;
+    Ok(link.clone())
 }
 
 fn checked_link_row(raw: String, payload_sha256: String) -> rusqlite::Result<CorrelationLink> {

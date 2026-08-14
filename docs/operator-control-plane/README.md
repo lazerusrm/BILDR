@@ -97,13 +97,14 @@ The current branch implements durable attention, investigation and external
 condition records, immutable snapshots/return views, deterministic material
 progress, observe-only liveness episodes, exact-revision intervention receipts,
 reconciliation/ownership evidence, bounded run topology, and a retry-safe
-in-product notification mirror. It also exposes immutable, bounded causal-link
-trace lookup; this is receipt inspection only, not yet full trace propagation
-through every producer. Supervisor snapshots receive bounded control-plane
-custody facts and restrict recommendations on uncertain custody. The browser
-and CLI can read these projections without acquiring work or changing
-controller state. The CLI can version-check the local presentation-only
-presence preference; it cannot deliver, suppress, retry, or resolve an item.
+in-product notification mirror. Each mirror receipt atomically records its
+source-attention causal link, and the API/CLI expose bounded immutable trace
+lookup. This is not yet full trace propagation through every producer.
+Supervisor snapshots receive bounded control-plane custody facts and restrict
+recommendations on uncertain custody. The browser and CLI can read these
+projections without acquiring work or changing controller state. The CLI can
+version-check the local presentation-only presence preference; it cannot
+deliver, suppress, retry, or resolve an item.
 
 Desktop notification delivery/batching, active intervention execution,
 reconciliation proof consumption, external wake adapters, adaptive supervisor
