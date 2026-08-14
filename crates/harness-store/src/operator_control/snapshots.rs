@@ -85,6 +85,12 @@ impl Store {
             })?,
             "liveness observation cursor",
         )?;
+        let reconciliation_cursor = non_negative(
+            transaction.query_row("SELECT count(*) FROM reconciliation_episodes", [], |row| {
+                row.get::<_, i64>(0)
+            })?,
+            "reconciliation cursor",
+        )?;
         let mut source_cursors = BTreeMap::new();
         source_cursors.insert("domain_events".to_owned(), event_cursor);
         source_cursors.insert("attention_events".to_owned(), attention_cursor);
@@ -103,6 +109,7 @@ impl Store {
             "liveness_observations".to_owned(),
             liveness_observation_cursor,
         );
+        source_cursors.insert("reconciliation_episodes".to_owned(), reconciliation_cursor);
         let source_cursors_sha256 = digest(&serde_json::to_string(&source_cursors)?);
 
         if let Some(existing) = transaction
@@ -132,6 +139,7 @@ impl Store {
             external_condition_rows(&transaction)?;
         let (progress_rows, progress_truncation) = material_progress_rows(&transaction)?;
         let (liveness_rows, liveness_truncation) = liveness_rows(&transaction)?;
+        let (reconciliation_rows, reconciliation_truncation) = reconciliation_rows(&transaction)?;
         let active_agents: i64 = transaction.query_row(
             "SELECT count(*) FROM agent_sessions WHERE state NOT IN ('COMPLETED','FAILED','CANCELED')",
             [],
@@ -171,6 +179,7 @@ impl Store {
             ("external_conditions", external_condition_truncation),
             ("progress", progress_truncation),
             ("liveness", liveness_truncation),
+            ("reconciliation", reconciliation_truncation),
         ] {
             if let Some(omitted_rows) = omitted {
                 truncation.push(SnapshotTruncation {
@@ -235,9 +244,15 @@ impl Store {
                 );
                 section
             },
-            reconciliation: unavailable(
-                "Reconciliation reducer is not wired into this deterministic slice.",
-            ),
+            reconciliation: {
+                let mut section = current(reconciliation_rows, reconciliation_cursor);
+                section.truncated = reconciliation_truncation.is_some();
+                section.detail = Some(
+                    "Closed reconciliation inventory records. This view cannot reset work, release a lease, or authorize a new attempt."
+                        .to_owned(),
+                );
+                section
+            },
             external_conditions: {
                 let mut section = current(
                     external_condition_rows,
@@ -667,6 +682,32 @@ fn liveness_rows(
     let rows = statement
         .query_map([SECTION_ROW_LIMIT], |row| {
             let episode = super::liveness::checked_episode_row(row.get(0)?, row.get(1)?)?;
+            serde_json::to_value(episode)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((
+        rows,
+        (count > SECTION_ROW_LIMIT as u64).then(|| count - SECTION_ROW_LIMIT as u64),
+    ))
+}
+
+fn reconciliation_rows(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(Vec<Value>, Option<u64>), StoreError> {
+    let count = non_negative(
+        transaction.query_row("SELECT count(*) FROM reconciliation_episodes", [], |row| {
+            row.get::<_, i64>(0)
+        })?,
+        "reconciliation episode count",
+    )?;
+    let mut statement = transaction.prepare(
+        "SELECT current_payload_json,current_payload_sha256 FROM reconciliation_episodes ORDER BY updated_at DESC,id DESC LIMIT ?1",
+    )?;
+    let rows = statement
+        .query_map([SECTION_ROW_LIMIT], |row| {
+            let episode =
+                super::reconciliation::checked_reconciliation_row(row.get(0)?, row.get(1)?)?;
             serde_json::to_value(episode)
                 .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
         })?

@@ -10,7 +10,9 @@ use axum::{
     http::HeaderMap,
     routing::{get, post},
 };
-use harness_domain::{AttentionItemId, ExternalConditionId, InvestigationArtifactId};
+use harness_domain::{
+    AttentionItemId, ExternalConditionId, InvestigationArtifactId, ReconciliationEpisodeId,
+};
 use serde::Deserialize;
 
 use super::{ApiError, ApiState, authenticate};
@@ -49,6 +51,11 @@ pub(super) fn routes() -> Router<ApiState> {
         .route("/api/v1/material-progress", get(list_material_progress))
         .route("/api/v1/liveness", get(list_liveness))
         .route("/api/v1/runs/{run_id}/liveness", get(list_run_liveness))
+        .route("/api/v1/reconciliations", get(list_reconciliations))
+        .route(
+            "/api/v1/reconciliations/{episode_id}",
+            get(get_reconciliation),
+        )
 }
 
 async fn control_plane_snapshot(
@@ -332,4 +339,39 @@ async fn list_run_liveness(
         Some(&run_id),
         query.limit.unwrap_or(50),
     )?))
+}
+
+async fn list_reconciliations(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<BoundedReadQuery>,
+) -> Result<Json<Vec<harness_domain::ReconciliationEpisode>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .store()
+            .list_reconciliation_episodes(query.run_id.as_deref(), query.limit.unwrap_or(50))?,
+    ))
+}
+
+async fn get_reconciliation(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(episode_id): Path<String>,
+) -> Result<Json<harness_domain::ReconciliationEpisode>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    let episode_id = ReconciliationEpisodeId::parse(episode_id).map_err(|error| {
+        ApiError::from(harness_store::StoreError::Validation(error.to_string()))
+    })?;
+    state
+        .orchestrator
+        .store()
+        .reconciliation_episode(&episode_id)?
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::from(harness_store::StoreError::NotFound(format!(
+                "reconciliation episode {episode_id}"
+            )))
+        })
 }

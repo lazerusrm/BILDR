@@ -1187,6 +1187,151 @@ pub enum ReconciliationActionKind {
     OpenAttention,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationEpisode {
+    pub schema: String,
+    pub episode_id: ReconciliationEpisodeId,
+    pub run_id: Option<String>,
+    pub trigger_kind: ReconciliationTrigger,
+    pub state: ReconciliationState,
+    pub version: u64,
+    pub opened_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub source_event_id: String,
+    pub inventory_sha256: String,
+    pub finding_count: u32,
+    pub action_count: u32,
+    pub report: Option<String>,
+    pub sha256: String,
+}
+
+impl ReconciliationEpisode {
+    pub fn digest(&self) -> Result<String, OperatorControlError> {
+        let mut unsigned = self.clone();
+        unsigned.sha256.clear();
+        digest_json(&unsigned)
+    }
+
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.schema != "harness.reconciliation-episode.v1" {
+            return Err(OperatorControlError::InvalidField {
+                field: "reconciliation episode schema",
+                reason: "must be harness.reconciliation-episode.v1",
+            });
+        }
+        validate_identifier(self.episode_id.as_str(), "reconciliation episode id")?;
+        if let Some(run_id) = &self.run_id {
+            validate_identifier(run_id, "reconciliation run id")?;
+        }
+        validate_identifier(&self.source_event_id, "reconciliation source event id")?;
+        if let Some(report) = &self.report {
+            validate_text(report, "reconciliation report", MAX_SUMMARY_LEN)?;
+        }
+        if self.version == 0 || self.opened_at_ms < 0 || self.updated_at_ms < self.opened_at_ms {
+            return Err(OperatorControlError::InvalidField {
+                field: "reconciliation timing/version",
+                reason: "must have a positive version and monotonic non-negative timestamps",
+            });
+        }
+        validate_lower_hex(
+            &self.inventory_sha256,
+            "reconciliation inventory sha256",
+            SHA256_HEX_LEN,
+        )?;
+        validate_lower_hex(&self.sha256, "reconciliation sha256", SHA256_HEX_LEN)?;
+        if self.digest()? != self.sha256 {
+            return Err(OperatorControlError::InvalidField {
+                field: "reconciliation sha256",
+                reason: "does not match the canonical payload",
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipProof {
+    pub schema: String,
+    pub proof_id: OwnershipProofId,
+    pub run_id: String,
+    pub task_id: String,
+    pub prior_attempt_id: String,
+    pub worktree_id: String,
+    pub source_event_id: String,
+    pub head_sha: String,
+    pub worktree_fingerprint: String,
+    pub lease_generation: u64,
+    pub process_state: String,
+    pub session_state: String,
+    pub command_state: String,
+    pub external_effect_state: String,
+    pub candidate_state: String,
+    pub approved_actions: Vec<String>,
+    pub expires_at_ms: i64,
+    pub sha256: String,
+}
+
+impl OwnershipProof {
+    pub fn digest(&self) -> Result<String, OperatorControlError> {
+        let mut unsigned = self.clone();
+        unsigned.sha256.clear();
+        digest_json(&unsigned)
+    }
+
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.schema != "harness.exclusive-ownership-proof.v1" {
+            return Err(OperatorControlError::InvalidField {
+                field: "ownership proof schema",
+                reason: "must be harness.exclusive-ownership-proof.v1",
+            });
+        }
+        for (value, field) in [
+            (self.proof_id.as_str(), "ownership proof id"),
+            (&self.run_id, "ownership proof run id"),
+            (&self.task_id, "ownership proof task id"),
+            (&self.prior_attempt_id, "ownership proof attempt id"),
+            (&self.worktree_id, "ownership proof worktree id"),
+            (&self.source_event_id, "ownership proof source event id"),
+        ] {
+            validate_identifier(value, field)?;
+        }
+        validate_hex(&self.head_sha, "ownership proof head sha", 40)?;
+        validate_lower_hex(
+            &self.worktree_fingerprint,
+            "ownership proof worktree fingerprint",
+            SHA256_HEX_LEN,
+        )?;
+        if self.process_state != "proven_absent"
+            || self.session_state != "proven_closed"
+            || self.command_state != "terminal_or_none"
+            || self.external_effect_state != "none_or_reconciled"
+            || self.candidate_state != "preserved"
+            || self.approved_actions != ["authorize_fresh_attempt"]
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "ownership proof exclusivity fields",
+                reason: "must prove the closed exclusive-ownership state for a fresh attempt",
+            });
+        }
+        if self.expires_at_ms < 0 {
+            return Err(OperatorControlError::InvalidField {
+                field: "ownership proof expiry",
+                reason: "must not be negative",
+            });
+        }
+        validate_lower_hex(&self.sha256, "ownership proof sha256", SHA256_HEX_LEN)?;
+        if self.digest()? != self.sha256 {
+            return Err(OperatorControlError::InvalidField {
+                field: "ownership proof sha256",
+                reason: "does not match the canonical payload",
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExternalConditionAdapter {

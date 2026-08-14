@@ -28,6 +28,7 @@ tags:
   - name: ExternalConditions
   - name: Progress
   - name: Liveness
+  - name: Reconciliation
 paths:
   /health:
     get:
@@ -375,6 +376,40 @@ paths:
           content:
             application/json:
               schema: {type: array, items: {$ref: '#/components/schemas/LivenessEpisode'}}
+  /reconciliations:
+    get:
+      tags: [Reconciliation]
+      operationId: listReconciliationEpisodes
+      description: Read-only controller inventory records. Listing cannot apply a recovery, reset a worktree, release a lease, or authorize replacement work.
+      parameters:
+        - name: run_id
+          in: query
+          schema: {type: string, maxLength: 160}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Bounded newest-first reconciliation episode records.
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/ReconciliationEpisode'}}
+  /reconciliations/{episodeId}:
+    get:
+      tags: [Reconciliation]
+      operationId: getReconciliationEpisode
+      parameters:
+        - name: episodeId
+          in: path
+          required: true
+          schema: {$ref: '#/components/schemas/OpaqueId'}
+      responses:
+        '200':
+          description: One immutable-custody checked reconciliation episode.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ReconciliationEpisode'}
+        '404': {$ref: '#/components/responses/NotFound'}
   /attention:
     get:
       tags: [Attention]
@@ -1619,6 +1654,25 @@ components:
         next_review_at_ms: {type: [integer, 'null'], minimum: 0}
         intervention_count: {type: integer, minimum: 0}
         outcome: {type: [string, 'null'], maxLength: 160}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    ReconciliationEpisode:
+      type: object
+      additionalProperties: false
+      required: [schema, episode_id, run_id, trigger_kind, state, version, opened_at_ms, updated_at_ms, source_event_id, inventory_sha256, finding_count, action_count, report, sha256]
+      properties:
+        schema: {const: harness.reconciliation-episode.v1}
+        episode_id: {type: string, maxLength: 160}
+        run_id: {type: [string, 'null'], maxLength: 160}
+        trigger_kind: {enum: [daemon_restart, app_server_loss, process_loss, version_transition, account_handoff, worktree_mismatch, uncertain_command_completion]}
+        state: {enum: [open, claimed, awaiting_evidence, resolved, refused]}
+        version: {type: integer, minimum: 1}
+        opened_at_ms: {type: integer, minimum: 0}
+        updated_at_ms: {type: integer, minimum: 0}
+        source_event_id: {type: string, maxLength: 160}
+        inventory_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        finding_count: {type: integer, minimum: 0}
+        action_count: {type: integer, minimum: 0}
+        report: {type: [string, 'null'], maxLength: 4000}
         sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
     AttentionSourceRef:
       type: object
