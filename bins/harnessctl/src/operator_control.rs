@@ -1,8 +1,8 @@
 //! Read-first operator-control CLI commands.
 //!
-//! This module deliberately exposes only bounded snapshots, source-owned
-//! attention, and presentation acknowledgement. It cannot resolve a source,
-//! approve work, or resume a run.
+//! This module deliberately exposes bounded snapshots, source-owned attention,
+//! and immutable controller receipts. It cannot resolve a source, approve work,
+//! request an intervention, or resume a run.
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -118,6 +118,14 @@ pub(super) async fn progress(api: &ApiClient, run_id: Option<String>) -> Result<
 pub(super) async fn liveness(api: &ApiClient, run_id: Option<String>) -> Result<Value> {
     api.get(&bounded_run_query("/api/v1/liveness", run_id))
         .await
+}
+
+pub(super) async fn intervention_receipts(api: &ApiClient, episode_id: String) -> Result<Value> {
+    let episode_id: String = url::form_urlencoded::byte_serialize(episode_id.as_bytes()).collect();
+    api.get(&format!(
+        "/api/v1/liveness/{episode_id}/interventions?limit=50"
+    ))
+    .await
 }
 
 pub(super) async fn topology(api: &ApiClient, run_id: String) -> Result<Value> {

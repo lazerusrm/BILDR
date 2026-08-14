@@ -19,6 +19,7 @@ import type {
   FailureTrace,
   InvestigationArtifact,
   InvestigationArtifactSummary,
+  InterventionReceipt,
   LivenessEpisode,
   MaterialProgressEvent,
   OutcomeVector,
@@ -210,6 +211,10 @@ class HarnessApi {
   runLiveness = (runId: string) =>
     this.get<LivenessEpisode[]>(
       `/runs/${encodeURIComponent(runId)}/liveness?limit=50`,
+    );
+  interventionReceipts = (episodeId: string) =>
+    this.get<InterventionReceipt[]>(
+      `/liveness/${encodeURIComponent(episodeId)}/interventions?limit=50`,
     );
   topology = (runId: string) =>
     this.get<TopologySnapshot>(

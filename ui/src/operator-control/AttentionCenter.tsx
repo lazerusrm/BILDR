@@ -11,6 +11,7 @@ import type {
   ExternalConditionSummary,
   InvestigationArtifact,
   InvestigationArtifactSummary,
+  InterventionReceipt,
   LivenessEpisode,
   MaterialProgressEvent,
   ReturnView,
@@ -26,6 +27,12 @@ export function AttentionCenter() {
   const [conditions, setConditions] = useState<ExternalConditionSummary[]>([]);
   const [progress, setProgress] = useState<MaterialProgressEvent[]>([]);
   const [liveness, setLiveness] = useState<LivenessEpisode[]>([]);
+  const [selectedLivenessEpisodeId, setSelectedLivenessEpisodeId] = useState<string>();
+  const [interventionHistory, setInterventionHistory] = useState<InterventionHistory>({
+    episodeId: undefined,
+    state: "idle",
+    receipts: [],
+  });
   const [topology, setTopology] = useState<TopologySnapshot>();
   const [topologyRunId, setTopologyRunId] = useState<string>();
   const [selectedInvestigationId, setSelectedInvestigationId] = useState<string>();
@@ -47,6 +54,7 @@ export function AttentionCenter() {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const conditionHistoryRequest = useRef(0);
+  const interventionHistoryRequest = useRef(0);
   const investigationDetailRequest = useRef(0);
   const conditionDetailRequest = useRef(0);
 
@@ -76,6 +84,8 @@ export function AttentionCenter() {
       setTopology(undefined);
       conditionHistoryRequest.current += 1;
       setConditionHistory({ conditionId: undefined, state: "idle", observations: [] });
+      interventionHistoryRequest.current += 1;
+      setInterventionHistory({ episodeId: undefined, state: "idle", receipts: [] });
       conditionDetailRequest.current += 1;
       setConditionDetail({ conditionId: undefined, state: "idle" });
       investigationDetailRequest.current += 1;
@@ -89,6 +99,11 @@ export function AttentionCenter() {
         current && nextConditions.some((condition) => condition.condition_id === current)
           ? current
           : nextConditions[0]?.condition_id,
+      );
+      setSelectedLivenessEpisodeId((current) =>
+        current && nextLiveness.some((episode) => episode.episode_id === current)
+          ? current
+          : nextLiveness[0]?.episode_id,
       );
       setSelected((current) =>
         current
@@ -154,6 +169,24 @@ export function AttentionCenter() {
       if (conditionHistoryRequest.current === request) {
         setConditionHistory({ conditionId, state: "error", observations: [] });
         setError(displayError(cause, "Could not load the recorded condition history."));
+      }
+    }
+  }, []);
+
+  const selectLivenessEpisode = useCallback(async (episodeId: string) => {
+    const request = interventionHistoryRequest.current + 1;
+    interventionHistoryRequest.current = request;
+    setSelectedLivenessEpisodeId(episodeId);
+    setInterventionHistory({ episodeId, state: "loading", receipts: [] });
+    try {
+      const receipts = await api.interventionReceipts(episodeId);
+      if (interventionHistoryRequest.current === request) {
+        setInterventionHistory({ episodeId, state: "loaded", receipts });
+      }
+    } catch (cause) {
+      if (interventionHistoryRequest.current === request) {
+        setInterventionHistory({ episodeId, state: "error", receipts: [] });
+        setError(displayError(cause, "Could not load immutable intervention receipts."));
       }
     }
   }, []);
@@ -279,7 +312,12 @@ export function AttentionCenter() {
       </section>
       <section className="control-plane-support" aria-label="Operator control records">
         <MaterialProgressTimeline events={progress} />
-        <LivenessEpisodes episodes={liveness} />
+        <LivenessEpisodes
+          episodes={liveness}
+          selectedEpisodeId={selectedLivenessEpisodeId}
+          history={interventionHistory}
+          onSelect={(episodeId) => void selectLivenessEpisode(episodeId)}
+        />
         <RunTopology
           runIds={snapshot?.runs.rows.map((row) => text(row.run_id)).filter((id) => id !== "unknown") ?? []}
           selectedRunId={topologyRunId}
@@ -370,7 +408,23 @@ function MaterialProgressTimeline({ events }: { events: MaterialProgressEvent[] 
   );
 }
 
-function LivenessEpisodes({ episodes }: { episodes: LivenessEpisode[] }) {
+type InterventionHistory = {
+  episodeId?: string;
+  state: "idle" | "loading" | "loaded" | "error";
+  receipts: InterventionReceipt[];
+};
+
+function LivenessEpisodes({
+  episodes,
+  selectedEpisodeId,
+  history,
+  onSelect,
+}: {
+  episodes: LivenessEpisode[];
+  selectedEpisodeId?: string;
+  history: InterventionHistory;
+  onSelect: (episodeId: string) => void;
+}) {
   return (
     <section className="control-plane-support-card" aria-labelledby="liveness-heading">
       <span className="eyebrow">Observe only</span>
@@ -381,17 +435,50 @@ function LivenessEpisodes({ episodes }: { episodes: LivenessEpisode[] }) {
         <ul className="control-plane-support-list">
           {episodes.map((episode) => (
             <li key={episode.episode_id}>
-              <div className="control-plane-static-record">
+              <button
+                className={`control-plane-support-item ${selectedEpisodeId === episode.episode_id ? "selected" : ""}`}
+                type="button"
+                aria-pressed={selectedEpisodeId === episode.episode_id}
+                onClick={() => onSelect(episode.episode_id)}
+              >
                 <strong>{episode.state.replaceAll("_", " ")}</strong>
                 <span>{episode.task_id ?? episode.attempt_id ?? episode.run_id ?? "Unscoped episode"}</span>
-                <small>{localTime(episode.updated_at_ms)} · {episode.state_reason_codes.join(", ") || "No reason code"}</small>
-              </div>
+                <small>{localTime(episode.updated_at_ms)} · {episode.intervention_count} recorded interventions · {episode.state_reason_codes.join(", ") || "No reason code"}</small>
+              </button>
             </li>
           ))}
         </ul>
       )}
+      <InterventionHistoryPanel episodeId={selectedEpisodeId} history={history} onLoad={onSelect} />
       <p className="control-plane-note">This is a deterministic observation projection. It does not resume, retry, clear, or execute work.</p>
     </section>
+  );
+}
+
+function InterventionHistoryPanel({
+  episodeId,
+  history,
+  onLoad,
+}: {
+  episodeId?: string;
+  history: InterventionHistory;
+  onLoad: (episodeId: string) => void;
+}) {
+  if (!episodeId) return null;
+  const current = history.episodeId === episodeId ? history : { state: "idle", receipts: [] };
+  return (
+    <div className="control-plane-detail" aria-label="Intervention receipt history">
+      <div className="section-heading"><h3>Intervention receipts</h3>{current.state === "idle" && <button className="button secondary" type="button" onClick={() => onLoad(episodeId)}>Load receipts</button>}</div>
+      {current.state === "loading" && <p className="empty-state">Loading immutable receipts…</p>}
+      {current.state === "error" && <p className="form-error">Could not load intervention receipts.</p>}
+      {current.state === "loaded" && current.receipts.length === 0 && <p className="empty-state">No intervention receipt is recorded for this episode.</p>}
+      {current.state === "loaded" && current.receipts.length > 0 && (
+        <ul className="control-plane-support-list">
+          {current.receipts.map((receipt) => <li key={receipt.intervention_id}><div className="control-plane-static-record"><strong>{receipt.kind.replaceAll("_", " ")}</strong><span>{receipt.requested_by} · policy {receipt.policy_version}</span><small>{localTime(receipt.created_at_ms)} · revision {receipt.target_version} · {receipt.source_event_id}</small></div></li>)}
+        </ul>
+      )}
+      <p className="control-plane-note">Receipts prove a completed controller-path action against an exact episode revision; this page cannot request or replay one.</p>
+    </div>
   );
 }
 

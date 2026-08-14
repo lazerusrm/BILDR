@@ -165,7 +165,11 @@ fn notification_from_attention(item: &AttentionItem) -> Result<NotificationDeliv
         state: NotificationState::Delivered,
         channel: "in_product_mirror".to_owned(),
         source_event_id,
-        created_at_ms: now_ms(),
+        // A delivery is an immutable mirror of one exact attention revision.
+        // Its source event ID is deterministic, so every field must be too:
+        // using the local refresh clock would turn a safe retry into a custody
+        // conflict after a restart or a second snapshot read.
+        created_at_ms: item.opened_at_ms,
         payload_sha256: digest(&serde_json::to_string(item)?),
         sha256: String::new(),
     };
@@ -257,6 +261,10 @@ fn digest(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use harness_domain::{
+        AttentionCategory, AttentionItemId, AttentionResurfacingPolicy, AttentionSourceRef,
+        AttentionSourceType, AttentionState,
+    };
     use tempfile::TempDir;
 
     use super::*;
@@ -280,5 +288,55 @@ mod tests {
             Err(StoreError::Conflict(_))
         ));
         assert!(store.list_notification_deliveries(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn notification_mirror_replays_an_attention_revision_exactly() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let attention = AttentionItem {
+            schema: "harness.attention-item.v1".to_owned(),
+            attention_id: AttentionItemId::new(),
+            repository_id: Some("repo-a".to_owned()),
+            run_id: Some("run-a".to_owned()),
+            task_id: Some("task-a".to_owned()),
+            source: AttentionSourceRef {
+                source_type: AttentionSourceType::Approval,
+                source_id: "approval-a".to_owned(),
+                source_revision: 1,
+            },
+            category: AttentionCategory::Approval,
+            severity: AttentionSeverity::High,
+            state: AttentionState::Open,
+            title: "Approval required".to_owned(),
+            summary: "A bound approval is required before execution.".to_owned(),
+            option_refs: vec![],
+            evidence_refs: vec![],
+            blocked_refs: vec!["task-a".to_owned()],
+            dedupe_key: "approval-task-a".to_owned(),
+            opened_event_id: "event-a".to_owned(),
+            opened_at_ms: 1_000,
+            acknowledged_at_ms: None,
+            due_at_ms: None,
+            resurfacing: AttentionResurfacingPolicy {
+                policy: "until_authority_receipt".to_owned(),
+                maximum_defer_ms: 60_000,
+            },
+            resolution: None,
+            version: 1,
+        };
+        store
+            .upsert_source_attention(&attention)
+            .expect("open attention");
+
+        let first = store.refresh_notification_mirror().expect("first mirror");
+        let replay = store.refresh_notification_mirror().expect("replay mirror");
+        assert_eq!(first, replay);
+        assert_eq!(store.list_notification_deliveries(10).unwrap(), first);
+        assert_eq!(first[0].created_at_ms, attention.opened_at_ms);
+        assert_eq!(
+            store.list_attention(false, 10).unwrap().items,
+            vec![attention]
+        );
     }
 }

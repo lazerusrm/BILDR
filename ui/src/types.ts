@@ -831,6 +831,23 @@ export interface LivenessEpisode {
   sha256: string;
 }
 
+export interface InterventionReceipt {
+  schema: "harness.intervention-receipt.v1";
+  intervention_id: string;
+  episode_id: string;
+  kind:
+    | "wait"
+    | "request_operator_decision"
+    | "request_reconciliation"
+    | "queue_read_only_review";
+  source_event_id: string;
+  target_version: number;
+  policy_version: string;
+  requested_by: string;
+  created_at_ms: number;
+  sha256: string;
+}
+
 export interface TopologyNode {
   id: string;
   kind: string;

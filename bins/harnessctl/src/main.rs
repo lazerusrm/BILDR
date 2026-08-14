@@ -83,6 +83,8 @@ enum Command {
         #[arg(long)]
         run_id: Option<String>,
     },
+    /// Inspect immutable receipts for controller-path interventions already completed against one liveness episode.
+    InterventionReceipts { episode_id: String },
     /// Show the bounded factual topology for one run.
     Topology { run_id: String },
     /// Inspect reconciliation inventory records. These commands cannot apply recovery actions.
@@ -733,6 +735,9 @@ async fn execute(api: &ApiClient, command: Command) -> Result<Value> {
         Command::Condition { command } => operator_control::condition(api, command).await,
         Command::Progress { run_id } => operator_control::progress(api, run_id).await,
         Command::Liveness { run_id } => operator_control::liveness(api, run_id).await,
+        Command::InterventionReceipts { episode_id } => {
+            operator_control::intervention_receipts(api, episode_id).await
+        }
         Command::Topology { run_id } => operator_control::topology(api, run_id).await,
         Command::Recovery { command } => operator_control::recovery(api, command).await,
         Command::Worktree { command } => match command {

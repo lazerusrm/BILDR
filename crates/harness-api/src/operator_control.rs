@@ -1,8 +1,9 @@
 //! Read-first operator-control API surface.
 //!
-//! The only mutation in this first vertical slice is a version-checked
-//! acknowledgement. It deliberately cannot resolve, approve, or force a
-//! recovery; source-specific controllers retain that authority.
+//! The only mutations are version-checked presentation acknowledgement and
+//! authority-neutral local presence. They deliberately cannot resolve,
+//! approve, or force recovery; source-specific controllers retain that
+//! authority.
 
 use axum::{
     Json, Router,
@@ -11,8 +12,8 @@ use axum::{
     routing::{get, post},
 };
 use harness_domain::{
-    AttentionItemId, ExternalConditionId, InvestigationArtifactId, OperatorPresenceMode,
-    ReconciliationEpisodeId,
+    AttentionItemId, ExternalConditionId, InvestigationArtifactId, LivenessEpisodeId,
+    OperatorPresenceMode, ReconciliationEpisodeId,
 };
 use serde::Deserialize;
 
@@ -52,6 +53,10 @@ pub(super) fn routes() -> Router<ApiState> {
         .route("/api/v1/material-progress", get(list_material_progress))
         .route("/api/v1/liveness", get(list_liveness))
         .route("/api/v1/runs/{run_id}/liveness", get(list_run_liveness))
+        .route(
+            "/api/v1/liveness/{episode_id}/interventions",
+            get(list_intervention_receipts),
+        )
         .route("/api/v1/runs/{run_id}/topology", get(run_topology))
         .route("/api/v1/reconciliations", get(list_reconciliations))
         .route(
@@ -349,6 +354,31 @@ async fn list_run_liveness(
         Some(&run_id),
         query.limit.unwrap_or(50),
     )?))
+}
+
+/// Immutable receipts for interventions already performed through an existing
+/// controller path. This route cannot request, replay, or apply an action.
+async fn list_intervention_receipts(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(episode_id): Path<String>,
+    Query(query): Query<LimitQuery>,
+) -> Result<Json<Vec<harness_domain::InterventionReceipt>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    let episode_id = LivenessEpisodeId::parse(episode_id).map_err(|error| {
+        ApiError::from(harness_store::StoreError::Validation(error.to_string()))
+    })?;
+    Ok(Json(
+        state
+            .orchestrator
+            .store()
+            .list_intervention_receipts(&episode_id, query.limit.unwrap_or(50))?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct LimitQuery {
+    limit: Option<u32>,
 }
 
 async fn run_topology(

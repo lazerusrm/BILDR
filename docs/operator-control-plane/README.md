@@ -95,14 +95,18 @@ controlled activation.
 
 The current branch implements durable attention, investigation and external
 condition records, immutable snapshots/return views, deterministic material
-progress, observe-only liveness episodes, and reconciliation/ownership evidence
-records. The browser and CLI can read these projections without acquiring work
-or changing controller state.
+progress, observe-only liveness episodes, exact-revision intervention receipts,
+reconciliation/ownership evidence, bounded run topology, and a retry-safe
+in-product notification mirror. Supervisor snapshots receive bounded
+control-plane custody facts and restrict recommendations on uncertain custody.
+The browser and CLI can read these projections without acquiring work or
+changing controller state.
 
-Notification delivery, topology, active intervention execution, adaptive
-supervisor behavior, empirical evaluation, and rollout activation remain
-explicitly disabled until their own evidence gates pass. Do not interpret an
-empty observe-only section as a healthy or automatically recovered run.
+Desktop notification delivery/batching, active intervention execution,
+reconciliation proof consumption, external wake adapters, adaptive supervisor
+behavior, empirical evaluation, and rollout activation remain explicitly gated
+until their own evidence passes. Do not interpret an empty observe-only section
+as a healthy or automatically recovered run.
 
 ## Critical implementation rules
 

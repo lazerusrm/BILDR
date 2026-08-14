@@ -377,6 +377,26 @@ paths:
           content:
             application/json:
               schema: {type: array, items: {$ref: '#/components/schemas/LivenessEpisode'}}
+  /liveness/{episodeId}/interventions:
+    get:
+      tags: [Liveness]
+      operationId: listInterventionReceipts
+      description: Immutable receipts for interventions already performed through a controller-owned path. This endpoint cannot request, replay, or apply an intervention.
+      parameters:
+        - name: episodeId
+          in: path
+          required: true
+          schema: {type: string, maxLength: 160}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Bounded newest-first immutable intervention receipts for one exact liveness episode.
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/InterventionReceipt'}}
+        '404': {$ref: '#/components/responses/NotFound'}
   /runs/{runId}/topology:
     get:
       tags: [ControlPlane]
@@ -1715,6 +1735,21 @@ components:
         next_review_at_ms: {type: [integer, 'null'], minimum: 0}
         intervention_count: {type: integer, minimum: 0}
         outcome: {type: [string, 'null'], maxLength: 160}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    InterventionReceipt:
+      type: object
+      additionalProperties: false
+      required: [schema, intervention_id, episode_id, kind, source_event_id, target_version, policy_version, requested_by, created_at_ms, sha256]
+      properties:
+        schema: {const: harness.intervention-receipt.v1}
+        intervention_id: {type: string, maxLength: 160}
+        episode_id: {type: string, maxLength: 160}
+        kind: {enum: [wait, request_operator_decision, request_reconciliation, queue_read_only_review]}
+        source_event_id: {type: string, maxLength: 160}
+        target_version: {type: integer, minimum: 1}
+        policy_version: {type: string, maxLength: 160}
+        requested_by: {type: string, maxLength: 160}
+        created_at_ms: {type: integer, minimum: 0}
         sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
     ReconciliationEpisode:
       type: object

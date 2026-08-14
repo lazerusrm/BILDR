@@ -1,8 +1,8 @@
 # Operator control plane implementation status
 
-**Current integrated head:** `9dff73b` on
-`implement/pr4-operator-control-foundation` (stacked on PR3 supervisor head
-`f58874d`).
+**Current integrated branch:** `implement/pr4-operator-control-foundation`
+(stacked on PR3 supervisor head `f58874d`). This status is intentionally a
+capability boundary, not release evidence.
 
 ## Implemented, read-only/observe-only slices
 
@@ -11,11 +11,17 @@
 - immutable investigation artifacts and passive external-condition observations;
 - deterministic allow-list material-progress classification;
 - liveness episodes with immutable observations; ordinary activity cannot clear
-  degraded/stalled state, and the reducer executes no intervention;
+  degraded/stalled state, plus exact-revision immutable receipts for completed
+  controller-path interventions; the reducer and UI execute no intervention;
 - reconciliation episode and exclusive-ownership proof custody; records cannot
   reset work, release leases, or authorize a replacement attempt;
 - bounded run topology table over durable run/task/attempt/agent/worktree and
   dependency facts; no graph layout or inferred links;
+- versioned local presence and deterministic, retry-safe in-product
+  notification-mirror receipts; delivery cannot close attention or change
+  controller authority;
+- bounded supervisor snapshots carrying control-plane custody facts and
+  restricting actions to wait/pause-for-human whenever ownership is uncertain;
 - authenticated localhost API, CLI, and browser control-plane surfaces for the
   above read models.
 
@@ -24,8 +30,8 @@
 - controller-owned reconciliation actions and proof consumption;
 - typed intervention execution;
 - external-condition polling/wake adapters;
-- presence/notification delivery and batching;
-- supervisor v2 integration with control-plane facts;
+- notification batching, desktop delivery, and delivery-health rollout;
+- adaptive supervisor policy or any independent control-plane mutation;
 - governed-knowledge candidate integration;
 - evaluation corpus, fault matrix, usability study, canary, rollback drill, and
   production activation.

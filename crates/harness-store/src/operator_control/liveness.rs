@@ -6,7 +6,8 @@
 //! resulting state but cannot clear it with model prose.
 
 use harness_domain::{
-    LivenessEpisode, LivenessEpisodeId, LivenessObservation, LivenessObservationKind, LivenessState,
+    InterventionKind, InterventionReceipt, LivenessEpisode, LivenessEpisodeId, LivenessObservation,
+    LivenessObservationKind, LivenessState,
 };
 use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
@@ -260,6 +261,196 @@ impl Store {
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         }
     }
+
+    /// Records controller-owned evidence for one legal liveness intervention.
+    ///
+    /// This is intentionally not an intervention executor: the caller must
+    /// have used an existing controller path to perform any work. The receipt
+    /// can only bind the current episode revision, so a stale recommendation
+    /// cannot be presented as an action on a newer custody state.
+    pub fn record_intervention_receipt(
+        &self,
+        receipt: &InterventionReceipt,
+    ) -> Result<LivenessEpisode, StoreError> {
+        receipt
+            .validate()
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        let receipt_raw = serde_json::to_string(receipt)?;
+        let receipt_digest = digest(&receipt_raw);
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+
+        if let Some((existing_raw, existing_digest)) = transaction
+            .query_row(
+                "SELECT payload_json,payload_sha256 FROM intervention_receipts WHERE id=?1",
+                [receipt.intervention_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            let existing = checked_intervention_receipt(existing_raw, existing_digest)?;
+            if existing != *receipt {
+                return Err(StoreError::Conflict(
+                    "intervention receipt id already has different content".to_owned(),
+                ));
+            }
+            let episode = transaction
+                .query_row(
+                    "SELECT current_payload_json,current_payload_sha256 FROM liveness_episodes WHERE id=?1",
+                    [receipt.episode_id.as_str()],
+                    |row| checked_episode_row(row.get(0)?, row.get(1)?),
+                )
+                .optional()?
+                .ok_or_else(|| StoreError::NotFound(format!("liveness episode {}", receipt.episode_id)))?;
+            transaction.commit()?;
+            return Ok(episode);
+        }
+        if let Some((existing_raw, existing_digest)) = transaction
+            .query_row(
+                "SELECT payload_json,payload_sha256 FROM intervention_receipts WHERE episode_id=?1 AND kind=?2 AND source_event_id=?3",
+                params![
+                    receipt.episode_id.as_str(),
+                    intervention_kind_name(receipt.kind),
+                    receipt.source_event_id.as_str(),
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            let existing = checked_intervention_receipt(existing_raw, existing_digest)?;
+            if existing != *receipt {
+                return Err(StoreError::Conflict(
+                    "intervention source event already has different content".to_owned(),
+                ));
+            }
+            let episode = transaction
+                .query_row(
+                    "SELECT current_payload_json,current_payload_sha256 FROM liveness_episodes WHERE id=?1",
+                    [receipt.episode_id.as_str()],
+                    |row| checked_episode_row(row.get(0)?, row.get(1)?),
+                )
+                .optional()?
+                .ok_or_else(|| StoreError::NotFound(format!("liveness episode {}", receipt.episode_id)))?;
+            transaction.commit()?;
+            return Ok(episode);
+        }
+
+        let (raw, stored_digest): (String, String) = transaction
+            .query_row(
+                "SELECT current_payload_json,current_payload_sha256 FROM liveness_episodes WHERE id=?1",
+                [receipt.episode_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("liveness episode {}", receipt.episode_id)))?;
+        let mut episode = checked_episode_row(raw, stored_digest)?;
+        if episode.version != receipt.target_version {
+            return Err(StoreError::Conflict(format!(
+                "liveness episode {} has version {}, intervention requires {}",
+                receipt.episode_id, episode.version, receipt.target_version
+            )));
+        }
+        if episode.state == LivenessState::Terminal {
+            return Err(StoreError::Conflict(
+                "a terminal liveness episode cannot accept an intervention receipt".to_owned(),
+            ));
+        }
+        if receipt.created_at_ms < episode.opened_at_ms {
+            return Err(StoreError::Validation(
+                "intervention receipt predates the liveness episode".to_owned(),
+            ));
+        }
+        episode.intervention_count =
+            episode.intervention_count.checked_add(1).ok_or_else(|| {
+                StoreError::Validation("liveness intervention count overflow".to_owned())
+            })?;
+        episode.version = episode.version.checked_add(1).ok_or_else(|| {
+            StoreError::Validation("liveness episode version overflow".to_owned())
+        })?;
+        episode.updated_at_ms = episode.updated_at_ms.max(receipt.created_at_ms);
+        if episode
+            .next_review_at_ms
+            .is_some_and(|next_review_at_ms| next_review_at_ms < episode.updated_at_ms)
+        {
+            // The due review is now immediately eligible. This updates the
+            // factual projection without scheduling, waking, or executing
+            // anything on behalf of the receipt.
+            episode.next_review_at_ms = Some(episode.updated_at_ms);
+        }
+        episode.sha256 = episode
+            .digest()
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        episode
+            .validate()
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        let episode_raw = serde_json::to_string(&episode)?;
+        let episode_digest = digest(&episode_raw);
+        let changed = transaction.execute(
+            "UPDATE liveness_episodes SET version=?1,updated_at=?2,current_payload_json=?3,current_payload_sha256=?4 WHERE id=?5 AND version=?6",
+            params![
+                to_i64(episode.version, "liveness episode version")?,
+                episode.updated_at_ms,
+                episode_raw,
+                episode_digest,
+                receipt.episode_id.as_str(),
+                to_i64(receipt.target_version, "intervention target version")?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "liveness episode {} changed during intervention recording",
+                receipt.episode_id
+            )));
+        }
+        transaction.execute(
+            "INSERT INTO intervention_receipts(id,episode_id,kind,source_event_id,created_at,payload_json,payload_sha256) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                receipt.intervention_id.as_str(),
+                receipt.episode_id.as_str(),
+                intervention_kind_name(receipt.kind),
+                receipt.source_event_id.as_str(),
+                receipt.created_at_ms,
+                receipt_raw,
+                receipt_digest,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(episode)
+    }
+
+    pub fn list_intervention_receipts(
+        &self,
+        episode_id: &LivenessEpisodeId,
+        limit: u32,
+    ) -> Result<Vec<InterventionReceipt>, StoreError> {
+        if limit == 0 || limit > MAX_LIVENESS_PAGE_SIZE {
+            return Err(StoreError::Validation(format!(
+                "intervention receipt page limit must be 1..={MAX_LIVENESS_PAGE_SIZE}"
+            )));
+        }
+        let connection = self.connection()?;
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM liveness_episodes WHERE id=?1",
+                [episode_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Err(StoreError::NotFound(format!(
+                "liveness episode {episode_id}"
+            )));
+        }
+        let mut statement = connection.prepare(
+            "SELECT payload_json,payload_sha256 FROM intervention_receipts WHERE episode_id=?1 ORDER BY created_at DESC,id DESC LIMIT ?2",
+        )?;
+        Ok(statement
+            .query_map(params![episode_id.as_str(), i64::from(limit)], |row| {
+                checked_intervention_receipt(row.get(0)?, row.get(1)?)
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
 }
 
 fn reduce_episode(
@@ -396,6 +587,26 @@ fn checked_observation_row(
     Ok(observation)
 }
 
+fn checked_intervention_receipt(
+    raw: String,
+    payload_sha256: String,
+) -> rusqlite::Result<InterventionReceipt> {
+    if digest(&raw) != payload_sha256 {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            "intervention receipt payload integrity check failed".into(),
+        ));
+    }
+    let receipt: InterventionReceipt = serde_json::from_str(&raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    receipt.validate().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(receipt)
+}
+
 fn state_name(state: LivenessState) -> &'static str {
     match state {
         LivenessState::Healthy => "healthy",
@@ -420,6 +631,15 @@ fn observation_kind_name(kind: LivenessObservationKind) -> &'static str {
     }
 }
 
+fn intervention_kind_name(kind: InterventionKind) -> &'static str {
+    match kind {
+        InterventionKind::Wait => "wait",
+        InterventionKind::RequestOperatorDecision => "request_operator_decision",
+        InterventionKind::RequestReconciliation => "request_reconciliation",
+        InterventionKind::QueueReadOnlyReview => "queue_read_only_review",
+    }
+}
+
 fn to_i64(value: u64, field: &str) -> Result<i64, StoreError> {
     i64::try_from(value)
         .map_err(|_| StoreError::Validation(format!("{field} exceeds SQLite integer range")))
@@ -431,7 +651,7 @@ fn digest(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use harness_domain::LivenessObservationId;
+    use harness_domain::{InterventionId, LivenessObservationId};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -479,6 +699,27 @@ mod tests {
         };
         observation.sha256 = observation.digest().expect("digest");
         observation
+    }
+
+    fn intervention(
+        episode_id: LivenessEpisodeId,
+        target_version: u64,
+        source_event_id: &str,
+    ) -> InterventionReceipt {
+        let mut receipt = InterventionReceipt {
+            schema: "harness.intervention-receipt.v1".to_owned(),
+            intervention_id: InterventionId::new(),
+            episode_id,
+            kind: InterventionKind::RequestReconciliation,
+            source_event_id: source_event_id.to_owned(),
+            target_version,
+            policy_version: "liveness-policy-v1".to_owned(),
+            requested_by: "controller".to_owned(),
+            created_at_ms: 2_000,
+            sha256: String::new(),
+        };
+        receipt.sha256 = receipt.digest().expect("digest");
+        receipt
     }
 
     #[test]
@@ -545,6 +786,47 @@ mod tests {
                     json!({"progress_id": "different"}),
                 ),
             ),
+            Err(StoreError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn intervention_receipt_is_exact_revisioned_and_replay_safe() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let opened = store.open_liveness_episode(&episode()).expect("open");
+        let receipt = intervention(opened.episode_id.clone(), opened.version, "event-action-a");
+
+        let applied = store
+            .record_intervention_receipt(&receipt)
+            .expect("record receipt");
+        assert_eq!(applied.version, opened.version + 1);
+        assert_eq!(applied.intervention_count, 1);
+        assert_eq!(
+            store.record_intervention_receipt(&receipt).expect("replay"),
+            applied
+        );
+        assert_eq!(
+            store
+                .list_intervention_receipts(&opened.episode_id, 10)
+                .expect("receipts"),
+            vec![receipt.clone()]
+        );
+        assert!(matches!(
+            store.list_intervention_receipts(&LivenessEpisodeId::new(), 10),
+            Err(StoreError::NotFound(_))
+        ));
+
+        let stale = intervention(opened.episode_id.clone(), opened.version, "event-action-b");
+        assert!(matches!(
+            store.record_intervention_receipt(&stale),
+            Err(StoreError::Conflict(_))
+        ));
+        let mut conflicting = receipt;
+        conflicting.requested_by = "other-controller".to_owned();
+        conflicting.sha256 = conflicting.digest().expect("digest");
+        assert!(matches!(
+            store.record_intervention_receipt(&conflicting),
             Err(StoreError::Conflict(_))
         ));
     }

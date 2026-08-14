@@ -1144,6 +1144,54 @@ pub enum InterventionKind {
     QueueReadOnlyReview,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterventionReceipt {
+    pub schema: String,
+    pub intervention_id: InterventionId,
+    pub episode_id: LivenessEpisodeId,
+    pub kind: InterventionKind,
+    pub source_event_id: String,
+    pub target_version: u64,
+    pub policy_version: String,
+    pub requested_by: String,
+    pub created_at_ms: i64,
+    pub sha256: String,
+}
+
+impl InterventionReceipt {
+    pub fn digest(&self) -> Result<String, OperatorControlError> {
+        let mut unsigned = self.clone();
+        unsigned.sha256.clear();
+        digest_json(&unsigned)
+    }
+
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.schema != "harness.intervention-receipt.v1"
+            || self.target_version == 0
+            || self.created_at_ms < 0
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "intervention receipt",
+                reason: "must use v1 with a target version and non-negative timestamp",
+            });
+        }
+        validate_identifier(self.intervention_id.as_str(), "intervention id")?;
+        validate_identifier(self.episode_id.as_str(), "intervention episode id")?;
+        validate_identifier(&self.source_event_id, "intervention source event id")?;
+        validate_identifier(&self.policy_version, "intervention policy version")?;
+        validate_identifier(&self.requested_by, "intervention requester")?;
+        validate_lower_hex(&self.sha256, "intervention sha256", SHA256_HEX_LEN)?;
+        if self.digest()? != self.sha256 {
+            return Err(OperatorControlError::InvalidField {
+                field: "intervention sha256",
+                reason: "does not match the canonical payload",
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReconciliationTrigger {
