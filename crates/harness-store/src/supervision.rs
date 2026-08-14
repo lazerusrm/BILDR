@@ -12,6 +12,7 @@ use crate::{Store, StoreError, queries};
 
 pub const SUPERVISOR_SNAPSHOT_SCHEMA: &str = "harness.supervisor-snapshot.v1";
 const EXPERT_REQUEST_SELECT: &str = "SELECT id,action_id,decision_id,run_id,snapshot_id,signature,state,payload_json,payload_sha256,requested_model,requested_effort,expires_at,created_at,started_at,completed_at,failure_reason,agent_session_id FROM expert_requests";
+const MAX_EXPERT_FRESHNESS_EVENTS: usize = 10_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SupervisorSnapshotRecord {
@@ -866,6 +867,22 @@ impl Store {
         &self,
         input: &NewExpertRequest,
     ) -> Result<ExpertRequestRecord, StoreError> {
+        self.create_expert_request_if_materially_current(input, |_| true)
+    }
+
+    /// Queues an expert request only if the action snapshot has not been
+    /// superseded by a later *material* controller event. Benign receipt and
+    /// transport events necessarily occur while a human reviews a supervisor
+    /// proposal; treating those as stale would make a valid expert action
+    /// impossible to apply after its originating review completes.
+    pub fn create_expert_request_if_materially_current<F>(
+        &self,
+        input: &NewExpertRequest,
+        is_material_event: F,
+    ) -> Result<ExpertRequestRecord, StoreError>
+    where
+        F: Fn(&DomainEvent) -> bool,
+    {
         let signature = exact_sha256(&input.signature, "expert escalation signature")?;
         let requested_model = bounded_text(&input.requested_model, 128, "expert model")?;
         let requested_effort = bounded_text(&input.requested_effort, 32, "expert effort")?;
@@ -911,14 +928,15 @@ impl Store {
                     .to_owned(),
             ));
         }
-        let later_event_exists: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM domain_events WHERE run_id=?1 AND id>?2)",
-            params![action.1.as_str(), input.event_cursor],
-            |row| row.get(0),
-        )?;
-        if later_event_exists {
+        if later_material_event_exists(
+            &transaction,
+            &RunId::from(action.1.as_str()),
+            input.event_cursor,
+            &is_material_event,
+        )? {
             return Err(StoreError::Conflict(
-                "a newer controller event superseded the expert request snapshot".to_owned(),
+                "a newer material controller event superseded the expert request snapshot"
+                    .to_owned(),
             ));
         }
         let active: i64 = transaction.query_row(
@@ -997,6 +1015,21 @@ impl Store {
         run_id: &RunId,
         event_cursor: i64,
     ) -> Result<ExpertRequestRecord, StoreError> {
+        self.begin_expert_request_if_materially_current(request_id, run_id, event_cursor, |_| true)
+    }
+
+    /// Binds and starts a queued expert request while preserving the same
+    /// material-event freshness contract used at request creation.
+    pub fn begin_expert_request_if_materially_current<F>(
+        &self,
+        request_id: &ExpertRequestId,
+        run_id: &RunId,
+        event_cursor: i64,
+        is_material_event: F,
+    ) -> Result<ExpertRequestRecord, StoreError>
+    where
+        F: Fn(&DomainEvent) -> bool,
+    {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         let request_run_id: String = transaction
@@ -1012,14 +1045,9 @@ impl Store {
                 "expert request run does not match its current snapshot run".to_owned(),
             ));
         }
-        let later_event_exists: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM domain_events WHERE run_id=?1 AND id>?2)",
-            params![run_id.as_str(), event_cursor],
-            |row| row.get(0),
-        )?;
-        if later_event_exists {
+        if later_material_event_exists(&transaction, run_id, event_cursor, &is_material_event)? {
             return Err(StoreError::Conflict(
-                "a newer controller event superseded the expert request before runtime launch"
+                "a newer material controller event superseded the expert request before runtime launch"
                     .to_owned(),
             ));
         }
@@ -1244,6 +1272,33 @@ impl Store {
         transaction.commit()?;
         Ok(record)
     }
+}
+
+fn later_material_event_exists<F>(
+    transaction: &Transaction<'_>,
+    run_id: &RunId,
+    event_cursor: i64,
+    is_material_event: &F,
+) -> Result<bool, StoreError>
+where
+    F: Fn(&DomainEvent) -> bool,
+{
+    let mut statement = transaction.prepare(
+        "SELECT id,run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json
+         FROM domain_events WHERE run_id=?1 AND id>?2 ORDER BY id LIMIT ?3",
+    )?;
+    let events = statement
+        .query_map(
+            params![
+                run_id.as_str(),
+                event_cursor,
+                i64::try_from(MAX_EXPERT_FRESHNESS_EVENTS + 1)
+                    .expect("bounded event limit fits i64"),
+            ],
+            queries::map_domain_event,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(events.len() > MAX_EXPERT_FRESHNESS_EVENTS || events.iter().any(is_material_event))
 }
 
 fn validate_snapshot_binding(
@@ -2161,6 +2216,69 @@ mod tests {
                     [response.id.as_str()],
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn expert_freshness_ignores_receipts_but_rejects_a_later_material_event() {
+        let (_temp, store, run) = fixture();
+        let decision = decision_with_action(&store, &run, "request_expert");
+        let action = store
+            .supervisor_actions_for_decision(&decision.id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        store
+            .evaluate_supervisor_action(&action.id, true, "hard escalation gate satisfied")
+            .unwrap();
+        let request = |id: &str| NewExpertRequest {
+            id: ExpertRequestId::from(id),
+            action_id: action.id.clone(),
+            event_cursor: 0,
+            signature: "e".repeat(64),
+            payload: serde_json::json!({"schema": "harness.expert-request.v1"}),
+            requested_model: "gpt-5.6-sol".to_owned(),
+            requested_effort: "xhigh".to_owned(),
+            expires_at_ms: now_ms() + 60_000,
+            max_completed_per_signature: 2,
+        };
+        store
+            .emit_domain_event(
+                Some(&run),
+                "agent",
+                "supervisor",
+                "agent.supervisor.decision_recorded",
+                &serde_json::json!({"automatic_action": false}),
+                None,
+            )
+            .expect("non-material supervisor receipt persists");
+        let queued = store
+            .create_expert_request_if_materially_current(&request("expert-nonmaterial"), |event| {
+                event.event_type == "task.start_failed"
+            })
+            .expect("a non-material receipt does not stale the expert snapshot");
+        store
+            .finish_expert_request(&queued.id, "FAILED", Some("fixture terminal"))
+            .expect("fixture request finishes without consuming the completion cap");
+        store
+            .emit_domain_event(
+                Some(&run),
+                "task",
+                "task-1",
+                "task.start_failed",
+                &serde_json::json!({"reason": "material fixture change"}),
+                None,
+            )
+            .expect("material controller event persists");
+        let error = store
+            .create_expert_request_if_materially_current(&request("expert-material"), |event| {
+                event.event_type == "task.start_failed"
+            })
+            .expect_err("a later material event must stale the expert snapshot");
+        assert!(
+            error
+                .to_string()
+                .contains("newer material controller event")
         );
     }
 

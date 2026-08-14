@@ -3105,17 +3105,20 @@ impl Orchestrator {
             reasoning_effort: supervision.expert.reasoning_effort.clone(),
             sandbox: supervision.expert.sandbox.clone(),
         };
-        let request = self.store.create_expert_request(&NewExpertRequest {
-            id: request_id.clone(),
-            action_id: action.id.clone(),
-            event_cursor: snapshot.event_cursor,
-            signature,
-            payload,
-            requested_model: route.model.clone(),
-            requested_effort: route.reasoning_effort.clone(),
-            expires_at_ms,
-            max_completed_per_signature: supervision.expert.max_completed_per_signature,
-        })?;
+        let request = self.store.create_expert_request_if_materially_current(
+            &NewExpertRequest {
+                id: request_id.clone(),
+                action_id: action.id.clone(),
+                event_cursor: snapshot.event_cursor,
+                signature,
+                payload,
+                requested_model: route.model.clone(),
+                requested_effort: route.reasoning_effort.clone(),
+                expires_at_ms,
+                max_completed_per_signature: supervision.expert.max_completed_per_signature,
+            },
+            |event| supervision::material_trigger(event).is_some(),
+        )?;
         #[cfg(test)]
         if self
             .emit_material_event_before_expert_launch
@@ -3153,10 +3156,11 @@ impl Orchestrator {
                 token_budget: Some(supervision.expert.token_budget),
             })?;
             self.store.attach_expert_agent(&request.id, &agent_id)?;
-            self.store.begin_expert_request_if_current(
+            self.store.begin_expert_request_if_materially_current(
                 &request.id,
                 &action.run_id,
                 snapshot.event_cursor,
+                |event| supervision::material_trigger(event).is_some(),
             )?;
             let prompt = expert_request_prompt(&request)?;
             self.start_agent(
