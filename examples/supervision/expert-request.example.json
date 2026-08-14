@@ -12,6 +12,13 @@
   "question": "Which invariant should govern the conflicting implementation paths, and what evidence would establish the correct resolution?",
   "context": {
     "goal": "Resolve the named architectural conflict without changing controller custody or the approved scope.",
+    "why_normal_agents_cannot_resolve": "The current bounded worker and reviewer conclusions conflict on the governing invariant.",
+    "known_facts": [
+      "The controller recorded two conflicting implementation conclusions."
+    ],
+    "disputed_claims": [
+      "One proposed implementation path may violate the governing invariant."
+    ],
     "constraints": [
       "The response is advisory and cannot execute a controller action.",
       "Use only the bounded evidence supplied by the controller."
@@ -22,5 +29,8 @@
       "List any missing evidence or human authority."
     ]
   },
-  "evidence_refs": ["finding-1", "validation-7"]
+  "evidence_refs": [
+    {"kind": "finding", "id": "finding-1", "summary": "The current implementation paths disagree on the invariant."},
+    {"kind": "validation", "id": "validation-7", "summary": "The exact candidate validation retained the disagreement."}
+  ]
 }

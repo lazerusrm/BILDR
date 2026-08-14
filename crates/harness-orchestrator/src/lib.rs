@@ -501,6 +501,7 @@ fn validate_expert_brief(
     required_bounded_text(brief, "why_normal_agents_cannot_resolve", 3_000)?;
     for (field, maximum, minimum) in [
         ("known_facts", 2_000_usize, 1_usize),
+        ("disputed_claims", 2_000, 0),
         ("constraints", 2_000, 0),
         ("required_output", 1_000, 1),
     ] {
@@ -920,18 +921,7 @@ fn expert_request_payload(
         .and_then(Value::as_array)
         .ok_or_else(|| OrchestratorError::Validation("expert evidence_refs are absent".to_owned()))?
         .iter()
-        .map(|reference| {
-            reference
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .filter(|id| !id.trim().is_empty() && id.chars().count() <= 128)
-                .ok_or_else(|| {
-                    OrchestratorError::Validation(
-                        "expert evidence_refs contain an invalid controller id".to_owned(),
-                    )
-                })
-        })
+        .map(|reference| controller_evidence_ref(reference).map_err(OrchestratorError::Validation))
         .collect::<Result<Vec<_>, _>>()?;
     let mut evidence_refs = evidence_refs;
     evidence_refs.sort();
@@ -941,6 +931,20 @@ fn expert_request_payload(
             "expert consultation needs at least one controller evidence reference".to_owned(),
         ));
     }
+    let evidence_payload = evidence_refs
+        .iter()
+        .map(|(kind, id, summary, digest)| {
+            let mut value = serde_json::Map::from_iter([
+                ("kind".to_owned(), json!(kind)),
+                ("id".to_owned(), json!(id)),
+                ("summary".to_owned(), json!(summary)),
+            ]);
+            if let Some(digest) = digest {
+                value.insert("digest".to_owned(), json!(digest));
+            }
+            Value::Object(value)
+        })
+        .collect::<Vec<_>>();
     let text_array = |field: &str, maximum: usize| -> Result<Vec<String>, OrchestratorError> {
         brief
             .get(field)
@@ -961,24 +965,34 @@ fn expert_request_payload(
             })
             .collect()
     };
-    let known_facts = text_array("known_facts", 2_000)?;
-    let mut constraints = text_array("constraints", 2_000)?;
+    let normalize_text_set = |mut values: Vec<String>| {
+        values.sort();
+        values.dedup();
+        values
+    };
+    let why_normal_agents_cannot_resolve =
+        required_bounded_text(brief, "why_normal_agents_cannot_resolve", 3_000)
+            .map_err(OrchestratorError::Validation)?;
+    let known_facts = normalize_text_set(text_array("known_facts", 2_000)?);
+    let disputed_claims = normalize_text_set(text_array("disputed_claims", 2_000)?);
+    let mut constraints = normalize_text_set(text_array("constraints", 2_000)?);
+    if constraints.len() > 48 {
+        return Err(OrchestratorError::Validation(
+            "expert constraints must leave room for the two controller safety constraints"
+                .to_owned(),
+        ));
+    }
     constraints.extend([
         "Read-only consultation; do not alter files, state, credentials, or approvals.".to_owned(),
         "Do not start children, request network access, or claim controller authority.".to_owned(),
     ]);
-    let required_output = text_array("required_output", 1_000)?;
+    let required_output = normalize_text_set(text_array("required_output", 1_000)?);
     let signature_material = json!({
         "run_id": run.id,
         "goal_revision": snapshot.payload.get("goal_revision").cloned().unwrap_or_else(|| json!(snapshot.revision)),
-        "category": category_source,
         "task_ids": task_ids,
         "evidence_refs": evidence_refs,
-        "question": question.trim(),
-        "known_facts": known_facts,
-        "constraints": constraints,
         "authority_digest": run.authority_digest,
-        "snapshot_id": snapshot.id,
     });
     let signature = hex::encode(Sha256::digest(serde_json::to_vec(&signature_material)?));
     let payload = json!({
@@ -995,10 +1009,13 @@ fn expert_request_payload(
         "question": question,
         "context": {
             "goal": run.objective,
+            "why_normal_agents_cannot_resolve": why_normal_agents_cannot_resolve,
+            "known_facts": known_facts,
+            "disputed_claims": disputed_claims,
             "constraints": constraints,
             "required_output": required_output,
         },
-        "evidence_refs": evidence_refs,
+        "evidence_refs": evidence_payload,
     });
     Ok((payload, signature))
 }
@@ -1020,6 +1037,16 @@ fn validate_expert_response(
     snapshot: &SupervisorSnapshotRecord,
     response: &Value,
 ) -> Result<(), OrchestratorError> {
+    let expires_at = supervision::parse_timestamp_millis(&request.expires_at).ok_or_else(|| {
+        OrchestratorError::Protocol(
+            "expert request has an invalid durable expiry timestamp".to_owned(),
+        )
+    })?;
+    if expires_at <= now_ms() {
+        return Err(OrchestratorError::Conflict(
+            "expert request expired before response intake".to_owned(),
+        ));
+    }
     let object = response.as_object().ok_or_else(|| {
         OrchestratorError::Validation("expert response must be a JSON object".to_owned())
     })?;
@@ -1083,7 +1110,7 @@ fn validate_expert_response(
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(Value::as_str)
+        .filter_map(|reference| reference.get("id").and_then(Value::as_str))
         .collect::<BTreeSet<_>>();
     let evidence_refs = object
         .get("evidence_refs")
@@ -8487,9 +8514,15 @@ impl Orchestrator {
             Ok(record) => record,
             Err(error) => {
                 let reason = format!("expert response rejected: {error}");
-                let _ = self
-                    .store
-                    .finish_expert_request(&request.id, "FAILED", Some(&reason));
+                let terminal_state = if error.to_string().contains("expired before response intake")
+                {
+                    "STALE"
+                } else {
+                    "FAILED"
+                };
+                let _ =
+                    self.store
+                        .finish_expert_request(&request.id, terminal_state, Some(&reason));
                 self.store.clear_agent_active_turn(agent_id)?;
                 self.store.update_agent_state(
                     agent_id,
@@ -17352,6 +17385,7 @@ mod tests {
                         "kind": "event",
                         "id": "event-fixture",
                         "summary": "The controller recorded a blocked integration conflict.",
+                        "digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
                     }],
                 }))
             })
@@ -17422,7 +17456,7 @@ mod tests {
                     "constraints": ["Do not propose an automatic state transition."],
                     "required_output": ["State the invariant and the next observable validation."],
                     "task_ids": [task.id],
-                    "evidence_refs": [{"kind": "event", "id": evidence_id, "summary": "The controller recorded a blocked integration conflict."}]
+                    "evidence_refs": [{"kind": "event", "id": evidence_id, "summary": "The controller recorded a blocked integration conflict.", "digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}]
                 }
             }]
         });
@@ -17545,7 +17579,7 @@ mod tests {
             "verdict": "recommendation",
             "summary": "The canonical integration invariant is explicit and testable.",
             "recommendation": "Keep one canonical adapter contract and prove it with the listed controller evidence.",
-            "evidence_refs": request.payload["evidence_refs"],
+            "evidence_refs": ["event-fixture"],
         });
         orchestrator
             .accept_expert_response(&expert_id, &response.to_string())
@@ -17592,6 +17626,65 @@ mod tests {
         assert_eq!(
             fresh_snapshot.payload["expert_consultations"][0]["response"]["id"],
             json!("expert-fixture-response")
+        );
+    }
+
+    #[tokio::test]
+    async fn expert_signature_is_stable_across_fresh_snapshots_and_payload_keeps_context() {
+        let (orchestrator, _temp, _runtime, run_id, _) = rollout_lost_plan_review_fixture().await;
+        let (action, _) = fixture_expert_action(&orchestrator, &run_id, "high").await;
+        let run = orchestrator
+            .store()
+            .run(&run_id)
+            .expect("fixture run reads");
+        let snapshot = orchestrator
+            .store()
+            .supervisor_snapshot(&action.snapshot_id)
+            .expect("snapshot reads")
+            .expect("fixture snapshot exists");
+        let expires_at_ms = now_ms().saturating_add(EXPERT_REQUEST_TTL_MS);
+        let (first_payload, first_signature) = expert_request_payload(
+            &action,
+            &run,
+            &snapshot,
+            &ExpertRequestId::from("stable-signature-one"),
+            expires_at_ms,
+        )
+        .expect("controller payload compiles");
+        let mut fresh_snapshot = snapshot.clone();
+        fresh_snapshot.id = harness_domain::SupervisorSnapshotId::from("fresh-snapshot-id");
+        fresh_snapshot.revision += 1;
+        let (_second_payload, second_signature) = expert_request_payload(
+            &action,
+            &run,
+            &fresh_snapshot,
+            &ExpertRequestId::from("stable-signature-two"),
+            expires_at_ms,
+        )
+        .expect("the same controller escalation has the same signature");
+        assert_eq!(first_signature, second_signature);
+        assert_eq!(
+            first_payload["context"]["why_normal_agents_cannot_resolve"],
+            json!(
+                "The current worker and reviewer have conflicting conclusions on a public integration contract."
+            )
+        );
+        assert_eq!(
+            first_payload["context"]["known_facts"],
+            json!(["The task is blocked after conflicting contract evidence."])
+        );
+        assert_eq!(
+            first_payload["context"]["disputed_claims"],
+            json!(["The adapter may preserve the canonical contract."])
+        );
+        assert_eq!(
+            first_payload["evidence_refs"][0],
+            json!({
+                "kind": "event",
+                "id": "event-fixture",
+                "summary": "The controller recorded a blocked integration conflict.",
+                "digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            })
         );
     }
 

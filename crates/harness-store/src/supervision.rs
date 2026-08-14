@@ -1189,7 +1189,7 @@ impl Store {
         let transaction = connection.transaction()?;
         let request = transaction
             .query_row(
-                "SELECT run_id,snapshot_id,state,agent_session_id FROM expert_requests WHERE id=?1",
+                "SELECT run_id,snapshot_id,state,agent_session_id,expires_at FROM expert_requests WHERE id=?1",
                 [request_id.as_str()],
                 |row| {
                     Ok((
@@ -1197,6 +1197,7 @@ impl Store {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
                     ))
                 },
             )
@@ -1208,6 +1209,16 @@ impl Store {
             )));
         }
         let now = now_ms();
+        if request.4 <= now {
+            transaction.execute(
+                "UPDATE expert_requests SET state='STALE',completed_at=?2,failure_reason='expert request expired before its response was accepted' WHERE id=?1 AND state='RUNNING'",
+                params![request_id.as_str(), now],
+            )?;
+            transaction.commit()?;
+            return Err(StoreError::Conflict(format!(
+                "expert request {request_id} expired before response intake"
+            )));
+        }
         transaction.execute(
             "INSERT INTO expert_responses(id,request_id,run_id,snapshot_id,payload_json,payload_sha256,byte_length,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
@@ -2233,5 +2244,87 @@ mod tests {
             ))
             .expect_err("a third completed response with the same signature is prohibited");
         assert!(cap_error.to_string().contains("completed-response cap"));
+    }
+
+    #[test]
+    fn expired_expert_response_is_not_persisted_as_current_advisory_evidence() {
+        let (_temp, store, run) = fixture();
+        let decision = decision_with_action(&store, &run, "request_expert");
+        let action = store
+            .supervisor_actions_for_decision(&decision.id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        store
+            .evaluate_supervisor_action(&action.id, true, "hard escalation gate satisfied")
+            .unwrap();
+        let request = store
+            .create_expert_request(&NewExpertRequest {
+                id: ExpertRequestId::from("expired-expert-request"),
+                action_id: action.id.clone(),
+                event_cursor: 0,
+                signature: "d".repeat(64),
+                payload: serde_json::json!({"schema": "harness.expert-request.v1"}),
+                requested_model: "gpt-5.6-sol".to_owned(),
+                requested_effort: "xhigh".to_owned(),
+                expires_at_ms: now_ms() + 60_000,
+                max_completed_per_signature: 2,
+            })
+            .expect("request queues before expiry");
+        let expert_id = AgentSessionId::from("expired-expert-session");
+        store
+            .create_agent_session(&NewAgentSession {
+                id: expert_id.clone(),
+                run_id: run.clone(),
+                task_attempt_id: None,
+                parent_agent_session_id: None,
+                runtime_kind: "test".to_owned(),
+                codex_account_id: None,
+                role: AgentRole::Expert,
+                nickname: Some("expired expert".to_owned()),
+                requested_model: "gpt-5.6-sol".to_owned(),
+                requested_reasoning_effort: "xhigh".to_owned(),
+                sandbox_mode: SandboxMode::ReadOnly,
+                approval_policy: "never".to_owned(),
+                cwd: PathBuf::from("/tmp"),
+                state: "STARTING".to_owned(),
+                current_goal: Some("bounded expert review".to_owned()),
+                token_budget: Some(48_000),
+            })
+            .unwrap();
+        store.attach_expert_agent(&request.id, &expert_id).unwrap();
+        store.begin_expert_request(&request.id).unwrap();
+
+        let connection = store.connection().unwrap();
+        connection
+            .execute_batch("DROP TRIGGER expert_requests_custody_immutable;")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE expert_requests SET expires_at=0 WHERE id=?1",
+                [request.id.as_str()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = store
+            .record_expert_response(
+                &request.id,
+                &ExpertResponseId::from("expired-expert-response"),
+                &serde_json::json!({"schema": "harness.expert-response.v1"}),
+            )
+            .expect_err("a response after durable expiry must not become evidence");
+        assert!(error.to_string().contains("expired before response intake"));
+        assert_eq!(store.expert_request(&request.id).unwrap().state, "STALE");
+        let response_count: i64 = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM expert_responses WHERE request_id=?1",
+                [request.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(response_count, 0);
     }
 }

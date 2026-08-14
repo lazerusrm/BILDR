@@ -577,7 +577,7 @@ fn bounded(value: &str, maximum: usize) -> String {
     value.chars().take(maximum).collect()
 }
 
-fn parse_timestamp_millis(value: &str) -> Option<i64> {
+pub(crate) fn parse_timestamp_millis(value: &str) -> Option<i64> {
     time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
         .ok()
         .and_then(|timestamp| i64::try_from(timestamp.unix_timestamp_nanos() / 1_000_000).ok())
