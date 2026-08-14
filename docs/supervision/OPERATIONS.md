@@ -73,7 +73,7 @@ model = "gpt-5.6-sol"
 reasoning_effort = "xhigh"
 sandbox = "read-only"
 max_active_per_run = 1
-max_per_task_signature = 2
+max_completed_per_signature = 2
 default_token_budget = 80000
 max_children = 0
 ```

@@ -317,6 +317,7 @@ fn validate_supervisor_decision(
         .flatten()
         .filter_map(|task| task.get("task_id").and_then(Value::as_str))
         .collect::<BTreeSet<_>>();
+    let high_risk_task_ids = snapshot_high_risk_task_ids(snapshot);
     let actions = object
         .get("actions")
         .and_then(Value::as_array)
@@ -401,11 +402,18 @@ fn validate_supervisor_decision(
             )));
         }
         if kind == "request_expert" {
-            validate_expert_brief(action, &task_ids).map_err(|reason| {
-                OrchestratorError::Validation(format!(
-                    "supervisor action {action_id} has an invalid expert brief: {reason}"
+            let evidence_refs = snapshot_expert_evidence_refs(snapshot).map_err(|reason| {
+                OrchestratorError::Protocol(format!(
+                    "supervisor snapshot has invalid controller evidence for expert escalation: {reason}"
                 ))
             })?;
+            validate_expert_brief(action, &task_ids, &high_risk_task_ids, &evidence_refs).map_err(
+                |reason| {
+                    OrchestratorError::Validation(format!(
+                        "supervisor action {action_id} has an invalid expert brief: {reason}"
+                    ))
+                },
+            )?;
         } else if action
             .get("expert_brief")
             .is_some_and(|brief| !brief.is_null())
@@ -456,6 +464,8 @@ fn required_bounded_text(
 fn validate_expert_brief(
     action: &serde_json::Map<String, Value>,
     snapshot_task_ids: &BTreeSet<&str>,
+    snapshot_high_risk_task_ids: &BTreeSet<&str>,
+    snapshot_evidence_refs: &BTreeSet<ControllerEvidenceRef>,
 ) -> Result<(), String> {
     let impact = action
         .get("impact")
@@ -517,6 +527,7 @@ fn validate_expert_brief(
         return Err("task_ids has an invalid item count".to_owned());
     }
     let mut unique_tasks = BTreeSet::new();
+    let mut has_controller_high_risk_task = false;
     for task_id in task_ids {
         let task_id = task_id
             .as_str()
@@ -525,18 +536,122 @@ fn validate_expert_brief(
         if !unique_tasks.insert(task_id) {
             return Err("expert task_ids must be unique".to_owned());
         }
+        has_controller_high_risk_task |= snapshot_high_risk_task_ids.contains(task_id);
+    }
+    if !has_controller_high_risk_task {
+        return Err(
+            "expert consultation requires at least one controller-classified high-risk task"
+                .to_owned(),
+        );
     }
     let evidence = brief
         .get("evidence_refs")
         .and_then(Value::as_array)
         .ok_or_else(|| "evidence_refs must be an array".to_owned())?;
-    if evidence.is_empty()
-        || evidence.len() > 100
-        || evidence.iter().any(|value| !value.is_object())
-    {
+    if evidence.is_empty() || evidence.len() > 100 {
         return Err("expert evidence_refs must contain one to 100 typed references".to_owned());
     }
+    let mut unique_evidence = BTreeSet::new();
+    for evidence_ref in evidence {
+        let evidence_ref = controller_evidence_ref(evidence_ref)?;
+        if !snapshot_evidence_refs.contains(&evidence_ref) {
+            return Err(
+                "expert evidence_refs must exactly match controller evidence in the snapshot"
+                    .to_owned(),
+            );
+        }
+        if !unique_evidence.insert(evidence_ref) {
+            return Err("expert evidence_refs must be unique".to_owned());
+        }
+    }
     Ok(())
+}
+
+type ControllerEvidenceRef = (String, String, String, Option<String>);
+
+fn snapshot_high_risk_task_ids(snapshot: &SupervisorSnapshotRecord) -> BTreeSet<&str> {
+    snapshot
+        .payload
+        .get("tasks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|task| {
+            task.get("task_id").and_then(Value::as_str).filter(|_| {
+                task.get("risk_flags")
+                    .and_then(Value::as_array)
+                    .is_some_and(|flags| {
+                        flags.iter().filter_map(Value::as_str).any(|flag| {
+                            matches!(
+                                flag,
+                                "canonical_contract"
+                                    | "generated_contract"
+                                    | "migration"
+                                    | "tenancy"
+                                    | "authentication"
+                                    | "authorization"
+                                    | "privacy"
+                                    | "unsafe_native"
+                                    | "hardware"
+                                    | "ota_release"
+                                    | "ci_required_context"
+                                    | "serial_path"
+                            )
+                        })
+                    })
+            })
+        })
+        .collect()
+}
+
+fn snapshot_expert_evidence_refs(
+    snapshot: &SupervisorSnapshotRecord,
+) -> Result<BTreeSet<ControllerEvidenceRef>, String> {
+    let evidence = snapshot
+        .payload
+        .get("evidence_refs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "snapshot has no controller evidence_refs array".to_owned())?;
+    if evidence.is_empty() || evidence.len() > 100 {
+        return Err("snapshot controller evidence_refs count is invalid".to_owned());
+    }
+    evidence.iter().map(controller_evidence_ref).collect()
+}
+
+fn controller_evidence_ref(value: &Value) -> Result<ControllerEvidenceRef, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "evidence reference must be an object".to_owned())?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "kind" | "id" | "summary" | "digest"))
+    {
+        return Err("evidence reference has an unknown field".to_owned());
+    }
+    let text = |field: &str, maximum: usize| {
+        object
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty() && value.chars().count() <= maximum)
+            .map(str::to_owned)
+            .ok_or_else(|| format!("evidence reference {field} is invalid"))
+    };
+    let kind = text("kind", 128)?;
+    let id = text("id", 128)?;
+    let summary = text("summary", 1_000)?;
+    let digest = match object.get("digest") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value))
+            if value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+        {
+            Some(value.clone())
+        }
+        _ => return Err("evidence reference digest is invalid".to_owned()),
+    };
+    Ok((kind, id, summary, digest))
 }
 
 fn supervisor_action_stale_reason(
@@ -648,16 +763,27 @@ fn supervisor_action_policy_reason(
                 .flatten()
                 .filter_map(|task| task.get("task_id").and_then(Value::as_str))
                 .collect::<BTreeSet<_>>();
+            let high_risk_task_ids = snapshot_high_risk_task_ids(&snapshot);
+            let evidence_refs = snapshot_expert_evidence_refs(&snapshot)?;
             let proposal = action.proposal.as_object().ok_or_else(|| {
                 "request_expert proposal is not a typed controller action".to_owned()
             })?;
-            validate_expert_brief(proposal, &task_ids)?;
+            validate_expert_brief(
+                proposal,
+                &task_ids,
+                &high_risk_task_ids,
+                &evidence_refs,
+            )?;
             let requested_tasks = proposal
                 .get("expert_brief")
                 .and_then(|brief| brief.get("task_ids"))
                 .and_then(Value::as_array)
                 .ok_or_else(|| "expert brief task_ids disappeared after validation".to_owned())?;
-            let mut still_blocked = false;
+            let (_, plan, _, _) = store
+                .latest_plan(&action.run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "the current controller plan is unavailable".to_owned())?;
+            let mut still_blocked_high_risk = false;
             for task_id in requested_tasks.iter().filter_map(Value::as_str) {
                 let task = store
                     .task(&TaskId::from(task_id))
@@ -665,7 +791,7 @@ fn supervisor_action_policy_reason(
                 if task.run_id != action.run_id {
                     return Err("expert task belongs to another run".to_owned());
                 }
-                still_blocked |= matches!(
+                let still_blocked = matches!(
                     task.state,
                     TaskState::NeedsHelp
                         | TaskState::ChangesRequested
@@ -674,15 +800,19 @@ fn supervisor_action_policy_reason(
                         | TaskState::Blocked
                         | TaskState::Failed
                 );
+                let high_risk = plan
+                    .tasks
+                    .iter()
+                    .any(|packet| packet.task_id == task.external_task_id && packet.is_high_risk());
+                still_blocked_high_risk |= still_blocked && high_risk;
             }
-            if !still_blocked {
+            if !still_blocked_high_risk {
                 return Err(
-                    "expert consultation requires at least one still-blocked scoped task"
-                        .to_owned(),
+                    "expert consultation requires at least one still-blocked controller-classified high-risk scoped task".to_owned(),
                 );
             }
             if store
-                .expert_requests_for_run(&action.run_id)
+                .expert_requests_for_run(&action.run_id, 100)
                 .map_err(|error| error.to_string())?
                 .iter()
                 .any(|request| matches!(request.state.as_str(), "QUEUED" | "RUNNING"))
@@ -1547,6 +1677,8 @@ pub struct Orchestrator {
     account_logins: Arc<Mutex<BTreeMap<String, CodexAccountLoginEntry>>>,
     #[cfg(test)]
     fail_next_plan_review_recovery_gate_write: Arc<AtomicBool>,
+    #[cfg(test)]
+    emit_material_event_before_expert_launch: Arc<AtomicBool>,
 }
 
 impl Orchestrator {
@@ -1614,6 +1746,8 @@ impl Orchestrator {
             account_logins: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(test)]
             fail_next_plan_review_recovery_gate_write: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            emit_material_event_before_expert_launch: Arc::new(AtomicBool::new(false)),
         };
         orchestrator.reconcile_native_subagents()?;
         orchestrator
@@ -2693,6 +2827,10 @@ impl Orchestrator {
         action_id: &SupervisorActionId,
         actor: &str,
     ) -> Result<SupervisorActionRecord, OrchestratorError> {
+        // Proposal freshness, policy evaluation, and the state transition to
+        // EXECUTING are one controller-critical section. The side effect is
+        // deliberately dispatched only after that durable transition.
+        let guard = self.operation_lock.lock().await;
         let action = self.store.supervisor_action(action_id)?;
         if action.state != "PROPOSED" {
             return Err(OrchestratorError::Conflict(format!(
@@ -2738,6 +2876,7 @@ impl Orchestrator {
             }),
         )?;
         let executing = self.store.begin_supervisor_action(action_id)?;
+        drop(guard);
         let outcome = match executing.kind.as_str() {
             "wait" => Ok(json!({
                 "schema": "harness.supervisor-action-receipt.v1",
@@ -2838,7 +2977,30 @@ impl Orchestrator {
                 "human-approved advisory supervision is no longer enabled".to_owned(),
             ));
         }
+        self.require_runtime_ready().await?;
+        self.select_preferred_codex_account_for_run(&action.run_id)
+            .await?;
+
+        // Runtime readiness can take time. Re-enter the controller critical
+        // section and re-read all immutable/live bindings immediately before
+        // creating or starting Sol so a material event cannot authorize a
+        // stale expert launch.
+        let _guard = self.operation_lock.lock().await;
+        let action = self.store.supervisor_action(&action.id)?;
+        if action.state != "EXECUTING" {
+            return Err(OrchestratorError::Conflict(format!(
+                "expert action {} is {}, not executing",
+                action.id, action.state
+            )));
+        }
         let run = self.store.run(&action.run_id)?;
+        if let Some(reason) = supervisor_action_stale_reason(&self.store, &action, &run)? {
+            return Err(OrchestratorError::Conflict(format!(
+                "expert proposal became stale before launch: {reason}"
+            )));
+        }
+        supervisor_action_policy_reason(&action, &run, &self.store)
+            .map_err(OrchestratorError::Validation)?;
         let snapshot = self
             .store
             .supervisor_snapshot(&action.snapshot_id)?
@@ -2850,10 +3012,7 @@ impl Orchestrator {
         let request_id = ExpertRequestId::new();
         let expires_at_ms = now_ms().saturating_add(EXPERT_REQUEST_TTL_MS);
         let (payload, signature) =
-            expert_request_payload(action, &run, &snapshot, &request_id, expires_at_ms)?;
-        self.require_runtime_ready().await?;
-        self.select_preferred_codex_account_for_run(&action.run_id)
-            .await?;
+            expert_request_payload(&action, &run, &snapshot, &request_id, expires_at_ms)?;
         let (active_total, _, _) = self.active_agent_counts()?;
         if active_total >= self.config.orchestration.max_total_agent_threads {
             return Err(OrchestratorError::Blocked(format!(
@@ -2880,12 +3039,28 @@ impl Orchestrator {
         let request = self.store.create_expert_request(&NewExpertRequest {
             id: request_id.clone(),
             action_id: action.id.clone(),
+            event_cursor: snapshot.event_cursor,
             signature,
             payload,
             requested_model: route.model.clone(),
             requested_effort: route.reasoning_effort.clone(),
             expires_at_ms,
+            max_completed_per_signature: supervision.expert.max_completed_per_signature,
         })?;
+        #[cfg(test)]
+        if self
+            .emit_material_event_before_expert_launch
+            .swap(false, Ordering::AcqRel)
+        {
+            self.store.emit_domain_event(
+                Some(&action.run_id),
+                "run",
+                action.run_id.as_str(),
+                "task.start_failed",
+                &json!({"reason": "injected material event before expert runtime launch"}),
+                None,
+            )?;
+        }
         let agent_id = AgentSessionId::new();
         let launch = async {
             self.store.create_agent_session(&NewAgentSession {
@@ -2909,7 +3084,11 @@ impl Orchestrator {
                 token_budget: Some(supervision.expert.token_budget),
             })?;
             self.store.attach_expert_agent(&request.id, &agent_id)?;
-            self.store.begin_expert_request(&request.id)?;
+            self.store.begin_expert_request_if_current(
+                &request.id,
+                &action.run_id,
+                snapshot.event_cursor,
+            )?;
             let prompt = expert_request_prompt(&request)?;
             self.start_agent(
                 &agent_id,
@@ -3931,7 +4110,7 @@ impl Orchestrator {
             supervisor_review: self.store.latest_supervisor_review(run_id)?,
             supervisor_decision: self.store.latest_supervisor_decision(run_id)?,
             supervisor_actions: self.store.supervisor_actions_for_run(run_id)?,
-            expert_requests: self.store.expert_requests_for_run(run_id)?,
+            expert_requests: self.store.expert_requests_for_run(run_id, 100)?,
         })
     }
 
@@ -16829,7 +17008,7 @@ mod tests {
                 lease_expires_at: "controller-managed".to_owned(),
                 stop_conditions: vec!["A human approval would be required".to_owned()],
                 handoff_path: "README.md".to_owned(),
-                risk_flags: Vec::new(),
+                risk_flags: vec!["canonical_contract".to_owned()],
             }],
         };
         orchestrator
@@ -17122,6 +17301,15 @@ mod tests {
         run_id: &RunId,
         impact: &str,
     ) -> (SupervisorActionRecord, TaskId) {
+        fixture_expert_action_with_evidence(orchestrator, run_id, impact, "event-fixture").await
+    }
+
+    async fn fixture_expert_action_with_evidence(
+        orchestrator: &Orchestrator,
+        run_id: &RunId,
+        impact: &str,
+        evidence_id: &str,
+    ) -> (SupervisorActionRecord, TaskId) {
         let task = orchestrator
             .store()
             .list_tasks(run_id)
@@ -17156,7 +17344,15 @@ mod tests {
                     "generated_at": "2026-08-14T00:00:00Z",
                     "goal_revision": 1,
                     "allowed_actions": ["request_expert"],
-                    "tasks": [{"task_id": task.id}],
+                    "tasks": [{
+                        "task_id": task.id,
+                        "risk_flags": ["canonical_contract"],
+                    }],
+                    "evidence_refs": [{
+                        "kind": "event",
+                        "id": "event-fixture",
+                        "summary": "The controller recorded a blocked integration conflict.",
+                    }],
                 }))
             })
             .expect("expert fixture snapshot persists");
@@ -17226,7 +17422,7 @@ mod tests {
                     "constraints": ["Do not propose an automatic state transition."],
                     "required_output": ["State the invariant and the next observable validation."],
                     "task_ids": [task.id],
-                    "evidence_refs": [{"kind": "event", "id": "event-fixture", "summary": "The controller recorded a blocked integration conflict."}]
+                    "evidence_refs": [{"kind": "event", "id": evidence_id, "summary": "The controller recorded a blocked integration conflict."}]
                 }
             }]
         });
@@ -17313,7 +17509,7 @@ mod tests {
         );
         let request = orchestrator
             .store()
-            .expert_requests_for_run(&run_id)
+            .expert_requests_for_run(&run_id, 100)
             .expect("expert request reads")
             .pop()
             .expect("one durable expert request exists");
@@ -17421,11 +17617,138 @@ mod tests {
         assert!(
             orchestrator
                 .store()
-                .expert_requests_for_run(&run_id)
+                .expert_requests_for_run(&run_id, 100)
                 .unwrap()
                 .is_empty()
         );
         assert!(runtime.started_threads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invented_expert_evidence_is_rejected_without_starting_sol() {
+        let (orchestrator, _temp, runtime, run_id, _) = rollout_lost_plan_review_fixture().await;
+        orchestrator
+            .update_operator_settings(operator_settings_request(Some(true), None))
+            .expect("advisory mode enables explicitly");
+        let (action, _) = fixture_expert_action_with_evidence(
+            &orchestrator,
+            &run_id,
+            "high",
+            "model-invented-event",
+        )
+        .await;
+        let rejected = orchestrator
+            .apply_supervisor_action(&action.id, "local-user")
+            .await
+            .expect("invented controller evidence receives a durable policy rejection");
+        assert_eq!(rejected.state, "POLICY_REJECTED");
+        assert!(
+            rejected
+                .policy_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("exactly match controller evidence")
+        );
+        assert!(
+            orchestrator
+                .store()
+                .expert_requests_for_run(&run_id, 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(runtime.started_threads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn material_event_before_expert_runtime_launch_fails_closed() {
+        let (orchestrator, _temp, runtime, run_id, _) = rollout_lost_plan_review_fixture().await;
+        orchestrator
+            .update_operator_settings(operator_settings_request(Some(true), None))
+            .expect("advisory mode enables explicitly");
+        let (action, _) = fixture_expert_action(&orchestrator, &run_id, "high").await;
+        orchestrator
+            .emit_material_event_before_expert_launch
+            .store(true, Ordering::Release);
+        let error = orchestrator
+            .apply_supervisor_action(&action.id, "local-user")
+            .await
+            .expect_err("a material event in the launch gap prevents Sol startup");
+        assert!(
+            error
+                .to_string()
+                .contains("superseded the expert request before runtime launch")
+        );
+        assert_eq!(
+            orchestrator
+                .store()
+                .supervisor_action(&action.id)
+                .unwrap()
+                .state,
+            "FAILED"
+        );
+        let requests = orchestrator
+            .store()
+            .expert_requests_for_run(&run_id, 100)
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].state, "FAILED");
+        assert!(runtime.started_threads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn expert_brief_requires_controller_high_risk_task_and_snapshot_evidence() {
+        let task_ids = BTreeSet::from(["task-1"]);
+        let evidence = BTreeSet::from([(
+            "event".to_owned(),
+            "event-1".to_owned(),
+            "controller-recorded conflict".to_owned(),
+            None,
+        )]);
+        let action = json!({
+            "impact": "high",
+            "reason_code": "integration_conflict",
+            "expert_brief": {
+                "category": "integration_conflict",
+                "impact": "high",
+                "question": "Which invariant remains required?",
+                "why_normal_agents_cannot_resolve": "The controller recorded a bounded conflict.",
+                "known_facts": ["The task is blocked."],
+                "disputed_claims": ["One invariant is disputed."],
+                "constraints": ["Remain read-only."],
+                "required_output": ["Name the invariant."],
+                "task_ids": ["task-1"],
+                "evidence_refs": [{
+                    "kind": "event",
+                    "id": "event-1",
+                    "summary": "controller-recorded conflict"
+                }]
+            }
+        });
+        assert!(
+            validate_expert_brief(
+                action.as_object().unwrap(),
+                &task_ids,
+                &BTreeSet::new(),
+                &evidence,
+            )
+            .expect_err("a model impact label cannot manufacture high risk")
+            .contains("controller-classified high-risk")
+        );
+
+        let mut high_risk_task_ids = BTreeSet::new();
+        high_risk_task_ids.insert("task-1");
+        let mut invented = action;
+        invented["expert_brief"]["evidence_refs"][0]["id"] = json!("invented");
+        assert!(
+            validate_expert_brief(
+                invented.as_object().unwrap(),
+                &task_ids,
+                &high_risk_task_ids,
+                &evidence,
+            )
+            .expect_err("model evidence ids must have snapshot custody")
+            .contains("exactly match controller evidence")
+        );
     }
 
     #[test]

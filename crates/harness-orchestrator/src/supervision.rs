@@ -7,7 +7,7 @@
 
 use harness_domain::{
     AgentSummary, DomainEvent, RunId, RunPlan, RunState, RunSummary, SupervisorMode,
-    SupervisorSnapshotId, TaskState, TaskSummary, format_timestamp, now_ms,
+    SupervisorSnapshotId, TaskPacket, TaskState, TaskSummary, format_timestamp, now_ms,
 };
 use harness_profile::SupervisionConfig;
 use harness_store::{Store, StoreError, SupervisorSnapshotRecord, packet_digest};
@@ -208,7 +208,13 @@ fn build_snapshot(
     let task_payloads = tasks
         .iter()
         .take(MAX_TASKS_PER_SNAPSHOT)
-        .map(|task| task_snapshot(task, terminal_states.contains(&task.state)))
+        .map(|task| {
+            let packet = plan
+                .tasks
+                .iter()
+                .find(|packet| packet.task_id == task.external_task_id);
+            task_snapshot(task, terminal_states.contains(&task.state), packet)
+        })
         .collect::<Vec<_>>();
     let agent_payloads = agents
         .iter()
@@ -329,7 +335,7 @@ fn build_snapshot(
             "active_thread_count": agents.iter().filter(|agent| agent.active_turn_id.is_some()).count(),
             "max_thread_count": max_thread_count,
         },
-        "allowed_actions": allowed_actions(run, tasks, config.mode),
+        "allowed_actions": allowed_actions(run, tasks, plan, config.mode),
         "evidence_refs": material_events.iter().map(|event| json!({
             "kind": "event",
             "id": format!("event-{}", event.id),
@@ -362,6 +368,7 @@ fn build_snapshot(
 fn allowed_actions(
     run: &RunSummary,
     tasks: &[TaskSummary],
+    plan: &RunPlan,
     mode: SupervisorMode,
 ) -> Vec<&'static str> {
     if mode != SupervisorMode::Advisory {
@@ -398,10 +405,10 @@ fn allowed_actions(
     if run.state == RunState::Blocked && run.phase.starts_with("plan_review_") {
         actions.push("start_followup_turn");
     }
-    // The decision schema requires a typed high/critical brief and the action
-    // policy independently revalidates it. Merely appearing here never starts
-    // Sol: the human must apply the proposal, and routine blockers are then
-    // rejected by the broker's exact gate.
+    // A model-declared impact label is never enough to start Sol. The
+    // controller must have certified at least one still-blocked task with a
+    // high-risk plan packet. The decision/action broker repeats this exact
+    // lookup immediately before launch.
     if run.state == RunState::Blocked
         && tasks.iter().any(|task| {
             matches!(
@@ -412,7 +419,10 @@ fn allowed_actions(
                     | TaskState::Stalled
                     | TaskState::Blocked
                     | TaskState::Failed
-            )
+            ) && plan
+                .tasks
+                .iter()
+                .any(|packet| packet.task_id == task.external_task_id && packet.is_high_risk())
         })
     {
         actions.push("request_expert");
@@ -420,7 +430,7 @@ fn allowed_actions(
     actions
 }
 
-fn task_snapshot(task: &TaskSummary, completed: bool) -> Value {
+fn task_snapshot(task: &TaskSummary, completed: bool, packet: Option<&TaskPacket>) -> Value {
     json!({
         // Decision targets must be the controller's exact opaque ID, never a
         // human-facing external label that could be duplicated or remapped.
@@ -428,7 +438,9 @@ fn task_snapshot(task: &TaskSummary, completed: bool) -> Value {
         "title": bounded(&task.title, 500),
         "state": task.state.to_string().to_ascii_lowercase(),
         "priority": priority_number(&task.priority),
-        "risk_flags": [],
+        "risk_flags": packet.map_or_else(Vec::new, |packet| {
+            packet.risk_flags.iter().map(|flag| bounded(flag, 128)).collect()
+        }),
         "objective": bounded(&task.objective, 4_000),
         "depends_on": task.dependencies,
         "current_attempt_id": null,

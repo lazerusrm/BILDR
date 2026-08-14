@@ -236,6 +236,10 @@ pub struct ExpertRouteConfig {
     pub sandbox: String,
     #[serde(default = "default_expert_token_budget")]
     pub token_budget: u64,
+    /// A completed response for one exact escalation signature is reusable
+    /// evidence; do not keep paying for the same question indefinitely.
+    #[serde(default = "default_expert_completed_signature_cap")]
+    pub max_completed_per_signature: u8,
     #[serde(default)]
     pub max_children: u8,
 }
@@ -247,6 +251,7 @@ impl Default for ExpertRouteConfig {
             reasoning_effort: default_expert_effort(),
             sandbox: default_read_only_sandbox(),
             token_budget: default_expert_token_budget(),
+            max_completed_per_signature: default_expert_completed_signature_cap(),
             max_children: 0,
         }
     }
@@ -298,6 +303,10 @@ fn default_expert_effort() -> String {
 
 const fn default_expert_token_budget() -> u64 {
     80_000
+}
+
+const fn default_expert_completed_signature_cap() -> u8 {
+    2
 }
 
 fn default_frozen_safety_anchor_sha256() -> String {
@@ -585,11 +594,12 @@ impl HarnessConfig {
         if supervision.expert.model != "gpt-5.6-sol"
             || supervision.expert.reasoning_effort != "xhigh"
             || supervision.expert.sandbox != "read-only"
-            || supervision.expert.token_budget == 0
+            || !(48_000..=80_000).contains(&supervision.expert.token_budget)
+            || !(1..=2).contains(&supervision.expert.max_completed_per_signature)
             || supervision.expert.max_children != 0
         {
             return Err(ProfileError::Validation(
-                "expert route must be fixed to gpt-5.6-sol/xhigh/read-only with zero children"
+                "expert route must be fixed to gpt-5.6-sol/xhigh/read-only with a 48k-80k token budget, one or two completed consultations per signature, and zero children"
                     .to_owned(),
             ));
         }
@@ -1213,6 +1223,14 @@ mod tests {
         let mut config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
         config.supervision.mode = SupervisorMode::ObserveOnly;
         config.supervision.expert.max_children = 1;
+        assert!(config.validate().is_err());
+
+        let mut config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
+        config.supervision.expert.token_budget = 80_001;
+        assert!(config.validate().is_err());
+
+        let mut config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
+        config.supervision.expert.max_completed_per_signature = 3;
         assert!(config.validate().is_err());
 
         let mut config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");

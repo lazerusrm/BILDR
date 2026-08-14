@@ -138,11 +138,17 @@ pub struct ExpertResponseRecord {
 pub struct NewExpertRequest {
     pub id: ExpertRequestId,
     pub action_id: SupervisorActionId,
+    /// The immutable snapshot's controller-event cursor. A request is only
+    /// durable when no newer event can make that snapshot stale.
+    pub event_cursor: i64,
     pub signature: String,
     pub payload: Value,
     pub requested_model: String,
     pub requested_effort: String,
     pub expires_at_ms: i64,
+    /// Controller configuration, not model output. Limits reusable answers to
+    /// one exact escalation signature while preserving the durable history.
+    pub max_completed_per_signature: u8,
 }
 
 /// The bounded expert evidence visible to a later supervisory snapshot. The
@@ -868,6 +874,11 @@ impl Store {
                 "expert request expiry must be in the future".to_owned(),
             ));
         }
+        if !(1..=2).contains(&input.max_completed_per_signature) {
+            return Err(StoreError::Validation(
+                "expert completed-signature cap must be one or two".to_owned(),
+            ));
+        }
         let raw = serde_json::to_string(&input.payload)?;
         if raw.is_empty() || raw.len() > 131_072 {
             return Err(StoreError::Validation(
@@ -897,6 +908,37 @@ impl Store {
         {
             return Err(StoreError::Conflict(
                 "only a policy-accepted request_expert action may create an expert request"
+                    .to_owned(),
+            ));
+        }
+        let later_event_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM domain_events WHERE run_id=?1 AND id>?2)",
+            params![action.1.as_str(), input.event_cursor],
+            |row| row.get(0),
+        )?;
+        if later_event_exists {
+            return Err(StoreError::Conflict(
+                "a newer controller event superseded the expert request snapshot".to_owned(),
+            ));
+        }
+        let active: i64 = transaction.query_row(
+            "SELECT count(*) FROM expert_requests WHERE run_id=?1 AND state IN ('QUEUED','RUNNING')",
+            [action.1.as_str()],
+            |row| row.get(0),
+        )?;
+        if active != 0 {
+            return Err(StoreError::Conflict(
+                "an expert consultation is already active for this run".to_owned(),
+            ));
+        }
+        let completed: i64 = transaction.query_row(
+            "SELECT count(*) FROM expert_requests WHERE run_id=?1 AND signature=?2 AND state IN ('COMPLETED','INCONCLUSIVE')",
+            params![action.1.as_str(), &signature],
+            |row| row.get(0),
+        )?;
+        if completed >= i64::from(input.max_completed_per_signature) {
+            return Err(StoreError::Conflict(
+                "the exact expert escalation signature has reached its completed-response cap"
                     .to_owned(),
             ));
         }
@@ -944,6 +986,62 @@ impl Store {
         self.expert_request(request_id)
     }
 
+    /// Atomically marks a bound request runnable only when its immutable
+    /// snapshot cursor is still the newest controller observation. The
+    /// orchestrator calls this immediately before the App Server start RPC;
+    /// accepting a benign-but-new event as fresh would be a fail-open expert
+    /// escalation boundary.
+    pub fn begin_expert_request_if_current(
+        &self,
+        request_id: &ExpertRequestId,
+        run_id: &RunId,
+        event_cursor: i64,
+    ) -> Result<ExpertRequestRecord, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let request_run_id: String = transaction
+            .query_row(
+                "SELECT run_id FROM expert_requests WHERE id=?1",
+                [request_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("expert request {request_id}")))?;
+        if request_run_id != run_id.as_str() {
+            return Err(StoreError::Validation(
+                "expert request run does not match its current snapshot run".to_owned(),
+            ));
+        }
+        let later_event_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM domain_events WHERE run_id=?1 AND id>?2)",
+            params![run_id.as_str(), event_cursor],
+            |row| row.get(0),
+        )?;
+        if later_event_exists {
+            return Err(StoreError::Conflict(
+                "a newer controller event superseded the expert request before runtime launch"
+                    .to_owned(),
+            ));
+        }
+        let now = now_ms();
+        let changed = transaction.execute(
+            "UPDATE expert_requests SET state='RUNNING',started_at=?2 WHERE id=?1 AND state='QUEUED' AND expires_at>?2 AND agent_session_id IS NOT NULL",
+            params![request_id.as_str(), now],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "expert request {request_id} is not queueable or has expired"
+            )));
+        }
+        let record = transaction.query_row(
+            &format!("{EXPERT_REQUEST_SELECT} WHERE id=?1"),
+            [request_id.as_str()],
+            map_expert_request,
+        )?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
     pub fn expert_request(
         &self,
         request_id: &ExpertRequestId,
@@ -961,13 +1059,22 @@ impl Store {
     pub fn expert_requests_for_run(
         &self,
         run_id: &RunId,
+        limit: u32,
     ) -> Result<Vec<ExpertRequestRecord>, StoreError> {
+        if limit == 0 || limit > 100 {
+            return Err(StoreError::Validation(
+                "expert request page limit must be 1..=100".to_owned(),
+            ));
+        }
         let connection = self.connection()?;
         let mut statement = connection.prepare(&format!(
-            "{EXPERT_REQUEST_SELECT} WHERE run_id=?1 ORDER BY created_at DESC,id DESC"
+            "{EXPERT_REQUEST_SELECT} WHERE run_id=?1 ORDER BY created_at DESC,id DESC LIMIT ?2"
         ))?;
         statement
-            .query_map([run_id.as_str()], map_expert_request)?
+            .query_map(
+                params![run_id.as_str(), i64::from(limit)],
+                map_expert_request,
+            )?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
@@ -1973,11 +2080,13 @@ mod tests {
         let input = NewExpertRequest {
             id: ExpertRequestId::from("expert-request-one"),
             action_id: action.id.clone(),
+            event_cursor: 0,
             signature: "a".repeat(64),
             payload: serde_json::json!({"schema": "harness.expert-request.v1", "question": "resolve one bounded invariant"}),
             requested_model: "gpt-5.6-sol".to_owned(),
             requested_effort: "xhigh".to_owned(),
             expires_at_ms: now_ms() + 60_000,
+            max_completed_per_signature: 2,
         };
         assert!(store.create_expert_request(&input).is_err());
         store
@@ -2042,5 +2151,87 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn expert_request_has_one_active_run_and_bounded_completed_signature_history() {
+        let (_temp, store, run) = fixture();
+        let decision = decision_with_action(&store, &run, "request_expert");
+        let action = store
+            .supervisor_actions_for_decision(&decision.id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        store
+            .evaluate_supervisor_action(&action.id, true, "hard escalation gate satisfied")
+            .unwrap();
+
+        let input = |id: &str, action_id: SupervisorActionId| NewExpertRequest {
+            id: ExpertRequestId::from(id),
+            action_id,
+            event_cursor: 0,
+            signature: "b".repeat(64),
+            payload: serde_json::json!({
+                "schema": "harness.expert-request.v1",
+                "question": "resolve one bounded invariant"
+            }),
+            requested_model: "gpt-5.6-sol".to_owned(),
+            requested_effort: "xhigh".to_owned(),
+            expires_at_ms: now_ms() + 60_000,
+            max_completed_per_signature: 2,
+        };
+        let request_one = store
+            .create_expert_request(&input("expert-request-cap-one", action.id.clone()))
+            .expect("first expert request queues");
+
+        let insert_accepted_action = |id: &str, proposal_action_id: &str| {
+            store
+                .connection()
+                .unwrap()
+                .execute(
+                    "INSERT INTO supervisor_actions(id,decision_id,run_id,snapshot_id,proposal_action_id,kind,target_json,proposal_json,proposal_sha256,dedupe_key,state,created_at) VALUES(?1,?2,?3,?4,?5,'request_expert','{}','{}',?6,?7,'POLICY_ACCEPTED',?8)",
+                    params![
+                        id,
+                        action.decision_id.as_str(),
+                        run.as_str(),
+                        action.snapshot_id.as_str(),
+                        proposal_action_id,
+                        "c".repeat(64),
+                        format!("cap-{proposal_action_id}"),
+                        now_ms(),
+                    ],
+                )
+                .unwrap();
+        };
+        insert_accepted_action("expert-cap-action-two", "expert-cap-two");
+        let active_error = store
+            .create_expert_request(&input(
+                "expert-request-cap-two",
+                SupervisorActionId::from("expert-cap-action-two"),
+            ))
+            .expect_err("only one queued or running expert request may exist per run");
+        assert!(active_error.to_string().contains("already active"));
+
+        store
+            .finish_expert_request(&request_one.id, "INCONCLUSIVE", Some("bounded result"))
+            .expect("the first bounded request finishes");
+        let request_two = store
+            .create_expert_request(&input(
+                "expert-request-cap-two",
+                SupervisorActionId::from("expert-cap-action-two"),
+            ))
+            .expect("second completed response remains within cap");
+        store
+            .finish_expert_request(&request_two.id, "INCONCLUSIVE", Some("bounded result"))
+            .expect("the second bounded request finishes");
+
+        insert_accepted_action("expert-cap-action-three", "expert-cap-three");
+        let cap_error = store
+            .create_expert_request(&input(
+                "expert-request-cap-three",
+                SupervisorActionId::from("expert-cap-action-three"),
+            ))
+            .expect_err("a third completed response with the same signature is prohibited");
+        assert!(cap_error.to_string().contains("completed-response cap"));
     }
 }
