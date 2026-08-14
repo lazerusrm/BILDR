@@ -15958,11 +15958,18 @@ mod tests {
                             "all fields must be required at {path}"
                         );
                     }
-                    if object.get("type").and_then(Value::as_str) == Some("object") {
+                    let declares_object = match object.get("type") {
+                        Some(Value::String(kind)) => kind == "object",
+                        Some(Value::Array(kinds)) => {
+                            kinds.iter().any(|kind| kind.as_str() == Some("object"))
+                        }
+                        _ => false,
+                    };
+                    if declares_object {
                         assert_eq!(
                             object.get("additionalProperties"),
                             Some(&Value::Bool(false)),
-                            "free-form object is not supported at {path}"
+                            "all object variants must be closed at {path}"
                         );
                     }
                     if object.contains_key("const") || object.contains_key("enum") {
