@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::{Store, StoreError, queries};
 
 pub const SUPERVISOR_SNAPSHOT_SCHEMA: &str = "harness.supervisor-snapshot.v1";
+const EXPERT_REQUEST_SELECT: &str = "SELECT id,action_id,decision_id,run_id,snapshot_id,signature,state,payload_json,payload_sha256,requested_model,requested_effort,expires_at,created_at,started_at,completed_at,failure_reason,agent_session_id FROM expert_requests";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SupervisorSnapshotRecord {
@@ -115,6 +116,10 @@ pub struct ExpertRequestRecord {
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
     pub failure_reason: Option<String>,
+    /// The one read-only advisory session permitted to answer this request.
+    /// This binding is append-only in SQLite and lets the event consumer reject
+    /// replies from any other agent after restarts or retries.
+    pub agent_session_id: Option<AgentSessionId>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -855,7 +860,9 @@ impl Store {
             )
             .optional()?
             .ok_or_else(|| StoreError::NotFound(format!("supervisor action {}", input.action_id)))?;
-        if action.3 != "request_expert" || action.4 != "POLICY_ACCEPTED" {
+        if action.3 != "request_expert"
+            || !matches!(action.4.as_str(), "POLICY_ACCEPTED" | "EXECUTING")
+        {
             return Err(StoreError::Conflict(
                 "only a policy-accepted request_expert action may create an expert request"
                     .to_owned(),
@@ -880,7 +887,7 @@ impl Store {
             ],
         )?;
         let record = transaction.query_row(
-            "SELECT id,action_id,decision_id,run_id,snapshot_id,signature,state,payload_json,payload_sha256,requested_model,requested_effort,expires_at,created_at,started_at,completed_at,failure_reason FROM expert_requests WHERE id=?1",
+            &format!("{EXPERT_REQUEST_SELECT} WHERE id=?1"),
             [input.id.as_str()],
             map_expert_request,
         )?;
@@ -894,7 +901,7 @@ impl Store {
     ) -> Result<ExpertRequestRecord, StoreError> {
         let now = now_ms();
         let changed = self.connection()?.execute(
-            "UPDATE expert_requests SET state='RUNNING',started_at=?2 WHERE id=?1 AND state='QUEUED' AND expires_at>?2",
+            "UPDATE expert_requests SET state='RUNNING',started_at=?2 WHERE id=?1 AND state='QUEUED' AND expires_at>?2 AND agent_session_id IS NOT NULL",
             params![request_id.as_str(), now],
         )?;
         if changed != 1 {
@@ -911,7 +918,7 @@ impl Store {
     ) -> Result<ExpertRequestRecord, StoreError> {
         self.connection()?
             .query_row(
-                "SELECT id,action_id,decision_id,run_id,snapshot_id,signature,state,payload_json,payload_sha256,requested_model,requested_effort,expires_at,created_at,started_at,completed_at,failure_reason FROM expert_requests WHERE id=?1",
+                &format!("{EXPERT_REQUEST_SELECT} WHERE id=?1"),
                 [request_id.as_str()],
                 map_expert_request,
             )
@@ -924,12 +931,76 @@ impl Store {
         run_id: &RunId,
     ) -> Result<Vec<ExpertRequestRecord>, StoreError> {
         let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT id,action_id,decision_id,run_id,snapshot_id,signature,state,payload_json,payload_sha256,requested_model,requested_effort,expires_at,created_at,started_at,completed_at,failure_reason FROM expert_requests WHERE run_id=?1 ORDER BY created_at DESC,id DESC",
-        )?;
+        let mut statement = connection.prepare(&format!(
+            "{EXPERT_REQUEST_SELECT} WHERE run_id=?1 ORDER BY created_at DESC,id DESC"
+        ))?;
         statement
             .query_map([run_id.as_str()], map_expert_request)?
             .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Atomically attaches the one expert session to its queued request.  The
+    /// session must belong to the same run and have the exact `Expert` role;
+    /// callers cannot bind a governor or a session from another run and then
+    /// feed its output through the expert result path.
+    pub fn attach_expert_agent(
+        &self,
+        request_id: &ExpertRequestId,
+        agent_session_id: &AgentSessionId,
+    ) -> Result<ExpertRequestRecord, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let request_run_id: String = transaction
+            .query_row(
+                "SELECT run_id FROM expert_requests WHERE id=?1",
+                [request_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("expert request {request_id}")))?;
+        let agent = transaction
+            .query_row(
+                "SELECT run_id,role FROM agent_sessions WHERE id=?1",
+                [agent_session_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("agent session {agent_session_id}")))?;
+        if agent.0 != request_run_id || agent.1 != "expert" {
+            return Err(StoreError::Validation(
+                "expert request agent must be an Expert session on the same run".to_owned(),
+            ));
+        }
+        let changed = transaction.execute(
+            "UPDATE expert_requests SET agent_session_id=?2 WHERE id=?1 AND state='QUEUED' AND agent_session_id IS NULL",
+            params![request_id.as_str(), agent_session_id.as_str()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "expert request {request_id} is not an unbound queued request"
+            )));
+        }
+        let record = transaction.query_row(
+            &format!("{EXPERT_REQUEST_SELECT} WHERE id=?1"),
+            [request_id.as_str()],
+            map_expert_request,
+        )?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    pub fn expert_request_for_agent(
+        &self,
+        agent_session_id: &AgentSessionId,
+    ) -> Result<Option<ExpertRequestRecord>, StoreError> {
+        self.connection()?
+            .query_row(
+                &format!("{EXPERT_REQUEST_SELECT} WHERE agent_session_id=?1"),
+                [agent_session_id.as_str()],
+                map_expert_request,
+            )
+            .optional()
             .map_err(Into::into)
     }
 
@@ -979,21 +1050,22 @@ impl Store {
         let transaction = connection.transaction()?;
         let request = transaction
             .query_row(
-                "SELECT run_id,snapshot_id,state FROM expert_requests WHERE id=?1",
+                "SELECT run_id,snapshot_id,state,agent_session_id FROM expert_requests WHERE id=?1",
                 [request_id.as_str()],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
             .optional()?
             .ok_or_else(|| StoreError::NotFound(format!("expert request {request_id}")))?;
-        if request.2 != "RUNNING" {
+        if request.2 != "RUNNING" || request.3.is_none() {
             return Err(StoreError::Conflict(format!(
-                "expert request {request_id} is not running"
+                "expert request {request_id} is not a bound running request"
             )));
         }
         let now = now_ms();
@@ -1363,6 +1435,7 @@ fn map_expert_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExpertRequest
         started_at: started_at.map(format_timestamp),
         completed_at: completed_at.map(format_timestamp),
         failure_reason: row.get(15)?,
+        agent_session_id: row.get::<_, Option<String>>(16)?.map(AgentSessionId::from),
     })
 }
 
@@ -1550,7 +1623,7 @@ mod tests {
             .expect("snapshot persists");
         assert_eq!(first.revision, 1);
         assert_eq!(store.supervisor_observation_cursor(&run).unwrap(), 41);
-        assert_eq!(store.check().unwrap().schema_version, "14");
+        assert_eq!(store.check().unwrap().schema_version, "15");
 
         let duplicate = store
             .record_supervisor_snapshot(&run, 41, "task_stalled", |_, _| {
@@ -1882,6 +1955,40 @@ mod tests {
             .create_expert_request(&input)
             .expect("accepted expert action creates one durable request");
         assert_eq!(request.state, "QUEUED");
+        assert!(store.begin_expert_request(&request.id).is_err());
+        let expert_id = AgentSessionId::from("expert-session-one");
+        store
+            .create_agent_session(&NewAgentSession {
+                id: expert_id.clone(),
+                run_id: run.clone(),
+                task_attempt_id: None,
+                parent_agent_session_id: None,
+                runtime_kind: "test".to_owned(),
+                codex_account_id: None,
+                role: AgentRole::Expert,
+                nickname: Some("expert".to_owned()),
+                requested_model: "gpt-5.6-sol".to_owned(),
+                requested_reasoning_effort: "xhigh".to_owned(),
+                sandbox_mode: SandboxMode::ReadOnly,
+                approval_policy: "never".to_owned(),
+                cwd: PathBuf::from("/tmp"),
+                state: "STARTING".to_owned(),
+                current_goal: Some("bounded expert review".to_owned()),
+                token_budget: Some(48_000),
+            })
+            .unwrap();
+        let request = store
+            .attach_expert_agent(&request.id, &expert_id)
+            .expect("one expert session binds before execution");
+        assert_eq!(request.agent_session_id.as_ref(), Some(&expert_id));
+        assert_eq!(
+            store
+                .expert_request_for_agent(&expert_id)
+                .unwrap()
+                .expect("expert binding reads")
+                .id,
+            request.id
+        );
         store.begin_expert_request(&request.id).unwrap();
         let response = store
             .record_expert_response(
