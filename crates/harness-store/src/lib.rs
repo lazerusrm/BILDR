@@ -587,7 +587,7 @@ mod tests {
         assert!(store.check().unwrap().ready);
         drop(store);
         let reopened = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(reopened.migration_version().unwrap(), "15");
+        assert_eq!(reopened.migration_version().unwrap(), "16");
         let has_worktree_fingerprint: bool = reopened
             .connection()
             .unwrap()
@@ -641,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_control_schema_and_v15_marker_roll_back_together_on_failure() {
+    fn operator_control_schema_and_v16_marker_roll_back_together_on_failure() {
         let mut connection = Connection::open_in_memory().unwrap();
         connection.execute_batch(INITIAL_MIGRATION).unwrap();
         connection.execute_batch(RUNTIME_MIGRATION).unwrap();
@@ -667,7 +667,7 @@ mod tests {
             )
             .unwrap();
         assert!(!attention_table_exists);
-        assert_ne!(version, "15");
+        assert_ne!(version, "16");
     }
 
     #[test]
@@ -1134,7 +1134,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let store = Store::open(&database, &temp.path().join("artifacts")).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "15");
+        assert_eq!(store.migration_version().unwrap(), "16");
         for name in [
             "improvement_revisions",
             "improvement_events",
@@ -1204,7 +1204,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "15");
+        assert_eq!(store.migration_version().unwrap(), "16");
         for name in [
             "failure_occurrences",
             "failure_clusters",
@@ -1264,7 +1264,7 @@ mod tests {
         );
         drop(store);
         let reopened = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(reopened.migration_version().unwrap(), "15");
+        assert_eq!(reopened.migration_version().unwrap(), "16");
         assert!(
             reopened
                 .backup(&temp.path().join("v6-backup.sqlite3"))
@@ -1303,7 +1303,7 @@ mod tests {
         drop(connection);
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "15");
+        assert_eq!(store.migration_version().unwrap(), "16");
         for name in [
             "taskset_revision_memberships",
             "evaluation_runs",
@@ -1337,7 +1337,7 @@ mod tests {
                 .unwrap()
                 .migration_version()
                 .unwrap(),
-            "15"
+            "16"
         );
         assert!(
             Store::open(&backup, &temp.path().join("backup-artifacts"))
@@ -1383,7 +1383,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "15");
+        assert_eq!(store.migration_version().unwrap(), "16");
         for name in [
             "policy_champion_bindings",
             "policy_current_champions",
@@ -1532,7 +1532,7 @@ mod tests {
                 .unwrap()
                 .migration_version()
                 .unwrap(),
-            "15"
+            "16"
         );
     }
 
@@ -1621,7 +1621,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "15");
+        assert_eq!(store.migration_version().unwrap(), "16");
         for (table, column) in [
             ("evaluation_runs", "controller_run_id"),
             ("evaluation_samples", "controller_evidence_id"),
@@ -1764,7 +1764,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "15");
+        assert_eq!(store.migration_version().unwrap(), "16");
         let backfilled: bool = store
             .connection()
             .unwrap()
@@ -1791,7 +1791,7 @@ mod tests {
                 .unwrap()
                 .migration_version()
                 .unwrap(),
-            "15"
+            "16"
         );
     }
 
