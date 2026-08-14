@@ -18,6 +18,7 @@ import type {
   Run,
   RunDetail,
   RuntimeStatus,
+  SupervisorAction,
   Task,
   Usage,
   UsageBreakdown,
@@ -173,6 +174,12 @@ class HarnessApi {
 
   requestSupervisorReview(runId: string) {
     return this.post(`/runs/${encodeURIComponent(runId)}/supervision/review`);
+  }
+
+  applySupervisorAction(actionId: string) {
+    return this.post<SupervisorAction>(
+      `/supervisor-actions/${encodeURIComponent(actionId)}/apply`,
+    );
   }
 
   selectCodexAccount(accountId: string) {

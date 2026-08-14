@@ -23,9 +23,9 @@ use harness_domain::{
     AgentRole, AgentSessionId, AgentSummary, ApprovalId, ApprovalSummary, ArtifactId, AttemptId,
     CodexRuntimeStatus, CommandRunId, ComponentStatus, DiffBudget, EvidenceId, ProofTier,
     RepositoryId, RepositorySummary, ResourceClass, ResultClass, RiskLevel, RunId, RunPlan,
-    RunState, RunSummary, RuntimeStatus, SandboxMode, SchedulerStatus, SupervisorDecisionId,
-    SupervisorMode, SupervisorReviewId, TaskId, TaskPacket, TaskState, TaskSummary, ValidationId,
-    WorktreeId, WorktreeSummary, format_timestamp, now_ms,
+    RunState, RunSummary, RuntimeStatus, SandboxMode, SchedulerStatus, SupervisorActionId,
+    SupervisorDecisionId, SupervisorMode, SupervisorReviewId, TaskId, TaskPacket, TaskState,
+    TaskSummary, ValidationId, WorktreeId, WorktreeSummary, format_timestamp, now_ms,
 };
 use harness_evidence::{EvidenceArtifactInput, EvidenceClaim, EvidenceService};
 use harness_git::{DiffPolicy, GitManager, WorktreeSpec, validate_public_change_metadata};
@@ -403,6 +403,138 @@ fn validate_supervisor_decision(
         }
     }
     Ok(())
+}
+
+fn supervisor_action_stale_reason(
+    store: &Store,
+    action: &SupervisorActionRecord,
+    run: &RunSummary,
+) -> Result<Option<String>, OrchestratorError> {
+    let Some(snapshot) = store.latest_supervisor_snapshot(&action.run_id)? else {
+        return Ok(Some(
+            "the bound supervisory snapshot no longer exists".to_owned(),
+        ));
+    };
+    if snapshot.id != action.snapshot_id || snapshot.run_id != action.run_id {
+        return Ok(Some(
+            "a newer or differently bound supervisory snapshot superseded this proposal".to_owned(),
+        ));
+    }
+    if matches!(
+        run.state,
+        RunState::Completed | RunState::Canceled | RunState::Failed | RunState::Archived
+    ) {
+        return Ok(Some("the target run is terminal".to_owned()));
+    }
+    // The action cannot be applied after an unbounded backlog whose material
+    // state cannot be revalidated. This mirrors decision receipt freshness,
+    // but is deliberately more conservative at the execution boundary.
+    let later_events =
+        store.list_domain_events(snapshot.event_cursor, Some(&action.run_id), 10_001)?;
+    if later_events.len() > 10_000 {
+        return Ok(Some(
+            "too many later events exist to revalidate this proposal safely".to_owned(),
+        ));
+    }
+    if later_events
+        .iter()
+        .any(|event| supervision::material_trigger(event).is_some())
+    {
+        return Ok(Some(
+            "a later material controller event superseded this proposal".to_owned(),
+        ));
+    }
+    Ok(None)
+}
+
+fn supervisor_action_policy_reason(
+    action: &SupervisorActionRecord,
+    run: &RunSummary,
+    store: &Store,
+) -> Result<String, String> {
+    match action.kind.as_str() {
+        "wait" if supervisor_action_targets_run(action, run) => Ok(
+            "the exact run remains current; waiting changes no controller state".to_owned(),
+        ),
+        "continue_attempt" if supervisor_action_targets_run(action, run) && run.scheduler_paused => Ok(
+            "the exact run is paused and can be resumed through the existing scheduler controller"
+                .to_owned(),
+        ),
+        "continue_attempt" => Err(
+            "continue_attempt requires the exact currently paused run target".to_owned(),
+        ),
+        "start_followup_turn"
+            if supervisor_action_targets_run(action, run)
+                && blocked_plan_review_budget_exhausted(run) =>
+        {
+            Ok(
+                "the exact final-review budget stop can be resumed through the durable manual gate"
+                    .to_owned(),
+            )
+        }
+        "start_followup_turn" => Err(
+            "start_followup_turn is permitted only for an exact blocked plan-review budget stop"
+                .to_owned(),
+        ),
+        "retry_fresh_attempt" => {
+            let task_id = supervisor_action_task_target(action)
+                .map_err(|error| error.to_string())?;
+            let task = store.task(&task_id).map_err(|error| error.to_string())?;
+            if task.run_id != action.run_id {
+                return Err("retry target belongs to another run".to_owned());
+            }
+            if !matches!(
+                task.state,
+                TaskState::NeedsHelp
+                    | TaskState::ChangesRequested
+                    | TaskState::Interrupted
+                    | TaskState::Stalled
+                    | TaskState::Blocked
+                    | TaskState::Failed
+            ) {
+                return Err(format!("task is {}, not retryable", task.state));
+            }
+            Ok("the exact failed task remains eligible for one controller-owned retry".to_owned())
+        }
+        other => Err(format!(
+            "supervisor action {other} has no registered bounded controller handler"
+        )),
+    }
+}
+
+fn supervisor_action_targets_run(action: &SupervisorActionRecord, run: &RunSummary) -> bool {
+    let Some(target) = action.target.as_object() else {
+        return false;
+    };
+    target.get("kind").and_then(Value::as_str) == Some("run")
+        && target.get("id").and_then(Value::as_str) == Some(run.id.as_str())
+        && ["task_id", "attempt_id", "session_id"]
+            .iter()
+            .all(|field| target.get(*field) == Some(&Value::Null))
+}
+
+fn supervisor_action_task_target(
+    action: &SupervisorActionRecord,
+) -> Result<TaskId, OrchestratorError> {
+    let target = action.target.as_object().ok_or_else(|| {
+        OrchestratorError::Validation("supervisor action target must be an object".to_owned())
+    })?;
+    let task_id = target
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            OrchestratorError::Validation("retry action is missing its task id".to_owned())
+        })?;
+    if target.get("kind").and_then(Value::as_str) != Some("task")
+        || target.get("id").and_then(Value::as_str) != Some(task_id)
+        || target.get("attempt_id") != Some(&Value::Null)
+        || target.get("session_id") != Some(&Value::Null)
+    {
+        return Err(OrchestratorError::Validation(
+            "retry action target must name one exact task and no attempt/session".to_owned(),
+        ));
+    }
+    Ok(TaskId::from(task_id))
 }
 
 #[derive(Clone, Debug)]
@@ -2109,6 +2241,144 @@ impl Orchestrator {
         };
         self.launch_supervisor_review(run_id, &snapshot).await?;
         Ok(operation("request_supervisor_review", run_id.as_str()))
+    }
+
+    /// Applies one stored supervisor proposal only after re-reading the exact
+    /// run, snapshot cursor, and target. This is a human-requested controller
+    /// operation, never a side effect of model output or a maintenance tick.
+    pub async fn apply_supervisor_action(
+        &self,
+        action_id: &SupervisorActionId,
+        actor: &str,
+    ) -> Result<SupervisorActionRecord, OrchestratorError> {
+        let action = self.store.supervisor_action(action_id)?;
+        if action.state != "PROPOSED" {
+            return Err(OrchestratorError::Conflict(format!(
+                "supervisor action {action_id} is {}, not pending operator application",
+                action.state
+            )));
+        }
+        if self.effective_supervision_config().mode != SupervisorMode::Advisory {
+            return Ok(self.store.evaluate_supervisor_action(
+                action_id,
+                false,
+                "human-approved advisory supervision is no longer enabled",
+            )?);
+        }
+        let run = self.store.run(&action.run_id)?;
+        let stale_reason = supervisor_action_stale_reason(&self.store, &action, &run)?;
+        if let Some(reason) = stale_reason {
+            return Ok(self.store.stale_supervisor_action(action_id, &reason)?);
+        }
+        let policy_reason = match supervisor_action_policy_reason(&action, &run, &self.store) {
+            Ok(reason) => reason,
+            Err(reason) => {
+                return Ok(self
+                    .store
+                    .evaluate_supervisor_action(action_id, false, &reason)?);
+            }
+        };
+        let accepted = self
+            .store
+            .evaluate_supervisor_action(action_id, true, &policy_reason)?;
+        self.store.record_human_action(
+            Some(&accepted.run_id),
+            None,
+            actor,
+            "apply_supervisor_action",
+            "supervisor_action",
+            accepted.id.as_str(),
+            &json!({
+                "decision_id": accepted.decision_id,
+                "kind": accepted.kind,
+                "snapshot_id": accepted.snapshot_id,
+                "proposal_sha256": accepted.proposal_sha256,
+            }),
+        )?;
+        let executing = self.store.begin_supervisor_action(action_id)?;
+        let outcome = match executing.kind.as_str() {
+            "wait" => Ok(json!({
+                "schema": "harness.supervisor-action-receipt.v1",
+                "kind": "wait",
+                "run_id": executing.run_id,
+                "result": "operator_kept_current_controller_state",
+                "completed_at": format_timestamp(now_ms()),
+            })),
+            "continue_attempt" => {
+                self.resume_scheduler(&executing.run_id, 0, actor)?;
+                let dispatched = self.tick(&executing.run_id).await?;
+                Ok(json!({
+                    "schema": "harness.supervisor-action-receipt.v1",
+                    "kind": "continue_attempt",
+                    "run_id": executing.run_id,
+                    "dispatched": dispatched,
+                }))
+            }
+            "start_followup_turn" => {
+                let operation = self
+                    .resume_blocked_plan_review(&executing.run_id, actor)
+                    .await?;
+                Ok(json!({
+                    "schema": "harness.supervisor-action-receipt.v1",
+                    "kind": "start_followup_turn",
+                    "run_id": executing.run_id,
+                    "operation": operation,
+                }))
+            }
+            "retry_fresh_attempt" => {
+                let task_id = supervisor_action_task_target(&executing)?;
+                let reason = executing
+                    .proposal
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Supervisor proposal supplied no additional retry summary")
+                    .chars()
+                    .take(4_000)
+                    .collect::<String>();
+                let operation = self
+                    .retry_task(
+                        &task_id,
+                        RetryTaskRequest {
+                            reason,
+                            revised_objective: None,
+                            model_route: "same".to_owned(),
+                            additional_token_budget: 0,
+                        },
+                        actor,
+                    )
+                    .await?;
+                Ok(json!({
+                    "schema": "harness.supervisor-action-receipt.v1",
+                    "kind": "retry_fresh_attempt",
+                    "run_id": executing.run_id,
+                    "task_id": task_id,
+                    "operation": operation,
+                }))
+            }
+            // `supervisor_action_policy_reason` rejects every other kind
+            // before state can enter EXECUTING. Keeping this branch fail-closed
+            // protects against future accidental policy widening.
+            other => Err(OrchestratorError::Validation(format!(
+                "supervisor action {other} has no registered handler"
+            ))),
+        };
+        match outcome {
+            Ok(receipt) => Ok(self
+                .store
+                .complete_supervisor_action(action_id, true, &receipt)?),
+            Err(error) => {
+                let _ = self.store.complete_supervisor_action(
+                    action_id,
+                    false,
+                    &json!({
+                        "schema": "harness.supervisor-action-receipt.v1",
+                        "result": "controller_operation_failed",
+                        "error": error.to_string(),
+                    }),
+                );
+                Err(error)
+            }
+        }
     }
 
     async fn launch_supervisor_review(
@@ -15974,6 +16244,88 @@ mod tests {
             agent_after_completion.failure_reason.as_deref(),
             Some(reason.as_str())
         );
+    }
+
+    async fn fixture_supervisor_action(
+        orchestrator: &Orchestrator,
+        kind: &str,
+    ) -> SupervisorActionRecord {
+        let (run_id, _agent_id, review_id) = supervisor_rejection_fixture(orchestrator).await;
+        let review = orchestrator
+            .store()
+            .supervisor_review(&review_id)
+            .expect("fixture review reads");
+        let payload = json!({
+            "schema": "harness.supervisor-decision.v1",
+            "decision_id": review.expected_decision_id,
+            "snapshot_id": review.snapshot_id,
+            "run_id": run_id,
+            "summary": "A bounded action proposal was retained for explicit operator review.",
+            "actions": [{
+                "action_id": "fixture-action",
+                "kind": kind,
+                "target": {"kind": "run", "id": run_id, "task_id": null, "attempt_id": null, "session_id": null},
+                "dedupe_key": format!("fixture-{kind}"),
+            }],
+        });
+        orchestrator
+            .store()
+            .record_current_supervisor_decision(&review_id, 1, &payload, |_| false)
+            .expect("decision/action fixture persists");
+        orchestrator
+            .store()
+            .supervisor_actions_for_run(&run_id)
+            .expect("action list reads")
+            .pop()
+            .expect("one proposal exists")
+    }
+
+    #[tokio::test]
+    async fn supervisor_action_is_explicitly_revalidated_and_receipted() {
+        let (orchestrator, _temp) = operator_settings_test_orchestrator().await;
+        orchestrator
+            .update_operator_settings(operator_settings_request(Some(true), None))
+            .expect("advisory mode enables explicitly");
+        let action = fixture_supervisor_action(&orchestrator, "wait").await;
+        let completed = orchestrator
+            .apply_supervisor_action(&action.id, "local-user")
+            .await
+            .expect("fresh explicit wait proposal completes");
+        assert_eq!(completed.state, "SUCCEEDED");
+        assert!(completed.execution_receipt.is_some());
+        assert!(completed.execution_receipt_sha256.is_some());
+        assert!(
+            orchestrator
+                .apply_supervisor_action(&action.id, "local-user")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn later_material_event_makes_supervisor_proposal_stale_before_application() {
+        let (orchestrator, _temp) = operator_settings_test_orchestrator().await;
+        orchestrator
+            .update_operator_settings(operator_settings_request(Some(true), None))
+            .expect("advisory mode enables explicitly");
+        let action = fixture_supervisor_action(&orchestrator, "wait").await;
+        orchestrator
+            .store()
+            .emit_domain_event(
+                Some(&action.run_id),
+                "task",
+                "fixture-task",
+                "task.start_failed",
+                &json!({"reason": "later material controller change"}),
+                None,
+            )
+            .expect("later material event persists");
+        let stale = orchestrator
+            .apply_supervisor_action(&action.id, "local-user")
+            .await
+            .expect("staleness is a durable non-executing outcome");
+        assert_eq!(stale.state, "STALE");
+        assert!(stale.execution_receipt.is_none());
     }
 
     #[test]

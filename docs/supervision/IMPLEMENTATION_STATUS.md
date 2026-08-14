@@ -17,18 +17,24 @@ the remaining slices have their own exact-head evidence and rollout gates.
   policy/execution lifecycle; an expert request can originate only from a
   policy-accepted `request_expert` action; expert responses are append-only
   and hash-verified.
+- explicit advisory application for the currently controller-backed handlers:
+  `wait`, paused-run continuation, bounded final-review follow-up, and exact
+  retry. The API/UI re-read snapshot freshness and exact target state, leave
+  later-material-event proposals stale, and record a success/failure receipt.
 
 The current operator setting selects only `disabled`, `observe_only`, or the
-human-approved `advisory` route. Even in advisory mode, no action proposal is
-executed and no Sol request starts until the later handler/broker slices are
-complete. The browser has no background model polling loop.
+human-approved `advisory` route. Advisory application always requires an
+explicit operator click; it does not run on a model result or maintenance tick.
+Unregistered action kinds are durably policy-rejected. No Sol request starts
+until the later broker slice is complete, and the browser has no background
+model polling loop.
 
 ## Deliberately deferred
 
-Action handlers and explicit advisory application, the Sol turn broker, the
-remaining supervision UI/CLI, replay evaluation, and canary activation remain
-unfinished. `shadow`, `active_low_risk`, and `active` remain rejected at
-startup rather than silently falling back or enabling partial authority.
+Additional action handlers, the Sol turn broker, the remaining supervision
+UI/CLI, replay evaluation, and canary activation remain unfinished. `shadow`,
+`active_low_risk`, and `active` remain rejected at startup rather than silently
+falling back or enabling partial authority.
 
 SO-009 activation requires the documented shadow/advisory evidence window:
 14 days or 100 representative runs, plus zero stale/duplicate action

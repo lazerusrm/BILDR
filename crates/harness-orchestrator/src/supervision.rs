@@ -381,7 +381,9 @@ fn allowed_actions(
 
 fn task_snapshot(task: &TaskSummary, completed: bool) -> Value {
     json!({
-        "task_id": task.external_task_id,
+        // Decision targets must be the controller's exact opaque ID, never a
+        // human-facing external label that could be duplicated or remapped.
+        "task_id": task.id,
         "title": bounded(&task.title, 500),
         "state": task.state.to_string().to_ascii_lowercase(),
         "priority": priority_number(&task.priority),

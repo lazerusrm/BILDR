@@ -992,6 +992,19 @@ kbd {
   color: var(--text-primary);
 }
 
+.supervisor-action-receipt {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.7rem;
+}
+
+.supervisor-action-receipt .small {
+  flex: 0 0 auto;
+  font-size: 0.72rem;
+  padding: 0.24rem 0.48rem;
+}
+
 .supervisor-decision > strong {
   color: var(--soft);
 }

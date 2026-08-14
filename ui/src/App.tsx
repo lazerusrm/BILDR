@@ -752,6 +752,13 @@ export default function App() {
                   "Terra started a read-only blocker analysis; recovery still requires your approval",
                 )
               }
+              onApplySupervisorAction={(actionId) =>
+                runAction(
+                  `apply-supervisor-action-${actionId}`,
+                  () => api.applySupervisorAction(actionId),
+                  "Supervisor proposal revalidated through the controller",
+                )
+              }
               onStop={() =>
                 runAction(
                   "stop",
@@ -2002,6 +2009,7 @@ function RunWorkspace({
   onRequestPlanChanges,
   onResumePlanReview,
   onRequestSupervisorReview,
+  onApplySupervisorAction,
   onApproveIntegration,
   onApproveSignoff,
   onRequestSignoffChanges,
@@ -2030,6 +2038,7 @@ function RunWorkspace({
   onRequestPlanChanges: (finding: string) => void;
   onResumePlanReview: () => void;
   onRequestSupervisorReview: () => void;
+  onApplySupervisorAction: (actionId: string) => void;
   onApproveIntegration: () => void;
   onApproveSignoff: () => void;
   onRequestSignoffChanges: (file: string, finding: string) => void;
@@ -2258,6 +2267,7 @@ function RunWorkspace({
         detail={detail}
         busy={busy}
         onRequestReview={onRequestSupervisorReview}
+        onApplyAction={onApplySupervisorAction}
       />
       <BlockedRunRecoveryPanel
         detail={detail}
@@ -3294,10 +3304,12 @@ export function SupervisorObservationPanel({
   detail,
   busy = "",
   onRequestReview = () => undefined,
+  onApplyAction = () => undefined,
 }: {
   detail: RunDetail;
   busy?: string;
   onRequestReview?: () => void;
+  onApplyAction?: (actionId: string) => void;
 }) {
   const mode = detail.supervision_mode || "disabled";
   const snapshot = detail.supervisor_snapshot;
@@ -3378,10 +3390,21 @@ export function SupervisorObservationPanel({
         <div className="supervisor-action-receipts" aria-label="Supervisor action receipts">
           <strong>Controller action policy</strong>
           {actionReceipts.slice(0, 6).map((action) => (
-            <span key={action.id} title={action.proposal_sha256}>
-              {action.kind.replaceAll("_", " ")} · {humanAgentState(action.state)}
-              {action.policy_reason ? ` — ${action.policy_reason}` : " — awaiting controller policy"}
-            </span>
+            <div key={action.id} className="supervisor-action-receipt" title={action.proposal_sha256}>
+              <span>
+                {action.kind.replaceAll("_", " ")} · {humanAgentState(action.state)}
+                {action.policy_reason ? ` — ${action.policy_reason}` : " — awaiting controller policy"}
+              </span>
+              {action.state === "PROPOSED" && (
+                <button
+                  className="button secondary small"
+                  onClick={() => onApplyAction(action.id)}
+                  disabled={!!busy}
+                >
+                  Revalidate and apply
+                </button>
+              )}
+            </div>
           ))}
           <p className="muted">These receipts explain proposed actions. They do not apply, resume, retry, or alter work.</p>
         </div>

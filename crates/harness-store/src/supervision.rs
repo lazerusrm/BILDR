@@ -751,6 +751,28 @@ impl Store {
         self.supervisor_action(action_id)
     }
 
+    /// Marks an unexecuted proposal stale when its snapshot/target no longer
+    /// matches live controller state. A stale receipt is preserved for the
+    /// operator; it cannot later be revived or applied.
+    pub fn stale_supervisor_action(
+        &self,
+        action_id: &SupervisorActionId,
+        reason: &str,
+    ) -> Result<SupervisorActionRecord, StoreError> {
+        let reason = bounded_text(reason, 4_000, "supervisor action stale reason")?;
+        let now = now_ms();
+        let changed = self.connection()?.execute(
+            "UPDATE supervisor_actions SET state='STALE',policy_reason=?2,evaluated_at=?3 WHERE id=?1 AND state IN ('PROPOSED','POLICY_ACCEPTED')",
+            params![action_id.as_str(), reason, now],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "supervisor action {action_id} is not eligible to become stale"
+            )));
+        }
+        self.supervisor_action(action_id)
+    }
+
     pub fn begin_supervisor_action(
         &self,
         action_id: &SupervisorActionId,

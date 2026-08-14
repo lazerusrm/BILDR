@@ -547,6 +547,24 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/OperationAccepted'}
         '409': {$ref: '#/components/responses/Conflict'}
+  /supervisor-actions/{actionId}/apply:
+    post:
+      tags: [Runs]
+      operationId: applySupervisorAction
+      description: Explicitly revalidates and applies one bounded advisory supervisor action through its registered controller handler. Model output never calls this route.
+      parameters:
+        - name: actionId
+          in: path
+          required: true
+          schema: {type: string}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      responses:
+        '200':
+          description: The resulting action receipt. A policy-rejected or stale proposal is returned as a durable receipt and performs no operation.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SupervisorAction'}
+        '409': {$ref: '#/components/responses/Conflict'}
   /runs/{runId}/stop:
     post:
       tags: [Runs]

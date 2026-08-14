@@ -136,6 +136,10 @@ pub fn router(orchestrator: Arc<Orchestrator>) -> Router {
             "/api/v1/runs/{run_id}/supervision/review",
             post(request_supervisor_review),
         )
+        .route(
+            "/api/v1/supervisor-actions/{action_id}/apply",
+            post(apply_supervisor_action),
+        )
         .route("/api/v1/runs/{run_id}/stop", post(stop_run))
         .route("/api/v1/runs/{run_id}/archive", post(archive_run))
         .route(
@@ -755,6 +759,23 @@ async fn request_supervisor_review(
                 .request_supervisor_review(&RunId::from(run_id), "local-user")
                 .await?,
         ),
+    ))
+}
+
+async fn apply_supervisor_action(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(action_id): Path<String>,
+) -> Result<Json<harness_store::SupervisorActionRecord>, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .apply_supervisor_action(
+                &harness_domain::SupervisorActionId::from(action_id),
+                "local-user",
+            )
+            .await?,
     ))
 }
 
