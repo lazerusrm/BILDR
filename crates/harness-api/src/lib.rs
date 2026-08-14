@@ -2192,6 +2192,9 @@ impl From<OrchestratorError> for ApiError {
             OrchestratorError::Store(harness_store::StoreError::Conflict(_)) => {
                 (StatusCode::CONFLICT, "conflict")
             }
+            OrchestratorError::Store(harness_store::StoreError::Validation(_)) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "validation")
+            }
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };
         Self {
@@ -2242,6 +2245,15 @@ mod tests {
     fn csrf_digest_comparison_is_stable() {
         assert_eq!(sha256(b"token"), sha256(b"token"));
         assert_ne!(sha256(b"token"), sha256(b"other"));
+    }
+
+    #[test]
+    fn store_validation_is_a_client_validation_error() {
+        let error = ApiError::from(harness_store::StoreError::Validation(
+            "cursor exceeds the snapshot boundary".to_owned(),
+        ));
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.code, "validation");
     }
 
     #[test]
