@@ -439,7 +439,7 @@ pub(crate) fn control_plane_summary(
     tasks: &[TaskSummary],
 ) -> Value {
     let facts = control_plane_fact_payload(snapshot, run_id, tasks);
-    let mut summary = json!({
+    let summary = json!({
         "schema": "harness.supervisor-control-facts.v1",
         "snapshot_id": snapshot.snapshot_id,
         "snapshot_revision": snapshot.revision,
@@ -526,6 +526,7 @@ pub(crate) fn control_plane_fact_payload(
                     | "investigations"
                     | "external_conditions"
                     | "progress"
+                    | "progress_classifier"
                     | "liveness"
                     | "reconciliation"
             )

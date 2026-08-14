@@ -11,7 +11,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{Store, StoreError};
 
-use super::{external_conditions::checked_condition_row, investigations::checked_artifact_row};
+use super::{
+    external_conditions::checked_condition_row, investigations::checked_artifact_row,
+    progress::MAX_CLASSIFIER_EVENTS_PER_PASS,
+};
 
 pub const CONTROL_PLANE_SNAPSHOT_SCHEMA: &str = "harness.control-plane-snapshot.v1";
 pub const RETURN_VIEW_SCHEMA: &str = "harness.return-view.v1";
@@ -39,11 +42,28 @@ impl Store {
         Ok(snapshot)
     }
 
+    #[cfg(test)]
+    fn control_plane_snapshot_after_projection_refresh<F>(
+        &self,
+        after_projection_refresh: F,
+    ) -> Result<ControlPlaneSnapshot, StoreError>
+    where
+        F: FnOnce() -> Result<(), StoreError>,
+    {
+        self.refresh_control_plane_projections()?;
+        after_projection_refresh()?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let snapshot = Self::compile_control_plane_snapshot(&transaction)?;
+        transaction.commit()?;
+        Ok(snapshot)
+    }
+
     /// Captures supervisor inputs and the operator-control evidence from one
     /// SQLite snapshot. The caller may persist a resulting supervisor receipt
     /// later, but its run/task evidence and operator-control facts always
     /// describe the same immutable database cut.
-    pub(crate) fn capture_supervisor_observation_with_control_plane(
+    pub fn capture_supervisor_observation_with_control_plane(
         &self,
         run_id: &harness_domain::RunId,
         max_events: u32,
@@ -110,6 +130,14 @@ impl Store {
             })?,
             "material progress cursor",
         )?;
+        let material_progress_classifier_cursor = non_negative(
+            transaction.query_row(
+                "SELECT event_cursor FROM material_progress_classifier_state WHERE id=1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            "material progress classifier cursor",
+        )?;
         let liveness_episode_cursor = non_negative(
             transaction.query_row("SELECT count(*) FROM liveness_episodes", [], |row| {
                 row.get::<_, i64>(0)
@@ -152,6 +180,10 @@ impl Store {
         source_cursors.insert(
             "material_progress_events".to_owned(),
             material_progress_cursor,
+        );
+        source_cursors.insert(
+            "material_progress_classifier".to_owned(),
+            material_progress_classifier_cursor,
         );
         source_cursors.insert("liveness_episodes".to_owned(), liveness_episode_cursor);
         source_cursors.insert(
@@ -241,6 +273,19 @@ impl Store {
                 });
             }
         }
+        let material_progress_backlog =
+            event_cursor.saturating_sub(material_progress_classifier_cursor);
+        if material_progress_backlog > 0 {
+            truncation.push(SnapshotTruncation {
+                section: "progress_classifier".to_owned(),
+                omitted_rows: material_progress_backlog,
+                limit: u64::try_from(MAX_CLASSIFIER_EVENTS_PER_PASS).map_err(|_| {
+                    StoreError::Validation(
+                        "material progress classifier limit is invalid".to_owned(),
+                    )
+                })?,
+            });
+        }
         let snapshot_id = ControlPlaneSnapshotId::new();
         let mut snapshot = ControlPlaneSnapshot {
             schema: CONTROL_PLANE_SNAPSHOT_SCHEMA.to_owned(),
@@ -273,11 +318,18 @@ impl Store {
             },
             progress: {
                 let mut section = current(progress_rows, material_progress_cursor);
-                section.truncated = progress_truncation.is_some();
-                section.detail = Some(
+                section.truncated = progress_truncation.is_some() || material_progress_backlog > 0;
+                section.detail = Some(if material_progress_backlog > 0 {
+                    format!(
+                        "Replayable material-progress records are catching up through domain event {material_progress_classifier_cursor} of {event_cursor}; {material_progress_backlog} source events remain. This section is stale and cannot be treated as complete custody."
+                    )
+                } else {
                     "Replayable material-progress records from the closed controller-event allow-list; ordinary activity is excluded."
-                        .to_owned(),
-                );
+                        .to_owned()
+                });
+                if material_progress_backlog > 0 {
+                    section.state = SnapshotSectionState::Stale;
+                }
                 section
             },
             liveness: {
@@ -1026,5 +1078,72 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0]["event_id"], Value::from(2));
         assert_eq!(events[1]["event_id"], Value::from(3));
+    }
+
+    #[test]
+    fn bounded_classifier_backlog_is_explicitly_stale_until_caught_up() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        for event in 0..=MAX_CLASSIFIER_EVENTS_PER_PASS {
+            store
+                .emit_domain_event(
+                    None,
+                    "operator_control_test",
+                    &format!("backlog_{event}"),
+                    "operator_control.backlog",
+                    &Value::Null,
+                    None,
+                )
+                .expect("event");
+        }
+        let stale = store.control_plane_snapshot().expect("bounded snapshot");
+        assert_eq!(stale.progress.state, SnapshotSectionState::Stale);
+        assert!(stale.progress.truncated);
+        assert!(stale.truncation.iter().any(|entry| {
+            entry.section == "progress_classifier"
+                && entry.omitted_rows == 1
+                && entry.limit == u64::try_from(MAX_CLASSIFIER_EVENTS_PER_PASS).unwrap()
+        }));
+        assert_eq!(
+            stale.source_cursors["material_progress_classifier"],
+            u64::try_from(MAX_CLASSIFIER_EVENTS_PER_PASS).unwrap()
+        );
+        let current = store.control_plane_snapshot().expect("caught-up snapshot");
+        assert_eq!(current.progress.state, SnapshotSectionState::Current);
+        assert!(
+            !current
+                .truncation
+                .iter()
+                .any(|entry| entry.section == "progress_classifier")
+        );
+    }
+
+    #[test]
+    fn event_committed_between_projection_refresh_and_capture_is_stale_not_hidden() {
+        let temp = TempDir::new().expect("temp");
+        let database = temp.path().join("harness.sqlite3");
+        let store = Store::open(&database, &temp.path().join("artifacts")).expect("store");
+        let writer = Store::open(&database, &temp.path().join("writer-artifacts")).expect("writer");
+        let captured = store
+            .control_plane_snapshot_after_projection_refresh(|| {
+                writer.emit_domain_event(
+                    None,
+                    "operator_control_test",
+                    "race_event",
+                    "task.verified",
+                    &Value::Null,
+                    None,
+                )?;
+                Ok(())
+            })
+            .expect("snapshot captures the later source cursor");
+        assert_eq!(captured.event_cursor, 1);
+        assert_eq!(captured.progress.state, SnapshotSectionState::Stale);
+        assert!(
+            captured
+                .truncation
+                .iter()
+                .any(|entry| { entry.section == "progress_classifier" && entry.omitted_rows == 1 })
+        );
     }
 }

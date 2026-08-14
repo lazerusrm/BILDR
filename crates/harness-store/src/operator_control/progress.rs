@@ -13,6 +13,10 @@ use crate::{Store, StoreError};
 
 const CLASSIFIER_VERSION: &str = "material-progress-v1";
 const MAX_PROGRESS_PAGE_SIZE: u32 = 200;
+/// One projection pass deliberately caps historical parsing. A fresh upgrade
+/// with a large durable event ledger catches up over bounded reads instead of
+/// monopolizing the store lock on the first operator page load.
+pub(crate) const MAX_CLASSIFIER_EVENTS_PER_PASS: i64 = 1_000;
 
 #[derive(Debug)]
 struct SourceEvent {
@@ -46,10 +50,10 @@ impl Store {
         }
         let events = {
             let mut statement = transaction.prepare(
-                "SELECT id,run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json FROM domain_events WHERE id>?1 ORDER BY id ASC",
+                "SELECT id,run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json FROM domain_events WHERE id>?1 ORDER BY id ASC LIMIT ?2",
             )?;
             statement
-                .query_map([cursor], |row| {
+                .query_map(params![cursor, MAX_CLASSIFIER_EVENTS_PER_PASS], |row| {
                     Ok(SourceEvent {
                         id: row.get(0)?,
                         run_id: row.get(1)?,
@@ -350,7 +354,7 @@ mod tests {
                 .emit_domain_event(
                     None,
                     "agent",
-                    format!("agent-{index}"),
+                    &format!("agent-{index}"),
                     "agent.output.delta",
                     &json!({"tokens": index}),
                     None,
@@ -447,5 +451,45 @@ mod tests {
             .expect("second classifier");
         let first_result = first.join().expect("classifier thread joins");
         assert_eq!(first_result.len() + second_result.len(), 1);
+    }
+
+    #[test]
+    fn classifier_backfill_is_hard_capped_and_advances_over_multiple_passes() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let total = usize::try_from(MAX_CLASSIFIER_EVENTS_PER_PASS).expect("positive limit") + 3;
+        for index in 0..total {
+            store
+                .emit_domain_event(
+                    None,
+                    "agent",
+                    &format!("agent-{index}"),
+                    "agent.output.delta",
+                    &json!({"tokens": index}),
+                    None,
+                )
+                .expect("noise event");
+        }
+        assert!(store.classify_material_progress().unwrap().is_empty());
+        let connection = store.connection().expect("connection");
+        let cursor: i64 = connection
+            .query_row(
+                "SELECT event_cursor FROM material_progress_classifier_state WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("cursor");
+        assert_eq!(cursor, MAX_CLASSIFIER_EVENTS_PER_PASS);
+        drop(connection);
+        assert!(store.classify_material_progress().unwrap().is_empty());
+        let connection = store.connection().expect("connection");
+        let cursor: i64 = connection
+            .query_row(
+                "SELECT event_cursor FROM material_progress_classifier_state WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("cursor");
+        assert_eq!(cursor, i64::try_from(total).expect("event count fits i64"));
     }
 }
