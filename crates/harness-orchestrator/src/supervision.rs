@@ -110,6 +110,11 @@ fn observe_run_with_force(
         .rev()
         .map(|event| (*event).clone())
         .collect::<Vec<_>>();
+    // The supervisor receives only a compact, immutable reference plus
+    // run-scoped facts from the operator-control projection. This remains a
+    // read path: compiling the projection neither schedules work nor changes
+    // any source-owned attention, recovery, or liveness state.
+    let control_plane = store.control_plane_snapshot()?;
     let snapshot = store.record_supervisor_snapshot(
         run_id,
         event_cursor,
@@ -127,6 +132,7 @@ fn observe_run_with_force(
                 observation.run_tokens_used,
                 &observation.repository_profile_id,
                 &material_events,
+                &control_plane,
                 event_cursor,
                 config,
                 max_thread_count,
@@ -193,6 +199,7 @@ fn build_snapshot(
     run_tokens_used: u64,
     profile_id: &str,
     material_events: &[DomainEvent],
+    control_plane: &harness_domain::ControlPlaneSnapshot,
     event_cursor: i64,
     config: &SupervisionConfig,
     max_thread_count: u32,
@@ -311,6 +318,29 @@ fn build_snapshot(
             )
         })
         .map(|event| format_timestamp(event.occurred_at));
+    let operator_control = control_plane_summary(control_plane, run.id.as_str());
+    let custody_uncertain = operator_control
+        .get("liveness")
+        .and_then(Value::as_array)
+        .is_some_and(|episodes| {
+            episodes.iter().any(|episode| {
+                matches!(
+                    episode.get("state").and_then(Value::as_str),
+                    Some("ownership_uncertain" | "recovery_required")
+                )
+            })
+        })
+        || operator_control
+            .get("reconciliation")
+            .and_then(Value::as_array)
+            .is_some_and(|episodes| {
+                episodes.iter().any(|episode| {
+                    !matches!(
+                        episode.get("state").and_then(Value::as_str),
+                        Some("resolved" | "refused")
+                    )
+                })
+            });
     json!({
         "schema": "harness.supervisor-snapshot.v1",
         "snapshot_id": snapshot_id,
@@ -367,7 +397,7 @@ fn build_snapshot(
             "active_thread_count": agents.iter().filter(|agent| agent.active_turn_id.is_some()).count(),
             "max_thread_count": max_thread_count,
         },
-        "allowed_actions": allowed_actions(run, tasks, plan, config.mode),
+        "allowed_actions": allowed_actions(run, tasks, plan, config.mode, custody_uncertain),
         "evidence_refs": material_events.iter().map(|event| json!({
             "kind": "event",
             "id": format!("event-{}", event.id),
@@ -395,6 +425,36 @@ fn build_snapshot(
                 })),
             })
         }).collect::<Vec<_>>(),
+        "operator_control": operator_control,
+    })
+}
+
+fn control_plane_summary(snapshot: &harness_domain::ControlPlaneSnapshot, run_id: &str) -> Value {
+    let run_rows = |section: &harness_domain::SnapshotSection| {
+        section
+            .rows
+            .iter()
+            .filter(|row| row.get("run_id").and_then(Value::as_str) == Some(run_id))
+            .take(50)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    json!({
+        "schema": "harness.supervisor-control-facts.v1",
+        "snapshot_id": snapshot.snapshot_id,
+        "snapshot_revision": snapshot.revision,
+        "snapshot_sha256": snapshot.sha256,
+        "event_cursor": snapshot.event_cursor,
+        "attention": run_rows(&snapshot.attention),
+        "material_progress": run_rows(&snapshot.progress),
+        "liveness": run_rows(&snapshot.liveness),
+        "reconciliation": run_rows(&snapshot.reconciliation),
+        "investigations": run_rows(&snapshot.investigations),
+        "external_conditions": run_rows(&snapshot.external_conditions),
+        "limitations": [
+            "operator-control facts are bounded read-only evidence",
+            "the supervisor cannot close attention, modify liveness, reconcile ownership, or deliver notifications",
+        ],
     })
 }
 
@@ -413,11 +473,20 @@ fn allowed_actions(
     tasks: &[TaskSummary],
     plan: &RunPlan,
     mode: SupervisorMode,
+    custody_uncertain: bool,
 ) -> Vec<&'static str> {
     if mode != SupervisorMode::Advisory {
         return vec!["wait"];
     }
     let mut actions = vec!["wait"];
+    if custody_uncertain {
+        // An unresolved ownership/recovery record is a hard controller
+        // boundary: the supervisor may only ask the human to pause and inspect
+        // it. It must never propose a fresh attempt, continuation, replan, or
+        // any action that could create a competing writer.
+        actions.push("pause_for_human");
+        return actions;
+    }
     if tasks.iter().any(|task| {
         matches!(
             task.state,
