@@ -97,7 +97,7 @@ max_snapshot_bytes = 65536
 model = "gpt-5.6-terra"
 reasoning_effort = "high"
 sandbox = "read-only"
-token_budget = 24000
+token_budget = 48000
 uncertainty_retries = 1
 
 [supervision.expert]

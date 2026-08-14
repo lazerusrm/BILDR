@@ -277,7 +277,11 @@ fn default_read_only_sandbox() -> String {
 }
 
 const fn default_supervisor_token_budget() -> u64 {
-    24_000
+    // A real App Server supervisor turn includes the fixed BILDR/Codex
+    // instructions before the immutable snapshot.  24k can be exhausted by
+    // that required context alone, leaving no capacity for an advisory
+    // decision.  Keep a bounded margin for the model response.
+    48_000
 }
 
 const fn default_supervision_uncertainty_retries() -> u8 {
@@ -570,11 +574,11 @@ impl HarnessConfig {
         if supervision.supervisor.model != "gpt-5.6-terra"
             || supervision.supervisor.reasoning_effort != "high"
             || supervision.supervisor.sandbox != "read-only"
-            || supervision.supervisor.token_budget == 0
+            || !(48_000..=80_000).contains(&supervision.supervisor.token_budget)
             || supervision.supervisor.uncertainty_retries != 1
         {
             return Err(ProfileError::Validation(
-                "supervisor route must be fixed to gpt-5.6-terra/high/read-only with one uncertainty retry"
+                "supervisor route must be fixed to gpt-5.6-terra/high/read-only with a 48k-80k token budget and one uncertainty retry"
                     .to_owned(),
             ));
         }
@@ -1188,6 +1192,7 @@ mod tests {
     fn supervision_defaults_disabled_and_rejects_unimplemented_or_writable_routes() {
         let config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
         assert_eq!(config.supervision.mode, SupervisorMode::Disabled);
+        assert_eq!(config.supervision.supervisor.token_budget, 48_000);
         config.validate().expect("disabled supervision validates");
 
         let mut config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
@@ -1208,6 +1213,10 @@ mod tests {
         let mut config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
         config.supervision.mode = SupervisorMode::ObserveOnly;
         config.supervision.expert.max_children = 1;
+        assert!(config.validate().is_err());
+
+        let mut config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
+        config.supervision.supervisor.token_budget = 47_999;
         assert!(config.validate().is_err());
     }
 

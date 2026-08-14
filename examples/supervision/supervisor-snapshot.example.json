@@ -56,7 +56,7 @@
     "run_tokens_used": 12000,
     "run_tokens_remaining": 88000,
     "supervisor_tokens_used": 0,
-    "supervisor_tokens_remaining": 24000,
+    "supervisor_tokens_remaining": 48000,
     "expert_tokens_used": 0,
     "expert_tokens_remaining": 80000,
     "expert_requests_remaining": 2,
