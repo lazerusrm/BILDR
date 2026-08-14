@@ -318,7 +318,7 @@ fn build_snapshot(
             )
         })
         .map(|event| format_timestamp(event.occurred_at));
-    let operator_control = control_plane_summary(control_plane, run.id.as_str());
+    let operator_control = control_plane_summary(control_plane, run.id.as_str(), tasks);
     let custody_uncertain = operator_control
         .get("liveness")
         .and_then(Value::as_array)
@@ -429,7 +429,11 @@ fn build_snapshot(
     })
 }
 
-fn control_plane_summary(snapshot: &harness_domain::ControlPlaneSnapshot, run_id: &str) -> Value {
+fn control_plane_summary(
+    snapshot: &harness_domain::ControlPlaneSnapshot,
+    run_id: &str,
+    tasks: &[TaskSummary],
+) -> Value {
     let run_rows = |section: &harness_domain::SnapshotSection| {
         section
             .rows
@@ -439,6 +443,37 @@ fn control_plane_summary(snapshot: &harness_domain::ControlPlaneSnapshot, run_id
             .cloned()
             .collect::<Vec<_>>()
     };
+    let task_owner_ids = tasks
+        .iter()
+        .flat_map(|task| [task.id.as_str(), task.external_task_id.as_str()])
+        .collect::<Vec<_>>();
+    let attempt_owner_ids = snapshot
+        .attempts
+        .rows
+        .iter()
+        .filter(|row| row.get("run_id").and_then(Value::as_str) == Some(run_id))
+        .filter_map(|row| row.get("attempt_id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    // External conditions are owned by a run, one of its tasks, or one of
+    // that run's attempts. Their compact summary intentionally has no
+    // `run_id`, unlike the other control-plane rows, so scope it through the
+    // explicit owner tuple rather than silently dropping all of them.
+    let external_conditions = snapshot
+        .external_conditions
+        .rows
+        .iter()
+        .filter(|row| {
+            let owner_id = row.get("owner_id").and_then(Value::as_str);
+            match row.get("owner_type").and_then(Value::as_str) {
+                Some("run") => owner_id == Some(run_id),
+                Some("task") => owner_id.is_some_and(|id| task_owner_ids.contains(&id)),
+                Some("attempt") => owner_id.is_some_and(|id| attempt_owner_ids.contains(&id)),
+                _ => false,
+            }
+        })
+        .take(50)
+        .cloned()
+        .collect::<Vec<_>>();
     json!({
         "schema": "harness.supervisor-control-facts.v1",
         "snapshot_id": snapshot.snapshot_id,
@@ -450,7 +485,7 @@ fn control_plane_summary(snapshot: &harness_domain::ControlPlaneSnapshot, run_id
         "liveness": run_rows(&snapshot.liveness),
         "reconciliation": run_rows(&snapshot.reconciliation),
         "investigations": run_rows(&snapshot.investigations),
-        "external_conditions": run_rows(&snapshot.external_conditions),
+        "external_conditions": external_conditions,
         "limitations": [
             "operator-control facts are bounded read-only evidence",
             "the supervisor cannot close attention, modify liveness, reconcile ownership, or deliver notifications",
@@ -765,7 +800,7 @@ mod tests {
     #[test]
     fn post_consultation_snapshot_is_schema_valid_and_reports_real_expert_usage() {
         let run_id = RunId::from("run-1");
-        let task_id = TaskId::from("task-1");
+        let task_id = TaskId::from("task-internal-1");
         let run = RunSummary {
             id: run_id.clone(),
             repository_id: RepositoryId::from("repository-1"),
@@ -799,6 +834,7 @@ mod tests {
                 state: "blocked".to_owned(),
                 priority: "P1".to_owned(),
                 execution_mode: "controller_governed".to_owned(),
+                execution_kind: harness_domain::TaskExecutionKind::Implementation,
                 owner_profile: "general".to_owned(),
                 reviewer_profile: "general".to_owned(),
                 checklist_rows: vec!["Keep the consultation advisory.".to_owned()],
@@ -922,6 +958,76 @@ mod tests {
         };
         let mut config = SupervisionConfig::default();
         config.mode = harness_domain::SupervisorMode::Advisory;
+        let current_section = harness_domain::SnapshotSection {
+            state: harness_domain::SnapshotSectionState::Current,
+            rows: Vec::new(),
+            source_cursor: 0,
+            truncated: false,
+            detail: None,
+        };
+        // The control-plane fixture retains one run-scoped condition through
+        // the full canonical projection, preventing the supervisor snapshot
+        // contract from drifting from the PR4 custody integration.
+        let control_plane = harness_domain::ControlPlaneSnapshot {
+            schema: "harness.control-plane-snapshot.v1".to_owned(),
+            snapshot_id: harness_domain::ControlPlaneSnapshotId::new(),
+            revision: 1,
+            compiled_at_ms: 0,
+            event_cursor: 0,
+            consistency: "fixture".to_owned(),
+            system: current_section.clone(),
+            accounts: current_section.clone(),
+            scheduler: current_section.clone(),
+            runs: current_section.clone(),
+            attention: current_section.clone(),
+            attempts: harness_domain::SnapshotSection {
+                rows: vec![json!({
+                    "run_id": run_id,
+                    "attempt_id": "attempt-1",
+                })],
+                ..current_section.clone()
+            },
+            investigations: current_section.clone(),
+            progress: current_section.clone(),
+            liveness: current_section.clone(),
+            reconciliation: current_section.clone(),
+            external_conditions: harness_domain::SnapshotSection {
+                rows: vec![
+                    json!({
+                        "schema": "harness.external-condition-summary.v1",
+                        "owner_type": "run",
+                        "owner_id": run_id,
+                    }),
+                    json!({
+                        "schema": "harness.external-condition-summary.v1",
+                        "owner_type": "task",
+                        "owner_id": "task-internal-1",
+                    }),
+                    json!({
+                        "schema": "harness.external-condition-summary.v1",
+                        "owner_type": "task",
+                        "owner_id": "task-1",
+                    }),
+                    json!({
+                        "schema": "harness.external-condition-summary.v1",
+                        "owner_type": "attempt",
+                        "owner_id": "attempt-1",
+                    }),
+                    json!({
+                        "schema": "harness.external-condition-summary.v1",
+                        "owner_type": "run",
+                        "owner_id": "other-run",
+                    }),
+                ],
+                ..current_section.clone()
+            },
+            cost: current_section.clone(),
+            notifications: current_section.clone(),
+            limits: current_section,
+            truncation: Vec::new(),
+            source_cursors: Default::default(),
+            sha256: "c".repeat(64),
+        };
         let snapshot = build_snapshot(
             &SupervisorSnapshotId::from("snapshot-1"),
             1,
@@ -934,6 +1040,7 @@ mod tests {
             12_345,
             "general",
             &[event("run.supervision.expert_completed", json!({}))],
+            &control_plane,
             7,
             &config,
             4,
@@ -948,6 +1055,13 @@ mod tests {
         );
         assert_eq!(snapshot["budgets"]["expert_completed_cap_per_signature"], 2);
         assert_eq!(snapshot["budgets"]["active_expert_requests"], 0);
+        assert_eq!(
+            snapshot["operator_control"]["external_conditions"]
+                .as_array()
+                .expect("external conditions are an array")
+                .len(),
+            4
+        );
         assert_eq!(
             snapshot["expert_consultations"][0]["response"]["verdict"],
             "recommendation"

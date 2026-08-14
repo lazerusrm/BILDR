@@ -67,5 +67,22 @@
   "allowed_actions": ["wait"],
   "evidence_refs": [],
   "prior_decision": null,
-  "expert_consultations": []
+  "expert_consultations": [],
+  "operator_control": {
+    "schema": "harness.supervisor-control-facts.v1",
+    "snapshot_id": "01k2p1a0f0a0a0a0a0a0a0a0a0",
+    "snapshot_revision": 1,
+    "snapshot_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "event_cursor": 42,
+    "attention": [],
+    "material_progress": [],
+    "liveness": [],
+    "reconciliation": [],
+    "investigations": [],
+    "external_conditions": [],
+    "limitations": [
+      "operator-control facts are bounded read-only evidence",
+      "the supervisor cannot close attention, modify liveness, reconcile ownership, or deliver notifications"
+    ]
+  }
 }

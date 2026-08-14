@@ -1,7 +1,7 @@
 # Operator control plane implementation status
 
 **Current integrated branch:** `implement/pr4-operator-control-foundation`
-(stacked on PR3 supervisor head `f58874d`). This status is intentionally a
+(rebased onto deployed PR3 supervisor head `63d6cc3`). This status is intentionally a
 capability boundary, not release evidence.
 
 ## Implemented, read-only/observe-only slices
@@ -42,8 +42,10 @@ sections are not evidence that a run is healthy, reconciled, or safe to resume.
 ## Verification recorded at this head family
 
 - `cargo test -p harness-store -p harness-api -p harnessctl --lib --bins -- --test-threads=1`
+- `cargo test --workspace --all-targets -- --test-threads=1`
 - `npm --prefix ui test -- --run`
 - `npm --prefix ui run build`
+- `cargo run -p xtask -- schema-check`
 - `cargo run -p xtask -- openapi-check`
 
 Temporary test output must use `/mnt/dev-fast`: `/mnt/bulk-fast` was at 100%
