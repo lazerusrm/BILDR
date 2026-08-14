@@ -36,6 +36,11 @@ event or scheduled liveness boundary requires judgment.
 - [IMPLEMENTATION_PLAN_2_RUNTIME.md](IMPLEMENTATION_PLAN_2_RUNTIME.md) — SO-004 through SO-006.
 - [IMPLEMENTATION_PLAN_3_PRODUCTIZATION.md](IMPLEMENTATION_PLAN_3_PRODUCTIZATION.md) — SO-007 through SO-009.
 - [RESEARCH.md](RESEARCH.md) — source-backed rationale and open empirical questions.
+- [Operator control plane](../operator-control-plane/README.md) — durable
+  attention, investigation artifacts, material-progress records, stateful
+  liveness, ownership-safe recovery, whole-system projections, return views,
+  notification policy, and implementation/evaluation plans that extend this
+  supervisor without expanding model authority.
 
 ## Existing Governor compatibility
 
@@ -68,6 +73,20 @@ material event
 Then add low-risk action execution, the one Terra xhigh retry, the Sol expert
 broker, replay evaluation, and gated activation. Automatic expert calls and
 broad active actions are intentionally late.
+
+The operator control plane's first vertical slice is intentionally deterministic
+and may proceed before active supervision:
+
+```text
+typed attention source
+ -> durable attention item
+ -> canonical control-plane snapshot
+ -> API, CLI, and browser attention view
+ -> restart reproduces the same unresolved set
+```
+
+The supervisor later consumes bounded references to those controller records.
+It never owns or closes them.
 
 ## Contracts included in this PR
 
