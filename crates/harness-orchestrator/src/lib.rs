@@ -23,10 +23,10 @@ use harness_domain::{
     AgentRole, AgentSessionId, AgentSummary, ApprovalId, ApprovalSummary, ArtifactId, AttemptId,
     CodexRuntimeStatus, CommandRunId, ComponentStatus, DiffBudget, EvidenceId, ExpertRequestId,
     ExpertResponseId, ProofTier, RepositoryId, RepositorySummary, ResourceClass, ResultClass,
-    RiskLevel, RunId, RunPlan, RunState, RunSummary, RuntimeStatus, SandboxMode,
-    SchedulerStatus, SupervisorActionId, SupervisorDecisionId, SupervisorMode,
-    SupervisorReviewId, TaskExecutionKind, TaskId, TaskPacket, TaskState, TaskSummary,
-    ValidationId, WorktreeId, WorktreeSummary, format_timestamp, now_ms,
+    RiskLevel, RunId, RunPlan, RunState, RunSummary, RuntimeStatus, SandboxMode, SchedulerStatus,
+    SupervisorActionId, SupervisorDecisionId, SupervisorMode, SupervisorReviewId,
+    TaskExecutionKind, TaskId, TaskPacket, TaskState, TaskSummary, ValidationId, WorktreeId,
+    WorktreeSummary, format_timestamp, now_ms,
 };
 use harness_evidence::{EvidenceArtifactInput, EvidenceClaim, EvidenceService};
 use harness_git::{DiffPolicy, GitManager, WorktreeSpec, validate_public_change_metadata};
