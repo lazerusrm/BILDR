@@ -1741,6 +1741,12 @@ pub struct Orchestrator {
     runtime: Arc<RwLock<Option<Arc<dyn CodexRuntime>>>>,
     yolo_mode: Arc<AtomicBool>,
     settings_lock: Arc<StdMutex<()>>,
+    // An enabled setting and a model turn are one lifecycle boundary.  A
+    // writer commits an enable/disable before returning; a reader holds the
+    // matching guard from its final setting read through thread/turn start.
+    // This lets a disable win while readiness is pending, and otherwise
+    // linearizes it after the already-issued model start.
+    supervision_lifecycle_lock: Arc<RwLock<()>>,
     operation_lock: Arc<Mutex<()>>,
     hygiene_lock: Arc<Mutex<()>>,
     account_logins: Arc<Mutex<BTreeMap<String, CodexAccountLoginEntry>>>,
@@ -1810,6 +1816,7 @@ impl Orchestrator {
             runtime: Arc::new(RwLock::new(runtime)),
             yolo_mode: Arc::new(AtomicBool::new(yolo_mode)),
             settings_lock: Arc::new(StdMutex::new(())),
+            supervision_lifecycle_lock: Arc::new(RwLock::new(())),
             operation_lock: Arc::new(Mutex::new(())),
             hygiene_lock: Arc::new(Mutex::new(())),
             account_logins: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2655,10 +2662,19 @@ impl Orchestrator {
         settings
     }
 
-    pub fn update_operator_settings(
+    pub async fn update_operator_settings(
         &self,
         request: UpdateOperatorSettingsRequest,
     ) -> Result<OperatorSettings, OrchestratorError> {
+        // A supervision toggle must not commit between the final advisory
+        // read and the matching model start.  Other settings retain their
+        // current synchronous control-plane serialization and do not take
+        // this narrower lifecycle lock.
+        let _supervision_guard = if request.supervision_enabled.is_some() {
+            Some(self.supervision_lifecycle_lock.write().await)
+        } else {
+            None
+        };
         // Settings is a single control-plane document. Serialize its
         // read/derive/write/receipt lifecycle so concurrently submitted
         // independent toggles cannot return an older composite response.
@@ -3040,8 +3056,8 @@ impl Orchestrator {
         &self,
         action: &SupervisorActionRecord,
     ) -> Result<Value, OrchestratorError> {
-        let supervision = self.effective_supervision_config();
-        if supervision.mode != SupervisorMode::Advisory {
+        let preflight_supervision = self.effective_supervision_config();
+        if preflight_supervision.mode != SupervisorMode::Advisory {
             return Err(OrchestratorError::Conflict(
                 "human-approved advisory supervision is no longer enabled".to_owned(),
             ));
@@ -3052,9 +3068,17 @@ impl Orchestrator {
 
         // Runtime readiness can take time. Re-enter the controller critical
         // section and re-read all immutable/live bindings immediately before
-        // creating or starting Sol so a material event cannot authorize a
-        // stale expert launch.
+        // creating or starting Sol so a material event, or an intervening
+        // operator disable, cannot authorize a stale expert launch.
         let _guard = self.operation_lock.lock().await;
+        let _supervision_guard = self.supervision_lifecycle_lock.read().await;
+        let supervision = self.effective_supervision_config();
+        if supervision.mode != SupervisorMode::Advisory {
+            return Err(OrchestratorError::Conflict(
+                "human-approved advisory supervision was disabled while the expert runtime was becoming ready"
+                    .to_owned(),
+            ));
+        }
         let action = self.store.supervisor_action(&action.id)?;
         if action.state != "EXECUTING" {
             return Err(OrchestratorError::Conflict(format!(
@@ -3267,6 +3291,15 @@ impl Orchestrator {
         }
         self.require_runtime_ready().await?;
         self.select_preferred_codex_account_for_run(run_id).await?;
+        // Read only after readiness and account selection.  Holding this
+        // guard through `start_agent` makes an operator disable linearize
+        // either before this final read (no Terra turn) or after the already
+        // issued controller-owned start.
+        let _supervision_guard = self.supervision_lifecycle_lock.read().await;
+        let supervision = self.effective_supervision_config();
+        if supervision.mode != SupervisorMode::Advisory {
+            return Ok(());
+        }
         let (active_total, _, _) = self.active_agent_counts()?;
         if active_total >= self.config.orchestration.max_total_agent_threads {
             return Err(OrchestratorError::Blocked(format!(
@@ -16804,11 +16837,18 @@ mod tests {
     struct RolloutLostPlanReviewRuntime {
         started_threads: StdMutex<Vec<StartThread>>,
         started_turns: StdMutex<Vec<StartTurn>>,
+        block_next_runtime_status: AtomicBool,
+        runtime_status_entered: tokio::sync::Notify,
+        runtime_status_release: tokio::sync::Notify,
     }
 
     #[async_trait]
     impl CodexRuntime for RolloutLostPlanReviewRuntime {
         async fn runtime_status(&self) -> CodexRuntimeStatus {
+            if self.block_next_runtime_status.swap(false, Ordering::AcqRel) {
+                self.runtime_status_entered.notify_one();
+                self.runtime_status_release.notified().await;
+            }
             CodexRuntimeStatus {
                 state: "ready".to_owned(),
                 detail: None,
@@ -17525,6 +17565,7 @@ mod tests {
         let (orchestrator, _temp) = operator_settings_test_orchestrator().await;
         orchestrator
             .update_operator_settings(operator_settings_request(Some(true), None))
+            .await
             .expect("advisory mode enables explicitly");
         let action = fixture_supervisor_action(&orchestrator, "wait").await;
         let completed = orchestrator
@@ -17547,6 +17588,7 @@ mod tests {
         let (orchestrator, _temp) = operator_settings_test_orchestrator().await;
         orchestrator
             .update_operator_settings(operator_settings_request(Some(true), None))
+            .await
             .expect("advisory mode enables explicitly");
         let action = fixture_supervisor_action(&orchestrator, "wait").await;
         orchestrator
@@ -17573,6 +17615,7 @@ mod tests {
         let (orchestrator, _temp, runtime, run_id, _) = rollout_lost_plan_review_fixture().await;
         orchestrator
             .update_operator_settings(operator_settings_request(Some(true), None))
+            .await
             .expect("advisory mode enables explicitly");
         let (action, task_id) = fixture_expert_action(&orchestrator, &run_id, "high").await;
         let applied = orchestrator
@@ -17776,6 +17819,7 @@ mod tests {
         let (orchestrator, _temp, runtime, run_id, _) = rollout_lost_plan_review_fixture().await;
         orchestrator
             .update_operator_settings(operator_settings_request(Some(true), None))
+            .await
             .expect("advisory mode enables explicitly");
         let (action, _) = fixture_expert_action(&orchestrator, &run_id, "low").await;
         let rejected = orchestrator
@@ -17805,6 +17849,7 @@ mod tests {
         let (orchestrator, _temp, runtime, run_id, _) = rollout_lost_plan_review_fixture().await;
         orchestrator
             .update_operator_settings(operator_settings_request(Some(true), None))
+            .await
             .expect("advisory mode enables explicitly");
         let (action, _) = fixture_expert_action_with_evidence(
             &orchestrator,
@@ -17840,6 +17885,7 @@ mod tests {
         let (orchestrator, _temp, runtime, run_id, _) = rollout_lost_plan_review_fixture().await;
         orchestrator
             .update_operator_settings(operator_settings_request(Some(true), None))
+            .await
             .expect("advisory mode enables explicitly");
         let (action, _) = fixture_expert_action(&orchestrator, &run_id, "high").await;
         orchestrator
@@ -17869,6 +17915,130 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].state, "FAILED");
         assert!(runtime.started_threads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabling_supervision_during_runtime_readiness_prevents_expert_launch() {
+        let (orchestrator, _temp, runtime, run_id, _) = rollout_lost_plan_review_fixture().await;
+        orchestrator
+            .update_operator_settings(operator_settings_request(Some(true), None))
+            .await
+            .expect("advisory mode enables explicitly");
+        let (action, _) = fixture_expert_action(&orchestrator, &run_id, "high").await;
+
+        // Construct the waiter before beginning the apply so the test cannot
+        // lose the readiness notification.  The toggle commits while launch
+        // is suspended in `require_runtime_ready`.
+        let readiness_entered = runtime.runtime_status_entered.notified();
+        runtime
+            .block_next_runtime_status
+            .store(true, Ordering::Release);
+        let launching = tokio::spawn({
+            let orchestrator = orchestrator.clone();
+            let action_id = action.id.clone();
+            async move {
+                orchestrator
+                    .apply_supervisor_action(&action_id, "local-user")
+                    .await
+            }
+        });
+        readiness_entered.await;
+        orchestrator
+            .update_operator_settings(operator_settings_request(Some(false), None))
+            .await
+            .expect("disable commits during runtime readiness");
+        runtime.runtime_status_release.notify_one();
+
+        let error = launching
+            .await
+            .expect("launch task joins")
+            .expect_err("the post-readiness disable prevents Sol startup");
+        assert!(
+            error
+                .to_string()
+                .contains("disabled while the expert runtime was becoming ready")
+        );
+        assert_eq!(
+            orchestrator
+                .store()
+                .supervisor_action(&action.id)
+                .unwrap()
+                .state,
+            "FAILED"
+        );
+        assert!(
+            orchestrator
+                .store()
+                .expert_requests_for_run(&run_id, 100)
+                .unwrap()
+                .is_empty(),
+            "no durable expert request is created after the disable"
+        );
+        assert!(
+            runtime.started_threads.lock().unwrap().is_empty(),
+            "a disabled supervisor starts no model turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_supervision_during_runtime_readiness_prevents_terra_launch() {
+        let (orchestrator, _temp, runtime, run_id, _) = rollout_lost_plan_review_fixture().await;
+        orchestrator
+            .update_operator_settings(operator_settings_request(Some(true), None))
+            .await
+            .expect("advisory mode enables explicitly");
+        let (action, _) = fixture_expert_action(&orchestrator, &run_id, "high").await;
+        let snapshot = orchestrator
+            .store()
+            .supervisor_snapshot(&action.snapshot_id)
+            .expect("fixture snapshot reads")
+            .expect("fixture snapshot exists");
+        let existing_review = orchestrator
+            .store()
+            .latest_supervisor_review(&run_id)
+            .expect("fixture review reads")
+            .expect("fixture review exists");
+        orchestrator
+            .store()
+            .fail_supervisor_review(&existing_review.id, "fixture review is no longer active")
+            .expect("fixture review ends");
+
+        let readiness_entered = runtime.runtime_status_entered.notified();
+        runtime
+            .block_next_runtime_status
+            .store(true, Ordering::Release);
+        let launching = tokio::spawn({
+            let orchestrator = orchestrator.clone();
+            async move {
+                orchestrator
+                    .launch_supervisor_review(&run_id, &snapshot)
+                    .await
+            }
+        });
+        readiness_entered.await;
+        orchestrator
+            .update_operator_settings(operator_settings_request(Some(false), None))
+            .await
+            .expect("disable commits during Terra runtime readiness");
+        runtime.runtime_status_release.notify_one();
+
+        launching
+            .await
+            .expect("Terra launch task joins")
+            .expect("a disabled supervisor cleanly declines the queued review");
+        assert!(
+            runtime.started_threads.lock().unwrap().is_empty(),
+            "a disabled supervisor starts no Terra model turn"
+        );
+        assert_eq!(
+            orchestrator
+                .store()
+                .latest_supervisor_review(&run_id)
+                .unwrap()
+                .expect("the original review remains the newest record")
+                .state,
+            "FAILED"
+        );
     }
 
     #[test]
@@ -18053,6 +18223,7 @@ mod tests {
 
         orchestrator
             .update_operator_settings(operator_settings_request(Some(true), None))
+            .await
             .expect("fresh advisory opt-in persists");
         assert_eq!(
             orchestrator.effective_supervision_config().mode,
@@ -18106,27 +18277,24 @@ mod tests {
         let (orchestrator, _temp) = operator_settings_test_orchestrator().await;
         let left = orchestrator.clone();
         let right = orchestrator.clone();
-        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let left_barrier = Arc::clone(&barrier);
         let right_barrier = Arc::clone(&barrier);
 
-        let (first, second) = std::thread::scope(|scope| {
-            let first = scope.spawn(move || {
-                left_barrier.wait();
-                left.update_operator_settings(operator_settings_request(Some(true), None))
-                    .expect("supervision update")
-            });
-            let second = scope.spawn(move || {
-                right_barrier.wait();
-                right
-                    .update_operator_settings(operator_settings_request(None, Some(true)))
-                    .expect("plan approval update")
-            });
-            (
-                first.join().expect("first update thread"),
-                second.join().expect("second update thread"),
-            )
-        });
+        let first = async move {
+            left_barrier.wait().await;
+            left.update_operator_settings(operator_settings_request(Some(true), None))
+                .await
+                .expect("supervision update")
+        };
+        let second = async move {
+            right_barrier.wait().await;
+            right
+                .update_operator_settings(operator_settings_request(None, Some(true)))
+                .await
+                .expect("plan approval update")
+        };
+        let (first, second) = tokio::join!(first, second);
 
         let final_settings = orchestrator.operator_settings();
         assert!(final_settings.supervision_enabled);

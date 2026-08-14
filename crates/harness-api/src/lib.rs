@@ -433,7 +433,9 @@ async fn update_operator_settings(
     Json(request): Json<UpdateOperatorSettingsRequest>,
 ) -> Result<Json<OperatorSettings>, ApiError> {
     authenticate(&state, &headers, true)?;
-    Ok(Json(state.orchestrator.update_operator_settings(request)?))
+    Ok(Json(
+        state.orchestrator.update_operator_settings(request).await?,
+    ))
 }
 
 async fn get_repository(
