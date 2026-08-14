@@ -307,6 +307,19 @@ select:focus-visible {
   border-color: var(--accent);
   background: var(--accent-bg);
 }
+.control-plane-static-record {
+  display: grid;
+  gap: 3px;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+.control-plane-static-record span,
+.control-plane-static-record small {
+  color: var(--muted);
+  font-size: 11px;
+}
 .control-plane-support-list span,
 .control-plane-support-list small {
   color: var(--muted);

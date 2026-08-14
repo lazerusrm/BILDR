@@ -11,6 +11,8 @@ import type {
   ExternalConditionSummary,
   InvestigationArtifact,
   InvestigationArtifactSummary,
+  LivenessEpisode,
+  MaterialProgressEvent,
   ReturnView,
   SnapshotSection,
 } from "../types";
@@ -21,6 +23,8 @@ export function AttentionCenter() {
   const [page, setPage] = useState<AttentionPage>();
   const [investigations, setInvestigations] = useState<InvestigationArtifactSummary[]>([]);
   const [conditions, setConditions] = useState<ExternalConditionSummary[]>([]);
+  const [progress, setProgress] = useState<MaterialProgressEvent[]>([]);
+  const [liveness, setLiveness] = useState<LivenessEpisode[]>([]);
   const [selectedInvestigationId, setSelectedInvestigationId] = useState<string>();
   const [selectedConditionId, setSelectedConditionId] = useState<string>();
   const [conditionHistory, setConditionHistory] = useState<ConditionHistory>({
@@ -46,18 +50,22 @@ export function AttentionCenter() {
   const load = useCallback(async () => {
     setBusy("refresh");
     try {
-      const [nextSnapshot, nextReturnView, nextPage, nextInvestigations, nextConditions] = await Promise.all([
+      const [nextSnapshot, nextReturnView, nextPage, nextInvestigations, nextConditions, nextProgress, nextLiveness] = await Promise.all([
         api.controlPlaneSnapshot(),
         api.controlPlaneReturnView(),
         api.attention(),
         api.investigations(),
         api.externalConditions(),
+        api.materialProgress(),
+        api.liveness(),
       ]);
       setSnapshot(nextSnapshot);
       setReturnView(nextReturnView);
       setPage(nextPage);
       setInvestigations(nextInvestigations);
       setConditions(nextConditions);
+      setProgress(nextProgress);
+      setLiveness(nextLiveness);
       conditionHistoryRequest.current += 1;
       setConditionHistory({ conditionId: undefined, state: "idle", observations: [] });
       conditionDetailRequest.current += 1;
@@ -251,7 +259,9 @@ export function AttentionCenter() {
           {busy === "return" ? "Recording…" : "Mark return view seen"}
         </button>
       </section>
-      <section className="control-plane-support" aria-label="Investigation artifacts and external conditions">
+      <section className="control-plane-support" aria-label="Operator control records">
+        <MaterialProgressTimeline events={progress} />
+        <LivenessEpisodes episodes={liveness} />
         <InvestigationArtifacts
           artifacts={investigations}
           selectedId={selectedInvestigationId}
@@ -308,6 +318,56 @@ export function AttentionCenter() {
         </p>
       ) : null}
     </div>
+  );
+}
+
+function MaterialProgressTimeline({ events }: { events: MaterialProgressEvent[] }) {
+  return (
+    <section className="control-plane-support-card" aria-labelledby="progress-heading">
+      <span className="eyebrow">Classified facts</span>
+      <h2 id="progress-heading">Material progress</h2>
+      {events.length === 0 ? (
+        <p className="empty-state">No material progress has been classified.</p>
+      ) : (
+        <ul className="control-plane-support-list">
+          {events.map((event) => (
+            <li key={event.event_id}>
+              <div className="control-plane-static-record">
+                <strong>{event.kind.replaceAll("_", " ")}</strong>
+                <span>{event.summary}</span>
+                <small>{localTime(event.occurred_at_ms)} · {event.task_id ?? event.run_id ?? "system"}</small>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="control-plane-note">Only a closed controller-event allow-list appears here. Output, token use, and repeated commands are not progress.</p>
+    </section>
+  );
+}
+
+function LivenessEpisodes({ episodes }: { episodes: LivenessEpisode[] }) {
+  return (
+    <section className="control-plane-support-card" aria-labelledby="liveness-heading">
+      <span className="eyebrow">Observe only</span>
+      <h2 id="liveness-heading">Liveness episodes</h2>
+      {episodes.length === 0 ? (
+        <p className="empty-state">No liveness episodes are recorded.</p>
+      ) : (
+        <ul className="control-plane-support-list">
+          {episodes.map((episode) => (
+            <li key={episode.episode_id}>
+              <div className="control-plane-static-record">
+                <strong>{episode.state.replaceAll("_", " ")}</strong>
+                <span>{episode.task_id ?? episode.attempt_id ?? episode.run_id ?? "Unscoped episode"}</span>
+                <small>{localTime(episode.updated_at_ms)} · {episode.state_reason_codes.join(", ") || "No reason code"}</small>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="control-plane-note">This is a deterministic observation projection. It does not resume, retry, clear, or execute work.</p>
+    </section>
   );
 }
 

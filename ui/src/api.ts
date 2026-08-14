@@ -19,6 +19,8 @@ import type {
   FailureTrace,
   InvestigationArtifact,
   InvestigationArtifactSummary,
+  LivenessEpisode,
+  MaterialProgressEvent,
   OutcomeVector,
   OperatorSettings,
   Repository,
@@ -194,6 +196,20 @@ class HarnessApi {
     this.get<ControlPlaneSnapshot>("/control-plane/snapshot");
   controlPlaneReturnView = () =>
     this.get<ReturnView>("/control-plane/return-view");
+  materialProgress = (runId?: string) => {
+    const params = new URLSearchParams({ limit: "50" });
+    if (runId) params.set("run_id", runId);
+    return this.get<MaterialProgressEvent[]>(`/material-progress?${params}`);
+  };
+  liveness = (runId?: string) => {
+    const params = new URLSearchParams({ limit: "50" });
+    if (runId) params.set("run_id", runId);
+    return this.get<LivenessEpisode[]>(`/liveness?${params}`);
+  };
+  runLiveness = (runId: string) =>
+    this.get<LivenessEpisode[]>(
+      `/runs/${encodeURIComponent(runId)}/liveness?limit=50`,
+    );
   attention = (cursor?: string, includeTerminal = false) => {
     const params = new URLSearchParams({ limit: "50" });
     if (cursor) params.set("cursor", cursor);

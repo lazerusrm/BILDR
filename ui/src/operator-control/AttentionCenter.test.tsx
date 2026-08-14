@@ -97,6 +97,8 @@ describe("AttentionCenter", () => {
     expect(markup).toContain("Loading attention");
     expect(markup).toContain("Artifacts are evidence records");
     expect(markup).toContain("does not poll a provider, wake work, or execute a result");
+    expect(markup).toContain("Material progress");
+    expect(markup).toContain("Liveness episodes");
   });
 
   it("renders bounded evidence and explicit condition history without an action control", () => {

@@ -26,6 +26,8 @@ tags:
   - name: Attention
   - name: Investigations
   - name: ExternalConditions
+  - name: Progress
+  - name: Liveness
 paths:
   /health:
     get:
@@ -321,6 +323,58 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/ReturnViewCursor'}
         '409': {$ref: '#/components/responses/Conflict'}
+  /material-progress:
+    get:
+      tags: [Progress]
+      operationId: listMaterialProgress
+      description: Deterministic, immutable material-progress records from the closed controller-event classifier. Ordinary output, tokens, and command activity are excluded.
+      parameters:
+        - name: run_id
+          in: query
+          schema: {type: string, maxLength: 160}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Bounded newest-first material progress records.
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/MaterialProgressEvent'}}
+  /liveness:
+    get:
+      tags: [Liveness]
+      operationId: listLivenessEpisodes
+      description: Observe-only deterministic liveness episodes. This endpoint does not collect, clear, recover, or execute anything.
+      parameters:
+        - name: run_id
+          in: query
+          schema: {type: string, maxLength: 160}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Bounded newest-first liveness episode views.
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/LivenessEpisode'}}
+  /runs/{runId}/liveness:
+    get:
+      tags: [Liveness]
+      operationId: listRunLivenessEpisodes
+      description: Observe-only liveness episodes for one exact run. This endpoint cannot initiate recovery or retry work.
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Bounded newest-first liveness episode views for the selected run.
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/LivenessEpisode'}}
   /attention:
     get:
       tags: [Attention]
@@ -1526,6 +1580,45 @@ components:
         limits: {$ref: '#/components/schemas/SnapshotSection'}
         truncation: {type: array, items: {$ref: '#/components/schemas/SnapshotTruncation'}}
         source_cursors: {type: object, additionalProperties: {type: integer, minimum: 0}}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    MaterialProgressEvent:
+      type: object
+      additionalProperties: false
+      required: [schema, event_id, run_id, task_id, attempt_id, kind, source_event_id, occurred_at_ms, classifier_version, summary, evidence_refs, candidate_sha, milestone_refs, sha256]
+      properties:
+        schema: {const: harness.material-progress.v1}
+        event_id: {type: string, maxLength: 160}
+        run_id: {type: [string, 'null'], maxLength: 160}
+        task_id: {type: [string, 'null'], maxLength: 160}
+        attempt_id: {type: [string, 'null'], maxLength: 160}
+        kind: {enum: [candidate_changed, validation_advanced, evidence_recorded, external_condition_changed, reconciliation_advanced, attention_changed]}
+        source_event_id: {type: string, maxLength: 160}
+        occurred_at_ms: {type: integer, minimum: 0}
+        classifier_version: {type: string, maxLength: 160}
+        summary: {type: string, maxLength: 4000}
+        evidence_refs: {type: array, maxItems: 1000, items: {type: string, maxLength: 4000}}
+        candidate_sha: {type: [string, 'null'], pattern: '^[0-9a-fA-F]{40}$'}
+        milestone_refs: {type: array, maxItems: 100, items: {type: string, maxLength: 4000}}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    LivenessEpisode:
+      type: object
+      additionalProperties: false
+      required: [schema, episode_id, run_id, task_id, attempt_id, state, version, opened_at_ms, updated_at_ms, state_reason_codes, last_material_progress_at_ms, next_review_at_ms, intervention_count, outcome, sha256]
+      properties:
+        schema: {const: harness.liveness-episode.v1}
+        episode_id: {type: string, maxLength: 160}
+        run_id: {type: [string, 'null'], maxLength: 160}
+        task_id: {type: [string, 'null'], maxLength: 160}
+        attempt_id: {type: [string, 'null'], maxLength: 160}
+        state: {enum: [healthy, quiet_active, waiting_external, degraded, suspected_stall, confirmed_stall, ownership_uncertain, recovery_required, terminal]}
+        version: {type: integer, minimum: 1}
+        opened_at_ms: {type: integer, minimum: 0}
+        updated_at_ms: {type: integer, minimum: 0}
+        state_reason_codes: {type: array, maxItems: 32, items: {type: string, maxLength: 160}}
+        last_material_progress_at_ms: {type: [integer, 'null'], minimum: 0}
+        next_review_at_ms: {type: [integer, 'null'], minimum: 0}
+        intervention_count: {type: integer, minimum: 0}
+        outcome: {type: [string, 'null'], maxLength: 160}
         sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
     AttentionSourceRef:
       type: object

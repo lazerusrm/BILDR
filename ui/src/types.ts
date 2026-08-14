@@ -781,6 +781,56 @@ export interface ControlPlaneSnapshot {
   sha256: string;
 }
 
+export interface MaterialProgressEvent {
+  schema: "harness.material-progress.v1";
+  event_id: string;
+  run_id: string | null;
+  task_id: string | null;
+  attempt_id: string | null;
+  kind:
+    | "candidate_changed"
+    | "validation_advanced"
+    | "evidence_recorded"
+    | "external_condition_changed"
+    | "reconciliation_advanced"
+    | "attention_changed";
+  source_event_id: string;
+  occurred_at_ms: number;
+  classifier_version: string;
+  summary: string;
+  evidence_refs: string[];
+  candidate_sha: string | null;
+  milestone_refs: string[];
+  sha256: string;
+}
+
+export interface LivenessEpisode {
+  schema: "harness.liveness-episode.v1";
+  episode_id: string;
+  run_id: string | null;
+  task_id: string | null;
+  attempt_id: string | null;
+  state:
+    | "healthy"
+    | "quiet_active"
+    | "waiting_external"
+    | "degraded"
+    | "suspected_stall"
+    | "confirmed_stall"
+    | "ownership_uncertain"
+    | "recovery_required"
+    | "terminal";
+  version: number;
+  opened_at_ms: number;
+  updated_at_ms: number;
+  state_reason_codes: string[];
+  last_material_progress_at_ms: number | null;
+  next_review_at_ms: number | null;
+  intervention_count: number;
+  outcome: string | null;
+  sha256: string;
+}
+
 export interface AttentionSourceRef {
   source_type:
     | "approval"

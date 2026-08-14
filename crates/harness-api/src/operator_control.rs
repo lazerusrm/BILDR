@@ -46,6 +46,9 @@ pub(super) fn routes() -> Router<ApiState> {
             "/api/v1/external-conditions/{condition_id}/observations",
             get(list_condition_observations),
         )
+        .route("/api/v1/material-progress", get(list_material_progress))
+        .route("/api/v1/liveness", get(list_liveness))
+        .route("/api/v1/runs/{run_id}/liveness", get(list_run_liveness))
 }
 
 async fn control_plane_snapshot(
@@ -276,4 +279,57 @@ async fn list_condition_observations(
 fn parse_condition_id(value: &str) -> Result<ExternalConditionId, ApiError> {
     ExternalConditionId::parse(value)
         .map_err(|error| ApiError::from(harness_store::StoreError::Validation(error.to_string())))
+}
+
+#[derive(Debug, Deserialize)]
+struct BoundedReadQuery {
+    run_id: Option<String>,
+    limit: Option<u32>,
+}
+
+/// Read-only material progress records produced by the deterministic
+/// classifier. This endpoint cannot submit classifications or change a run.
+async fn list_material_progress(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<BoundedReadQuery>,
+) -> Result<Json<Vec<harness_domain::MaterialProgressEvent>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    state.orchestrator.store().classify_material_progress()?;
+    Ok(Json(state.orchestrator.store().list_material_progress(
+        query.run_id.as_deref(),
+        query.limit.unwrap_or(50),
+    )?))
+}
+
+/// Observe-only liveness episodes. Listing does not collect a fresh
+/// observation, start recovery, or apply an intervention.
+async fn list_liveness(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<BoundedReadQuery>,
+) -> Result<Json<Vec<harness_domain::LivenessEpisode>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(state.orchestrator.store().list_liveness_episodes(
+        query.run_id.as_deref(),
+        query.limit.unwrap_or(50),
+    )?))
+}
+
+async fn list_run_liveness(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Query(query): Query<BoundedReadQuery>,
+) -> Result<Json<Vec<harness_domain::LivenessEpisode>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    if query.run_id.is_some() {
+        return Err(ApiError::from(harness_store::StoreError::Validation(
+            "run liveness route does not accept a second run_id filter".to_owned(),
+        )));
+    }
+    Ok(Json(state.orchestrator.store().list_liveness_episodes(
+        Some(&run_id),
+        query.limit.unwrap_or(50),
+    )?))
 }
