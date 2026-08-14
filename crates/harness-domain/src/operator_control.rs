@@ -884,7 +884,77 @@ pub struct MaterialProgressEvent {
     pub kind: MaterialProgressKind,
     pub source_event_id: String,
     pub occurred_at_ms: i64,
+    pub classifier_version: String,
+    pub summary: String,
+    pub evidence_refs: Vec<String>,
+    pub candidate_sha: Option<String>,
+    pub milestone_refs: Vec<String>,
     pub sha256: String,
+}
+
+impl MaterialProgressEvent {
+    pub fn digest(&self) -> Result<String, OperatorControlError> {
+        let mut unsigned = self.clone();
+        unsigned.sha256.clear();
+        digest_json(&unsigned)
+    }
+
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.schema != "harness.material-progress.v1" {
+            return Err(OperatorControlError::InvalidField {
+                field: "material progress schema",
+                reason: "must be harness.material-progress.v1",
+            });
+        }
+        validate_identifier(self.event_id.as_str(), "material progress id")?;
+        for (value, field) in [
+            (self.run_id.as_deref(), "material progress run id"),
+            (self.task_id.as_deref(), "material progress task id"),
+            (self.attempt_id.as_deref(), "material progress attempt id"),
+            (
+                Some(self.source_event_id.as_str()),
+                "material progress source event id",
+            ),
+            (
+                Some(self.classifier_version.as_str()),
+                "material progress classifier version",
+            ),
+        ] {
+            if let Some(value) = value {
+                validate_identifier(value, field)?;
+            }
+        }
+        validate_text(&self.summary, "material progress summary", MAX_SUMMARY_LEN)?;
+        validate_bounded_texts(
+            &self.evidence_refs,
+            "material progress evidence refs",
+            MAX_INVESTIGATION_REFS,
+            MAX_INVESTIGATION_LIST_ITEM_LEN,
+        )?;
+        validate_bounded_texts(
+            &self.milestone_refs,
+            "material progress milestone refs",
+            100,
+            MAX_INVESTIGATION_LIST_ITEM_LEN,
+        )?;
+        if let Some(candidate_sha) = &self.candidate_sha {
+            validate_hex(candidate_sha, "material progress candidate sha", 40)?;
+        }
+        if self.occurred_at_ms < 0 {
+            return Err(OperatorControlError::InvalidField {
+                field: "material progress occurred at",
+                reason: "must not be negative",
+            });
+        }
+        validate_lower_hex(&self.sha256, "material progress sha256", SHA256_HEX_LEN)?;
+        if self.digest()? != self.sha256 {
+            return Err(OperatorControlError::InvalidField {
+                field: "material progress sha256",
+                reason: "does not match the canonical payload",
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -909,6 +979,160 @@ pub enum LivenessObservationKind {
     CommandActivity,
     ExternalWait,
     OwnershipEvidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LivenessObservation {
+    pub schema: String,
+    pub observation_id: LivenessObservationId,
+    pub episode_id: LivenessEpisodeId,
+    pub observation_kind: LivenessObservationKind,
+    pub source_event_id: String,
+    pub observed_at_ms: i64,
+    pub value: Value,
+    pub classifier_version: String,
+    pub sha256: String,
+}
+
+impl LivenessObservation {
+    pub fn digest(&self) -> Result<String, OperatorControlError> {
+        let mut unsigned = self.clone();
+        unsigned.sha256.clear();
+        digest_json(&unsigned)
+    }
+
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.schema != "harness.liveness-observation.v1" {
+            return Err(OperatorControlError::InvalidField {
+                field: "liveness observation schema",
+                reason: "must be harness.liveness-observation.v1",
+            });
+        }
+        validate_identifier(self.observation_id.as_str(), "liveness observation id")?;
+        validate_identifier(self.episode_id.as_str(), "liveness episode id")?;
+        validate_identifier(
+            &self.source_event_id,
+            "liveness observation source event id",
+        )?;
+        validate_identifier(
+            &self.classifier_version,
+            "liveness observation classifier version",
+        )?;
+        if self.observed_at_ms < 0 {
+            return Err(OperatorControlError::InvalidField {
+                field: "liveness observation observed at",
+                reason: "must not be negative",
+            });
+        }
+        if serde_json::to_vec(&self.value)
+            .map_err(|_| OperatorControlError::InvalidField {
+                field: "liveness observation value",
+                reason: "must serialize as JSON",
+            })?
+            .len()
+            > MAX_CONDITION_PAYLOAD_BYTES
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "liveness observation value",
+                reason: "exceeds the bounded payload limit",
+            });
+        }
+        validate_lower_hex(&self.sha256, "liveness observation sha256", SHA256_HEX_LEN)?;
+        if self.digest()? != self.sha256 {
+            return Err(OperatorControlError::InvalidField {
+                field: "liveness observation sha256",
+                reason: "does not match the canonical payload",
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LivenessEpisode {
+    pub schema: String,
+    pub episode_id: LivenessEpisodeId,
+    pub run_id: Option<String>,
+    pub task_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub state: LivenessState,
+    pub version: u64,
+    pub opened_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub state_reason_codes: Vec<String>,
+    pub last_material_progress_at_ms: Option<i64>,
+    pub next_review_at_ms: Option<i64>,
+    pub intervention_count: u32,
+    pub outcome: Option<String>,
+    pub sha256: String,
+}
+
+impl LivenessEpisode {
+    pub fn digest(&self) -> Result<String, OperatorControlError> {
+        let mut unsigned = self.clone();
+        unsigned.sha256.clear();
+        digest_json(&unsigned)
+    }
+
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.schema != "harness.liveness-episode.v1" {
+            return Err(OperatorControlError::InvalidField {
+                field: "liveness episode schema",
+                reason: "must be harness.liveness-episode.v1",
+            });
+        }
+        validate_identifier(self.episode_id.as_str(), "liveness episode id")?;
+        for (value, field) in [
+            (self.run_id.as_deref(), "liveness episode run id"),
+            (self.task_id.as_deref(), "liveness episode task id"),
+            (self.attempt_id.as_deref(), "liveness episode attempt id"),
+            (self.outcome.as_deref(), "liveness episode outcome"),
+        ] {
+            if let Some(value) = value {
+                validate_identifier(value, field)?;
+            }
+        }
+        if self.version == 0 || self.opened_at_ms < 0 || self.updated_at_ms < self.opened_at_ms {
+            return Err(OperatorControlError::InvalidField {
+                field: "liveness episode timing/version",
+                reason: "must have a positive version and monotonic non-negative timestamps",
+            });
+        }
+        if self
+            .last_material_progress_at_ms
+            .is_some_and(|value| value < self.opened_at_ms || value > self.updated_at_ms)
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "liveness last material progress",
+                reason: "must be within the episode lifetime",
+            });
+        }
+        if self
+            .next_review_at_ms
+            .is_some_and(|value| value < self.updated_at_ms)
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "liveness next review",
+                reason: "must not precede the current episode revision",
+            });
+        }
+        validate_bounded_texts(
+            &self.state_reason_codes,
+            "liveness state reason codes",
+            32,
+            MAX_IDENTIFIER_LEN,
+        )?;
+        validate_lower_hex(&self.sha256, "liveness episode sha256", SHA256_HEX_LEN)?;
+        if self.digest()? != self.sha256 {
+            return Err(OperatorControlError::InvalidField {
+                field: "liveness episode sha256",
+                reason: "does not match the canonical payload",
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

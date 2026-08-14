@@ -9,6 +9,8 @@ mod attention;
 mod correlation;
 mod external_conditions;
 mod investigations;
+mod liveness;
+mod progress;
 mod snapshots;
 
 pub use attention::*;

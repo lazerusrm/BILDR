@@ -31,13 +31,15 @@ do not copy parent changes into this program.
 
 ### Migration number
 
-ADR-0011 reserves `0012_supervisory_control.sql`. Use:
+The stacked supervision implementation now occupies migrations `0013` through
+`0016`. The operator-control foundation therefore uses:
 
 ```text
-migrations/0013_operator_control_plane.sql
+migrations/0017_operator_control_plane.sql
 ```
 
-Confirm the number again immediately before implementation.
+Confirm the number again immediately before integration; a later migration must
+never be renumbered to fit an obsolete design placeholder.
 
 ## Delivery strategy
 

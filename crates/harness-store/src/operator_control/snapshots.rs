@@ -31,6 +31,7 @@ impl Store {
     /// cursor matches, so direct attention updates cannot be hidden behind an
     /// unchanged controller-domain cursor.
     pub fn control_plane_snapshot(&self) -> Result<ControlPlaneSnapshot, StoreError> {
+        self.classify_material_progress()?;
         self.refresh_approval_attention()?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -66,6 +67,24 @@ impl Store {
             })?,
             "condition observation cursor",
         )?;
+        let material_progress_cursor = non_negative(
+            transaction.query_row("SELECT count(*) FROM material_progress_events", [], |row| {
+                row.get::<_, i64>(0)
+            })?,
+            "material progress cursor",
+        )?;
+        let liveness_episode_cursor = non_negative(
+            transaction.query_row("SELECT count(*) FROM liveness_episodes", [], |row| {
+                row.get::<_, i64>(0)
+            })?,
+            "liveness episode cursor",
+        )?;
+        let liveness_observation_cursor = non_negative(
+            transaction.query_row("SELECT count(*) FROM liveness_observations", [], |row| {
+                row.get::<_, i64>(0)
+            })?,
+            "liveness observation cursor",
+        )?;
         let mut source_cursors = BTreeMap::new();
         source_cursors.insert("domain_events".to_owned(), event_cursor);
         source_cursors.insert("attention_events".to_owned(), attention_cursor);
@@ -74,6 +93,15 @@ impl Store {
         source_cursors.insert(
             "condition_observations".to_owned(),
             condition_observation_cursor,
+        );
+        source_cursors.insert(
+            "material_progress_events".to_owned(),
+            material_progress_cursor,
+        );
+        source_cursors.insert("liveness_episodes".to_owned(), liveness_episode_cursor);
+        source_cursors.insert(
+            "liveness_observations".to_owned(),
+            liveness_observation_cursor,
         );
         let source_cursors_sha256 = digest(&serde_json::to_string(&source_cursors)?);
 
@@ -102,6 +130,8 @@ impl Store {
         let (investigation_rows, investigation_truncation) = investigation_rows(&transaction)?;
         let (external_condition_rows, external_condition_truncation) =
             external_condition_rows(&transaction)?;
+        let (progress_rows, progress_truncation) = material_progress_rows(&transaction)?;
+        let (liveness_rows, liveness_truncation) = liveness_rows(&transaction)?;
         let active_agents: i64 = transaction.query_row(
             "SELECT count(*) FROM agent_sessions WHERE state NOT IN ('COMPLETED','FAILED','CANCELED')",
             [],
@@ -139,6 +169,8 @@ impl Store {
             ("attempts", attempt_truncation),
             ("investigations", investigation_truncation),
             ("external_conditions", external_condition_truncation),
+            ("progress", progress_truncation),
+            ("liveness", liveness_truncation),
         ] {
             if let Some(omitted_rows) = omitted {
                 truncation.push(SnapshotTruncation {
@@ -178,10 +210,31 @@ impl Store {
                 section.truncated = investigation_truncation.is_some();
                 section
             },
-            progress: unavailable(
-                "Material-progress adapter is not wired into this deterministic slice.",
-            ),
-            liveness: unavailable("Liveness reducer is not wired into this deterministic slice."),
+            progress: {
+                let mut section = current(progress_rows, material_progress_cursor);
+                section.truncated = progress_truncation.is_some();
+                section.detail = Some(
+                    "Replayable material-progress records from the closed controller-event allow-list; ordinary activity is excluded."
+                        .to_owned(),
+                );
+                section
+            },
+            liveness: {
+                let mut section = current(
+                    liveness_rows,
+                    liveness_episode_cursor
+                        .checked_add(liveness_observation_cursor)
+                        .ok_or_else(|| {
+                            StoreError::Validation("liveness snapshot cursor overflow".to_owned())
+                        })?,
+                );
+                section.truncated = liveness_truncation.is_some();
+                section.detail = Some(
+                    "Observe-only deterministic liveness episodes. This projection never starts recovery or clears state from model prose."
+                        .to_owned(),
+                );
+                section
+            },
             reconciliation: unavailable(
                 "Reconciliation reducer is not wired into this deterministic slice.",
             ),
@@ -425,7 +478,7 @@ fn controller_event_rows(
         })?,
         truncated: count > RETURN_CHANGE_ROW_LIMIT as u64,
         detail: Some(
-            "Chronological controller events since the last acknowledgement; material-progress classification is not wired into this slice."
+            "Chronological controller events since the last acknowledgement; the separate progress section contains only classifier-approved material changes."
                 .to_owned(),
         ),
     })
@@ -565,6 +618,56 @@ fn external_condition_rows(
         .query_map([SECTION_ROW_LIMIT], |row| {
             let condition = checked_condition_row(row.get(0)?, row.get(1)?)?;
             serde_json::to_value(harness_domain::ExternalConditionSummary::from(&condition))
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((
+        rows,
+        (count > SECTION_ROW_LIMIT as u64).then(|| count - SECTION_ROW_LIMIT as u64),
+    ))
+}
+
+fn material_progress_rows(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(Vec<Value>, Option<u64>), StoreError> {
+    let count = non_negative(
+        transaction.query_row("SELECT count(*) FROM material_progress_events", [], |row| {
+            row.get::<_, i64>(0)
+        })?,
+        "material progress count",
+    )?;
+    let mut statement = transaction.prepare(
+        "SELECT payload_json,payload_sha256 FROM material_progress_events ORDER BY occurred_at DESC,id DESC LIMIT ?1",
+    )?;
+    let rows = statement
+        .query_map([SECTION_ROW_LIMIT], |row| {
+            let progress = super::progress::checked_progress_row(row.get(0)?, row.get(1)?)?;
+            serde_json::to_value(progress)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((
+        rows,
+        (count > SECTION_ROW_LIMIT as u64).then(|| count - SECTION_ROW_LIMIT as u64),
+    ))
+}
+
+fn liveness_rows(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(Vec<Value>, Option<u64>), StoreError> {
+    let count = non_negative(
+        transaction.query_row("SELECT count(*) FROM liveness_episodes", [], |row| {
+            row.get::<_, i64>(0)
+        })?,
+        "liveness episode count",
+    )?;
+    let mut statement = transaction.prepare(
+        "SELECT current_payload_json,current_payload_sha256 FROM liveness_episodes ORDER BY updated_at DESC,id DESC LIMIT ?1",
+    )?;
+    let rows = statement
+        .query_map([SECTION_ROW_LIMIT], |row| {
+            let episode = super::liveness::checked_episode_row(row.get(0)?, row.get(1)?)?;
+            serde_json::to_value(episode)
                 .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -714,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn return_view_preserves_unknown_sections_and_cursor_cannot_regress() {
+    fn return_view_preserves_current_observe_only_sections_and_cursor_cannot_regress() {
         let temp = TempDir::new().expect("temp");
         let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
         for event in 0..4 {
@@ -747,7 +850,7 @@ mod tests {
         );
         assert_eq!(
             view.sections.get("liveness").expect("liveness").state,
-            SnapshotSectionState::Unknown
+            SnapshotSectionState::Current
         );
         assert!(matches!(
             store.advance_return_view_cursor("operator_a", snapshot.revision, 3),
