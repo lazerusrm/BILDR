@@ -97,10 +97,12 @@ The current branch implements durable attention, investigation and external
 condition records, immutable snapshots/return views, deterministic material
 progress, observe-only liveness episodes, exact-revision intervention receipts,
 reconciliation/ownership evidence, bounded run topology, and a retry-safe
-in-product notification mirror. Supervisor snapshots receive bounded
-control-plane custody facts and restrict recommendations on uncertain custody.
-The browser and CLI can read these projections without acquiring work or
-changing controller state.
+in-product notification mirror. It also exposes immutable, bounded causal-link
+trace lookup; this is receipt inspection only, not yet full trace propagation
+through every producer. Supervisor snapshots receive bounded control-plane
+custody facts and restrict recommendations on uncertain custody. The browser
+and CLI can read these projections without acquiring work or changing
+controller state.
 
 Desktop notification delivery/batching, active intervention execution,
 reconciliation proof consumption, external wake adapters, adaptive supervisor

@@ -85,6 +85,8 @@ enum Command {
     },
     /// Inspect immutable receipts for controller-path interventions already completed against one liveness episode.
     InterventionReceipts { episode_id: String },
+    /// Inspect one bounded, immutable causal trace. This cannot create a link or change controller state.
+    Trace { trace_id: String },
     /// Show the bounded factual topology for one run.
     Topology { run_id: String },
     /// Inspect reconciliation inventory records. These commands cannot apply recovery actions.
@@ -738,6 +740,7 @@ async fn execute(api: &ApiClient, command: Command) -> Result<Value> {
         Command::InterventionReceipts { episode_id } => {
             operator_control::intervention_receipts(api, episode_id).await
         }
+        Command::Trace { trace_id } => operator_control::trace(api, trace_id).await,
         Command::Topology { run_id } => operator_control::topology(api, run_id).await,
         Command::Recovery { command } => operator_control::recovery(api, command).await,
         Command::Worktree { command } => match command {

@@ -128,6 +128,12 @@ pub(super) async fn intervention_receipts(api: &ApiClient, episode_id: String) -
     .await
 }
 
+pub(super) async fn trace(api: &ApiClient, trace_id: String) -> Result<Value> {
+    let trace_id: String = url::form_urlencoded::byte_serialize(trace_id.as_bytes()).collect();
+    api.get(&format!("/api/v1/traces/{trace_id}?limit=50"))
+        .await
+}
+
 pub(super) async fn topology(api: &ApiClient, run_id: String) -> Result<Value> {
     let run_id: String = url::form_urlencoded::byte_serialize(run_id.as_bytes()).collect();
     api.get(&format!("/api/v1/runs/{run_id}/topology")).await

@@ -397,6 +397,25 @@ paths:
             application/json:
               schema: {type: array, items: {$ref: '#/components/schemas/InterventionReceipt'}}
         '404': {$ref: '#/components/responses/NotFound'}
+  /traces/{traceId}:
+    get:
+      tags: [ControlPlane]
+      operationId: listCorrelationLinks
+      description: Bounded immutable causal-link receipts for one exact trace. This endpoint cannot create links, start work, or expose raw event payloads.
+      parameters:
+        - name: traceId
+          in: path
+          required: true
+          schema: {type: string, pattern: '^[0-9a-f]{32}$'}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 8192, default: 50}
+      responses:
+        '200':
+          description: Stable, bounded causal-link receipts for the trace. An unknown trace returns an empty list.
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/CorrelationLink'}}
   /runs/{runId}/topology:
     get:
       tags: [ControlPlane]
@@ -1751,6 +1770,28 @@ components:
         requested_by: {type: string, maxLength: 160}
         created_at_ms: {type: integer, minimum: 0}
         sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    TraceContext:
+      type: object
+      additionalProperties: false
+      required: [trace_id, span_id, parent_span_id]
+      properties:
+        trace_id: {type: string, pattern: '^[0-9a-f]{32}$'}
+        span_id: {type: string, pattern: '^[0-9a-f]{16}$'}
+        parent_span_id: {type: [string, 'null'], pattern: '^[0-9a-f]{16}$'}
+    CorrelationLink:
+      type: object
+      additionalProperties: false
+      required: [schema, link_id, trace, from_kind, from_id, to_kind, to_id, relation, created_at_ms]
+      properties:
+        schema: {const: harness.correlation-link.v1}
+        link_id: {type: string, maxLength: 160}
+        trace: {$ref: '#/components/schemas/TraceContext'}
+        from_kind: {type: string, maxLength: 160}
+        from_id: {type: string, maxLength: 160}
+        to_kind: {type: string, maxLength: 160}
+        to_id: {type: string, maxLength: 160}
+        relation: {type: string, maxLength: 160}
+        created_at_ms: {type: integer, minimum: 0}
     ReconciliationEpisode:
       type: object
       additionalProperties: false

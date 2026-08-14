@@ -57,6 +57,7 @@ pub(super) fn routes() -> Router<ApiState> {
             "/api/v1/liveness/{episode_id}/interventions",
             get(list_intervention_receipts),
         )
+        .route("/api/v1/traces/{trace_id}", get(list_correlation_links))
         .route("/api/v1/runs/{run_id}/topology", get(run_topology))
         .route("/api/v1/reconciliations", get(list_reconciliations))
         .route(
@@ -379,6 +380,24 @@ async fn list_intervention_receipts(
 #[derive(Debug, Deserialize)]
 struct LimitQuery {
     limit: Option<u32>,
+}
+
+/// A bounded, immutable causal trace. Trace links are receipts produced by
+/// controller-owned paths; looking them up cannot add a link, resume a run,
+/// or disclose unbounded event payloads.
+async fn list_correlation_links(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(trace_id): Path<String>,
+    Query(query): Query<LimitQuery>,
+) -> Result<Json<Vec<harness_domain::CorrelationLink>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .store()
+            .correlation_links(&trace_id, query.limit.unwrap_or(50))?,
+    ))
 }
 
 async fn run_topology(
