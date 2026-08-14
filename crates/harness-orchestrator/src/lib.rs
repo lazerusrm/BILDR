@@ -916,6 +916,7 @@ fn expert_request_payload(
     let mut task_ids = task_ids;
     task_ids.sort();
     task_ids.dedup();
+    let failure_scope = expert_signature_failure_scope(snapshot, &task_ids);
     let evidence_refs = brief
         .get("evidence_refs")
         .and_then(Value::as_array)
@@ -991,10 +992,16 @@ fn expert_request_payload(
         "run_id": run.id,
         "goal_revision": snapshot.payload.get("goal_revision").cloned().unwrap_or_else(|| json!(snapshot.revision)),
         "task_ids": task_ids,
-        "evidence_refs": evidence_refs,
+        "failure_scope": failure_scope,
         "authority_digest": run.authority_digest,
     });
     let signature = hex::encode(Sha256::digest(serde_json::to_vec(&signature_material)?));
+    let goal = run.objective.chars().take(8_000).collect::<String>();
+    if goal.trim().is_empty() {
+        return Err(OrchestratorError::Protocol(
+            "expert request run objective is empty after schema bounding".to_owned(),
+        ));
+    }
     let payload = json!({
         "schema": "harness.expert-request.v1",
         "request_id": request_id,
@@ -1008,7 +1015,7 @@ fn expert_request_payload(
         "category": category,
         "question": question,
         "context": {
-            "goal": run.objective,
+            "goal": goal,
             "why_normal_agents_cannot_resolve": why_normal_agents_cannot_resolve,
             "known_facts": known_facts,
             "disputed_claims": disputed_claims,
@@ -1018,6 +1025,41 @@ fn expert_request_payload(
         "evidence_refs": evidence_payload,
     });
     Ok((payload, signature))
+}
+
+/// The expert completion cap is deliberately keyed to controller-owned task
+/// and failure scope, not the latest snapshot/event IDs. An expert response
+/// itself emits a material event and therefore produces a fresh snapshot; if
+/// that churn changed the signature, every completed consultation could reset
+/// its own cap.
+fn expert_signature_failure_scope(
+    snapshot: &SupervisorSnapshotRecord,
+    task_ids: &[String],
+) -> Vec<(String, Vec<String>)> {
+    let mut scope = task_ids
+        .iter()
+        .map(|task_id| {
+            let mut blockers = snapshot
+                .payload
+                .get("tasks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|task| task.get("task_id").and_then(Value::as_str) == Some(task_id))
+                .and_then(|task| task.get("blockers").and_then(Value::as_array))
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|blocker| !blocker.trim().is_empty() && blocker.chars().count() <= 1_000)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            blockers.sort();
+            blockers.dedup();
+            (task_id.clone(), blockers)
+        })
+        .collect::<Vec<_>>();
+    scope.sort();
+    scope
 }
 
 fn expert_request_prompt(request: &ExpertRequestRecord) -> Result<String, OrchestratorError> {
@@ -17380,6 +17422,7 @@ mod tests {
                     "tasks": [{
                         "task_id": task.id,
                         "risk_flags": ["canonical_contract"],
+                        "blockers": ["high impact integration conflict"],
                     }],
                     "evidence_refs": [{
                         "kind": "event",
@@ -17654,6 +17697,13 @@ mod tests {
         let mut fresh_snapshot = snapshot.clone();
         fresh_snapshot.id = harness_domain::SupervisorSnapshotId::from("fresh-snapshot-id");
         fresh_snapshot.revision += 1;
+        fresh_snapshot.payload["event_cursor"] = json!(snapshot.event_cursor + 1);
+        fresh_snapshot.payload["evidence_refs"] = json!([{
+            "kind": "event",
+            "id": "expert-completed-event",
+            "summary": "A prior expert completion created this fresh snapshot.",
+            "digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        }]);
         let (_second_payload, second_signature) = expert_request_payload(
             &action,
             &run,
@@ -17685,6 +17735,25 @@ mod tests {
                 "summary": "The controller recorded a blocked integration conflict.",
                 "digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             })
+        );
+
+        let mut long_goal_run = run.clone();
+        long_goal_run.objective = "g".repeat(8_001);
+        let (long_goal_payload, _) = expert_request_payload(
+            &action,
+            &long_goal_run,
+            &snapshot,
+            &ExpertRequestId::from("bounded-goal-request"),
+            expires_at_ms,
+        )
+        .expect("a valid long run objective remains bounded for the expert schema");
+        assert_eq!(
+            long_goal_payload["context"]["goal"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            8_000
         );
     }
 
