@@ -77,6 +77,16 @@ CREATE TABLE IF NOT EXISTS material_progress_events (
 );
 CREATE INDEX IF NOT EXISTS idx_material_progress_run_occurred ON material_progress_events(run_id, occurred_at DESC);
 
+-- One durable classifier checkpoint makes progress projection incremental.
+-- It advances in the same immediate transaction as the immutable rows, so a
+-- failed classification never skips a source event and a completed suffix is
+-- never replayed on every operator refresh.
+CREATE TABLE IF NOT EXISTS material_progress_classifier_state (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    event_cursor INTEGER NOT NULL CHECK(event_cursor >= 0)
+);
+INSERT OR IGNORE INTO material_progress_classifier_state(id, event_cursor) VALUES(1, 0);
+
 CREATE TABLE IF NOT EXISTS liveness_episodes (
     id TEXT PRIMARY KEY,
     run_id TEXT,

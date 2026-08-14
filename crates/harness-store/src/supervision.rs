@@ -201,6 +201,25 @@ impl Store {
     {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
+        let observation = Self::capture_supervisor_observation_in_transaction(
+            &transaction,
+            run_id,
+            max_events,
+            after_run_read,
+        )?;
+        transaction.commit()?;
+        Ok(observation)
+    }
+
+    pub(crate) fn capture_supervisor_observation_in_transaction<F>(
+        transaction: &Transaction<'_>,
+        run_id: &RunId,
+        max_events: u32,
+        after_run_read: F,
+    ) -> Result<SupervisorObservationInput, StoreError>
+    where
+        F: FnOnce() -> Result<(), StoreError>,
+    {
         let run = transaction
             .query_row(
                 &format!("{} WHERE r.id=?1", queries::run_select()),
@@ -299,7 +318,6 @@ impl Store {
             [run.repository_id.as_str()],
             |row| row.get(0),
         )?;
-        transaction.commit()?;
         Ok(SupervisorObservationInput {
             run,
             cursor,

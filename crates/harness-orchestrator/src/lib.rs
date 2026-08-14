@@ -695,6 +695,36 @@ fn supervisor_action_stale_reason(
             "a later material controller event superseded this proposal".to_owned(),
         ));
     }
+    let bound_facts = snapshot
+        .payload
+        .get("operator_control")
+        .ok_or_else(|| {
+            OrchestratorError::Protocol(
+                "the bound supervisory snapshot has no operator-control custody facts".to_owned(),
+            )
+        })
+        .and_then(|summary| {
+            supervision::operator_control_fact_payload_from_summary(summary)
+                .map_err(OrchestratorError::Protocol)
+        });
+    let bound_facts = match bound_facts {
+        Ok(facts) => facts,
+        Err(error) => return Ok(Some(error.to_string())),
+    };
+    // Capture current run-scoped liveness, reconciliation, and related
+    // custody facts through the canonical projection. This deliberately
+    // compares facts only, not global snapshot metadata: recording the
+    // supervisor decision itself emits controller events and must not stale
+    // an otherwise unchanged human proposal.
+    let control_plane = store.control_plane_snapshot()?;
+    let tasks = store.list_tasks(&action.run_id)?;
+    let current_facts =
+        supervision::control_plane_fact_payload(&control_plane, action.run_id.as_str(), &tasks);
+    if current_facts != bound_facts {
+        return Ok(Some(
+            "operator-control custody facts changed after this proposal was reviewed".to_owned(),
+        ));
+    }
     Ok(None)
 }
 
@@ -17249,6 +17279,12 @@ mod tests {
                 token_budget: Some(1_000_000),
             })
             .expect("fixture run persists");
+        let control_plane = orchestrator
+            .store()
+            .control_plane_snapshot()
+            .expect("fixture control-plane snapshot persists");
+        let operator_control =
+            supervision::control_plane_summary(&control_plane, run_id.as_str(), &[]);
         let snapshot = orchestrator
             .store()
             .record_supervisor_snapshot(&run_id, 1, "operator_steered", |id, revision| {
@@ -17260,7 +17296,8 @@ mod tests {
                     "event_cursor": 1,
                     "generated_at": "2026-08-14T00:00:00Z",
                     "allowed_actions": ["request_replan"],
-                    "tasks": [{"task_id": "task-1"}]
+                    "tasks": [{"task_id": "task-1"}],
+                    "operator_control": operator_control,
                 }))
             })
             .expect("fixture snapshot persists");
@@ -17458,6 +17495,15 @@ mod tests {
             .last()
             .map(|event| event.id)
             .unwrap_or(0);
+        let control_plane = orchestrator
+            .store()
+            .control_plane_snapshot()
+            .expect("expert fixture control-plane snapshot persists");
+        let operator_control = supervision::control_plane_summary(
+            &control_plane,
+            run_id.as_str(),
+            std::slice::from_ref(&task),
+        );
         let snapshot = orchestrator
             .store()
             .record_supervisor_snapshot(run_id, event_cursor, "operator_steered", |id, revision| {
@@ -17481,6 +17527,7 @@ mod tests {
                         "summary": "The controller recorded a blocked integration conflict.",
                         "digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
                     }],
+                    "operator_control": operator_control,
                 }))
             })
             .expect("expert fixture snapshot persists");
@@ -17613,6 +17660,81 @@ mod tests {
             .apply_supervisor_action(&action.id, "local-user")
             .await
             .expect("staleness is a durable non-executing outcome");
+        assert_eq!(stale.state, "STALE");
+        assert!(stale.execution_receipt.is_none());
+    }
+
+    #[tokio::test]
+    async fn later_liveness_custody_change_makes_supervisor_proposal_stale() {
+        let (orchestrator, _temp) = operator_settings_test_orchestrator().await;
+        orchestrator
+            .update_operator_settings(operator_settings_request(Some(true), None))
+            .await
+            .expect("advisory mode enables explicitly");
+        let action = fixture_supervisor_action(&orchestrator, "wait").await;
+        let mut episode = harness_domain::LivenessEpisode {
+            schema: "harness.liveness-episode.v1".to_owned(),
+            episode_id: harness_domain::LivenessEpisodeId::new(),
+            run_id: Some(action.run_id.to_string()),
+            task_id: Some("fixture-task".to_owned()),
+            attempt_id: Some("fixture-attempt".to_owned()),
+            state: harness_domain::LivenessState::Healthy,
+            version: 1,
+            opened_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            state_reason_codes: vec!["opened".to_owned()],
+            last_material_progress_at_ms: None,
+            next_review_at_ms: None,
+            intervention_count: 0,
+            outcome: None,
+            sha256: String::new(),
+        };
+        episode.sha256 = episode.digest().expect("liveness fixture digest");
+        orchestrator
+            .store()
+            .open_liveness_episode(&episode)
+            .expect("later liveness episode persists");
+        let stale = orchestrator
+            .apply_supervisor_action(&action.id, "local-user")
+            .await
+            .expect("liveness change becomes a durable stale outcome");
+        assert_eq!(stale.state, "STALE");
+        assert!(stale.execution_receipt.is_none());
+    }
+
+    #[tokio::test]
+    async fn later_reconciliation_custody_change_makes_supervisor_proposal_stale() {
+        let (orchestrator, _temp) = operator_settings_test_orchestrator().await;
+        orchestrator
+            .update_operator_settings(operator_settings_request(Some(true), None))
+            .await
+            .expect("advisory mode enables explicitly");
+        let action = fixture_supervisor_action(&orchestrator, "wait").await;
+        let mut episode = harness_domain::ReconciliationEpisode {
+            schema: "harness.reconciliation-episode.v1".to_owned(),
+            episode_id: harness_domain::ReconciliationEpisodeId::new(),
+            run_id: Some(action.run_id.to_string()),
+            trigger_kind: harness_domain::ReconciliationTrigger::AppServerLoss,
+            state: harness_domain::ReconciliationState::Open,
+            version: 1,
+            opened_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            source_event_id: "event-fixture-reconciliation".to_owned(),
+            inventory_sha256: "a".repeat(64),
+            finding_count: 0,
+            action_count: 0,
+            report: None,
+            sha256: String::new(),
+        };
+        episode.sha256 = episode.digest().expect("reconciliation fixture digest");
+        orchestrator
+            .store()
+            .open_reconciliation_episode(&episode)
+            .expect("later reconciliation episode persists");
+        let stale = orchestrator
+            .apply_supervisor_action(&action.id, "local-user")
+            .await
+            .expect("reconciliation change becomes a durable stale outcome");
         assert_eq!(stale.state, "STALE");
         assert!(stale.execution_receipt.is_none());
     }

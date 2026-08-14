@@ -80,6 +80,7 @@
     "reconciliation": [],
     "investigations": [],
     "external_conditions": [],
+    "truncated_sections": [],
     "limitations": [
       "operator-control facts are bounded read-only evidence",
       "the supervisor cannot close attention, modify liveness, reconcile ownership, or deliver notifications"

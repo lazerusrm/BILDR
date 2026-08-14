@@ -143,6 +143,7 @@ async fn get_attention(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AcknowledgeAttentionRequest {
     expected_version: u64,
     acknowledged_at_ms: Option<i64>,
@@ -164,6 +165,7 @@ async fn acknowledge_attention(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AdvanceReturnViewCursorRequest {
     operator_id: String,
     expected_snapshot_revision: u64,
@@ -461,6 +463,7 @@ async fn get_operator_presence(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SetPresenceRequest {
     operator_id: String,
     mode: OperatorPresenceMode,
@@ -497,4 +500,44 @@ async fn list_notification_deliveries(
             .store()
             .list_notification_deliveries(query.limit.unwrap_or(50))?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    // Axum's Json extractor maps these serde failures to a 422 response before
+    // the mutation handler/authentication path runs. Keeping the request
+    // structs closed here makes that HTTP behavior match the checked-in
+    // OpenAPI `additionalProperties: false` contract.
+    #[test]
+    fn operator_control_mutation_bodies_reject_unknown_http_json_fields() {
+        assert!(
+            serde_json::from_value::<AcknowledgeAttentionRequest>(json!({
+                "expected_version": 1,
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<AdvanceReturnViewCursorRequest>(json!({
+                "operator_id": "local_operator",
+                "expected_snapshot_revision": 1,
+                "acknowledged_cursor": 0,
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<SetPresenceRequest>(json!({
+                "operator_id": "local_operator",
+                "mode": "interactive",
+                "expected_version": 0,
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+    }
 }

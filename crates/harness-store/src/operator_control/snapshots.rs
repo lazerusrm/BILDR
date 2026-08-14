@@ -4,7 +4,7 @@ use harness_domain::{
     AttentionItem, ControlPlaneSnapshot, ControlPlaneSnapshotId, ReturnView, ReturnViewId,
     SnapshotSection, SnapshotSectionState, SnapshotTruncation, now_ms,
 };
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -31,11 +31,47 @@ impl Store {
     /// cursor matches, so direct attention updates cannot be hidden behind an
     /// unchanged controller-domain cursor.
     pub fn control_plane_snapshot(&self) -> Result<ControlPlaneSnapshot, StoreError> {
+        self.refresh_control_plane_projections()?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let snapshot = Self::compile_control_plane_snapshot(&transaction)?;
+        transaction.commit()?;
+        Ok(snapshot)
+    }
+
+    /// Captures supervisor inputs and the operator-control evidence from one
+    /// SQLite snapshot. The caller may persist a resulting supervisor receipt
+    /// later, but its run/task evidence and operator-control facts always
+    /// describe the same immutable database cut.
+    pub(crate) fn capture_supervisor_observation_with_control_plane(
+        &self,
+        run_id: &harness_domain::RunId,
+        max_events: u32,
+    ) -> Result<(crate::SupervisorObservationInput, ControlPlaneSnapshot), StoreError> {
+        self.refresh_control_plane_projections()?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let observation = Self::capture_supervisor_observation_in_transaction(
+            &transaction,
+            run_id,
+            max_events,
+            || Ok(()),
+        )?;
+        let control_plane = Self::compile_control_plane_snapshot(&transaction)?;
+        transaction.commit()?;
+        Ok((observation, control_plane))
+    }
+
+    fn refresh_control_plane_projections(&self) -> Result<(), StoreError> {
         self.classify_material_progress()?;
         self.refresh_approval_attention()?;
         self.refresh_notification_mirror()?;
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Ok(())
+    }
+
+    fn compile_control_plane_snapshot(
+        transaction: &Transaction<'_>,
+    ) -> Result<ControlPlaneSnapshot, StoreError> {
         let event_cursor = non_negative(
             transaction.query_row("SELECT coalesce(max(id),0) FROM domain_events", [], |row| {
                 row.get::<_, i64>(0)
@@ -135,7 +171,6 @@ impl Store {
             )
             .optional()?
         {
-            transaction.commit()?;
             return Ok(existing);
         }
         let revision = non_negative(
@@ -340,7 +375,6 @@ impl Store {
                 ],
             )?;
         }
-        transaction.commit()?;
         Ok(snapshot)
     }
 

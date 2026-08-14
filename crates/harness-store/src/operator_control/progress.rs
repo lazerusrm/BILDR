@@ -5,7 +5,7 @@
 //! names cannot become progress by accident.
 
 use harness_domain::{MaterialProgressEvent, MaterialProgressEventId, MaterialProgressKind};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -26,18 +26,30 @@ struct SourceEvent {
 }
 
 impl Store {
-    /// Replays the closed material-progress classifier over durable controller
-    /// events. The source event id and kind are the idempotency key, so retry
-    /// and restart preserve exactly one immutable progress record.
+    /// Advances the closed material-progress classifier over previously
+    /// unclassified controller events. A durable cursor makes a normal read
+    /// path bounded by the new event suffix, not the lifetime event ledger.
+    /// The source event id and kind remain the immutable idempotency key, so a
+    /// crash before commit simply retries the same suffix.
     pub fn classify_material_progress(&self) -> Result<Vec<MaterialProgressEvent>, StoreError> {
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cursor: i64 = transaction.query_row(
+            "SELECT event_cursor FROM material_progress_classifier_state WHERE id=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if cursor < 0 {
+            return Err(StoreError::Validation(
+                "material progress classifier cursor is negative".to_owned(),
+            ));
+        }
         let events = {
             let mut statement = transaction.prepare(
-                "SELECT id,run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json FROM domain_events ORDER BY id ASC",
+                "SELECT id,run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json FROM domain_events WHERE id>?1 ORDER BY id ASC",
             )?;
             statement
-                .query_map([], |row| {
+                .query_map([cursor], |row| {
                     Ok(SourceEvent {
                         id: row.get(0)?,
                         run_id: row.get(1)?,
@@ -59,7 +71,9 @@ impl Store {
                 .collect::<Result<Vec<_>, _>>()?
         };
         let mut classified = Vec::new();
+        let mut advanced_cursor = cursor;
         for event in events {
+            advanced_cursor = event.id;
             let Some((kind, summary)) = classify_source_event(&event) else {
                 continue;
             };
@@ -98,6 +112,12 @@ impl Store {
                 ],
             )?;
             classified.push(progress);
+        }
+        if advanced_cursor != cursor {
+            transaction.execute(
+                "UPDATE material_progress_classifier_state SET event_cursor=?1 WHERE id=1",
+                [advanced_cursor],
+            )?;
         }
         transaction.commit()?;
         Ok(classified)
@@ -314,7 +334,118 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].kind, MaterialProgressKind::CandidateChanged);
         let replay = store.classify_material_progress().expect("replay");
-        assert_eq!(first, replay);
+        assert!(
+            replay.is_empty(),
+            "a fully classified ledger is not replayed"
+        );
         assert_eq!(store.list_material_progress(None, 10).unwrap(), first);
+    }
+
+    #[test]
+    fn classifier_advances_a_durable_suffix_cursor() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        for index in 0..3 {
+            store
+                .emit_domain_event(
+                    None,
+                    "agent",
+                    format!("agent-{index}"),
+                    "agent.output.delta",
+                    &json!({"tokens": index}),
+                    None,
+                )
+                .expect("noise");
+        }
+        store
+            .emit_domain_event(
+                None,
+                "task",
+                "task-first",
+                "task.governor.candidate_materialized",
+                &json!({"tree_sha": "a".repeat(40)}),
+                None,
+            )
+            .expect("first material event");
+        let first = store.classify_material_progress().expect("first suffix");
+        assert_eq!(first.len(), 1);
+        store
+            .emit_domain_event(
+                None,
+                "task",
+                "task-second",
+                "task.verified",
+                &json!({}),
+                None,
+            )
+            .expect("second material event");
+        let second = store.classify_material_progress().expect("second suffix");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].kind, MaterialProgressKind::ValidationAdvanced);
+        let connection = store.connection().expect("connection");
+        let cursor: i64 = connection
+            .query_row(
+                "SELECT event_cursor FROM material_progress_classifier_state WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("cursor");
+        let max_event: i64 = connection
+            .query_row("SELECT max(id) FROM domain_events", [], |row| row.get(0))
+            .expect("event cursor");
+        assert_eq!(cursor, max_event);
+        drop(connection);
+        assert_eq!(store.list_material_progress(None, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn classifier_cursor_survives_restart_and_serializes_concurrent_readers() {
+        use std::sync::{Arc, Barrier};
+
+        let temp = TempDir::new().expect("temp");
+        let database = temp.path().join("harness.sqlite3");
+        let store = Store::open(&database, &temp.path().join("artifacts-a")).expect("store");
+        store
+            .emit_domain_event(
+                None,
+                "task",
+                "task-restart",
+                "task.verified",
+                &json!({}),
+                None,
+            )
+            .expect("material event");
+        assert_eq!(store.classify_material_progress().unwrap().len(), 1);
+        drop(store);
+
+        let restarted =
+            Store::open(&database, &temp.path().join("artifacts-b")).expect("restarted store");
+        assert!(restarted.classify_material_progress().unwrap().is_empty());
+        restarted
+            .emit_domain_event(
+                None,
+                "task",
+                "task-concurrent",
+                "task.verified",
+                &json!({}),
+                None,
+            )
+            .expect("new material event");
+        let second =
+            Store::open(&database, &temp.path().join("artifacts-c")).expect("second reader");
+        let barrier = Arc::new(Barrier::new(2));
+        let first_barrier = Arc::clone(&barrier);
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            restarted
+                .classify_material_progress()
+                .expect("first classifier")
+        });
+        barrier.wait();
+        let second_result = second
+            .classify_material_progress()
+            .expect("second classifier");
+        let first_result = first.join().expect("classifier thread joins");
+        assert_eq!(first_result.len() + second_result.len(), 1);
     }
 }

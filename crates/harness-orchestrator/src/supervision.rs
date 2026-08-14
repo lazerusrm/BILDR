@@ -75,7 +75,12 @@ fn observe_run_with_force(
             "supervision mode is not enabled by the advisory runtime".to_owned(),
         ));
     }
-    let observation = store.capture_supervisor_observation(run_id, MAX_EVENTS_PER_OBSERVATION)?;
+    // Run/task evidence and operator-control custody must come from one
+    // SQLite transaction cut. Capturing them through separate Store calls can
+    // otherwise construct a formally immutable but internally inconsistent
+    // supervisor snapshot under a concurrent controller update.
+    let (observation, control_plane) = store
+        .capture_supervisor_observation_with_control_plane(run_id, MAX_EVENTS_PER_OBSERVATION)?;
     let Some(last_event) = observation.events.last() else {
         return Ok(None);
     };
@@ -110,11 +115,6 @@ fn observe_run_with_force(
         .rev()
         .map(|event| (*event).clone())
         .collect::<Vec<_>>();
-    // The supervisor receives only a compact, immutable reference plus
-    // run-scoped facts from the operator-control projection. This remains a
-    // read path: compiling the projection neither schedules work nor changes
-    // any source-owned attention, recovery, or liveness state.
-    let control_plane = store.control_plane_snapshot()?;
     let snapshot = store.record_supervisor_snapshot(
         run_id,
         event_cursor,
@@ -340,7 +340,11 @@ fn build_snapshot(
                         Some("resolved" | "refused")
                     )
                 })
-            });
+            })
+        || operator_control
+            .get("truncated_sections")
+            .and_then(Value::as_array)
+            .is_some_and(|sections| !sections.is_empty());
     json!({
         "schema": "harness.supervisor-snapshot.v1",
         "snapshot_id": snapshot_id,
@@ -429,7 +433,48 @@ fn build_snapshot(
     })
 }
 
-fn control_plane_summary(
+pub(crate) fn control_plane_summary(
+    snapshot: &harness_domain::ControlPlaneSnapshot,
+    run_id: &str,
+    tasks: &[TaskSummary],
+) -> Value {
+    let facts = control_plane_fact_payload(snapshot, run_id, tasks);
+    let mut summary = json!({
+        "schema": "harness.supervisor-control-facts.v1",
+        "snapshot_id": snapshot.snapshot_id,
+        "snapshot_revision": snapshot.revision,
+        "snapshot_sha256": snapshot.sha256,
+        "event_cursor": snapshot.event_cursor,
+        "attention": facts["attention"],
+        "material_progress": facts["material_progress"],
+        "liveness": facts["liveness"],
+        "reconciliation": facts["reconciliation"],
+        "investigations": facts["investigations"],
+        "external_conditions": facts["external_conditions"],
+        "truncated_sections": facts["truncated_sections"],
+        "limitations": [
+            "operator-control facts are bounded read-only evidence",
+            "the supervisor cannot close attention, modify liveness, reconcile ownership, or deliver notifications",
+        ],
+    });
+    summary
+}
+
+const OPERATOR_CONTROL_FACT_KEYS: [&str; 7] = [
+    "attention",
+    "material_progress",
+    "liveness",
+    "reconciliation",
+    "investigations",
+    "external_conditions",
+    "truncated_sections",
+];
+
+/// Canonical, run-scoped controller facts used both in a supervisor snapshot
+/// and during action freshness validation. Metadata such as a global snapshot
+/// revision is intentionally excluded: recording an advisory decision itself
+/// must not stale its own proposal.
+pub(crate) fn control_plane_fact_payload(
     snapshot: &harness_domain::ControlPlaneSnapshot,
     run_id: &str,
     tasks: &[TaskSummary],
@@ -445,7 +490,7 @@ fn control_plane_summary(
     };
     let task_owner_ids = tasks
         .iter()
-        .flat_map(|task| [task.id.as_str(), task.external_task_id.as_str()])
+        .map(|task| task.id.as_str())
         .collect::<Vec<_>>();
     let attempt_owner_ids = snapshot
         .attempts
@@ -454,10 +499,6 @@ fn control_plane_summary(
         .filter(|row| row.get("run_id").and_then(Value::as_str) == Some(run_id))
         .filter_map(|row| row.get("attempt_id").and_then(Value::as_str))
         .collect::<Vec<_>>();
-    // External conditions are owned by a run, one of its tasks, or one of
-    // that run's attempts. Their compact summary intentionally has no
-    // `run_id`, unlike the other control-plane rows, so scope it through the
-    // explicit owner tuple rather than silently dropping all of them.
     let external_conditions = snapshot
         .external_conditions
         .rows
@@ -474,23 +515,58 @@ fn control_plane_summary(
         .take(50)
         .cloned()
         .collect::<Vec<_>>();
+    let truncated_sections = snapshot
+        .truncation
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.section.as_str(),
+                "attention"
+                    | "attempts"
+                    | "investigations"
+                    | "external_conditions"
+                    | "progress"
+                    | "liveness"
+                    | "reconciliation"
+            )
+        })
+        .map(|entry| {
+            json!({
+                "section": entry.section,
+                "omitted_rows": entry.omitted_rows,
+                "limit": entry.limit,
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
-        "schema": "harness.supervisor-control-facts.v1",
-        "snapshot_id": snapshot.snapshot_id,
-        "snapshot_revision": snapshot.revision,
-        "snapshot_sha256": snapshot.sha256,
-        "event_cursor": snapshot.event_cursor,
         "attention": run_rows(&snapshot.attention),
         "material_progress": run_rows(&snapshot.progress),
         "liveness": run_rows(&snapshot.liveness),
         "reconciliation": run_rows(&snapshot.reconciliation),
         "investigations": run_rows(&snapshot.investigations),
         "external_conditions": external_conditions,
-        "limitations": [
-            "operator-control facts are bounded read-only evidence",
-            "the supervisor cannot close attention, modify liveness, reconcile ownership, or deliver notifications",
-        ],
+        "truncated_sections": truncated_sections,
     })
+}
+
+pub(crate) fn operator_control_fact_payload_from_summary(summary: &Value) -> Result<Value, String> {
+    let object = summary
+        .as_object()
+        .ok_or_else(|| "operator-control binding is not an object".to_owned())?;
+    if object.get("schema").and_then(Value::as_str) != Some("harness.supervisor-control-facts.v1") {
+        return Err("operator-control binding has an unknown schema".to_owned());
+    }
+    let mut facts = serde_json::Map::new();
+    for key in OPERATOR_CONTROL_FACT_KEYS {
+        let value = object
+            .get(key)
+            .ok_or_else(|| format!("operator-control binding is missing {key}"))?;
+        if !value.is_array() {
+            return Err(format!("operator-control binding {key} is not an array"));
+        }
+        facts.insert(key.to_owned(), value.clone());
+    }
+    Ok(Value::Object(facts))
 }
 
 fn validate_snapshot_contract(payload: &Value) -> Result<(), StoreError> {
@@ -1003,6 +1079,10 @@ mod tests {
                         "owner_type": "task",
                         "owner_id": "task-internal-1",
                     }),
+                    // This value deliberately matches the external label of
+                    // the target task but not its controller TaskId. A second
+                    // run may reuse that external label, so it must not enter
+                    // this run-scoped custody binding.
                     json!({
                         "schema": "harness.external-condition-summary.v1",
                         "owner_type": "task",
@@ -1024,7 +1104,15 @@ mod tests {
             cost: current_section.clone(),
             notifications: current_section.clone(),
             limits: current_section,
-            truncation: Vec::new(),
+            // These omitted rows may belong to a different run, but the
+            // bounded global projection cannot prove that. Surface the gap
+            // and restrict action selection instead of treating absence as
+            // healthy custody.
+            truncation: vec![harness_domain::SnapshotTruncation {
+                section: "liveness".to_owned(),
+                omitted_rows: 1,
+                limit: 100,
+            }],
             source_cursors: Default::default(),
             sha256: "c".repeat(64),
         };
@@ -1048,6 +1136,14 @@ mod tests {
 
         validate_snapshot_contract(&snapshot).expect("post-consultation snapshot is schema valid");
         assert_eq!(snapshot["trigger"]["kind"], "expert_completed");
+        assert_eq!(
+            snapshot["operator_control"]["truncated_sections"][0]["section"],
+            "liveness"
+        );
+        assert_eq!(
+            snapshot["allowed_actions"],
+            json!(["wait", "pause_for_human"])
+        );
         assert_eq!(snapshot["budgets"]["expert_tokens_used"], 12_345);
         assert_eq!(
             snapshot["budgets"]["expert_token_budget_per_request"],
@@ -1060,7 +1156,7 @@ mod tests {
                 .as_array()
                 .expect("external conditions are an array")
                 .len(),
-            4
+            3
         );
         assert_eq!(
             snapshot["expert_consultations"][0]["response"]["verdict"],
