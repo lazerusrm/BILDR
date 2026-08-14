@@ -767,6 +767,27 @@ export interface RunDetail {
   supervisor_review?: SupervisorReview | null;
   supervisor_decision?: SupervisorDecision | null;
   supervisor_actions?: SupervisorAction[];
+  expert_requests?: ExpertRequest[];
+}
+
+export interface ExpertRequest {
+  id: string;
+  action_id: string;
+  decision_id: string;
+  run_id: string;
+  snapshot_id: string;
+  signature: string;
+  state: "QUEUED" | "RUNNING" | "COMPLETED" | "FAILED" | "INCONCLUSIVE" | "CANCELED" | "STALE" | string;
+  payload: Record<string, unknown>;
+  payload_sha256: string;
+  requested_model: string;
+  requested_effort: string;
+  expires_at: string;
+  created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  failure_reason?: string | null;
+  agent_session_id?: string | null;
 }
 
 export interface SupervisorSnapshot {

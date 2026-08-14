@@ -3316,6 +3316,7 @@ export function SupervisorObservationPanel({
   const review = detail.supervisor_review;
   const decision = detail.supervisor_decision;
   const actionReceipts = detail.supervisor_actions || [];
+  const expertRequests = detail.expert_requests || [];
   const observing = mode === "observe_only";
   const advisory = mode === "advisory";
   const reviewRunning = ["STARTING", "RUNNING"].includes(review?.state || "");
@@ -3407,6 +3408,23 @@ export function SupervisorObservationPanel({
             </div>
           ))}
           <p className="muted">These receipts explain proposed actions. They do not apply, resume, retry, or alter work.</p>
+        </div>
+      )}
+      {expertRequests.length > 0 && (
+        <div className="supervisor-action-receipts" aria-label="Expert consultation receipts">
+          <strong>Read-only expert consultations</strong>
+          {expertRequests.slice(0, 3).map((request) => (
+            <div key={request.id} className="supervisor-action-receipt" title={request.payload_sha256}>
+              <span>
+                Sol xhigh · {humanAgentState(request.state)}
+                {request.failure_reason ? ` — ${request.failure_reason}` : " — advisory evidence only"}
+              </span>
+              <span>
+                Started {formatLocalTimestamp(request.started_at || request.created_at)}
+                {request.completed_at ? ` · completed ${formatLocalTimestamp(request.completed_at)}` : ""}
+              </span>
+            </div>
+          ))}
         </div>
       )}
       {canRequest && (

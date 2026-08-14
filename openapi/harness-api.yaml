@@ -2080,10 +2080,32 @@ components:
         evaluated_at: {type: [string, 'null'], format: date-time}
         execution_started_at: {type: [string, 'null'], format: date-time}
         completed_at: {type: [string, 'null'], format: date-time}
+    ExpertRequest:
+      type: object
+      additionalProperties: false
+      required: [id, action_id, decision_id, run_id, snapshot_id, signature, state, payload, payload_sha256, requested_model, requested_effort, expires_at, created_at, started_at, completed_at, failure_reason, agent_session_id]
+      properties:
+        id: {type: string}
+        action_id: {type: string}
+        decision_id: {type: string}
+        run_id: {type: string}
+        snapshot_id: {type: string}
+        signature: {type: string, pattern: '^[0-9a-f]{64}$'}
+        state: {enum: [QUEUED, RUNNING, COMPLETED, FAILED, INCONCLUSIVE, CANCELED, STALE]}
+        payload: {type: object}
+        payload_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        requested_model: {type: string}
+        requested_effort: {type: string}
+        expires_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+        started_at: {type: [string, 'null'], format: date-time}
+        completed_at: {type: [string, 'null'], format: date-time}
+        failure_reason: {type: [string, 'null']}
+        agent_session_id: {type: [string, 'null']}
     RunDetail:
       type: object
       additionalProperties: false
-      required: [run, intent_interview, tasks, agents, worktrees, approvals, plan_review_history, planning_tokens_used, signoff_packet, draft_pr_ci, automatic_plan_approval, governor_progress, supervision_mode, supervisor_snapshot, supervisor_review, supervisor_decision, supervisor_actions]
+      required: [run, intent_interview, tasks, agents, worktrees, approvals, plan_review_history, planning_tokens_used, signoff_packet, draft_pr_ci, automatic_plan_approval, governor_progress, supervision_mode, supervisor_snapshot, supervisor_review, supervisor_decision, supervisor_actions, expert_requests]
       properties:
         run: {$ref: '#/components/schemas/Run'}
         intent_interview:
@@ -2126,6 +2148,7 @@ components:
             - {$ref: '#/components/schemas/SupervisorDecision'}
             - {type: 'null'}
         supervisor_actions: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/SupervisorAction'}}
+        expert_requests: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/ExpertRequest'}}
     RunPage:
       type: object
       additionalProperties: false

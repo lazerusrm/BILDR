@@ -16,7 +16,10 @@ the remaining slices have their own exact-head evidence and rollout gates.
   materializes hash-verified action proposals, each with a closed
   policy/execution lifecycle; an expert request can originate only from a
   policy-accepted `request_expert` action; expert responses are append-only
-  and hash-verified.
+  and hash-verified. A human-applied, high/critical typed brief starts exactly
+  one controller-owned Sol `xhigh`/read-only/no-network/no-child session;
+  its immutable advisory response triggers a fresh Terra review and never an
+  executor call.
 - explicit advisory application for the currently controller-backed handlers:
   `wait`, paused-run continuation, bounded final-review follow-up, and exact
   retry. The API/UI re-read snapshot freshness and exact target state, leave
@@ -31,8 +34,8 @@ model polling loop.
 
 ## Deliberately deferred
 
-Additional action handlers, the Sol turn broker, the remaining supervision
-UI/CLI, replay evaluation, and canary activation remain unfinished. `shadow`,
+Additional action handlers, the remaining supervision UI/CLI, replay
+evaluation, and canary activation remain unfinished. `shadow`,
 `active_low_risk`, and `active` remain rejected at startup rather than silently
 falling back or enabling partial authority.
 

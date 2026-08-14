@@ -145,6 +145,15 @@ pub struct NewExpertRequest {
     pub expires_at_ms: i64,
 }
 
+/// The bounded expert evidence visible to a later supervisory snapshot. The
+/// response remains independently immutable; this projection merely keeps the
+/// following Terra review from treating a completed consultation as invisible.
+#[derive(Clone, Debug)]
+pub struct ExpertConsultationObservation {
+    pub request: ExpertRequestRecord,
+    pub response: Option<ExpertResponseRecord>,
+}
+
 /// A single, internally consistent controller projection captured for the
 /// observe-only supervisor.  The event cursor and every value represented in
 /// a resulting receipt come from one SQLite read transaction.
@@ -156,6 +165,7 @@ pub struct SupervisorObservationInput {
     pub latest_plan: Option<(RunPlan, u64)>,
     pub tasks: Vec<TaskSummary>,
     pub agents: Vec<AgentSummary>,
+    pub expert_consultations: Vec<ExpertConsultationObservation>,
     pub run_tokens_used: u64,
     pub repository_profile_id: String,
 }
@@ -249,6 +259,27 @@ impl Store {
             let rows = statement.query_map([run_id.as_str()], queries::map_agent)?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        let expert_consultations = {
+            let mut statement = transaction.prepare(&format!(
+                "{EXPERT_REQUEST_SELECT} WHERE run_id=?1 ORDER BY created_at DESC,id DESC LIMIT 3"
+            ))?;
+            let requests = statement
+                .query_map([run_id.as_str()], map_expert_request)?
+                .collect::<Result<Vec<_>, _>>()?;
+            requests
+                .into_iter()
+                .map(|request| {
+                    let response = transaction
+                        .query_row(
+                            "SELECT id,request_id,run_id,snapshot_id,payload_json,payload_sha256,byte_length,created_at FROM expert_responses WHERE request_id=?1 ORDER BY created_at DESC,id DESC LIMIT 1",
+                            [request.id.as_str()],
+                            map_expert_response,
+                        )
+                        .optional()?;
+                    Ok(ExpertConsultationObservation { request, response })
+                })
+                .collect::<Result<Vec<_>, rusqlite::Error>>()?
+        };
         let run_tokens_used: i64 = transaction.query_row(
             "SELECT coalesce(sum(ts.total_tokens),0) FROM token_samples ts JOIN codex_threads ct ON ct.thread_id=ts.thread_id JOIN agent_sessions a ON a.id=ct.agent_session_id WHERE a.run_id=?1",
             [run_id.as_str()],
@@ -269,6 +300,7 @@ impl Store {
             latest_plan,
             tasks,
             agents,
+            expert_consultations,
             run_tokens_used,
             repository_profile_id,
         })

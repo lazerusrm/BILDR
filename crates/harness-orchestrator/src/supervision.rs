@@ -110,6 +110,7 @@ fn observe_run_with_force(
                 plan_revision,
                 &observation.tasks,
                 &observation.agents,
+                &observation.expert_consultations,
                 observation.run_tokens_used,
                 &observation.repository_profile_id,
                 &material_events,
@@ -156,6 +157,7 @@ pub(crate) fn material_trigger(event: &DomainEvent) -> Option<&'static str> {
         "run.plan.revision_requested"
         | "run.plan.review_resume_requested"
         | "run.supervision.operator_review_requested" => Some("operator_steered"),
+        "run.supervision.expert_completed" => Some("expert_consultation_completed"),
         "task.governor.candidate_materialized" | "run.final_audit.accepted" => {
             Some("agent_completed")
         }
@@ -172,6 +174,7 @@ fn build_snapshot(
     plan_revision: u64,
     tasks: &[TaskSummary],
     agents: &[AgentSummary],
+    expert_consultations: &[harness_store::ExpertConsultationObservation],
     run_tokens_used: u64,
     profile_id: &str,
     material_events: &[DomainEvent],
@@ -333,7 +336,26 @@ fn build_snapshot(
             "summary": bounded(&event.event_type, 1_000),
         })).collect::<Vec<_>>(),
         "prior_decision": null,
-        "expert_consultations": [],
+        "expert_consultations": expert_consultations.iter().map(|consultation| {
+            let request = &consultation.request;
+            let response = consultation.response.as_ref();
+            json!({
+                "request_id": request.id,
+                "action_id": request.action_id,
+                "state": request.state,
+                "category": request.payload.get("category").and_then(Value::as_str).unwrap_or("other"),
+                "requested_model": request.requested_model,
+                "requested_effort": request.requested_effort,
+                "response": response.map(|response| json!({
+                    "id": response.id,
+                    "payload_sha256": response.payload_sha256,
+                    "verdict": response.payload.get("verdict").and_then(Value::as_str).unwrap_or("insufficient_evidence"),
+                    "summary": bounded(response.payload.get("summary").and_then(Value::as_str).unwrap_or("No expert summary was retained."), 4_000),
+                    "recommendation": bounded(response.payload.get("recommendation").and_then(Value::as_str).unwrap_or("No expert recommendation was retained."), 6_000),
+                    "evidence_refs": response.payload.get("evidence_refs").cloned().unwrap_or_else(|| json!([])),
+                })),
+            })
+        }).collect::<Vec<_>>(),
     })
 }
 
@@ -375,6 +397,25 @@ fn allowed_actions(
     }
     if run.state == RunState::Blocked && run.phase.starts_with("plan_review_") {
         actions.push("start_followup_turn");
+    }
+    // The decision schema requires a typed high/critical brief and the action
+    // policy independently revalidates it. Merely appearing here never starts
+    // Sol: the human must apply the proposal, and routine blockers are then
+    // rejected by the broker's exact gate.
+    if run.state == RunState::Blocked
+        && tasks.iter().any(|task| {
+            matches!(
+                task.state,
+                TaskState::NeedsHelp
+                    | TaskState::ChangesRequested
+                    | TaskState::Interrupted
+                    | TaskState::Stalled
+                    | TaskState::Blocked
+                    | TaskState::Failed
+            )
+        })
+    {
+        actions.push("request_expert");
     }
     actions
 }

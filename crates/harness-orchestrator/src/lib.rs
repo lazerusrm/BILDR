@@ -21,11 +21,12 @@ use harness_codex::{
 use harness_context::{ContextCompiler, ContextPacket};
 use harness_domain::{
     AgentRole, AgentSessionId, AgentSummary, ApprovalId, ApprovalSummary, ArtifactId, AttemptId,
-    CodexRuntimeStatus, CommandRunId, ComponentStatus, DiffBudget, EvidenceId, ProofTier,
-    RepositoryId, RepositorySummary, ResourceClass, ResultClass, RiskLevel, RunId, RunPlan,
-    RunState, RunSummary, RuntimeStatus, SandboxMode, SchedulerStatus, SupervisorActionId,
-    SupervisorDecisionId, SupervisorMode, SupervisorReviewId, TaskId, TaskPacket, TaskState,
-    TaskSummary, ValidationId, WorktreeId, WorktreeSummary, format_timestamp, now_ms,
+    CodexRuntimeStatus, CommandRunId, ComponentStatus, DiffBudget, EvidenceId, ExpertRequestId,
+    ExpertResponseId, ProofTier, RepositoryId, RepositorySummary, ResourceClass, ResultClass,
+    RiskLevel, RunId, RunPlan, RunState, RunSummary, RuntimeStatus, SandboxMode, SchedulerStatus,
+    SupervisorActionId, SupervisorDecisionId, SupervisorMode, SupervisorReviewId, TaskId,
+    TaskPacket, TaskState, TaskSummary, ValidationId, WorktreeId, WorktreeSummary,
+    format_timestamp, now_ms,
 };
 use harness_evidence::{EvidenceArtifactInput, EvidenceClaim, EvidenceService};
 use harness_git::{DiffPolicy, GitManager, WorktreeSpec, validate_public_change_metadata};
@@ -36,11 +37,11 @@ use harness_profile::{
 };
 use harness_runner::{CommandOutcome, CommandRunner, CommandSpec, ResourceManager};
 use harness_store::{
-    ContextSourceRecord, NewAgentSession, NewApproval, NewArtifact, NewCommandRecord,
-    NewContextPacket, NewRepository, NewRun, NewSupervisorReview, NewTaskAttempt,
-    NewValidationRecord, NewWorktree, PriorAttemptContext, ProtocolProjection,
-    RepositoryHealthInput, Store, SupervisorActionRecord, SupervisorDecisionRecord,
-    SupervisorReviewRecord, SupervisorSnapshotRecord, packet_digest,
+    ContextSourceRecord, ExpertRequestRecord, NewAgentSession, NewApproval, NewArtifact,
+    NewCommandRecord, NewContextPacket, NewExpertRequest, NewRepository, NewRun,
+    NewSupervisorReview, NewTaskAttempt, NewValidationRecord, NewWorktree, PriorAttemptContext,
+    ProtocolProjection, RepositoryHealthInput, Store, SupervisorActionRecord,
+    SupervisorDecisionRecord, SupervisorReviewRecord, SupervisorSnapshotRecord, packet_digest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -62,6 +63,9 @@ const INTENT_INTERVIEW_TURN_SCHEMA: &str =
     include_str!("../../../schemas/harness.intent-interview-turn.v1.schema.json");
 const SUPERVISOR_DECISION_SCHEMA: &str =
     include_str!("../../../schemas/harness.supervisor-decision.v1.schema.json");
+const EXPERT_RESPONSE_SCHEMA: &str =
+    include_str!("../../../schemas/harness.expert-response.v1.schema.json");
+const EXPERT_REQUEST_TTL_MS: i64 = 30 * 60 * 1_000;
 const SETTING_REASONING_SUMMARIES: &str = "settings.store_reasoning_summaries";
 const SETTING_RAW_REASONING: &str = "settings.store_raw_reasoning";
 const SETTING_YOLO_MODE: &str = "settings.yolo_mode";
@@ -236,7 +240,7 @@ fn supervisor_review_prompt(
         ));
     }
     Ok(format!(
-        "You are the human-approved BILDR thread supervisor. Analyze only the supplied immutable snapshot. Do not use tools, start child agents, edit files, request approvals, or perform any controller operation. Your output is advisory: the human, never you, chooses whether to apply a recovery control.\n\nThe decision must bind exactly to these controller-owned values:\n- decision_id: {decision_id}\n- snapshot_id: {snapshot_id}\n- run_id: {run_id}\n- snapshot_revision: {snapshot_revision}\n- requested_model: {model}\n- effective_model: {model}\n- requested_effort: {effort}\n- effective_effort: {effort}\n\nChoose only action kinds listed in `allowed_actions`; if the evidence does not justify an intervention, propose a single `wait` action. For `wait`, `continue_attempt`, `request_replan`, and `start_followup_turn`, `target` must be exactly the run target: `{{\"kind\":\"run\",\"id\":\"{run_id}\",\"task_id\":null,\"attempt_id\":null,\"session_id\":null}}`. Only `retry_fresh_attempt` may target a task, and then its `id` and `task_id` must be the same supplied task identifier. Do not invent task, attempt, session, evidence, or state identifiers. Explain the concrete blocker, evidence, uncertainty, and the next observable result. The controller will reject a stale or malformed response and will execute nothing automatically. Set `created_at` to the snapshot's `generated_at` value. Return only one JSON object matching the supplied schema.\n\nImmutable snapshot:\n{snapshot_json}",
+        "You are the human-approved BILDR thread supervisor. Analyze only the supplied immutable snapshot. Do not use tools, start child agents, edit files, request approvals, or perform any controller operation. Your output is advisory: the human, never you, chooses whether to apply a recovery control.\n\nThe decision must bind exactly to these controller-owned values:\n- decision_id: {decision_id}\n- snapshot_id: {snapshot_id}\n- run_id: {run_id}\n- snapshot_revision: {snapshot_revision}\n- requested_model: {model}\n- effective_model: {model}\n- requested_effort: {effort}\n- effective_effort: {effort}\n\nChoose only action kinds listed in `allowed_actions`; if the evidence does not justify an intervention, propose a single `wait` action. For `wait`, `continue_attempt`, `request_replan`, `start_followup_turn`, and `request_expert`, `target` must be exactly the run target: `{{\"kind\":\"run\",\"id\":\"{run_id}\",\"task_id\":null,\"attempt_id\":null,\"session_id\":null}}`. Only `retry_fresh_attempt` may target a task, and then its `id` and `task_id` must be the same supplied task identifier. `request_expert` is exceptional: propose it only for a high/critical typed expert brief scoped to listed blocked task ids and evidence. It never grants a model route, authority, credentials, approval, or execution; the operator may decline it. Do not invent task, attempt, session, evidence, or state identifiers. Explain the concrete blocker, evidence, uncertainty, and the next observable result. The controller will reject a stale or malformed response and will execute nothing automatically. Set `created_at` to the snapshot's `generated_at` value. Return only one JSON object matching the supplied schema.\n\nImmutable snapshot:\n{snapshot_json}",
         decision_id = review.expected_decision_id,
         snapshot_id = snapshot.id,
         run_id = snapshot.run_id,
@@ -372,7 +376,11 @@ fn validate_supervisor_decision(
                     && task_id == Some(target_id)
                     && fields_are_null(&["attempt_id", "session_id"])
             }
-            "wait" | "continue_attempt" | "request_replan" | "start_followup_turn" => {
+            "wait"
+            | "continue_attempt"
+            | "request_replan"
+            | "start_followup_turn"
+            | "request_expert" => {
                 target_kind == "run"
                     && target_id == snapshot.run_id.as_str()
                     && fields_are_null(&["task_id", "attempt_id", "session_id"])
@@ -382,6 +390,28 @@ fn validate_supervisor_decision(
         if !valid_target {
             return Err(OrchestratorError::Validation(format!(
                 "supervisor action {action_id} has an invalid target"
+            )));
+        }
+        if action
+            .get("model_route")
+            .is_some_and(|route| !route.is_null())
+        {
+            return Err(OrchestratorError::Validation(format!(
+                "supervisor action {action_id} attempts to select a model route"
+            )));
+        }
+        if kind == "request_expert" {
+            validate_expert_brief(action, &task_ids).map_err(|reason| {
+                OrchestratorError::Validation(format!(
+                    "supervisor action {action_id} has an invalid expert brief: {reason}"
+                ))
+            })?;
+        } else if action
+            .get("expert_brief")
+            .is_some_and(|brief| !brief.is_null())
+        {
+            return Err(OrchestratorError::Validation(format!(
+                "supervisor action {action_id} attaches an expert brief to a non-expert action"
             )));
         }
         for (field, maximum) in [
@@ -401,6 +431,110 @@ fn validate_supervisor_decision(
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+fn required_bounded_text(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    maximum: usize,
+) -> Result<String, String> {
+    let value = object
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.chars().count() <= maximum)
+        .ok_or_else(|| format!("{field} must be non-empty text within {maximum} characters"))?;
+    Ok(value.to_owned())
+}
+
+/// Validates only the controller-relevant, high-impact escalation boundary.
+/// The full structured-output schema constrains syntax; this verifies that a
+/// malicious or replayed response cannot turn a generic blocked run into a
+/// Sol consultation merely by naming `request_expert`.
+fn validate_expert_brief(
+    action: &serde_json::Map<String, Value>,
+    snapshot_task_ids: &BTreeSet<&str>,
+) -> Result<(), String> {
+    let impact = action
+        .get("impact")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "action impact is required".to_owned())?;
+    if !matches!(impact, "high" | "critical") {
+        return Err("request_expert requires high or critical action impact".to_owned());
+    }
+    let brief = action
+        .get("expert_brief")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "request_expert requires a typed expert_brief".to_owned())?;
+    let category = required_bounded_text(brief, "category", 128)?;
+    if !matches!(
+        category.as_str(),
+        "architecture_invariant"
+            | "canonical_contract"
+            | "security_authorization"
+            | "tenancy_privacy"
+            | "data_integrity"
+            | "unsafe_native_or_hardware"
+            | "integration_conflict"
+            | "repeated_failure"
+            | "qualified_agent_disagreement"
+            | "other_high_impact"
+    ) {
+        return Err("expert category is not in the controller allowlist".to_owned());
+    }
+    if brief.get("impact").and_then(Value::as_str) != Some(impact) {
+        return Err("expert brief impact must exactly match the action impact".to_owned());
+    }
+    required_bounded_text(brief, "question", 4_000)?;
+    required_bounded_text(brief, "why_normal_agents_cannot_resolve", 3_000)?;
+    for (field, maximum, minimum) in [
+        ("known_facts", 2_000_usize, 1_usize),
+        ("constraints", 2_000, 0),
+        ("required_output", 1_000, 1),
+    ] {
+        let entries = brief
+            .get(field)
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("{field} must be an array"))?;
+        if entries.len() < minimum || entries.len() > 50 {
+            return Err(format!("{field} has an invalid item count"));
+        }
+        if entries.iter().any(|entry| {
+            !entry
+                .as_str()
+                .is_some_and(|value| !value.trim().is_empty() && value.chars().count() <= maximum)
+        }) {
+            return Err(format!("{field} contains invalid text"));
+        }
+    }
+    let task_ids = brief
+        .get("task_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "task_ids must be an array".to_owned())?;
+    if task_ids.is_empty() || task_ids.len() > 20 {
+        return Err("task_ids has an invalid item count".to_owned());
+    }
+    let mut unique_tasks = BTreeSet::new();
+    for task_id in task_ids {
+        let task_id = task_id
+            .as_str()
+            .filter(|id| snapshot_task_ids.contains(*id))
+            .ok_or_else(|| "expert task_ids must be exact tasks in the snapshot".to_owned())?;
+        if !unique_tasks.insert(task_id) {
+            return Err("expert task_ids must be unique".to_owned());
+        }
+    }
+    let evidence = brief
+        .get("evidence_refs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "evidence_refs must be an array".to_owned())?;
+    if evidence.is_empty()
+        || evidence.len() > 100
+        || evidence.iter().any(|value| !value.is_object())
+    {
+        return Err("expert evidence_refs must contain one to 100 typed references".to_owned());
     }
     Ok(())
 }
@@ -496,6 +630,70 @@ fn supervisor_action_policy_reason(
             }
             Ok("the exact failed task remains eligible for one controller-owned retry".to_owned())
         }
+        "request_expert" => {
+            if !supervisor_action_targets_run(action, run) || run.state != RunState::Blocked {
+                return Err(
+                    "request_expert requires the exact currently blocked run target".to_owned(),
+                );
+            }
+            let snapshot = store
+                .supervisor_snapshot(&action.snapshot_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "the bound expert snapshot no longer exists".to_owned())?;
+            let task_ids = snapshot
+                .payload
+                .get("tasks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|task| task.get("task_id").and_then(Value::as_str))
+                .collect::<BTreeSet<_>>();
+            let proposal = action.proposal.as_object().ok_or_else(|| {
+                "request_expert proposal is not a typed controller action".to_owned()
+            })?;
+            validate_expert_brief(proposal, &task_ids)?;
+            let requested_tasks = proposal
+                .get("expert_brief")
+                .and_then(|brief| brief.get("task_ids"))
+                .and_then(Value::as_array)
+                .ok_or_else(|| "expert brief task_ids disappeared after validation".to_owned())?;
+            let mut still_blocked = false;
+            for task_id in requested_tasks.iter().filter_map(Value::as_str) {
+                let task = store
+                    .task(&TaskId::from(task_id))
+                    .map_err(|error| error.to_string())?;
+                if task.run_id != action.run_id {
+                    return Err("expert task belongs to another run".to_owned());
+                }
+                still_blocked |= matches!(
+                    task.state,
+                    TaskState::NeedsHelp
+                        | TaskState::ChangesRequested
+                        | TaskState::Interrupted
+                        | TaskState::Stalled
+                        | TaskState::Blocked
+                        | TaskState::Failed
+                );
+            }
+            if !still_blocked {
+                return Err(
+                    "expert consultation requires at least one still-blocked scoped task"
+                        .to_owned(),
+                );
+            }
+            if store
+                .expert_requests_for_run(&action.run_id)
+                .map_err(|error| error.to_string())?
+                .iter()
+                .any(|request| matches!(request.state.as_str(), "QUEUED" | "RUNNING"))
+            {
+                return Err("an expert consultation is already active for this run".to_owned());
+            }
+            Ok(
+                "a typed high-impact expert brief remains bound to the current blocked task set"
+                    .to_owned(),
+            )
+        }
         other => Err(format!(
             "supervisor action {other} has no registered bounded controller handler"
         )),
@@ -535,6 +733,247 @@ fn supervisor_action_task_target(
         ));
     }
     Ok(TaskId::from(task_id))
+}
+
+fn expert_category(category: &str) -> Result<&'static str, OrchestratorError> {
+    match category {
+        "architecture_invariant" => Ok("architecture"),
+        "canonical_contract" => Ok("contract"),
+        "security_authorization" | "tenancy_privacy" | "data_integrity" => Ok("data"),
+        "unsafe_native_or_hardware" | "integration_conflict" => Ok("integration"),
+        "repeated_failure" => Ok("repeated_failure"),
+        "qualified_agent_disagreement" => Ok("disagreement"),
+        "other_high_impact" => Ok("other"),
+        _ => Err(OrchestratorError::Validation(
+            "expert brief category is not controller-mappable".to_owned(),
+        )),
+    }
+}
+
+fn expert_request_payload(
+    action: &SupervisorActionRecord,
+    run: &RunSummary,
+    snapshot: &SupervisorSnapshotRecord,
+    request_id: &ExpertRequestId,
+    expires_at_ms: i64,
+) -> Result<(Value, String), OrchestratorError> {
+    let proposal = action.proposal.as_object().ok_or_else(|| {
+        OrchestratorError::Validation("expert action proposal must be an object".to_owned())
+    })?;
+    let brief = proposal
+        .get("expert_brief")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            OrchestratorError::Validation("expert action lacks expert_brief".to_owned())
+        })?;
+    let category_source =
+        required_bounded_text(brief, "category", 128).map_err(OrchestratorError::Validation)?;
+    let category = expert_category(&category_source)?;
+    let question =
+        required_bounded_text(brief, "question", 4_000).map_err(OrchestratorError::Validation)?;
+    let task_ids = brief
+        .get("task_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| OrchestratorError::Validation("expert task_ids are absent".to_owned()))?
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                OrchestratorError::Validation("expert task_ids contain non-text values".to_owned())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut task_ids = task_ids;
+    task_ids.sort();
+    task_ids.dedup();
+    let evidence_refs = brief
+        .get("evidence_refs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| OrchestratorError::Validation("expert evidence_refs are absent".to_owned()))?
+        .iter()
+        .map(|reference| {
+            reference
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .filter(|id| !id.trim().is_empty() && id.chars().count() <= 128)
+                .ok_or_else(|| {
+                    OrchestratorError::Validation(
+                        "expert evidence_refs contain an invalid controller id".to_owned(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut evidence_refs = evidence_refs;
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    if evidence_refs.is_empty() {
+        return Err(OrchestratorError::Validation(
+            "expert consultation needs at least one controller evidence reference".to_owned(),
+        ));
+    }
+    let text_array = |field: &str, maximum: usize| -> Result<Vec<String>, OrchestratorError> {
+        brief
+            .get(field)
+            .and_then(Value::as_array)
+            .ok_or_else(|| OrchestratorError::Validation(format!("expert {field} is absent")))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty() && value.chars().count() <= maximum)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        OrchestratorError::Validation(format!(
+                            "expert {field} contains invalid text"
+                        ))
+                    })
+            })
+            .collect()
+    };
+    let known_facts = text_array("known_facts", 2_000)?;
+    let mut constraints = text_array("constraints", 2_000)?;
+    constraints.extend([
+        "Read-only consultation; do not alter files, state, credentials, or approvals.".to_owned(),
+        "Do not start children, request network access, or claim controller authority.".to_owned(),
+    ]);
+    let required_output = text_array("required_output", 1_000)?;
+    let signature_material = json!({
+        "run_id": run.id,
+        "goal_revision": snapshot.payload.get("goal_revision").cloned().unwrap_or_else(|| json!(snapshot.revision)),
+        "category": category_source,
+        "task_ids": task_ids,
+        "evidence_refs": evidence_refs,
+        "question": question.trim(),
+        "known_facts": known_facts,
+        "constraints": constraints,
+        "authority_digest": run.authority_digest,
+        "snapshot_id": snapshot.id,
+    });
+    let signature = hex::encode(Sha256::digest(serde_json::to_vec(&signature_material)?));
+    let payload = json!({
+        "schema": "harness.expert-request.v1",
+        "request_id": request_id,
+        "run_id": run.id,
+        "snapshot_id": snapshot.id,
+        "snapshot_revision": snapshot.revision,
+        "decision_id": action.decision_id,
+        "created_at": format_timestamp(now_ms()),
+        "expires_at": format_timestamp(expires_at_ms),
+        "signature": signature,
+        "category": category,
+        "question": question,
+        "context": {
+            "goal": run.objective,
+            "constraints": constraints,
+            "required_output": required_output,
+        },
+        "evidence_refs": evidence_refs,
+    });
+    Ok((payload, signature))
+}
+
+fn expert_request_prompt(request: &ExpertRequestRecord) -> Result<String, OrchestratorError> {
+    let request_json = serde_json::to_string_pretty(&request.payload)?;
+    if request_json.len() > 65_536 {
+        return Err(OrchestratorError::Validation(
+            "expert prompt would exceed its bounded request custody limit".to_owned(),
+        ));
+    }
+    Ok(format!(
+        "You are a bounded BILDR technical expert. Analyze only the immutable controller request below. Do not edit files, start child agents, use network access, request credentials or approvals, make controller decisions, or claim any action has occurred. Your response is advisory evidence only; a later Terra review and the human decide what happens. Bind every identifier and evidence reference exactly to the request. If evidence is insufficient, say so. Set `no_direct_action` to true. Return only one JSON object matching the supplied schema.\n\nImmutable expert request:\n{request_json}"
+    ))
+}
+
+fn validate_expert_response(
+    request: &ExpertRequestRecord,
+    snapshot: &SupervisorSnapshotRecord,
+    response: &Value,
+) -> Result<(), OrchestratorError> {
+    let object = response.as_object().ok_or_else(|| {
+        OrchestratorError::Validation("expert response must be a JSON object".to_owned())
+    })?;
+    let exact =
+        |field: &str, expected: &str| object.get(field).and_then(Value::as_str) == Some(expected);
+    if !exact("schema", "harness.expert-response.v1")
+        || !exact("request_id", request.id.as_str())
+        || !exact("run_id", request.run_id.as_str())
+        || !exact("snapshot_id", request.snapshot_id.as_str())
+        || object.get("snapshot_revision").and_then(Value::as_u64) != Some(snapshot.revision)
+        || object.get("no_direct_action") != Some(&Value::Bool(true))
+    {
+        return Err(OrchestratorError::Validation(
+            "expert response does not match its immutable request envelope".to_owned(),
+        ));
+    }
+    let response_id = object
+        .get("response_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && id.chars().count() <= 128)
+        .ok_or_else(|| OrchestratorError::Validation("expert response_id is invalid".to_owned()))?;
+    if !response_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err(OrchestratorError::Validation(
+            "expert response_id contains unsupported characters".to_owned(),
+        ));
+    }
+    let verdict = object.get("verdict").and_then(Value::as_str);
+    if !matches!(
+        verdict,
+        Some("recommendation")
+            | Some("insufficient_evidence")
+            | Some("human_input_required")
+            | Some("replan_required")
+            | Some("no_change")
+    ) {
+        return Err(OrchestratorError::Validation(
+            "expert response verdict is invalid".to_owned(),
+        ));
+    }
+    for (field, maximum) in [
+        ("completed_at", 128),
+        ("summary", 4_000),
+        ("recommendation", 8_000),
+    ] {
+        if !object
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty() && value.chars().count() <= maximum)
+        {
+            return Err(OrchestratorError::Validation(format!(
+                "expert response {field} is invalid"
+            )));
+        }
+    }
+    let allowed_refs = request
+        .payload
+        .get("evidence_refs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    let evidence_refs = object
+        .get("evidence_refs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            OrchestratorError::Validation("expert response evidence_refs are absent".to_owned())
+        })?;
+    if evidence_refs.is_empty()
+        || evidence_refs.len() > 100
+        || evidence_refs.iter().any(|reference| {
+            !reference
+                .as_str()
+                .is_some_and(|reference| allowed_refs.contains(reference))
+        })
+    {
+        return Err(OrchestratorError::Validation(
+            "expert response cites evidence outside the immutable request".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -830,6 +1269,9 @@ pub struct RunDetail {
     /// Bounded lifecycle receipts, separate from the immutable model decision.
     /// Read visibility does not grant application authority.
     pub supervisor_actions: Vec<SupervisorActionRecord>,
+    /// Immutable, read-only Sol consultation lifecycle records. Their output
+    /// is advisory evidence for a later Terra review, never executable input.
+    pub expert_requests: Vec<ExpertRequestRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2314,6 +2756,7 @@ impl Orchestrator {
                     "dispatched": dispatched,
                 }))
             }
+            "request_expert" => self.launch_expert_consultation(&executing).await,
             "start_followup_turn" => {
                 let operation = self
                     .resume_blocked_plan_review(&executing.run_id, actor)
@@ -2379,6 +2822,173 @@ impl Orchestrator {
                 Err(error)
             }
         }
+    }
+
+    /// Starts one controller-owned Sol consultation after an operator has
+    /// explicitly applied a policy-valid expert proposal.  The model route,
+    /// sandbox, prompt, request digest, expiry, and agent/request binding are
+    /// all controller-derived; no field from the Terra proposal selects them.
+    async fn launch_expert_consultation(
+        &self,
+        action: &SupervisorActionRecord,
+    ) -> Result<Value, OrchestratorError> {
+        let supervision = self.effective_supervision_config();
+        if supervision.mode != SupervisorMode::Advisory {
+            return Err(OrchestratorError::Conflict(
+                "human-approved advisory supervision is no longer enabled".to_owned(),
+            ));
+        }
+        let run = self.store.run(&action.run_id)?;
+        let snapshot = self
+            .store
+            .supervisor_snapshot(&action.snapshot_id)?
+            .ok_or_else(|| {
+                OrchestratorError::Protocol(
+                    "the immutable expert snapshot disappeared before launch".to_owned(),
+                )
+            })?;
+        let request_id = ExpertRequestId::new();
+        let expires_at_ms = now_ms().saturating_add(EXPERT_REQUEST_TTL_MS);
+        let (payload, signature) =
+            expert_request_payload(action, &run, &snapshot, &request_id, expires_at_ms)?;
+        self.require_runtime_ready().await?;
+        self.select_preferred_codex_account_for_run(&action.run_id)
+            .await?;
+        let (active_total, _, _) = self.active_agent_counts()?;
+        if active_total >= self.config.orchestration.max_total_agent_threads {
+            return Err(OrchestratorError::Blocked(format!(
+                "all {} Codex thread slots are active; the expert consultation was not started",
+                self.config.orchestration.max_total_agent_threads
+            )));
+        }
+        let inspection = self
+            .store
+            .list_worktrees(Some(&action.run_id))?
+            .into_iter()
+            .find(|worktree| worktree.kind == "inspection" && worktree.state == "READY")
+            .ok_or_else(|| {
+                OrchestratorError::Blocked(
+                    "expert consultation cannot start because the inspection worktree is unavailable"
+                        .to_owned(),
+                )
+            })?;
+        let route = ModelRoute {
+            model: supervision.expert.model.clone(),
+            reasoning_effort: supervision.expert.reasoning_effort.clone(),
+            sandbox: supervision.expert.sandbox.clone(),
+        };
+        let request = self.store.create_expert_request(&NewExpertRequest {
+            id: request_id.clone(),
+            action_id: action.id.clone(),
+            signature,
+            payload,
+            requested_model: route.model.clone(),
+            requested_effort: route.reasoning_effort.clone(),
+            expires_at_ms,
+        })?;
+        let agent_id = AgentSessionId::new();
+        let launch = async {
+            self.store.create_agent_session(&NewAgentSession {
+                id: agent_id.clone(),
+                run_id: action.run_id.clone(),
+                task_attempt_id: None,
+                parent_agent_session_id: None,
+                runtime_kind: "codex_controller".to_owned(),
+                codex_account_id: self.selected_codex_account_id(),
+                role: AgentRole::Expert,
+                nickname: Some(format!("expert-{}", request.id)),
+                requested_model: route.model.clone(),
+                requested_reasoning_effort: route.reasoning_effort.clone(),
+                sandbox_mode: SandboxMode::ReadOnly,
+                approval_policy: "never".to_owned(),
+                cwd: PathBuf::from(&inspection.path),
+                state: "STARTING".to_owned(),
+                current_goal: Some(
+                    "Bounded read-only expert consultation for one immutable request".to_owned(),
+                ),
+                token_budget: Some(supervision.expert.token_budget),
+            })?;
+            self.store.attach_expert_agent(&request.id, &agent_id)?;
+            self.store.begin_expert_request(&request.id)?;
+            let prompt = expert_request_prompt(&request)?;
+            self.start_agent(
+                &agent_id,
+                &action.run_id,
+                None,
+                Path::new(&inspection.path),
+                &route,
+                SandboxMode::ReadOnly,
+                false,
+                "Bounded read-only expert consultation",
+                Some(supervision.expert.token_budget),
+                prompt,
+                Some(model_output_schema(serde_json::from_str(
+                    EXPERT_RESPONSE_SCHEMA,
+                )?)),
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = launch {
+            let reason = error.to_string();
+            let _ = self
+                .store
+                .finish_expert_request(&request.id, "FAILED", Some(&reason));
+            let _ = self.store.update_agent_state(
+                &agent_id,
+                "FAILED",
+                Some("Expert consultation could not be started"),
+                None,
+                None,
+                Some(("infrastructure_unavailable", &reason)),
+            );
+            let _ = self.emit_run_event(
+                &run,
+                "run.supervision.expert_failed",
+                json!({
+                    "request_id": request.id,
+                    "agent_session_id": agent_id,
+                    "reason": reason,
+                    "automatic_action": false,
+                }),
+            );
+            return Err(error);
+        }
+        self.emit_agent_event(
+            &action.run_id,
+            &agent_id,
+            "agent.expert.started",
+            json!({
+                "request_id": request.id,
+                "snapshot_id": request.snapshot_id,
+                "model": route.model,
+                "reasoning_effort": route.reasoning_effort,
+                "sandbox": "read-only",
+                "network_access": false,
+                "children": 0,
+            }),
+        )?;
+        self.emit_run_event(
+            &run,
+            "run.supervision.expert_started",
+            json!({
+                "request_id": request.id,
+                "agent_session_id": agent_id,
+                "automatic_action": false,
+            }),
+        )?;
+        Ok(json!({
+            "schema": "harness.supervisor-action-receipt.v1",
+            "kind": "request_expert",
+            "result": "read_only_expert_consultation_started",
+            "run_id": action.run_id,
+            "request_id": request.id,
+            "agent_session_id": agent_id,
+            "requested_model": request.requested_model,
+            "requested_effort": request.requested_effort,
+            "expires_at": request.expires_at,
+            "automatic_action": false,
+        }))
     }
 
     async fn launch_supervisor_review(
@@ -3321,6 +3931,7 @@ impl Orchestrator {
             supervisor_review: self.store.latest_supervisor_review(run_id)?,
             supervisor_decision: self.store.latest_supervisor_decision(run_id)?,
             supervisor_actions: self.store.supervisor_actions_for_run(run_id)?,
+            expert_requests: self.store.expert_requests_for_run(run_id)?,
         })
     }
 
@@ -6986,6 +7597,18 @@ impl Orchestrator {
             Some(&route.reasoning_effort),
             false,
         )?;
+        // `turn/start` is the App Server acknowledgement that the requested
+        // route was accepted for this concrete turn. Persist it before any
+        // model item can arrive, so a structured response is never accepted
+        // against an unknown effective route (notably the Sol expert lane).
+        self.store.update_agent_state(
+            agent_id,
+            "RUNNING",
+            None,
+            Some(&route.model),
+            Some(&route.reasoning_effort),
+            None,
+        )?;
         Ok(())
     }
 
@@ -7503,6 +8126,9 @@ impl Orchestrator {
             AgentRole::Supervisor => {
                 self.accept_supervisor_decision(agent_id, text).await?;
             }
+            AgentRole::Expert => {
+                self.accept_expert_response(agent_id, text).await?;
+            }
             AgentRole::Governor => {
                 // Governor commentary may produce completed message items too;
                 // only the schema-constrained final checkpoint is controller
@@ -7621,6 +8247,165 @@ impl Orchestrator {
                 "automatic_action": false,
             }),
         )?;
+        Ok(())
+    }
+
+    async fn accept_expert_response(
+        &self,
+        agent_id: &AgentSessionId,
+        text: &str,
+    ) -> Result<(), OrchestratorError> {
+        let request = self
+            .store
+            .expert_request_for_agent(agent_id)?
+            .ok_or_else(|| {
+                OrchestratorError::Protocol(
+                    "expert agent is missing its durable request envelope".to_owned(),
+                )
+            })?;
+        if request.state == "COMPLETED" {
+            // Completed App Server items may be replayed after restart. The
+            // append-only response receipt is authoritative and cannot be
+            // overwritten by a duplicate callback.
+            return Ok(());
+        }
+        let agent = self.store.agent(agent_id)?;
+        let expected = self.effective_supervision_config().expert;
+        let route_valid = agent.role == AgentRole::Expert
+            && agent.sandbox_mode == SandboxMode::ReadOnly
+            && agent.requested_model == expected.model
+            && agent.requested_reasoning_effort == expected.reasoning_effort
+            && agent.effective_model.as_deref() == Some(expected.model.as_str())
+            && agent.effective_reasoning_effort.as_deref()
+                == Some(expected.reasoning_effort.as_str());
+        let snapshot = self
+            .store
+            .supervisor_snapshot(&request.snapshot_id)?
+            .ok_or_else(|| {
+                OrchestratorError::Protocol(
+                    "the immutable expert snapshot disappeared before response intake".to_owned(),
+                )
+            })?;
+        let response = parse_json_text::<Value>(text);
+        let intake = response.and_then(|response| {
+            if !route_valid {
+                return Err(OrchestratorError::Protocol(
+                    "expert response route or sandbox does not match controller custody".to_owned(),
+                ));
+            }
+            validate_expert_response(&request, &snapshot, &response)?;
+            let response_id = response
+                .get("response_id")
+                .and_then(Value::as_str)
+                .expect("validated expert response has an id");
+            Ok(self.store.record_expert_response(
+                &request.id,
+                &ExpertResponseId::from(response_id),
+                &response,
+            )?)
+        });
+        let recorded = match intake {
+            Ok(record) => record,
+            Err(error) => {
+                let reason = format!("expert response rejected: {error}");
+                let _ = self
+                    .store
+                    .finish_expert_request(&request.id, "FAILED", Some(&reason));
+                self.store.clear_agent_active_turn(agent_id)?;
+                self.store.update_agent_state(
+                    agent_id,
+                    "FAILED",
+                    Some("Read-only expert response was rejected"),
+                    None,
+                    None,
+                    Some(("protocol_error", &reason)),
+                )?;
+                let run = self.store.run(&request.run_id)?;
+                self.emit_run_event(
+                    &run,
+                    "run.supervision.expert_failed",
+                    json!({
+                        "request_id": request.id,
+                        "agent_session_id": agent_id,
+                        "reason": reason,
+                        "automatic_action": false,
+                    }),
+                )?;
+                return Err(error);
+            }
+        };
+        self.store.clear_agent_active_turn(agent_id)?;
+        self.store.update_agent_state(
+            agent_id,
+            "COMPLETED",
+            Some("Read-only expert consultation is ready for a separate Terra review"),
+            None,
+            None,
+            None,
+        )?;
+        let run = self.store.run(&request.run_id)?;
+        self.emit_agent_event(
+            &request.run_id,
+            agent_id,
+            "agent.expert.response_recorded",
+            json!({
+                "request_id": request.id,
+                "response_id": recorded.id,
+                "snapshot_id": request.snapshot_id,
+                "automatic_action": false,
+            }),
+        )?;
+        self.emit_run_event(
+            &run,
+            "run.supervision.expert_completed",
+            json!({
+                "request_id": request.id,
+                "response_id": recorded.id,
+                "snapshot_id": request.snapshot_id,
+                "automatic_action": false,
+            }),
+        )?;
+        // This starts a new read-only Terra pass from a fresh snapshot that
+        // contains only the bounded expert receipt. It never applies the
+        // recommendation and failure to schedule the follow-up cannot rewrite
+        // the completed expert custody record.
+        if self.effective_supervision_config().mode == SupervisorMode::Advisory {
+            match supervision::observe_run_now(
+                &self.store,
+                &self.effective_supervision_config(),
+                self.config.orchestration.max_total_agent_threads,
+                &request.run_id,
+            ) {
+                Ok(Some(fresh_snapshot)) => {
+                    if let Err(error) = self
+                        .launch_supervisor_review(&request.run_id, &fresh_snapshot)
+                        .await
+                    {
+                        self.emit_run_event(
+                            &run,
+                            "run.supervision.expert_followup_deferred",
+                            json!({
+                                "request_id": request.id,
+                                "reason": error.to_string(),
+                                "automatic_action": false,
+                            }),
+                        )?;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.emit_run_event(
+                        &run,
+                        "run.supervision.expert_followup_deferred",
+                        json!({
+                            "request_id": request.id,
+                            "reason": error.to_string(),
+                            "automatic_action": false,
+                        }),
+                    )?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -8169,6 +8954,58 @@ impl Orchestrator {
                     json!({"agent_id": agent_id, "reason": reason, "automatic_action": false}),
                 )?;
             }
+            return Ok(());
+        }
+        if agent.role == AgentRole::Expert {
+            let request = self.store.expert_request_for_agent(agent_id)?;
+            if status == "completed"
+                && request
+                    .as_ref()
+                    .is_some_and(|request| request.state == "COMPLETED")
+            {
+                return Ok(());
+            }
+            let reason = if status == "completed" {
+                "expert returned no schema-valid advisory response".to_owned()
+            } else if session_budget_interrupted {
+                "expert session token budget exhausted".to_owned()
+            } else {
+                format!("expert turn ended with status {status}")
+            };
+            if let Some(request) = request
+                && matches!(request.state.as_str(), "QUEUED" | "RUNNING")
+            {
+                self.store
+                    .finish_expert_request(&request.id, "FAILED", Some(&reason))?;
+                if let Ok(run) = self.store.run(&request.run_id) {
+                    self.emit_run_event(
+                        &run,
+                        "run.supervision.expert_failed",
+                        json!({
+                            "request_id": request.id,
+                            "agent_session_id": agent_id,
+                            "reason": reason,
+                            "automatic_action": false,
+                        }),
+                    )?;
+                }
+            }
+            self.store.clear_agent_active_turn(agent_id)?;
+            self.store.update_agent_state(
+                agent_id,
+                "FAILED",
+                Some("Read-only expert consultation did not produce a usable response"),
+                None,
+                None,
+                Some((
+                    if status == "completed" {
+                        "protocol_error"
+                    } else {
+                        terminal_failure_class
+                    },
+                    &reason,
+                )),
+            )?;
             return Ok(());
         }
         if status != "completed" {
@@ -16280,6 +17117,132 @@ mod tests {
             .expect("one proposal exists")
     }
 
+    async fn fixture_expert_action(
+        orchestrator: &Orchestrator,
+        run_id: &RunId,
+        impact: &str,
+    ) -> (SupervisorActionRecord, TaskId) {
+        let task = orchestrator
+            .store()
+            .list_tasks(run_id)
+            .expect("fixture task reads")
+            .into_iter()
+            .next()
+            .expect("fixture plan creates one task");
+        orchestrator
+            .store()
+            .transition_task(&task.id, TaskState::Blocked, None)
+            .expect("fixture task becomes blocked");
+        orchestrator
+            .store()
+            .set_task_failure_reason(&task.id, Some("high impact integration conflict"))
+            .expect("fixture task gets a durable blocker reason");
+        let event_cursor = orchestrator
+            .store()
+            .list_domain_events(0, Some(run_id), 10_000)
+            .expect("fixture events read")
+            .last()
+            .map(|event| event.id)
+            .unwrap_or(0);
+        let snapshot = orchestrator
+            .store()
+            .record_supervisor_snapshot(run_id, event_cursor, "operator_steered", |id, revision| {
+                Ok(json!({
+                    "schema": "harness.supervisor-snapshot.v1",
+                    "snapshot_id": id,
+                    "run_id": run_id,
+                    "revision": revision,
+                    "event_cursor": event_cursor,
+                    "generated_at": "2026-08-14T00:00:00Z",
+                    "goal_revision": 1,
+                    "allowed_actions": ["request_expert"],
+                    "tasks": [{"task_id": task.id}],
+                }))
+            })
+            .expect("expert fixture snapshot persists");
+        let supervisor_id = AgentSessionId::from("expert-fixture-supervisor");
+        orchestrator
+            .store()
+            .create_agent_session(&NewAgentSession {
+                id: supervisor_id.clone(),
+                run_id: run_id.clone(),
+                task_attempt_id: None,
+                parent_agent_session_id: None,
+                runtime_kind: "test".to_owned(),
+                codex_account_id: None,
+                role: AgentRole::Supervisor,
+                nickname: Some("expert fixture supervisor".to_owned()),
+                requested_model: "gpt-5.6-terra".to_owned(),
+                requested_reasoning_effort: "high".to_owned(),
+                sandbox_mode: SandboxMode::ReadOnly,
+                approval_policy: "never".to_owned(),
+                cwd: PathBuf::from("/tmp"),
+                state: "STARTING".to_owned(),
+                current_goal: Some("fixture proposal".to_owned()),
+                token_budget: Some(48_000),
+            })
+            .expect("fixture supervisor persists");
+        let review = orchestrator
+            .store()
+            .create_supervisor_review(&NewSupervisorReview {
+                id: SupervisorReviewId::from("expert-fixture-review"),
+                run_id: run_id.clone(),
+                snapshot_id: snapshot.id.clone(),
+                agent_session_id: supervisor_id,
+                expected_decision_id: SupervisorDecisionId::from("expert-fixture-decision"),
+                trigger_kind: "operator_steered".to_owned(),
+                requested_model: "gpt-5.6-terra".to_owned(),
+                requested_effort: "high".to_owned(),
+            })
+            .expect("fixture review persists");
+        orchestrator
+            .store()
+            .mark_supervisor_review_running(&review.id)
+            .expect("fixture review starts");
+        let decision = json!({
+            "schema": "harness.supervisor-decision.v1",
+            "decision_id": review.expected_decision_id,
+            "snapshot_id": snapshot.id,
+            "run_id": run_id,
+            "summary": "A bounded high-impact disagreement needs a separate advisory opinion.",
+            "actions": [{
+                "action_id": "request-expert",
+                "kind": "request_expert",
+                "target": {"kind": "run", "id": run_id, "task_id": null, "attempt_id": null, "session_id": null},
+                "impact": impact,
+                "reason_code": "integration_conflict",
+                "summary": "Ask a read-only expert to resolve the canonical integration invariant.",
+                "expected_observable_outcome": "A separate advisory response is recorded for Terra to assess.",
+                "dedupe_key": "expert-fixture-request",
+                "expires_at": "2026-08-14T01:00:00Z",
+                "model_route": null,
+                "expert_brief": {
+                    "category": "integration_conflict",
+                    "impact": impact,
+                    "question": "Which compatibility invariant must hold before this blocked integration can safely continue?",
+                    "why_normal_agents_cannot_resolve": "The current worker and reviewer have conflicting conclusions on a public integration contract.",
+                    "known_facts": ["The task is blocked after conflicting contract evidence."],
+                    "disputed_claims": ["The adapter may preserve the canonical contract."],
+                    "constraints": ["Do not propose an automatic state transition."],
+                    "required_output": ["State the invariant and the next observable validation."],
+                    "task_ids": [task.id],
+                    "evidence_refs": [{"kind": "event", "id": "event-fixture", "summary": "The controller recorded a blocked integration conflict."}]
+                }
+            }]
+        });
+        orchestrator
+            .store()
+            .record_current_supervisor_decision(&review.id, event_cursor, &decision, |_| false)
+            .expect("fixture expert decision persists");
+        let action = orchestrator
+            .store()
+            .supervisor_actions_for_run(run_id)
+            .expect("fixture action reads")
+            .pop()
+            .expect("one expert proposal exists");
+        (action, task.id)
+    }
+
     #[tokio::test]
     async fn supervisor_action_is_explicitly_revalidated_and_receipted() {
         let (orchestrator, _temp) = operator_settings_test_orchestrator().await;
@@ -16326,6 +17289,143 @@ mod tests {
             .expect("staleness is a durable non-executing outcome");
         assert_eq!(stale.state, "STALE");
         assert!(stale.execution_receipt.is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_expert_consultation_stays_advisory_and_triggers_fresh_terra_review() {
+        let (orchestrator, _temp, runtime, run_id, _) = rollout_lost_plan_review_fixture().await;
+        orchestrator
+            .update_operator_settings(operator_settings_request(Some(true), None))
+            .expect("advisory mode enables explicitly");
+        let (action, task_id) = fixture_expert_action(&orchestrator, &run_id, "high").await;
+        let applied = orchestrator
+            .apply_supervisor_action(&action.id, "local-user")
+            .await
+            .expect("the explicit high-impact proposal starts one expert");
+        assert_eq!(applied.state, "SUCCEEDED");
+        assert_eq!(
+            applied
+                .execution_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.get("result"))
+                .and_then(Value::as_str),
+            Some("read_only_expert_consultation_started")
+        );
+        let request = orchestrator
+            .store()
+            .expert_requests_for_run(&run_id)
+            .expect("expert request reads")
+            .pop()
+            .expect("one durable expert request exists");
+        assert_eq!(request.state, "RUNNING");
+        let expert_id = request
+            .agent_session_id
+            .clone()
+            .expect("request has bound agent");
+        let expert = orchestrator
+            .store()
+            .agent(&expert_id)
+            .expect("expert reads");
+        assert_eq!(expert.role, AgentRole::Expert);
+        assert_eq!(expert.requested_model, "gpt-5.6-sol");
+        assert_eq!(expert.requested_reasoning_effort, "xhigh");
+        assert_eq!(expert.sandbox_mode, SandboxMode::ReadOnly);
+        assert_eq!(runtime.started_threads.lock().unwrap().len(), 1);
+        assert_eq!(
+            runtime.started_threads.lock().unwrap()[0].model,
+            "gpt-5.6-sol"
+        );
+        assert_eq!(runtime.started_turns.lock().unwrap()[0].effort, "xhigh");
+
+        let response = json!({
+            "schema": "harness.expert-response.v1",
+            "response_id": "expert-fixture-response",
+            "request_id": request.id,
+            "run_id": run_id,
+            "snapshot_id": request.snapshot_id,
+            "snapshot_revision": request.payload["snapshot_revision"],
+            "completed_at": "2026-08-14T00:10:00Z",
+            "no_direct_action": true,
+            "verdict": "recommendation",
+            "summary": "The canonical integration invariant is explicit and testable.",
+            "recommendation": "Keep one canonical adapter contract and prove it with the listed controller evidence.",
+            "evidence_refs": request.payload["evidence_refs"],
+        });
+        orchestrator
+            .accept_expert_response(&expert_id, &response.to_string())
+            .await
+            .expect("a bound advisory response persists");
+        assert_eq!(
+            orchestrator
+                .store()
+                .expert_request(&request.id)
+                .unwrap()
+                .state,
+            "COMPLETED"
+        );
+        assert_eq!(
+            orchestrator.store().run(&run_id).unwrap().state,
+            RunState::Blocked
+        );
+        assert_eq!(
+            orchestrator.store().task(&task_id).unwrap().state,
+            TaskState::Blocked
+        );
+        assert_eq!(
+            orchestrator
+                .store()
+                .supervisor_action(&action.id)
+                .unwrap()
+                .state,
+            "SUCCEEDED"
+        );
+        assert_eq!(
+            runtime.started_threads.lock().unwrap().len(),
+            2,
+            "one fresh Terra review follows the expert receipt"
+        );
+        assert_eq!(
+            runtime.started_threads.lock().unwrap()[1].model,
+            "gpt-5.6-terra"
+        );
+        let fresh_snapshot = orchestrator
+            .store()
+            .latest_supervisor_snapshot(&run_id)
+            .unwrap()
+            .expect("fresh expert-result snapshot exists");
+        assert_eq!(
+            fresh_snapshot.payload["expert_consultations"][0]["response"]["id"],
+            json!("expert-fixture-response")
+        );
+    }
+
+    #[tokio::test]
+    async fn routine_expert_proposal_is_rejected_without_starting_sol() {
+        let (orchestrator, _temp, runtime, run_id, _) = rollout_lost_plan_review_fixture().await;
+        orchestrator
+            .update_operator_settings(operator_settings_request(Some(true), None))
+            .expect("advisory mode enables explicitly");
+        let (action, _) = fixture_expert_action(&orchestrator, &run_id, "low").await;
+        let rejected = orchestrator
+            .apply_supervisor_action(&action.id, "local-user")
+            .await
+            .expect("routine proposal receives a durable policy rejection");
+        assert_eq!(rejected.state, "POLICY_REJECTED");
+        assert!(
+            rejected
+                .policy_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("high or critical")
+        );
+        assert!(
+            orchestrator
+                .store()
+                .expert_requests_for_run(&run_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(runtime.started_threads.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -17239,6 +18339,10 @@ mod tests {
             (
                 "supervisor",
                 model_output_schema(serde_json::from_str(SUPERVISOR_DECISION_SCHEMA).unwrap()),
+            ),
+            (
+                "expert",
+                model_output_schema(serde_json::from_str(EXPERT_RESPONSE_SCHEMA).unwrap()),
             ),
         ] {
             assert_compatible(&schema, name);
