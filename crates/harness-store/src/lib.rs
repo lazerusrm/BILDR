@@ -48,6 +48,8 @@ const SUPERVISION_OBSERVE_MIGRATION: &str =
     include_str!("../../../migrations/0013_supervision_observe.sql");
 const SUPERVISION_ADVISORY_MIGRATION: &str =
     include_str!("../../../migrations/0014_supervision_advisory.sql");
+const SUPERVISION_ACTIONS_MIGRATION: &str =
+    include_str!("../../../migrations/0015_supervision_actions.sql");
 
 #[derive(Clone)]
 pub struct Store {
@@ -344,6 +346,16 @@ fn apply_runtime_migrations(connection: &mut Connection) -> Result<(), StoreErro
     } else {
         set_runtime_schema_version(connection, "13")?;
     }
+    let has_supervisor_actions: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='supervisor_actions')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_supervisor_actions {
+        apply_supervision_actions_migration(connection, || Ok(()))?;
+    } else {
+        set_runtime_schema_version(connection, "14")?;
+    }
     Ok(())
 }
 
@@ -383,6 +395,24 @@ where
     transaction.execute_batch(SUPERVISION_ADVISORY_MIGRATION)?;
     after_schema()?;
     set_runtime_schema_version(&transaction, "13")?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Install the action and expert custody tables as one transaction. A running
+/// binary must never advertise this schema before both action dedupe and the
+/// immutable expert-response receipt exist.
+fn apply_supervision_actions_migration<F>(
+    connection: &mut Connection,
+    after_schema: F,
+) -> Result<(), StoreError>
+where
+    F: FnOnce() -> Result<(), StoreError>,
+{
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(SUPERVISION_ACTIONS_MIGRATION)?;
+    after_schema()?;
+    set_runtime_schema_version(&transaction, "14")?;
     transaction.commit()?;
     Ok(())
 }
@@ -503,7 +533,7 @@ mod tests {
         assert!(store.check().unwrap().ready);
         drop(store);
         let reopened = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(reopened.migration_version().unwrap(), "13");
+        assert_eq!(reopened.migration_version().unwrap(), "14");
         let has_worktree_fingerprint: bool = reopened
             .connection()
             .unwrap()
@@ -661,6 +691,54 @@ mod tests {
             .unwrap();
         assert!(!review_table_exists);
         assert_eq!(version, "12");
+    }
+
+    #[test]
+    fn supervision_action_schema_and_v14_marker_roll_back_together_on_failure() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::in_memory(&temp.path().join("artifacts")).unwrap();
+        let mut connection = store.connection().unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER expert_responses_no_update;
+                 DROP TRIGGER expert_responses_no_delete;
+                 DROP TRIGGER expert_requests_custody_immutable;
+                 DROP TRIGGER supervisor_actions_proposal_immutable;
+                 DROP TABLE expert_responses;
+                 DROP INDEX idx_expert_requests_active_signature;
+                 DROP INDEX idx_expert_requests_active_run;
+                 DROP INDEX idx_expert_requests_run_created;
+                 DROP TABLE expert_requests;
+                 DROP INDEX idx_supervisor_actions_active_dedupe;
+                 DROP INDEX idx_supervisor_actions_run_created;
+                 DROP TABLE supervisor_actions;
+                 UPDATE schema_migrations_meta SET value='13' WHERE key='runtime_schema_version';",
+            )
+            .unwrap();
+
+        let error = apply_supervision_actions_migration(&mut connection, || {
+            Err(StoreError::Migration(
+                "injected failure after supervisory action DDL".to_owned(),
+            ))
+        })
+        .expect_err("a migration failure must roll back action and expert custody");
+        assert!(error.to_string().contains("injected failure"));
+        let actions_table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='supervisor_actions')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let version: String = connection
+            .query_row(
+                "SELECT value FROM schema_migrations_meta WHERE key='runtime_schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!actions_table_exists);
+        assert_eq!(version, "13");
     }
 
     #[test]
@@ -930,7 +1008,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let store = Store::open(&database, &temp.path().join("artifacts")).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "13");
+        assert_eq!(store.migration_version().unwrap(), "14");
         for name in [
             "improvement_revisions",
             "improvement_events",
@@ -1000,7 +1078,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "13");
+        assert_eq!(store.migration_version().unwrap(), "14");
         for name in [
             "failure_occurrences",
             "failure_clusters",
@@ -1060,7 +1138,7 @@ mod tests {
         );
         drop(store);
         let reopened = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(reopened.migration_version().unwrap(), "13");
+        assert_eq!(reopened.migration_version().unwrap(), "14");
         assert!(
             reopened
                 .backup(&temp.path().join("v6-backup.sqlite3"))
@@ -1099,7 +1177,7 @@ mod tests {
         drop(connection);
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "13");
+        assert_eq!(store.migration_version().unwrap(), "14");
         for name in [
             "taskset_revision_memberships",
             "evaluation_runs",
@@ -1133,7 +1211,7 @@ mod tests {
                 .unwrap()
                 .migration_version()
                 .unwrap(),
-            "13"
+            "14"
         );
         assert!(
             Store::open(&backup, &temp.path().join("backup-artifacts"))
@@ -1179,7 +1257,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "13");
+        assert_eq!(store.migration_version().unwrap(), "14");
         for name in [
             "policy_champion_bindings",
             "policy_current_champions",
@@ -1328,7 +1406,7 @@ mod tests {
                 .unwrap()
                 .migration_version()
                 .unwrap(),
-            "13"
+            "14"
         );
     }
 
@@ -1417,7 +1495,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "13");
+        assert_eq!(store.migration_version().unwrap(), "14");
         for (table, column) in [
             ("evaluation_runs", "controller_run_id"),
             ("evaluation_samples", "controller_evidence_id"),
@@ -1560,7 +1638,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "13");
+        assert_eq!(store.migration_version().unwrap(), "14");
         let backfilled: bool = store
             .connection()
             .unwrap()
@@ -1587,7 +1665,7 @@ mod tests {
                 .unwrap()
                 .migration_version()
                 .unwrap(),
-            "13"
+            "14"
         );
     }
 

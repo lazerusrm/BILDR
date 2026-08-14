@@ -1,8 +1,9 @@
 use harness_domain::{
-    AgentSessionId, AgentSummary, DomainEvent, RunId, RunPlan, RunSummary, SupervisorDecisionId,
-    SupervisorReviewId, SupervisorSnapshotId, TaskSummary, format_timestamp, now_ms,
+    AgentSessionId, AgentSummary, DomainEvent, ExpertRequestId, ExpertResponseId, RunId, RunPlan,
+    RunSummary, SupervisorActionId, SupervisorDecisionId, SupervisorReviewId, SupervisorSnapshotId,
+    TaskSummary, format_timestamp, now_ms,
 };
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -66,6 +67,77 @@ pub struct SupervisorDecisionRecord {
     pub payload_sha256: String,
     pub byte_length: u64,
     pub created_at: String,
+}
+
+/// One immutable action proposal projected from a hash-bound supervisor
+/// decision. Lifecycle transitions are deliberately separate from the model
+/// payload so policy and execution cannot rewrite the original proposal.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SupervisorActionRecord {
+    pub id: SupervisorActionId,
+    pub decision_id: SupervisorDecisionId,
+    pub run_id: RunId,
+    pub snapshot_id: SupervisorSnapshotId,
+    pub proposal_action_id: String,
+    pub kind: String,
+    pub target: Value,
+    pub proposal: Value,
+    pub proposal_sha256: String,
+    pub dedupe_key: String,
+    pub state: String,
+    pub policy_reason: Option<String>,
+    pub execution_receipt: Option<Value>,
+    pub execution_receipt_sha256: Option<String>,
+    pub created_at: String,
+    pub evaluated_at: Option<String>,
+    pub execution_started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+/// A controller-constructed, bounded expert request. It is never a direct
+/// authority grant: only an already policy-accepted `request_expert` action
+/// may own one of these records.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExpertRequestRecord {
+    pub id: ExpertRequestId,
+    pub action_id: SupervisorActionId,
+    pub decision_id: SupervisorDecisionId,
+    pub run_id: RunId,
+    pub snapshot_id: SupervisorSnapshotId,
+    pub signature: String,
+    pub state: String,
+    pub payload: Value,
+    pub payload_sha256: String,
+    pub requested_model: String,
+    pub requested_effort: String,
+    pub expires_at: String,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExpertResponseRecord {
+    pub id: ExpertResponseId,
+    pub request_id: ExpertRequestId,
+    pub run_id: RunId,
+    pub snapshot_id: SupervisorSnapshotId,
+    pub payload: Value,
+    pub payload_sha256: String,
+    pub byte_length: u64,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewExpertRequest {
+    pub id: ExpertRequestId,
+    pub action_id: SupervisorActionId,
+    pub signature: String,
+    pub payload: Value,
+    pub requested_model: String,
+    pub requested_effort: String,
+    pub expires_at_ms: i64,
 }
 
 /// A single, internally consistent controller projection captured for the
@@ -519,6 +591,15 @@ impl Store {
                 now,
             ],
         )?;
+        insert_supervisor_action_proposals(
+            &transaction,
+            &review.expected_decision_id,
+            &review.run_id,
+            &review.snapshot_id,
+            payload,
+            policy_state,
+            now,
+        )?;
         transaction.execute(
             "UPDATE supervisor_reviews SET state=?2,completed_at=?3,failure_reason=NULL WHERE id=?1",
             params![review.id.as_str(), if policy_state == "STALE" { "STALE" } else { "COMPLETED" }, now],
@@ -599,6 +680,311 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn supervisor_actions_for_decision(
+        &self,
+        decision_id: &SupervisorDecisionId,
+    ) -> Result<Vec<SupervisorActionRecord>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id,decision_id,run_id,snapshot_id,proposal_action_id,kind,target_json,proposal_json,proposal_sha256,dedupe_key,state,policy_reason,execution_receipt_json,execution_receipt_sha256,created_at,evaluated_at,execution_started_at,completed_at FROM supervisor_actions WHERE decision_id=?1 ORDER BY created_at,id",
+        )?;
+        statement
+            .query_map([decision_id.as_str()], map_supervisor_action)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn supervisor_action(
+        &self,
+        action_id: &SupervisorActionId,
+    ) -> Result<SupervisorActionRecord, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT id,decision_id,run_id,snapshot_id,proposal_action_id,kind,target_json,proposal_json,proposal_sha256,dedupe_key,state,policy_reason,execution_receipt_json,execution_receipt_sha256,created_at,evaluated_at,execution_started_at,completed_at FROM supervisor_actions WHERE id=?1",
+                [action_id.as_str()],
+                map_supervisor_action,
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("supervisor action {action_id}")))
+    }
+
+    /// Records exactly one closed policy outcome. The caller cannot move an
+    /// action straight into execution or overwrite a prior decision.
+    pub fn evaluate_supervisor_action(
+        &self,
+        action_id: &SupervisorActionId,
+        accepted: bool,
+        reason: &str,
+    ) -> Result<SupervisorActionRecord, StoreError> {
+        let reason = bounded_text(reason, 4_000, "supervisor action policy reason")?;
+        let state = if accepted {
+            "POLICY_ACCEPTED"
+        } else {
+            "POLICY_REJECTED"
+        };
+        let now = now_ms();
+        let changed = self.connection()?.execute(
+            "UPDATE supervisor_actions SET state=?2,policy_reason=?3,evaluated_at=?4 WHERE id=?1 AND state='PROPOSED'",
+            params![action_id.as_str(), state, reason, now],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "supervisor action {action_id} is not pending policy evaluation"
+            )));
+        }
+        self.supervisor_action(action_id)
+    }
+
+    pub fn begin_supervisor_action(
+        &self,
+        action_id: &SupervisorActionId,
+    ) -> Result<SupervisorActionRecord, StoreError> {
+        let now = now_ms();
+        let changed = self.connection()?.execute(
+            "UPDATE supervisor_actions SET state='EXECUTING',execution_started_at=?2 WHERE id=?1 AND state='POLICY_ACCEPTED'",
+            params![action_id.as_str(), now],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "supervisor action {action_id} is not policy-accepted"
+            )));
+        }
+        self.supervisor_action(action_id)
+    }
+
+    /// Persists a bounded, hash-verifiable controller receipt. The receipt is
+    /// written only from `EXECUTING`, making retries and late callbacks unable
+    /// to change a terminal action.
+    pub fn complete_supervisor_action(
+        &self,
+        action_id: &SupervisorActionId,
+        succeeded: bool,
+        receipt: &Value,
+    ) -> Result<SupervisorActionRecord, StoreError> {
+        let raw = serde_json::to_string(receipt)?;
+        if raw.is_empty() || raw.len() > 65_536 {
+            return Err(StoreError::Validation(
+                "supervisor action receipt exceeds its bounded custody limit".to_owned(),
+            ));
+        }
+        let state = if succeeded { "SUCCEEDED" } else { "FAILED" };
+        let now = now_ms();
+        let changed = self.connection()?.execute(
+            "UPDATE supervisor_actions SET state=?2,execution_receipt_json=?3,execution_receipt_sha256=?4,completed_at=?5 WHERE id=?1 AND state='EXECUTING'",
+            params![action_id.as_str(), state, raw, hex::encode(Sha256::digest(raw.as_bytes())), now],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "supervisor action {action_id} is not executing"
+            )));
+        }
+        self.supervisor_action(action_id)
+    }
+
+    pub fn create_expert_request(
+        &self,
+        input: &NewExpertRequest,
+    ) -> Result<ExpertRequestRecord, StoreError> {
+        let signature = exact_sha256(&input.signature, "expert escalation signature")?;
+        let requested_model = bounded_text(&input.requested_model, 128, "expert model")?;
+        let requested_effort = bounded_text(&input.requested_effort, 32, "expert effort")?;
+        if input.expires_at_ms <= now_ms() {
+            return Err(StoreError::Validation(
+                "expert request expiry must be in the future".to_owned(),
+            ));
+        }
+        let raw = serde_json::to_string(&input.payload)?;
+        if raw.is_empty() || raw.len() > 131_072 {
+            return Err(StoreError::Validation(
+                "expert request payload exceeds its bounded custody limit".to_owned(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let action = transaction
+            .query_row(
+                "SELECT decision_id,run_id,snapshot_id,kind,state FROM supervisor_actions WHERE id=?1",
+                [input.action_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("supervisor action {}", input.action_id)))?;
+        if action.3 != "request_expert" || action.4 != "POLICY_ACCEPTED" {
+            return Err(StoreError::Conflict(
+                "only a policy-accepted request_expert action may create an expert request"
+                    .to_owned(),
+            ));
+        }
+        let now = now_ms();
+        transaction.execute(
+            "INSERT INTO expert_requests(id,action_id,decision_id,run_id,snapshot_id,signature,state,payload_json,payload_sha256,requested_model,requested_effort,expires_at,created_at) VALUES(?1,?2,?3,?4,?5,?6,'QUEUED',?7,?8,?9,?10,?11,?12)",
+            params![
+                input.id.as_str(),
+                input.action_id.as_str(),
+                action.0,
+                action.1,
+                action.2,
+                signature,
+                raw,
+                hex::encode(Sha256::digest(raw.as_bytes())),
+                requested_model,
+                requested_effort,
+                input.expires_at_ms,
+                now,
+            ],
+        )?;
+        let record = transaction.query_row(
+            "SELECT id,action_id,decision_id,run_id,snapshot_id,signature,state,payload_json,payload_sha256,requested_model,requested_effort,expires_at,created_at,started_at,completed_at,failure_reason FROM expert_requests WHERE id=?1",
+            [input.id.as_str()],
+            map_expert_request,
+        )?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    pub fn begin_expert_request(
+        &self,
+        request_id: &ExpertRequestId,
+    ) -> Result<ExpertRequestRecord, StoreError> {
+        let now = now_ms();
+        let changed = self.connection()?.execute(
+            "UPDATE expert_requests SET state='RUNNING',started_at=?2 WHERE id=?1 AND state='QUEUED' AND expires_at>?2",
+            params![request_id.as_str(), now],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "expert request {request_id} is not queueable or has expired"
+            )));
+        }
+        self.expert_request(request_id)
+    }
+
+    pub fn expert_request(
+        &self,
+        request_id: &ExpertRequestId,
+    ) -> Result<ExpertRequestRecord, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT id,action_id,decision_id,run_id,snapshot_id,signature,state,payload_json,payload_sha256,requested_model,requested_effort,expires_at,created_at,started_at,completed_at,failure_reason FROM expert_requests WHERE id=?1",
+                [request_id.as_str()],
+                map_expert_request,
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("expert request {request_id}")))
+    }
+
+    pub fn expert_requests_for_run(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Vec<ExpertRequestRecord>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id,action_id,decision_id,run_id,snapshot_id,signature,state,payload_json,payload_sha256,requested_model,requested_effort,expires_at,created_at,started_at,completed_at,failure_reason FROM expert_requests WHERE run_id=?1 ORDER BY created_at DESC,id DESC",
+        )?;
+        statement
+            .query_map([run_id.as_str()], map_expert_request)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn finish_expert_request(
+        &self,
+        request_id: &ExpertRequestId,
+        state: &str,
+        failure_reason: Option<&str>,
+    ) -> Result<ExpertRequestRecord, StoreError> {
+        if !matches!(
+            state,
+            "COMPLETED" | "FAILED" | "INCONCLUSIVE" | "CANCELED" | "STALE"
+        ) {
+            return Err(StoreError::Validation(
+                "expert request terminal state is invalid".to_owned(),
+            ));
+        }
+        let failure_reason = failure_reason
+            .map(|value| bounded_text(value, 4_000, "expert request failure reason"))
+            .transpose()?;
+        let now = now_ms();
+        let changed = self.connection()?.execute(
+            "UPDATE expert_requests SET state=?2,completed_at=?3,failure_reason=?4 WHERE id=?1 AND state IN ('QUEUED','RUNNING')",
+            params![request_id.as_str(), state, now, failure_reason],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "expert request {request_id} is not active"
+            )));
+        }
+        self.expert_request(request_id)
+    }
+
+    pub fn record_expert_response(
+        &self,
+        request_id: &ExpertRequestId,
+        response_id: &ExpertResponseId,
+        payload: &Value,
+    ) -> Result<ExpertResponseRecord, StoreError> {
+        let raw = serde_json::to_string(payload)?;
+        if raw.is_empty() || raw.len() > 131_072 {
+            return Err(StoreError::Validation(
+                "expert response payload exceeds its bounded custody limit".to_owned(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let request = transaction
+            .query_row(
+                "SELECT run_id,snapshot_id,state FROM expert_requests WHERE id=?1",
+                [request_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("expert request {request_id}")))?;
+        if request.2 != "RUNNING" {
+            return Err(StoreError::Conflict(format!(
+                "expert request {request_id} is not running"
+            )));
+        }
+        let now = now_ms();
+        transaction.execute(
+            "INSERT INTO expert_responses(id,request_id,run_id,snapshot_id,payload_json,payload_sha256,byte_length,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                response_id.as_str(),
+                request_id.as_str(),
+                request.0,
+                request.1,
+                raw,
+                hex::encode(Sha256::digest(raw.as_bytes())),
+                i64::try_from(raw.len()).map_err(|_| StoreError::Validation("expert response payload is too large".to_owned()))?,
+                now,
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE expert_requests SET state='COMPLETED',completed_at=?2,failure_reason=NULL WHERE id=?1 AND state='RUNNING'",
+            params![request_id.as_str(), now],
+        )?;
+        let record = transaction.query_row(
+            "SELECT id,request_id,run_id,snapshot_id,payload_json,payload_sha256,byte_length,created_at FROM expert_responses WHERE id=?1",
+            [response_id.as_str()],
+            map_expert_response,
+        )?;
+        transaction.commit()?;
+        Ok(record)
     }
 }
 
@@ -733,6 +1119,253 @@ fn map_supervisor_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<Supervis
     })
 }
 
+fn insert_supervisor_action_proposals(
+    transaction: &Transaction<'_>,
+    decision_id: &SupervisorDecisionId,
+    run_id: &RunId,
+    snapshot_id: &SupervisorSnapshotId,
+    payload: &Value,
+    policy_state: &str,
+    created_at: i64,
+) -> Result<(), StoreError> {
+    let Some(actions) = payload.get("actions") else {
+        // Store-level custody fixtures intentionally test only the immutable
+        // envelope. The orchestrator schema validator requires actions before
+        // any real decision can arrive here.
+        return Ok(());
+    };
+    let actions = actions.as_array().ok_or_else(|| {
+        StoreError::Validation("supervisor decision actions must be an array".to_owned())
+    })?;
+    if actions.is_empty() || actions.len() > 50 {
+        return Err(StoreError::Validation(
+            "supervisor decision action count is invalid".to_owned(),
+        ));
+    }
+    let state = if policy_state == "STALE" {
+        "STALE"
+    } else {
+        "PROPOSED"
+    };
+    for action in actions {
+        let object = action.as_object().ok_or_else(|| {
+            StoreError::Validation("supervisor decision action must be an object".to_owned())
+        })?;
+        let proposal_action_id =
+            object
+                .get("action_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    StoreError::Validation("supervisor action lacks action_id".to_owned())
+                })?;
+        let proposal_action_id = bounded_text(proposal_action_id, 128, "supervisor action id")?;
+        let kind = object
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| StoreError::Validation("supervisor action lacks kind".to_owned()))?;
+        if !SUPERVISOR_ACTION_KINDS.contains(&kind) {
+            return Err(StoreError::Validation(format!(
+                "supervisor action {proposal_action_id} has an unknown kind"
+            )));
+        }
+        let target = object
+            .get("target")
+            .cloned()
+            .ok_or_else(|| StoreError::Validation("supervisor action lacks target".to_owned()))?;
+        let dedupe_key = object
+            .get("dedupe_key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                StoreError::Validation("supervisor action lacks dedupe key".to_owned())
+            })?;
+        let dedupe_key = bounded_text(dedupe_key, 256, "supervisor action dedupe key")?;
+        let target_raw = serde_json::to_string(&target)?;
+        let proposal_raw = serde_json::to_string(action)?;
+        if target_raw.len() > 16_384 || proposal_raw.len() > 65_536 {
+            return Err(StoreError::Validation(
+                "supervisor action proposal exceeds its bounded custody limit".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO supervisor_actions(id,decision_id,run_id,snapshot_id,proposal_action_id,kind,target_json,proposal_json,proposal_sha256,dedupe_key,state,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![
+                SupervisorActionId::new().as_str(),
+                decision_id.as_str(),
+                run_id.as_str(),
+                snapshot_id.as_str(),
+                proposal_action_id,
+                kind,
+                target_raw,
+                proposal_raw,
+                hex::encode(Sha256::digest(proposal_raw.as_bytes())),
+                dedupe_key,
+                state,
+                created_at,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+const SUPERVISOR_ACTION_KINDS: &[&str] = &[
+    "wait",
+    "continue_attempt",
+    "steer_active_turn",
+    "start_followup_turn",
+    "retry_fresh_attempt",
+    "spawn_explorer",
+    "spawn_reviewer",
+    "reroute_attempt",
+    "request_expert",
+    "request_replan",
+    "request_verification",
+    "queue_integration",
+    "cancel_attempt",
+    "pause_for_human",
+    "stop_run",
+];
+
+fn bounded_text(value: &str, maximum: usize, field: &str) -> Result<String, StoreError> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > maximum {
+        return Err(StoreError::Validation(format!("{field} is invalid")));
+    }
+    Ok(value.to_owned())
+}
+
+fn exact_sha256(value: &str, field: &str) -> Result<String, StoreError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(StoreError::Validation(format!(
+            "{field} must be lowercase SHA-256"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+fn map_supervisor_action(row: &rusqlite::Row<'_>) -> rusqlite::Result<SupervisorActionRecord> {
+    let target_raw: String = row.get(6)?;
+    let proposal_raw: String = row.get(7)?;
+    let proposal_sha256: String = row.get(8)?;
+    let receipt_raw: Option<String> = row.get(12)?;
+    let receipt_sha256: Option<String> = row.get(13)?;
+    if proposal_sha256 != hex::encode(Sha256::digest(proposal_raw.as_bytes())) {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            7,
+            rusqlite::types::Type::Text,
+            "supervisor action proposal integrity check failed".into(),
+        ));
+    }
+    if let (Some(raw), Some(digest)) = (&receipt_raw, &receipt_sha256)
+        && digest != &hex::encode(Sha256::digest(raw.as_bytes()))
+    {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            12,
+            rusqlite::types::Type::Text,
+            "supervisor action receipt integrity check failed".into(),
+        ));
+    }
+    let created_at: i64 = row.get(14)?;
+    let evaluated_at: Option<i64> = row.get(15)?;
+    let execution_started_at: Option<i64> = row.get(16)?;
+    let completed_at: Option<i64> = row.get(17)?;
+    Ok(SupervisorActionRecord {
+        id: SupervisorActionId::from(row.get::<_, String>(0)?),
+        decision_id: SupervisorDecisionId::from(row.get::<_, String>(1)?),
+        run_id: RunId::from(row.get::<_, String>(2)?),
+        snapshot_id: SupervisorSnapshotId::from(row.get::<_, String>(3)?),
+        proposal_action_id: row.get(4)?,
+        kind: row.get(5)?,
+        target: serde_json::from_str(&target_raw).map_err(json_column_error(6))?,
+        proposal: serde_json::from_str(&proposal_raw).map_err(json_column_error(7))?,
+        proposal_sha256,
+        dedupe_key: row.get(9)?,
+        state: row.get(10)?,
+        policy_reason: row.get(11)?,
+        execution_receipt: receipt_raw
+            .map(|raw| serde_json::from_str(&raw).map_err(json_column_error(12)))
+            .transpose()?,
+        execution_receipt_sha256: receipt_sha256,
+        created_at: format_timestamp(created_at),
+        evaluated_at: evaluated_at.map(format_timestamp),
+        execution_started_at: execution_started_at.map(format_timestamp),
+        completed_at: completed_at.map(format_timestamp),
+    })
+}
+
+fn map_expert_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExpertRequestRecord> {
+    let payload_raw: String = row.get(7)?;
+    let payload_sha256: String = row.get(8)?;
+    if payload_sha256 != hex::encode(Sha256::digest(payload_raw.as_bytes())) {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            7,
+            rusqlite::types::Type::Text,
+            "expert request payload integrity check failed".into(),
+        ));
+    }
+    let expires_at: i64 = row.get(11)?;
+    let created_at: i64 = row.get(12)?;
+    let started_at: Option<i64> = row.get(13)?;
+    let completed_at: Option<i64> = row.get(14)?;
+    Ok(ExpertRequestRecord {
+        id: ExpertRequestId::from(row.get::<_, String>(0)?),
+        action_id: SupervisorActionId::from(row.get::<_, String>(1)?),
+        decision_id: SupervisorDecisionId::from(row.get::<_, String>(2)?),
+        run_id: RunId::from(row.get::<_, String>(3)?),
+        snapshot_id: SupervisorSnapshotId::from(row.get::<_, String>(4)?),
+        signature: row.get(5)?,
+        state: row.get(6)?,
+        payload: serde_json::from_str(&payload_raw).map_err(json_column_error(7))?,
+        payload_sha256,
+        requested_model: row.get(9)?,
+        requested_effort: row.get(10)?,
+        expires_at: format_timestamp(expires_at),
+        created_at: format_timestamp(created_at),
+        started_at: started_at.map(format_timestamp),
+        completed_at: completed_at.map(format_timestamp),
+        failure_reason: row.get(15)?,
+    })
+}
+
+fn map_expert_response(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExpertResponseRecord> {
+    let payload_raw: String = row.get(4)?;
+    let payload_sha256: String = row.get(5)?;
+    let byte_length = positive_u64(6, row.get(6)?)?;
+    if byte_length != payload_raw.len() as u64
+        || payload_sha256 != hex::encode(Sha256::digest(payload_raw.as_bytes()))
+    {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Text,
+            "expert response payload integrity check failed".into(),
+        ));
+    }
+    let created_at: i64 = row.get(7)?;
+    Ok(ExpertResponseRecord {
+        id: ExpertResponseId::from(row.get::<_, String>(0)?),
+        request_id: ExpertRequestId::from(row.get::<_, String>(1)?),
+        run_id: RunId::from(row.get::<_, String>(2)?),
+        snapshot_id: SupervisorSnapshotId::from(row.get::<_, String>(3)?),
+        payload: serde_json::from_str(&payload_raw).map_err(json_column_error(4))?,
+        payload_sha256,
+        byte_length,
+        created_at: format_timestamp(created_at),
+    })
+}
+
+fn json_column_error(column: usize) -> impl FnOnce(serde_json::Error) -> rusqlite::Error {
+    move |error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,6 +1431,72 @@ mod tests {
         (store, run)
     }
 
+    fn decision_with_action(store: &Store, run: &RunId, kind: &str) -> SupervisorDecisionRecord {
+        let snapshot = store
+            .record_supervisor_snapshot(run, 1, "operator_steered", |id, revision| {
+                Ok(serde_json::json!({
+                    "schema": SUPERVISOR_SNAPSHOT_SCHEMA,
+                    "snapshot_id": id,
+                    "run_id": run,
+                    "revision": revision,
+                    "event_cursor": 1,
+                }))
+            })
+            .expect("snapshot persists");
+        let agent_id = AgentSessionId::from("supervisor-action-agent");
+        store
+            .create_agent_session(&NewAgentSession {
+                id: agent_id.clone(),
+                run_id: run.clone(),
+                task_attempt_id: None,
+                parent_agent_session_id: None,
+                runtime_kind: "test".to_owned(),
+                codex_account_id: None,
+                role: AgentRole::Supervisor,
+                nickname: Some("supervisor".to_owned()),
+                requested_model: "gpt-5.6-terra".to_owned(),
+                requested_reasoning_effort: "high".to_owned(),
+                sandbox_mode: SandboxMode::ReadOnly,
+                approval_policy: "never".to_owned(),
+                cwd: PathBuf::from("/tmp"),
+                state: "STARTING".to_owned(),
+                current_goal: Some("read-only review".to_owned()),
+                token_budget: Some(24_000),
+            })
+            .expect("agent persists");
+        let review = store
+            .create_supervisor_review(&NewSupervisorReview {
+                id: SupervisorReviewId::from("supervisor-action-review"),
+                run_id: run.clone(),
+                snapshot_id: snapshot.id.clone(),
+                agent_session_id: agent_id,
+                expected_decision_id: SupervisorDecisionId::from("supervisor-action-decision"),
+                trigger_kind: "operator_steered".to_owned(),
+                requested_model: "gpt-5.6-terra".to_owned(),
+                requested_effort: "high".to_owned(),
+            })
+            .expect("review persists");
+        store
+            .mark_supervisor_review_running(&review.id)
+            .expect("review starts");
+        let payload = serde_json::json!({
+            "schema": "harness.supervisor-decision.v1",
+            "decision_id": review.expected_decision_id,
+            "snapshot_id": snapshot.id,
+            "run_id": run,
+            "summary": "A bounded controller action was proposed.",
+            "actions": [{
+                "action_id": "action-one",
+                "kind": kind,
+                "target": {"kind": "run", "id": run, "task_id": null, "attempt_id": null, "session_id": null},
+                "dedupe_key": format!("fixture-{kind}"),
+            }],
+        });
+        store
+            .record_current_supervisor_decision(&review.id, 1, &payload, |_| false)
+            .expect("decision and its action proposal persist together")
+    }
+
     #[test]
     fn snapshot_custody_is_immutable_and_idempotent_at_an_event_cursor() {
         let (_temp, store, run) = fixture();
@@ -815,7 +1514,7 @@ mod tests {
             .expect("snapshot persists");
         assert_eq!(first.revision, 1);
         assert_eq!(store.supervisor_observation_cursor(&run).unwrap(), 41);
-        assert_eq!(store.check().unwrap().schema_version, "13");
+        assert_eq!(store.check().unwrap().schema_version, "14");
 
         let duplicate = store
             .record_supervisor_snapshot(&run, 41, "task_stalled", |_, _| {
@@ -1070,6 +1769,103 @@ mod tests {
             store.list_domain_events(0, Some(&run), 10).unwrap().len(),
             1,
             "the concurrent event exists, but was not mixed into the prior read view"
+        );
+    }
+
+    #[test]
+    fn action_proposals_are_hash_bound_and_follow_a_closed_lifecycle() {
+        let (_temp, store, run) = fixture();
+        let decision = decision_with_action(&store, &run, "wait");
+        let action = store
+            .supervisor_actions_for_decision(&decision.id)
+            .expect("action projection reads")
+            .pop()
+            .expect("one action proposal is materialized with its decision");
+        assert_eq!(action.state, "PROPOSED");
+        assert!(store.begin_supervisor_action(&action.id).is_err());
+        let accepted = store
+            .evaluate_supervisor_action(&action.id, true, "current run still matches snapshot")
+            .expect("policy accepts once");
+        assert_eq!(accepted.state, "POLICY_ACCEPTED");
+        assert!(
+            store
+                .evaluate_supervisor_action(&action.id, false, "late rejection")
+                .is_err()
+        );
+        let executing = store
+            .begin_supervisor_action(&action.id)
+            .expect("accepted action begins once");
+        assert_eq!(executing.state, "EXECUTING");
+        let terminal = store
+            .complete_supervisor_action(
+                &action.id,
+                true,
+                &serde_json::json!({"schema": "harness.supervisor-action-receipt.v1", "outcome": "wait_scheduled"}),
+            )
+            .expect("terminal receipt persists");
+        assert_eq!(terminal.state, "SUCCEEDED");
+        assert!(
+            store
+                .complete_supervisor_action(&action.id, false, &serde_json::json!({"late": true}))
+                .is_err()
+        );
+        let connection = store.connection().expect("connection");
+        assert!(
+            connection
+                .execute(
+                    "UPDATE supervisor_actions SET dedupe_key='rewritten' WHERE id=?1",
+                    [action.id.as_str()],
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn expert_request_requires_policy_and_response_is_immutable() {
+        let (_temp, store, run) = fixture();
+        let decision = decision_with_action(&store, &run, "request_expert");
+        let action = store
+            .supervisor_actions_for_decision(&decision.id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let input = NewExpertRequest {
+            id: ExpertRequestId::from("expert-request-one"),
+            action_id: action.id.clone(),
+            signature: "a".repeat(64),
+            payload: serde_json::json!({"schema": "harness.expert-request.v1", "question": "resolve one bounded invariant"}),
+            requested_model: "gpt-5.6-sol".to_owned(),
+            requested_effort: "xhigh".to_owned(),
+            expires_at_ms: now_ms() + 60_000,
+        };
+        assert!(store.create_expert_request(&input).is_err());
+        store
+            .evaluate_supervisor_action(&action.id, true, "hard escalation gate satisfied")
+            .unwrap();
+        let request = store
+            .create_expert_request(&input)
+            .expect("accepted expert action creates one durable request");
+        assert_eq!(request.state, "QUEUED");
+        store.begin_expert_request(&request.id).unwrap();
+        let response = store
+            .record_expert_response(
+                &request.id,
+                &ExpertResponseId::from("expert-response-one"),
+                &serde_json::json!({"schema": "harness.expert-response.v1", "recommendation": "preserve the stated invariant"}),
+            )
+            .expect("running expert request receives one immutable response");
+        assert_eq!(
+            store.expert_request(&request.id).unwrap().state,
+            "COMPLETED"
+        );
+        let connection = store.connection().expect("connection");
+        assert!(
+            connection
+                .execute(
+                    "UPDATE expert_responses SET payload_json='{}' WHERE id=?1",
+                    [response.id.as_str()],
+                )
+                .is_err()
         );
     }
 }
