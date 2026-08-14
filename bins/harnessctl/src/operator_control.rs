@@ -7,7 +7,7 @@
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use super::{ApiClient, AttentionCommand};
+use super::{ApiClient, AttentionCommand, ConditionCommand, InvestigationCommand};
 
 pub(super) async fn return_view(api: &ApiClient, operator_id: String) -> Result<Value> {
     let operator_id: String =
@@ -51,6 +51,60 @@ pub(super) async fn attention(api: &ApiClient, command: AttentionCommand) -> Res
                 &format!("/api/v1/attention/{attention_id}/acknowledge"),
                 json!({"expected_version": expected_version}),
             )
+            .await
+        }
+    }
+}
+
+pub(super) async fn investigation(api: &ApiClient, command: InvestigationCommand) -> Result<Value> {
+    match command {
+        InvestigationCommand::List { run_id, task_id } => {
+            let mut query = vec!["limit=50".to_owned()];
+            if let Some(run_id) = run_id {
+                let run_id: String =
+                    url::form_urlencoded::byte_serialize(run_id.as_bytes()).collect();
+                query.push(format!("run_id={run_id}"));
+            }
+            if let Some(task_id) = task_id {
+                let task_id: String =
+                    url::form_urlencoded::byte_serialize(task_id.as_bytes()).collect();
+                query.push(format!("task_id={task_id}"));
+            }
+            api.get(&format!("/api/v1/investigations?{}", query.join("&")))
+                .await
+        }
+        InvestigationCommand::Show { artifact_id } => {
+            let artifact_id: String =
+                url::form_urlencoded::byte_serialize(artifact_id.as_bytes()).collect();
+            api.get(&format!("/api/v1/investigations/{artifact_id}"))
+                .await
+        }
+    }
+}
+
+pub(super) async fn condition(api: &ApiClient, command: ConditionCommand) -> Result<Value> {
+    match command {
+        ConditionCommand::List { include_terminal } => {
+            let query = if include_terminal {
+                "limit=50&include_terminal=true"
+            } else {
+                "limit=50"
+            };
+            api.get(&format!("/api/v1/external-conditions?{query}"))
+                .await
+        }
+        ConditionCommand::Show { condition_id } => {
+            let condition_id: String =
+                url::form_urlencoded::byte_serialize(condition_id.as_bytes()).collect();
+            api.get(&format!("/api/v1/external-conditions/{condition_id}"))
+                .await
+        }
+        ConditionCommand::Observations { condition_id } => {
+            let condition_id: String =
+                url::form_urlencoded::byte_serialize(condition_id.as_bytes()).collect();
+            api.get(&format!(
+                "/api/v1/external-conditions/{condition_id}/observations?limit=50"
+            ))
             .await
         }
     }

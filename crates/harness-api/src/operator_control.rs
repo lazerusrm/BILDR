@@ -10,7 +10,7 @@ use axum::{
     http::HeaderMap,
     routing::{get, post},
 };
-use harness_domain::AttentionItemId;
+use harness_domain::{AttentionItemId, ExternalConditionId, InvestigationArtifactId};
 use serde::Deserialize;
 
 use super::{ApiError, ApiState, authenticate};
@@ -31,6 +31,20 @@ pub(super) fn routes() -> Router<ApiState> {
         .route(
             "/api/v1/attention/{attention_id}/acknowledge",
             post(acknowledge_attention),
+        )
+        .route("/api/v1/investigations", get(list_investigations))
+        .route(
+            "/api/v1/investigations/{artifact_id}",
+            get(get_investigation),
+        )
+        .route("/api/v1/external-conditions", get(list_external_conditions))
+        .route(
+            "/api/v1/external-conditions/{condition_id}",
+            get(get_external_condition),
+        )
+        .route(
+            "/api/v1/external-conditions/{condition_id}/observations",
+            get(list_condition_observations),
         )
 }
 
@@ -147,5 +161,111 @@ async fn advance_return_view_cursor(
 
 fn parse_attention_id(value: &str) -> Result<AttentionItemId, ApiError> {
     AttentionItemId::parse(value)
+        .map_err(|error| ApiError::from(harness_store::StoreError::Validation(error.to_string())))
+}
+
+#[derive(Debug, Deserialize)]
+struct InvestigationQuery {
+    run_id: Option<String>,
+    task_id: Option<String>,
+    limit: Option<u32>,
+}
+
+async fn list_investigations(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<InvestigationQuery>,
+) -> Result<Json<Vec<harness_domain::InvestigationArtifact>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(
+        state.orchestrator.store().list_investigation_artifacts(
+            query.run_id.as_deref(),
+            query.task_id.as_deref(),
+            query.limit.unwrap_or(50),
+        )?,
+    ))
+}
+
+async fn get_investigation(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(artifact_id): Path<String>,
+) -> Result<Json<harness_domain::InvestigationArtifact>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    let artifact_id = InvestigationArtifactId::parse(&artifact_id).map_err(|error| {
+        ApiError::from(harness_store::StoreError::Validation(error.to_string()))
+    })?;
+    state
+        .orchestrator
+        .store()
+        .investigation_artifact(&artifact_id)?
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::from(harness_store::StoreError::NotFound(format!(
+                "investigation artifact {artifact_id}"
+            )))
+        })
+}
+
+#[derive(Debug, Deserialize)]
+struct ExternalConditionQuery {
+    include_terminal: Option<bool>,
+    limit: Option<u32>,
+}
+
+async fn list_external_conditions(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<ExternalConditionQuery>,
+) -> Result<Json<Vec<harness_domain::ExternalCondition>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(state.orchestrator.store().list_external_conditions(
+        query.include_terminal.unwrap_or(false),
+        query.limit.unwrap_or(50),
+    )?))
+}
+
+async fn get_external_condition(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(condition_id): Path<String>,
+) -> Result<Json<harness_domain::ExternalCondition>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    let condition_id = parse_condition_id(&condition_id)?;
+    state
+        .orchestrator
+        .store()
+        .external_condition(&condition_id)?
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::from(harness_store::StoreError::NotFound(format!(
+                "external condition {condition_id}"
+            )))
+        })
+}
+
+#[derive(Debug, Deserialize)]
+struct ConditionObservationQuery {
+    limit: Option<u32>,
+}
+
+async fn list_condition_observations(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(condition_id): Path<String>,
+    Query(query): Query<ConditionObservationQuery>,
+) -> Result<Json<Vec<harness_domain::ConditionObservation>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    let condition_id = parse_condition_id(&condition_id)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .store()
+            .list_condition_observations(&condition_id, query.limit.unwrap_or(50))?,
+    ))
+}
+
+fn parse_condition_id(value: &str) -> Result<ExternalConditionId, ApiError> {
+    ExternalConditionId::parse(value)
         .map_err(|error| ApiError::from(harness_store::StoreError::Validation(error.to_string())))
 }

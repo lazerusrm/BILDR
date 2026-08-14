@@ -1,5 +1,9 @@
 //! Exact-SHA evidence records and self-verifying bundle exports.
 
+mod investigation;
+
+pub use investigation::InvestigationEvidenceService;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},

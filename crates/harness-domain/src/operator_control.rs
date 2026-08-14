@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -17,6 +18,14 @@ const MAX_SECTION_ROWS: usize = 1_000;
 const SHA256_HEX_LEN: usize = 64;
 const TRACE_ID_HEX_LEN: usize = 32;
 const SPAN_ID_HEX_LEN: usize = 16;
+const MAX_INVESTIGATION_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+const MAX_INVESTIGATION_FINDINGS: usize = 200;
+const MAX_INVESTIGATION_RECOMMENDATIONS: usize = 100;
+const MAX_INVESTIGATION_DECISIONS: usize = 100;
+const MAX_INVESTIGATION_REFS: usize = 1_000;
+const MAX_INVESTIGATION_LIST_ITEM_LEN: usize = 4_000;
+const MAX_CONDITION_PAYLOAD_BYTES: usize = 256 * 1024;
+const MAX_CONDITION_SPEC_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum OperatorControlError {
@@ -95,6 +104,52 @@ fn validate_lower_hex(
         });
     }
     Ok(())
+}
+
+fn validate_relative_repo_path(
+    value: &str,
+    field: &'static str,
+) -> Result<(), OperatorControlError> {
+    if value.is_empty()
+        || value.len() > MAX_IDENTIFIER_LEN
+        || value.starts_with('/')
+        || value.starts_with('\\')
+        || value
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(OperatorControlError::InvalidField {
+            field,
+            reason: "must be a bounded relative repository path",
+        });
+    }
+    Ok(())
+}
+
+fn validate_bounded_texts(
+    values: &[String],
+    field: &'static str,
+    maximum_items: usize,
+    maximum_len: usize,
+) -> Result<(), OperatorControlError> {
+    if values.len() > maximum_items {
+        return Err(OperatorControlError::InvalidField {
+            field,
+            reason: "exceeds the bounded item limit",
+        });
+    }
+    for value in values {
+        validate_text(value, field, maximum_len)?;
+    }
+    Ok(())
+}
+
+fn digest_json<T: Serialize>(value: &T) -> Result<String, OperatorControlError> {
+    let raw = serde_json::to_vec(value).map_err(|_| OperatorControlError::InvalidField {
+        field: "operator control payload",
+        reason: "must serialize as JSON",
+    })?;
+    Ok(hex::encode(Sha256::digest(raw)))
 }
 
 macro_rules! operator_control_id {
@@ -413,12 +468,102 @@ impl AttentionItem {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct InvestigationScope {
+    #[serde(default)]
+    pub owned_read_paths: Vec<String>,
+    #[serde(default)]
+    pub forbidden_paths: Vec<String>,
+    pub time_budget_ms: u64,
+    pub token_budget: u64,
+}
+
+impl InvestigationScope {
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.owned_read_paths.is_empty()
+            || self.owned_read_paths.len() > MAX_INVESTIGATION_REFS
+            || self.forbidden_paths.len() > MAX_INVESTIGATION_REFS
+            || self.time_budget_ms == 0
+            || self.token_budget == 0
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "investigation scope",
+                reason: "must have bounded read paths and positive time and token budgets",
+            });
+        }
+        for path in self.owned_read_paths.iter().chain(&self.forbidden_paths) {
+            validate_relative_repo_path(path, "investigation scope path")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvestigationFindingClassification {
+    Confirmed,
+    Supported,
+    Hypothesis,
+    Disproven,
+    Inconclusive,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvestigationSensitivity {
+    Public,
+    Internal,
+    Restricted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InvestigationFinding {
     pub finding_id: String,
-    pub classification: String,
+    pub classification: InvestigationFindingClassification,
     pub summary: String,
+    pub confidence_milli: u16,
     #[serde(default)]
     pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub affected_refs: Vec<String>,
+    pub risk: AttentionSeverity,
+    #[serde(default)]
+    pub limitations: Vec<String>,
+}
+
+impl InvestigationFinding {
+    fn validate(&self) -> Result<(), OperatorControlError> {
+        validate_identifier(&self.finding_id, "investigation finding id")?;
+        validate_text(
+            &self.summary,
+            "investigation finding summary",
+            MAX_SUMMARY_LEN,
+        )?;
+        if self.confidence_milli > 1_000 {
+            return Err(OperatorControlError::InvalidField {
+                field: "investigation finding confidence",
+                reason: "must be in 0..=1000",
+            });
+        }
+        validate_bounded_texts(
+            &self.evidence_refs,
+            "investigation finding evidence refs",
+            MAX_INVESTIGATION_REFS,
+            MAX_IDENTIFIER_LEN,
+        )?;
+        validate_bounded_texts(
+            &self.affected_refs,
+            "investigation finding affected refs",
+            MAX_INVESTIGATION_REFS,
+            MAX_IDENTIFIER_LEN,
+        )?;
+        validate_bounded_texts(
+            &self.limitations,
+            "investigation finding limitations",
+            MAX_INVESTIGATION_REFS,
+            MAX_INVESTIGATION_LIST_ITEM_LEN,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -426,7 +571,45 @@ pub struct InvestigationFinding {
 pub struct InvestigationRecommendation {
     pub recommendation_id: String,
     pub summary: String,
-    pub authority: String,
+    pub required_authority: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub alternatives: Vec<String>,
+    pub risk: AttentionSeverity,
+    pub next_verification: String,
+}
+
+impl InvestigationRecommendation {
+    fn validate(&self) -> Result<(), OperatorControlError> {
+        validate_identifier(&self.recommendation_id, "investigation recommendation id")?;
+        validate_text(
+            &self.summary,
+            "investigation recommendation summary",
+            MAX_SUMMARY_LEN,
+        )?;
+        validate_identifier(
+            &self.required_authority,
+            "investigation recommendation required authority",
+        )?;
+        validate_bounded_texts(
+            &self.evidence_refs,
+            "investigation recommendation evidence refs",
+            MAX_INVESTIGATION_REFS,
+            MAX_IDENTIFIER_LEN,
+        )?;
+        validate_bounded_texts(
+            &self.alternatives,
+            "investigation recommendation alternatives",
+            MAX_INVESTIGATION_REFS,
+            MAX_INVESTIGATION_LIST_ITEM_LEN,
+        )?;
+        validate_text(
+            &self.next_verification,
+            "investigation recommendation next verification",
+            MAX_SUMMARY_LEN,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -435,6 +618,62 @@ pub struct DecisionInventoryItem {
     pub decision_id: String,
     pub question: String,
     pub state: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    pub impact: String,
+    pub recommended_option: Option<String>,
+    pub required_actor: String,
+    #[serde(default)]
+    pub blocking_refs: Vec<String>,
+    pub independent_work_can_continue: bool,
+}
+
+impl DecisionInventoryItem {
+    fn validate(&self) -> Result<(), OperatorControlError> {
+        validate_identifier(&self.decision_id, "investigation decision id")?;
+        validate_text(
+            &self.question,
+            "investigation decision question",
+            MAX_SUMMARY_LEN,
+        )?;
+        validate_identifier(&self.state, "investigation decision state")?;
+        validate_bounded_texts(
+            &self.options,
+            "investigation decision options",
+            MAX_INVESTIGATION_REFS,
+            MAX_SUMMARY_LEN,
+        )?;
+        validate_bounded_texts(
+            &self.evidence_refs,
+            "investigation decision evidence refs",
+            MAX_INVESTIGATION_REFS,
+            MAX_IDENTIFIER_LEN,
+        )?;
+        validate_text(
+            &self.impact,
+            "investigation decision impact",
+            MAX_SUMMARY_LEN,
+        )?;
+        if let Some(option) = &self.recommended_option {
+            validate_text(
+                option,
+                "investigation decision recommended option",
+                MAX_SUMMARY_LEN,
+            )?;
+        }
+        validate_identifier(
+            &self.required_actor,
+            "investigation decision required actor",
+        )?;
+        validate_bounded_texts(
+            &self.blocking_refs,
+            "investigation decision blocking refs",
+            MAX_INVESTIGATION_REFS,
+            MAX_IDENTIFIER_LEN,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -444,8 +683,15 @@ pub struct InvestigationArtifact {
     pub artifact_id: InvestigationArtifactId,
     pub run_id: String,
     pub task_id: String,
+    pub attempt_id: String,
+    pub question: String,
+    pub scope: InvestigationScope,
     pub base_sha: String,
     pub repository_state_digest: String,
+    #[serde(default)]
+    pub methods: Vec<String>,
+    #[serde(default)]
+    pub sources: Vec<String>,
     #[serde(default)]
     pub findings: Vec<InvestigationFinding>,
     #[serde(default)]
@@ -456,8 +702,120 @@ pub struct InvestigationArtifact {
     pub limitations: Vec<String>,
     #[serde(default)]
     pub rejected_hypotheses: Vec<String>,
+    pub sensitivity: InvestigationSensitivity,
+    #[serde(default)]
+    pub artifact_refs: Vec<String>,
     pub created_at_ms: i64,
     pub sha256: String,
+}
+
+impl InvestigationArtifact {
+    pub fn digest(&self) -> Result<String, OperatorControlError> {
+        let mut unsigned = self.clone();
+        unsigned.sha256.clear();
+        digest_json(&unsigned)
+    }
+
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.schema != "harness.investigation-artifact.v1" {
+            return Err(OperatorControlError::InvalidField {
+                field: "investigation artifact schema",
+                reason: "must be harness.investigation-artifact.v1",
+            });
+        }
+        validate_identifier(self.artifact_id.as_str(), "investigation artifact id")?;
+        for (field, value) in [
+            ("investigation run id", &self.run_id),
+            ("investigation task id", &self.task_id),
+            ("investigation attempt id", &self.attempt_id),
+        ] {
+            validate_identifier(value, field)?;
+        }
+        validate_text(&self.question, "investigation question", MAX_SUMMARY_LEN)?;
+        self.scope.validate()?;
+        validate_lower_hex(&self.base_sha, "investigation base SHA", 40)?;
+        validate_lower_hex(
+            &self.repository_state_digest,
+            "investigation repository state digest",
+            SHA256_HEX_LEN,
+        )?;
+        if self.created_at_ms < 0 {
+            return Err(OperatorControlError::InvalidField {
+                field: "investigation creation time",
+                reason: "must be a UTC epoch millisecond timestamp",
+            });
+        }
+        validate_bounded_texts(
+            &self.methods,
+            "investigation methods",
+            MAX_INVESTIGATION_REFS,
+            MAX_INVESTIGATION_LIST_ITEM_LEN,
+        )?;
+        validate_bounded_texts(
+            &self.sources,
+            "investigation sources",
+            MAX_INVESTIGATION_REFS,
+            MAX_IDENTIFIER_LEN,
+        )?;
+        if self.findings.len() > MAX_INVESTIGATION_FINDINGS
+            || self.recommendations.len() > MAX_INVESTIGATION_RECOMMENDATIONS
+            || self.decision_inventory.len() > MAX_INVESTIGATION_DECISIONS
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "investigation artifact collections",
+                reason: "exceeds the contract bounds",
+            });
+        }
+        for finding in &self.findings {
+            finding.validate()?;
+        }
+        for recommendation in &self.recommendations {
+            recommendation.validate()?;
+        }
+        for decision in &self.decision_inventory {
+            decision.validate()?;
+        }
+        validate_bounded_texts(
+            &self.limitations,
+            "investigation limitations",
+            MAX_INVESTIGATION_REFS,
+            MAX_INVESTIGATION_LIST_ITEM_LEN,
+        )?;
+        validate_bounded_texts(
+            &self.rejected_hypotheses,
+            "investigation rejected hypotheses",
+            MAX_INVESTIGATION_REFS,
+            MAX_INVESTIGATION_LIST_ITEM_LEN,
+        )?;
+        validate_bounded_texts(
+            &self.artifact_refs,
+            "investigation artifact refs",
+            MAX_INVESTIGATION_REFS,
+            MAX_IDENTIFIER_LEN,
+        )?;
+        let raw = serde_json::to_vec(self).map_err(|_| OperatorControlError::InvalidField {
+            field: "investigation artifact",
+            reason: "must serialize as JSON",
+        })?;
+        if raw.len() > MAX_INVESTIGATION_PAYLOAD_BYTES {
+            return Err(OperatorControlError::InvalidField {
+                field: "investigation artifact payload",
+                reason: "exceeds the 2 MiB contract bound",
+            });
+        }
+        validate_lower_hex(
+            &self.sha256,
+            "investigation artifact sha256",
+            SHA256_HEX_LEN,
+        )?;
+        if self.digest()? != self.sha256 {
+            return Err(OperatorControlError::InvalidField {
+                field: "investigation artifact sha256",
+                reason: "does not match the canonical artifact payload",
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -574,12 +932,216 @@ pub enum ExternalConditionAdapter {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ExternalConditionOwnerType {
+    Run,
+    Task,
+    Attempt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ExternalConditionState {
     Open,
     Satisfied,
     Unsatisfied,
     Unknown,
     Cancelled,
+}
+
+impl ExternalConditionState {
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Satisfied | Self::Unsatisfied | Self::Cancelled)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalConditionPollPolicy {
+    pub initial_ms: u64,
+    pub maximum_ms: u64,
+    pub deadline_ms: Option<i64>,
+}
+
+impl ExternalConditionPollPolicy {
+    fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.initial_ms == 0 || self.maximum_ms < self.initial_ms {
+            return Err(OperatorControlError::InvalidField {
+                field: "external condition poll policy",
+                reason: "must have a positive initial interval no larger than its maximum",
+            });
+        }
+        if self.deadline_ms.is_some_and(|deadline| deadline < 0) {
+            return Err(OperatorControlError::InvalidField {
+                field: "external condition deadline",
+                reason: "must be a UTC epoch millisecond timestamp",
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConditionObservation {
+    pub schema: String,
+    pub observation_id: ConditionObservationId,
+    pub condition_id: ExternalConditionId,
+    pub source_event_id: String,
+    pub sequence: u64,
+    pub observed_at_ms: i64,
+    pub state: ExternalConditionState,
+    pub payload: Value,
+    pub sha256: String,
+}
+
+impl ConditionObservation {
+    pub fn digest(&self) -> Result<String, OperatorControlError> {
+        let mut unsigned = self.clone();
+        unsigned.sha256.clear();
+        digest_json(&unsigned)
+    }
+
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.schema != "harness.condition-observation.v1" {
+            return Err(OperatorControlError::InvalidField {
+                field: "condition observation schema",
+                reason: "must be harness.condition-observation.v1",
+            });
+        }
+        validate_identifier(self.observation_id.as_str(), "condition observation id")?;
+        validate_identifier(
+            self.condition_id.as_str(),
+            "condition observation condition id",
+        )?;
+        validate_identifier(
+            &self.source_event_id,
+            "condition observation source event id",
+        )?;
+        if self.observed_at_ms < 0 {
+            return Err(OperatorControlError::InvalidField {
+                field: "condition observation time",
+                reason: "must be a UTC epoch millisecond timestamp",
+            });
+        }
+        let raw = serde_json::to_vec(self).map_err(|_| OperatorControlError::InvalidField {
+            field: "condition observation",
+            reason: "must serialize as JSON",
+        })?;
+        if raw.len() > MAX_CONDITION_PAYLOAD_BYTES {
+            return Err(OperatorControlError::InvalidField {
+                field: "condition observation payload",
+                reason: "exceeds the bounded payload limit",
+            });
+        }
+        validate_lower_hex(&self.sha256, "condition observation sha256", SHA256_HEX_LEN)?;
+        if self.digest()? != self.sha256 {
+            return Err(OperatorControlError::InvalidField {
+                field: "condition observation sha256",
+                reason: "does not match the canonical observation payload",
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalCondition {
+    pub schema: String,
+    pub condition_id: ExternalConditionId,
+    pub owner_type: ExternalConditionOwnerType,
+    pub owner_id: String,
+    pub adapter: ExternalConditionAdapter,
+    pub source_id: String,
+    pub spec: Value,
+    pub state: ExternalConditionState,
+    pub sequence: u64,
+    pub poll_policy: ExternalConditionPollPolicy,
+    pub source_identity_digest: String,
+    pub last_observation: Option<ConditionObservation>,
+    pub version: u64,
+    pub opened_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub sha256: String,
+}
+
+impl ExternalCondition {
+    pub fn digest(&self) -> Result<String, OperatorControlError> {
+        let mut unsigned = self.clone();
+        unsigned.sha256.clear();
+        digest_json(&unsigned)
+    }
+
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.schema != "harness.external-condition.v1" {
+            return Err(OperatorControlError::InvalidField {
+                field: "external condition schema",
+                reason: "must be harness.external-condition.v1",
+            });
+        }
+        validate_identifier(self.condition_id.as_str(), "external condition id")?;
+        validate_identifier(&self.owner_id, "external condition owner id")?;
+        validate_identifier(&self.source_id, "external condition source id")?;
+        validate_lower_hex(
+            &self.source_identity_digest,
+            "external condition source identity digest",
+            SHA256_HEX_LEN,
+        )?;
+        if self.version == 0 || self.opened_at_ms < 0 || self.updated_at_ms < self.opened_at_ms {
+            return Err(OperatorControlError::InvalidField {
+                field: "external condition version or timestamps",
+                reason: "must be monotonic and use UTC epoch milliseconds",
+            });
+        }
+        self.poll_policy.validate()?;
+        let spec =
+            serde_json::to_vec(&self.spec).map_err(|_| OperatorControlError::InvalidField {
+                field: "external condition spec",
+                reason: "must serialize as JSON",
+            })?;
+        if spec.len() > MAX_CONDITION_SPEC_BYTES {
+            return Err(OperatorControlError::InvalidField {
+                field: "external condition spec",
+                reason: "exceeds the bounded specification limit",
+            });
+        }
+        if let Some(observation) = &self.last_observation {
+            observation.validate()?;
+            if observation.condition_id != self.condition_id
+                || observation.sequence != self.sequence
+                || observation.state != self.state
+            {
+                return Err(OperatorControlError::InvalidField {
+                    field: "external condition last observation",
+                    reason: "must bind the exact condition, current sequence, and current state",
+                });
+            }
+        } else if self.sequence != 0 {
+            return Err(OperatorControlError::InvalidField {
+                field: "external condition sequence",
+                reason: "cannot advance without an observation",
+            });
+        }
+        let raw = serde_json::to_vec(self).map_err(|_| OperatorControlError::InvalidField {
+            field: "external condition",
+            reason: "must serialize as JSON",
+        })?;
+        if raw.len() > MAX_CONDITION_PAYLOAD_BYTES {
+            return Err(OperatorControlError::InvalidField {
+                field: "external condition payload",
+                reason: "exceeds the bounded payload limit",
+            });
+        }
+        validate_lower_hex(&self.sha256, "external condition sha256", SHA256_HEX_LEN)?;
+        if self.digest()? != self.sha256 {
+            return Err(OperatorControlError::InvalidField {
+                field: "external condition sha256",
+                reason: "does not match the canonical condition payload",
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -663,6 +1225,7 @@ pub struct ControlPlaneSnapshot {
     pub runs: SnapshotSection,
     pub attention: SnapshotSection,
     pub attempts: SnapshotSection,
+    pub investigations: SnapshotSection,
     pub progress: SnapshotSection,
     pub liveness: SnapshotSection,
     pub reconciliation: SnapshotSection,
@@ -693,6 +1256,7 @@ impl ControlPlaneSnapshot {
             &self.runs,
             &self.attention,
             &self.attempts,
+            &self.investigations,
             &self.progress,
             &self.liveness,
             &self.reconciliation,

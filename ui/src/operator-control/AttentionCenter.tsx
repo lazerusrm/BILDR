@@ -6,6 +6,8 @@ import type {
   AttentionItem,
   AttentionPage,
   ControlPlaneSnapshot,
+  ExternalCondition,
+  InvestigationArtifact,
   ReturnView,
   SnapshotSection,
 } from "../types";
@@ -14,6 +16,8 @@ export function AttentionCenter() {
   const [snapshot, setSnapshot] = useState<ControlPlaneSnapshot>();
   const [returnView, setReturnView] = useState<ReturnView>();
   const [page, setPage] = useState<AttentionPage>();
+  const [investigations, setInvestigations] = useState<InvestigationArtifact[]>([]);
+  const [conditions, setConditions] = useState<ExternalCondition[]>([]);
   const [selected, setSelected] = useState<AttentionItem>();
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -21,14 +25,18 @@ export function AttentionCenter() {
   const load = useCallback(async () => {
     setBusy("refresh");
     try {
-      const [nextSnapshot, nextReturnView, nextPage] = await Promise.all([
+      const [nextSnapshot, nextReturnView, nextPage, nextInvestigations, nextConditions] = await Promise.all([
         api.controlPlaneSnapshot(),
         api.controlPlaneReturnView(),
         api.attention(),
+        api.investigations(),
+        api.externalConditions(),
       ]);
       setSnapshot(nextSnapshot);
       setReturnView(nextReturnView);
       setPage(nextPage);
+      setInvestigations(nextInvestigations);
+      setConditions(nextConditions);
       setSelected((current) =>
         current
           ? nextPage.items.find((item) => item.attention_id === current.attention_id)
@@ -135,6 +143,7 @@ export function AttentionCenter() {
         <SectionStatus name="Needs action" section={returnView?.sections.attention} />
         <SectionStatus name="Current work" section={returnView?.sections.runs} />
         <SectionStatus name="Active attempts" section={returnView?.sections.attempts} />
+        <SectionStatus name="Investigations" section={returnView?.sections.investigations} />
         <SectionStatus name="Recovery" section={returnView?.sections.reconciliation} />
         <SectionStatus name="Waiting & blocked" section={returnView?.sections.liveness} />
         <SectionStatus name="External conditions" section={returnView?.sections.external_conditions} />
@@ -149,6 +158,10 @@ export function AttentionCenter() {
         >
           {busy === "return" ? "Recording…" : "Mark return view seen"}
         </button>
+      </section>
+      <section className="control-plane-support" aria-label="Investigation artifacts and external conditions">
+        <InvestigationArtifacts artifacts={investigations} />
+        <ExternalConditions conditions={conditions} />
       </section>
       <div className="control-plane-layout">
         <section className="control-plane-list" aria-labelledby="attention-heading">
@@ -191,6 +204,54 @@ export function AttentionCenter() {
         </p>
       ) : null}
     </div>
+  );
+}
+
+function InvestigationArtifacts({ artifacts }: { artifacts: InvestigationArtifact[] }) {
+  return (
+    <section className="control-plane-support-card" aria-labelledby="investigations-heading">
+      <span className="eyebrow">Immutable evidence</span>
+      <h2 id="investigations-heading">Investigations</h2>
+      {artifacts.length === 0 ? (
+        <p className="empty-state">No recorded investigation artifacts.</p>
+      ) : (
+        <ul className="control-plane-support-list">
+          {artifacts.map((artifact) => (
+            <li key={artifact.artifact_id}>
+              <strong>{artifact.question}</strong>
+              <span>{artifact.findings.length} findings · {artifact.recommendations.length} recommendations</span>
+              <small>
+                {localTime(artifact.created_at_ms)} · {artifact.sensitivity} · {artifact.base_sha.slice(0, 12)}
+              </small>
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="control-plane-note">Artifacts are evidence records. They cannot create implementation work or grant mutable custody.</p>
+    </section>
+  );
+}
+
+function ExternalConditions({ conditions }: { conditions: ExternalCondition[] }) {
+  return (
+    <section className="control-plane-support-card" aria-labelledby="conditions-heading">
+      <span className="eyebrow">Passive waits</span>
+      <h2 id="conditions-heading">External conditions</h2>
+      {conditions.length === 0 ? (
+        <p className="empty-state">No active external conditions.</p>
+      ) : (
+        <ul className="control-plane-support-list">
+          {conditions.map((condition) => (
+            <li key={condition.condition_id}>
+              <strong>{condition.adapter.replaceAll("_", " ")} · {condition.state}</strong>
+              <span>{condition.owner_type}:{condition.owner_id} · sequence {condition.sequence}</span>
+              <small>{condition.last_observation ? localTime(condition.last_observation.observed_at_ms) : "No observation recorded"}</small>
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="control-plane-note">These are stored observations only. This view does not poll a provider, wake work, or execute a result.</p>
+    </section>
   );
 }
 

@@ -1,6 +1,6 @@
 # Event-Driven Supervisory Orchestrator
 
-**Status:** implementation-ready design; runtime remains disabled
+**Status:** advisory runtime delivered; automatic supervision remains disabled
 **Prepared:** 2026-08-13
 
 ## Decision
@@ -67,13 +67,15 @@ same attempt.
 material event
  -> immutable snapshot
  -> Terra high structured decision
- -> shadow-only policy receipt
+ -> validated advisory policy receipt
  -> UI goal/progress/efficiency/decision panel
 ```
 
-Then add low-risk action execution, the one Terra xhigh retry, the Sol expert
-broker, replay evaluation, and gated activation. Automatic expert calls and
-broad active actions are intentionally late.
+The advisory path is explicitly operator-enabled and remains read-only: it
+cannot dispatch, approve, resume, change task/run state, or publish. Then add
+low-risk action execution, the one Terra xhigh retry, the Sol expert broker,
+replay evaluation, and gated activation. Automatic expert calls and broad
+active actions are intentionally late.
 
 The operator control plane's first vertical slice is intentionally deterministic
 and may proceed before active supervision:

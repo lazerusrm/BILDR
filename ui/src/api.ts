@@ -6,14 +6,17 @@ import type {
   Approval,
   CodexAccountLoginStatus,
   CodexAccountsSnapshot,
+  ConditionObservation,
   ControlPlaneSnapshot,
   EvidenceSnapshot,
   EvaluationCaseSummary,
   EvaluationOccurrenceSource,
   EvaluationRunSummary,
   EvaluationSampleSummary,
+  ExternalCondition,
   FailureOverview,
   FailureTrace,
+  InvestigationArtifact,
   OutcomeVector,
   OperatorSettings,
   Repository,
@@ -209,6 +212,25 @@ class HarnessApi {
       expected_snapshot_revision: expectedSnapshotRevision,
       acknowledged_cursor: acknowledgedCursor,
     });
+  investigations = (runId?: string, taskId?: string) => {
+    const params = new URLSearchParams({ limit: "50" });
+    if (runId) params.set("run_id", runId);
+    if (taskId) params.set("task_id", taskId);
+    return this.get<InvestigationArtifact[]>(`/investigations?${params}`);
+  };
+  investigation = (artifactId: string) =>
+    this.get<InvestigationArtifact>(`/investigations/${encodeURIComponent(artifactId)}`);
+  externalConditions = (includeTerminal = false) => {
+    const params = new URLSearchParams({ limit: "50" });
+    if (includeTerminal) params.set("include_terminal", "true");
+    return this.get<ExternalCondition[]>(`/external-conditions?${params}`);
+  };
+  externalCondition = (conditionId: string) =>
+    this.get<ExternalCondition>(`/external-conditions/${encodeURIComponent(conditionId)}`);
+  conditionObservations = (conditionId: string) =>
+    this.get<ConditionObservation[]>(
+      `/external-conditions/${encodeURIComponent(conditionId)}/observations?limit=50`,
+    );
 
   selectCodexAccount(accountId: string) {
     return this.post<CodexAccountsSnapshot>(

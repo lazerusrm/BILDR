@@ -1,8 +1,8 @@
 # Supervisory Runtime Delivery Status
 
-This implementation is progressing through the PR #3 supervision roadmap.
-The installed production binary remains the reviewed advisory foundation until
-the remaining slices have their own exact-head evidence and rollout gates.
+This implementation is progressing through the PR #3 supervision roadmap. The
+installed production binary remains the reviewed advisory foundation until the
+remaining slices have their own exact-head evidence and rollout gates.
 
 ## Included in the implementation branch
 
@@ -28,9 +28,9 @@ the remaining slices have their own exact-head evidence and rollout gates.
 The current operator setting selects only `disabled`, `observe_only`, or the
 human-approved `advisory` route. Advisory application always requires an
 explicit operator click; it does not run on a model result or maintenance tick.
-Unregistered action kinds are durably policy-rejected. No Sol request starts
-until the later broker slice is complete, and the browser has no background
-model polling loop.
+Unregistered action kinds are durably policy-rejected. The Sol broker itself
+starts only from a human-applied, policy-valid `request_expert` proposal, and
+the browser has no background model polling loop.
 
 ## Deliberately deferred
 

@@ -11,6 +11,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{Store, StoreError};
 
+use super::{external_conditions::checked_condition_row, investigations::checked_artifact_row};
+
 pub const CONTROL_PLANE_SNAPSHOT_SCHEMA: &str = "harness.control-plane-snapshot.v1";
 pub const RETURN_VIEW_SCHEMA: &str = "harness.return-view.v1";
 const SECTION_ROW_LIMIT: i64 = 100;
@@ -46,9 +48,33 @@ impl Store {
             )?,
             "attention event cursor",
         )?;
+        let investigation_cursor = non_negative(
+            transaction.query_row("SELECT count(*) FROM investigation_artifacts", [], |row| {
+                row.get::<_, i64>(0)
+            })?,
+            "investigation artifact cursor",
+        )?;
+        let external_condition_cursor = non_negative(
+            transaction.query_row("SELECT count(*) FROM external_conditions", [], |row| {
+                row.get::<_, i64>(0)
+            })?,
+            "external condition cursor",
+        )?;
+        let condition_observation_cursor = non_negative(
+            transaction.query_row("SELECT count(*) FROM condition_observations", [], |row| {
+                row.get::<_, i64>(0)
+            })?,
+            "condition observation cursor",
+        )?;
         let mut source_cursors = BTreeMap::new();
         source_cursors.insert("domain_events".to_owned(), event_cursor);
         source_cursors.insert("attention_events".to_owned(), attention_cursor);
+        source_cursors.insert("investigation_artifacts".to_owned(), investigation_cursor);
+        source_cursors.insert("external_conditions".to_owned(), external_condition_cursor);
+        source_cursors.insert(
+            "condition_observations".to_owned(),
+            condition_observation_cursor,
+        );
         let source_cursors_sha256 = digest(&serde_json::to_string(&source_cursors)?);
 
         if let Some(existing) = transaction
@@ -73,6 +99,9 @@ impl Store {
         let (attention_rows, attention_truncation) = attention_rows(&transaction)?;
         let (run_rows, run_truncation) = run_rows(&transaction)?;
         let (attempt_rows, attempt_truncation) = attempt_rows(&transaction)?;
+        let (investigation_rows, investigation_truncation) = investigation_rows(&transaction)?;
+        let (external_condition_rows, external_condition_truncation) =
+            external_condition_rows(&transaction)?;
         let active_agents: i64 = transaction.query_row(
             "SELECT count(*) FROM agent_sessions WHERE state NOT IN ('COMPLETED','FAILED','CANCELED')",
             [],
@@ -108,6 +137,8 @@ impl Store {
             ("attention", attention_truncation),
             ("runs", run_truncation),
             ("attempts", attempt_truncation),
+            ("investigations", investigation_truncation),
+            ("external_conditions", external_condition_truncation),
         ] {
             if let Some(omitted_rows) = omitted {
                 truncation.push(SnapshotTruncation {
@@ -142,6 +173,11 @@ impl Store {
             runs,
             attention,
             attempts,
+            investigations: {
+                let mut section = current(investigation_rows, investigation_cursor);
+                section.truncated = investigation_truncation.is_some();
+                section
+            },
             progress: unavailable(
                 "Material-progress adapter is not wired into this deterministic slice.",
             ),
@@ -149,9 +185,24 @@ impl Store {
             reconciliation: unavailable(
                 "Reconciliation reducer is not wired into this deterministic slice.",
             ),
-            external_conditions: unavailable(
-                "External-condition adapters are not wired into this deterministic slice.",
-            ),
+            external_conditions: {
+                let mut section = current(
+                    external_condition_rows,
+                    external_condition_cursor
+                        .checked_add(condition_observation_cursor)
+                        .ok_or_else(|| {
+                            StoreError::Validation(
+                                "external condition snapshot cursor overflow".to_owned(),
+                            )
+                        })?,
+                );
+                section.truncated = external_condition_truncation.is_some();
+                section.detail = Some(
+                    "Passive source-owned condition records only; this slice does not poll, wake work, or execute a result."
+                        .to_owned(),
+                );
+                section
+            },
             cost: unavailable("Cost projection is not wired into this deterministic slice."),
             notifications: unavailable(
                 "Notification delivery projection is not wired into this deterministic slice.",
@@ -469,6 +520,58 @@ fn attempt_rows(
     )
 }
 
+fn investigation_rows(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(Vec<Value>, Option<u64>), StoreError> {
+    let count = non_negative(
+        transaction.query_row("SELECT count(*) FROM investigation_artifacts", [], |row| {
+            row.get::<_, i64>(0)
+        })?,
+        "investigation artifact count",
+    )?;
+    let mut statement = transaction.prepare(
+        "SELECT payload_json,payload_sha256 FROM investigation_artifacts ORDER BY created_at DESC,id DESC LIMIT ?1",
+    )?;
+    let rows = statement
+        .query_map([SECTION_ROW_LIMIT], |row| {
+            let artifact = checked_artifact_row(row.get(0)?, row.get(1)?)?;
+            serde_json::to_value(artifact)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((
+        rows,
+        (count > SECTION_ROW_LIMIT as u64).then(|| count - SECTION_ROW_LIMIT as u64),
+    ))
+}
+
+fn external_condition_rows(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(Vec<Value>, Option<u64>), StoreError> {
+    let count = non_negative(
+        transaction.query_row(
+            "SELECT count(*) FROM external_conditions WHERE state IN ('open','unknown')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        "active external condition count",
+    )?;
+    let mut statement = transaction.prepare(
+        "SELECT current_payload_json,current_payload_sha256 FROM external_conditions WHERE state IN ('open','unknown') ORDER BY updated_at DESC,id DESC LIMIT ?1",
+    )?;
+    let rows = statement
+        .query_map([SECTION_ROW_LIMIT], |row| {
+            let condition = checked_condition_row(row.get(0)?, row.get(1)?)?;
+            serde_json::to_value(condition)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((
+        rows,
+        (count > SECTION_ROW_LIMIT as u64).then(|| count - SECTION_ROW_LIMIT as u64),
+    ))
+}
+
 fn bounded_json_rows<F>(
     transaction: &rusqlite::Transaction<'_>,
     count_sql: &str,
@@ -491,7 +594,7 @@ where
     ))
 }
 
-fn snapshot_sections(snapshot: &ControlPlaneSnapshot) -> [(&str, &SnapshotSection); 13] {
+fn snapshot_sections(snapshot: &ControlPlaneSnapshot) -> [(&str, &SnapshotSection); 14] {
     [
         ("system", &snapshot.system),
         ("accounts", &snapshot.accounts),
@@ -499,6 +602,7 @@ fn snapshot_sections(snapshot: &ControlPlaneSnapshot) -> [(&str, &SnapshotSectio
         ("runs", &snapshot.runs),
         ("attention", &snapshot.attention),
         ("attempts", &snapshot.attempts),
+        ("investigations", &snapshot.investigations),
         ("progress", &snapshot.progress),
         ("liveness", &snapshot.liveness),
         ("reconciliation", &snapshot.reconciliation),

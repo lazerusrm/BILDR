@@ -7,6 +7,8 @@
 mod approval;
 mod attention;
 mod correlation;
+mod external_conditions;
+mod investigations;
 mod snapshots;
 
 pub use attention::*;

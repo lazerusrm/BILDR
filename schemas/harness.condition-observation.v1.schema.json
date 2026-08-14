@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:bildr:harness.condition-observation.v1",
+  "title": "BILDR external condition observation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "observation_id", "condition_id", "source_event_id", "sequence", "observed_at_ms", "state", "payload", "sha256"],
+  "properties": {
+    "schema": {"const": "harness.condition-observation.v1"},
+    "observation_id": {"$ref": "#/$defs/id"},
+    "condition_id": {"$ref": "#/$defs/id"},
+    "source_event_id": {"$ref": "#/$defs/id"},
+    "sequence": {"type": "integer", "minimum": 1},
+    "observed_at_ms": {"type": "integer", "minimum": 0},
+    "state": {"enum": ["open", "satisfied", "unsatisfied", "unknown", "cancelled"]},
+    "payload": {"type": "object"},
+    "sha256": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "id": {"type": "string", "minLength": 1, "maxLength": 160, "pattern": "^[A-Za-z0-9._:-]+$"},
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

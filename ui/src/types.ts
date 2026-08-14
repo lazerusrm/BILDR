@@ -768,6 +768,7 @@ export interface ControlPlaneSnapshot {
   runs: SnapshotSection;
   attention: SnapshotSection;
   attempts: SnapshotSection;
+  investigations: SnapshotSection;
   progress: SnapshotSection;
   liveness: SnapshotSection;
   reconciliation: SnapshotSection;
@@ -842,6 +843,93 @@ export interface AttentionPage {
   items: AttentionItem[];
   includes_terminal: boolean;
   next_cursor: string | null;
+}
+
+export interface InvestigationArtifact {
+  schema: "harness.investigation-artifact.v1";
+  artifact_id: string;
+  run_id: string;
+  task_id: string;
+  attempt_id: string;
+  question: string;
+  scope: {
+    owned_read_paths: string[];
+    forbidden_paths: string[];
+    time_budget_ms: number;
+    token_budget: number;
+  };
+  base_sha: string;
+  repository_state_digest: string;
+  methods: string[];
+  sources: string[];
+  findings: Array<{
+    finding_id: string;
+    classification: "confirmed" | "supported" | "hypothesis" | "disproven" | "inconclusive";
+    summary: string;
+    confidence_milli: number;
+    evidence_refs: string[];
+    affected_refs: string[];
+    risk: "info" | "normal" | "high" | "critical";
+    limitations: string[];
+  }>;
+  recommendations: Array<{
+    recommendation_id: string;
+    summary: string;
+    required_authority: string;
+    evidence_refs: string[];
+    alternatives: string[];
+    risk: "info" | "normal" | "high" | "critical";
+    next_verification: string;
+  }>;
+  decision_inventory: Array<{
+    decision_id: string;
+    question: string;
+    state: string;
+    options: string[];
+    evidence_refs: string[];
+    impact: string;
+    recommended_option: string | null;
+    required_actor: string;
+    blocking_refs: string[];
+    independent_work_can_continue: boolean;
+  }>;
+  limitations: string[];
+  rejected_hypotheses: string[];
+  sensitivity: "public" | "internal" | "restricted";
+  artifact_refs: string[];
+  created_at_ms: number;
+  sha256: string;
+}
+
+export interface ConditionObservation {
+  schema: "harness.condition-observation.v1";
+  observation_id: string;
+  condition_id: string;
+  source_event_id: string;
+  sequence: number;
+  observed_at_ms: number;
+  state: "open" | "satisfied" | "unsatisfied" | "unknown" | "cancelled";
+  payload: Record<string, unknown>;
+  sha256: string;
+}
+
+export interface ExternalCondition {
+  schema: "harness.external-condition.v1";
+  condition_id: string;
+  owner_type: "run" | "task" | "attempt";
+  owner_id: string;
+  adapter: "ci_check" | "review_state" | "credential_availability" | "time_gate" | "hardware_capacity" | "service_availability";
+  source_id: string;
+  spec: Record<string, unknown>;
+  state: "open" | "satisfied" | "unsatisfied" | "unknown" | "cancelled";
+  sequence: number;
+  poll_policy: { initial_ms: number; maximum_ms: number; deadline_ms: number | null };
+  source_identity_digest: string;
+  last_observation: ConditionObservation | null;
+  version: number;
+  opened_at_ms: number;
+  updated_at_ms: number;
+  sha256: string;
 }
 
 export interface ReturnView {

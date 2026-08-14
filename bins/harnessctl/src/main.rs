@@ -63,6 +63,16 @@ enum Command {
         #[command(subcommand)]
         command: AttentionCommand,
     },
+    /// Inspect immutable read-only investigation artifacts.
+    Investigation {
+        #[command(subcommand)]
+        command: InvestigationCommand,
+    },
+    /// Inspect passive source-owned external conditions and their observations.
+    Condition {
+        #[command(subcommand)]
+        command: ConditionCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -242,6 +252,32 @@ enum AttentionCommand {
         #[arg(long)]
         expected_version: u64,
     },
+}
+
+#[derive(Subcommand)]
+enum InvestigationCommand {
+    /// List immutable investigation artifacts, optionally scoped to a run or task.
+    List {
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        task_id: Option<String>,
+    },
+    /// Show one immutable investigation artifact.
+    Show { artifact_id: String },
+}
+
+#[derive(Subcommand)]
+enum ConditionCommand {
+    /// List passive source-owned conditions. This cannot poll or wake work.
+    List {
+        #[arg(long)]
+        include_terminal: bool,
+    },
+    /// Show one passive condition.
+    Show { condition_id: String },
+    /// Show immutable observations captured for one condition.
+    Observations { condition_id: String },
 }
 
 #[derive(Subcommand)]
@@ -665,6 +701,8 @@ async fn execute(api: &ApiClient, command: Command) -> Result<Value> {
         },
         Command::Return { operator_id } => operator_control::return_view(api, operator_id).await,
         Command::Attention { command } => operator_control::attention(api, command).await,
+        Command::Investigation { command } => operator_control::investigation(api, command).await,
+        Command::Condition { command } => operator_control::condition(api, command).await,
         Command::Worktree { command } => match command {
             WorktreeCommand::List { run } => {
                 let path = run.map_or_else(
