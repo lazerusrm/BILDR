@@ -15,8 +15,8 @@ use std::{
 
 use globset::Glob;
 use harness_codex::{
-    CodexAccountsSnapshot, CodexEvent, CodexRuntime, EventDirection, EventKind, StartThread,
-    StartTurn,
+    CodexAccountsSnapshot, CodexError, CodexEvent, CodexRuntime, EventDirection, EventKind,
+    StartThread, StartTurn,
 };
 use harness_context::{ContextCompiler, ContextPacket};
 use harness_domain::{
@@ -968,6 +968,8 @@ pub struct Orchestrator {
     operation_lock: Arc<Mutex<()>>,
     hygiene_lock: Arc<Mutex<()>>,
     account_logins: Arc<Mutex<BTreeMap<String, CodexAccountLoginEntry>>>,
+    #[cfg(test)]
+    fail_next_plan_review_recovery_gate_write: Arc<AtomicBool>,
 }
 
 impl Orchestrator {
@@ -1033,6 +1035,8 @@ impl Orchestrator {
             operation_lock: Arc::new(Mutex::new(())),
             hygiene_lock: Arc::new(Mutex::new(())),
             account_logins: Arc::new(Mutex::new(BTreeMap::new())),
+            #[cfg(test)]
+            fail_next_plan_review_recovery_gate_write: Arc::new(AtomicBool::new(false)),
         };
         orchestrator.reconcile_native_subagents()?;
         orchestrator
@@ -4905,13 +4909,32 @@ impl Orchestrator {
         let prompt = format!(
             "Finalize the adversarial review for plan revision {revision}, digest {digest}, now. Reuse the repository and authority evidence already inspected in this thread. Do not call tools, repeat discovery, inventory features, or add process for its own sake. Return the best evidence-grounded accept-or-changes-requested verdict now, using only the supplied JSON schema. Distinguish blocking findings from advisory execution context and return only the JSON object."
         );
-        self.store.prepare_agent_continuation(
-            &reviewer.id,
-            PLAN_REVIEWER_SESSION_TOKEN_BUDGET,
-            "Finalizing the existing adversarial review without repeated inspection",
-        )?;
         let runtime = self.runtime().await?;
         if let Err(error) = runtime.resume_thread(thread_id).await {
+            if thread_resume_requires_fresh_reviewer(&error) {
+                self.emit_agent_event(
+                    &run.id,
+                    &reviewer.id,
+                    "agent.plan_reviewer.thread_unavailable",
+                    json!({
+                        "revision": revision,
+                        "digest": digest,
+                        "thread_id": thread_id,
+                        "recovery": "fresh_independent_reviewer",
+                    }),
+                )?;
+                self.emit_run_event(
+                    run,
+                    "run.plan.review_fresh_reviewer_requested",
+                    json!({
+                        "prior_agent_id": reviewer.id,
+                        "revision": revision,
+                        "digest": digest,
+                        "reason": "prior_app_server_rollout_unavailable",
+                    }),
+                )?;
+                return Ok(false);
+            }
             self.store.update_agent_state(
                 &reviewer.id,
                 "FAILED",
@@ -4922,6 +4945,11 @@ impl Orchestrator {
             )?;
             return Err(error.into());
         }
+        self.store.prepare_agent_continuation(
+            &reviewer.id,
+            PLAN_REVIEWER_SESSION_TOKEN_BUDGET,
+            "Finalizing the existing adversarial review without repeated inspection",
+        )?;
         let turn = match runtime
             .start_turn(StartTurn {
                 thread_id: thread_id.to_owned(),
@@ -5218,18 +5246,35 @@ impl Orchestrator {
                 .runtime_metadata(&format!("run-automatic-plan-approval:{run_id}"))?
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false);
+            let recovery_requires_human_approval = self
+                .store
+                .runtime_metadata(&plan_review_recovery_manual_approval_key(
+                    run_id, revision, &digest,
+                ))?
+                .is_some();
             drop(_guard);
-            if automatic && certificate.automatic_approval_eligible && !certified.scheduler_paused {
+            if automatic
+                && !recovery_requires_human_approval
+                && certificate.automatic_approval_eligible
+                && !certified.scheduler_paused
+            {
                 self.approve_plan(run_id, &digest, false, None, "automatic-plan-policy")
                     .await?;
             } else if automatic {
+                let mut reasons = certificate.automatic_approval_blockers;
+                if recovery_requires_human_approval {
+                    reasons.push(
+                        "the operator resumed an interrupted final review; approval remains an explicit human action"
+                            .to_owned(),
+                    );
+                }
                 self.emit_run_event(
                     &certified,
                     "run.plan.automatic_approval_deferred",
                     json!({
                         "digest": digest,
                         "revision": revision,
-                        "reasons": certificate.automatic_approval_blockers,
+                        "reasons": reasons,
                     }),
                 )?;
             }
@@ -5630,6 +5675,10 @@ impl Orchestrator {
             )));
         }
         let digest = packet_digest(&plan)?;
+        // The manual-approval gate must be durable before the run becomes
+        // reviewable. If persistence fails, leave the run blocked so neither
+        // the heartbeat nor a reviewer verdict can expose automatic approval.
+        self.persist_plan_review_recovery_manual_approval_gate(run_id, revision, &digest, actor)?;
         let reviewing = self.store.transition_run(
             run_id,
             RunState::PlanAdversarialReview,
@@ -5681,6 +5730,33 @@ impl Orchestrator {
             return Err(error);
         }
         Ok(operation("resume_blocked_plan_review", run_id.as_str()))
+    }
+
+    fn persist_plan_review_recovery_manual_approval_gate(
+        &self,
+        run_id: &RunId,
+        revision: u64,
+        digest: &str,
+        actor: &str,
+    ) -> Result<(), OrchestratorError> {
+        #[cfg(test)]
+        if self
+            .fail_next_plan_review_recovery_gate_write
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(OrchestratorError::Io(std::io::Error::other(
+                "injected plan-review recovery gate write failure",
+            )));
+        }
+        self.store.put_runtime_metadata(
+            &plan_review_recovery_manual_approval_key(run_id, revision, digest),
+            &json!({
+                "reason": "operator_resumed_interrupted_final_review",
+                "actor": actor,
+                "recorded_at": format_timestamp(now_ms()),
+            }),
+        )?;
+        Ok(())
     }
 
     pub async fn approve_plan(
@@ -12683,6 +12759,10 @@ fn plan_review_metadata_key(run_id: &RunId, revision: u64) -> String {
     format!("plan-review:{run_id}:{revision}")
 }
 
+fn plan_review_recovery_manual_approval_key(run_id: &RunId, revision: u64, digest: &str) -> String {
+    format!("plan-review-recovery-manual-approval:{run_id}:{revision}:{digest}")
+}
+
 fn intent_interview_metadata_key(run_id: &RunId) -> String {
     format!("intent-interview:{run_id}")
 }
@@ -15069,6 +15149,18 @@ fn blocked_plan_review_recovery(run: &RunSummary) -> bool {
     blocked_plan_review_budget_exhausted(run) || run.phase == "plan_review_deadlocked"
 }
 
+fn thread_resume_requires_fresh_reviewer(error: &CodexError) -> bool {
+    matches!(
+        error,
+        CodexError::Rpc {
+            method,
+            code: -32600,
+            message,
+            ..
+        } if method == "thread/resume" && message.to_ascii_lowercase().contains("no rollout found")
+    )
+}
+
 fn nonempty(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.to_owned())
 }
@@ -15335,7 +15427,100 @@ pub enum OrchestratorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use harness_domain::TaskMilestone;
     use tempfile::TempDir;
+
+    #[derive(Default)]
+    struct RolloutLostPlanReviewRuntime {
+        started_threads: StdMutex<Vec<StartThread>>,
+        started_turns: StdMutex<Vec<StartTurn>>,
+    }
+
+    #[async_trait]
+    impl CodexRuntime for RolloutLostPlanReviewRuntime {
+        async fn runtime_status(&self) -> CodexRuntimeStatus {
+            CodexRuntimeStatus {
+                state: "ready".to_owned(),
+                detail: None,
+                version: Some("test".to_owned()),
+                required_version: None,
+                protocol_schema_sha256: None,
+                schema_match: true,
+                native_multi_agent: false,
+                native_multi_agent_feature: None,
+                pid: None,
+                restart_count: 0,
+            }
+        }
+
+        async fn start_thread(&self, request: StartThread) -> Result<Value, CodexError> {
+            self.started_threads.lock().unwrap().push(request);
+            Ok(json!({"thread": {"id": "fresh-plan-review-thread"}}))
+        }
+
+        async fn resume_thread(&self, _thread_id: &str) -> Result<Value, CodexError> {
+            Err(CodexError::Rpc {
+                method: "thread/resume".to_owned(),
+                code: -32600,
+                message: "no rollout found for thread id stale-plan-review-thread".to_owned(),
+                data: None,
+            })
+        }
+
+        async fn start_turn(&self, request: StartTurn) -> Result<Value, CodexError> {
+            self.started_turns.lock().unwrap().push(request);
+            Ok(json!({"turn": {"id": "fresh-plan-review-turn"}}))
+        }
+
+        async fn steer_turn(
+            &self,
+            _thread_id: &str,
+            _turn_id: &str,
+            _message: &str,
+        ) -> Result<Value, CodexError> {
+            Ok(json!({}))
+        }
+
+        async fn interrupt_turn(
+            &self,
+            _thread_id: &str,
+            _turn_id: &str,
+        ) -> Result<Value, CodexError> {
+            Ok(json!({}))
+        }
+
+        async fn set_goal(
+            &self,
+            _thread_id: &str,
+            _objective: &str,
+            _token_budget: Option<u64>,
+        ) -> Result<Value, CodexError> {
+            Ok(json!({}))
+        }
+
+        async fn start_review(
+            &self,
+            _thread_id: &str,
+            _target: Value,
+            _detached: bool,
+        ) -> Result<Value, CodexError> {
+            Ok(json!({}))
+        }
+
+        async fn respond_rpc(&self, _id: Value, _result: Value) -> Result<(), CodexError> {
+            Ok(())
+        }
+
+        async fn respond_rpc_error(
+            &self,
+            _id: Value,
+            _code: i64,
+            _message: &str,
+        ) -> Result<(), CodexError> {
+            Ok(())
+        }
+    }
 
     async fn operator_settings_test_orchestrator() -> (Orchestrator, TempDir) {
         let temp = TempDir::new().expect("temporary directory");
@@ -15376,6 +15561,224 @@ mod tests {
             governor_goal_token_budget: None,
             governor_attempt_token_ceiling: None,
         }
+    }
+
+    fn git_output(root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git fixture command starts");
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("git output is utf-8")
+            .trim()
+            .to_owned()
+    }
+
+    async fn rollout_lost_plan_review_fixture() -> (
+        Orchestrator,
+        TempDir,
+        Arc<RolloutLostPlanReviewRuntime>,
+        RunId,
+        AgentSessionId,
+    ) {
+        let (orchestrator, temp) = operator_settings_test_orchestrator().await;
+        let repository_root = temp.path().join("inspection");
+        std::fs::create_dir_all(&repository_root).expect("fixture repository directory");
+        std::fs::write(repository_root.join("README.md"), "# recovery fixture\n")
+            .expect("fixture README");
+        git_output(&repository_root, &["init", "-q"]);
+        git_output(
+            &repository_root,
+            &["config", "user.email", "test@example.com"],
+        );
+        git_output(&repository_root, &["config", "user.name", "Harness Test"]);
+        git_output(&repository_root, &["add", "README.md"]);
+        git_output(&repository_root, &["commit", "-qm", "fixture"]);
+        let base_sha = git_output(&repository_root, &["rev-parse", "HEAD"]);
+
+        let repository_id = RepositoryId::from("rollout-lost-plan-review-repository");
+        orchestrator
+            .store()
+            .create_repository(&NewRepository {
+                id: repository_id.clone(),
+                profile_id: "general".to_owned(),
+                profile_version: 1,
+                display_name: "Rollout-loss plan-review fixture".to_owned(),
+                root_path: repository_root.clone(),
+                origin_url: None,
+                default_branch: "main".to_owned(),
+                expected_coordination_branch: None,
+                state: "READY".to_owned(),
+            })
+            .expect("fixture repository persists");
+        let run_id = RunId::from("rollout-lost-plan-review-run");
+        orchestrator
+            .store()
+            .create_run(&NewRun {
+                id: run_id.clone(),
+                repository_id,
+                title: "Rollout-loss plan-review fixture".to_owned(),
+                objective: "Recover a bounded final review without authorizing execution."
+                    .to_owned(),
+                mode: "plan_only".to_owned(),
+                publication_mode: "local_only".to_owned(),
+                state: RunState::Blocked.to_string(),
+                phase: "plan_review_budget_exhausted".to_owned(),
+                base_ref: "main".to_owned(),
+                base_sha: base_sha.clone(),
+                authority_digest: "fixture".to_owned(),
+                profile_digest: "fixture".to_owned(),
+                codex_version: None,
+                protocol_schema_sha256: None,
+                requested_by: "test".to_owned(),
+                token_budget: Some(1_000_000),
+            })
+            .expect("fixture run persists");
+        orchestrator
+            .store()
+            .create_worktree(&NewWorktree {
+                id: WorktreeId::from("rollout-lost-plan-review-worktree"),
+                run_id: run_id.clone(),
+                task_attempt_id: None,
+                kind: "inspection".to_owned(),
+                path: repository_root.clone(),
+                branch: None,
+                base_sha: base_sha.clone(),
+                head_sha: Some(base_sha.clone()),
+                state: "READY".to_owned(),
+            })
+            .expect("fixture worktree persists");
+        let architect_id = AgentSessionId::from("rollout-lost-plan-review-architect");
+        orchestrator
+            .store()
+            .create_agent_session(&NewAgentSession {
+                id: architect_id.clone(),
+                run_id: run_id.clone(),
+                task_attempt_id: None,
+                parent_agent_session_id: None,
+                runtime_kind: "test".to_owned(),
+                codex_account_id: None,
+                role: AgentRole::Architect,
+                nickname: Some("architect".to_owned()),
+                requested_model: "gpt-5.6-sol".to_owned(),
+                requested_reasoning_effort: "xhigh".to_owned(),
+                sandbox_mode: SandboxMode::ReadOnly,
+                approval_policy: "never".to_owned(),
+                cwd: repository_root.clone(),
+                state: "COMPLETED".to_owned(),
+                current_goal: Some("fixture plan".to_owned()),
+                token_budget: Some(80_000),
+            })
+            .expect("fixture architect persists");
+        let plan = RunPlan {
+            schema: "harness.orchestration.plan.v1".to_owned(),
+            summary: "Review the single bounded fixture task.".to_owned(),
+            tasks: vec![TaskPacket {
+                schema: "harness.orchestration.task.v1".to_owned(),
+                program_id: "RECOVERY".to_owned(),
+                task_id: "RECOVERY-001".to_owned(),
+                title: "Review recovery".to_owned(),
+                state: "proposed".to_owned(),
+                priority: "P1".to_owned(),
+                execution_mode: "controller_governed".to_owned(),
+                owner_profile: "general".to_owned(),
+                reviewer_profile: "general".to_owned(),
+                checklist_rows: vec!["Keep recovery human controlled".to_owned()],
+                authority_refs: vec!["README.md".to_owned()],
+                base_sha: base_sha.clone(),
+                dependency_shas: BTreeMap::new(),
+                depends_on: Vec::new(),
+                owned_paths: vec!["README.md".to_owned()],
+                forbidden_paths: Vec::new(),
+                reserved_serial_paths: Vec::new(),
+                objective: "Exercise the review lifecycle only.".to_owned(),
+                milestones: vec![TaskMilestone {
+                    id: "recovery-lifecycle".to_owned(),
+                    title: "Keep the recovery bounded".to_owned(),
+                    objective: "Produce a review verdict without execution.".to_owned(),
+                    success_criteria: vec!["The plan remains human approved".to_owned()],
+                }],
+                non_goals: vec!["Do not execute the task".to_owned()],
+                success_criteria: vec!["The final review is available".to_owned()],
+                required_positive_tests: Vec::new(),
+                required_negative_tests: Vec::new(),
+                required_metrics: Vec::new(),
+                required_evidence: vec!["README.md".to_owned()],
+                proof_limits: vec!["fixture only".to_owned()],
+                diff_budget: DiffBudget { files: 1, lines: 1 },
+                token_budget: 1_000,
+                tool_budget: Some(1),
+                lease_expires_at: "controller-managed".to_owned(),
+                stop_conditions: vec!["A human approval would be required".to_owned()],
+                handoff_path: "README.md".to_owned(),
+                risk_flags: Vec::new(),
+            }],
+        };
+        orchestrator
+            .store()
+            .store_plan(&run_id, &architect_id, &plan)
+            .expect("fixture proposed plan persists");
+        let reviewer_id = AgentSessionId::from("rollout-lost-plan-review-reviewer");
+        orchestrator
+            .store()
+            .create_agent_session(&NewAgentSession {
+                id: reviewer_id.clone(),
+                run_id: run_id.clone(),
+                task_attempt_id: None,
+                parent_agent_session_id: None,
+                runtime_kind: "test".to_owned(),
+                codex_account_id: None,
+                role: AgentRole::PlanReviewer,
+                nickname: Some("plan-review-r1".to_owned()),
+                requested_model: "gpt-5.6-terra".to_owned(),
+                requested_reasoning_effort: "xhigh".to_owned(),
+                sandbox_mode: SandboxMode::ReadOnly,
+                approval_policy: "never".to_owned(),
+                cwd: repository_root,
+                state: "FAILED".to_owned(),
+                current_goal: Some("fixture final review".to_owned()),
+                token_budget: Some(80_000),
+            })
+            .expect("fixture stale reviewer persists");
+        orchestrator
+            .store()
+            .attach_codex_thread(
+                &reviewer_id,
+                "stale-plan-review-thread",
+                None,
+                "test",
+                None,
+                None,
+            )
+            .expect("fixture stale thread persists");
+        orchestrator
+            .store()
+            .update_agent_state(
+                &reviewer_id,
+                "FAILED",
+                Some("Session budget exhausted"),
+                None,
+                None,
+                Some(("budget_exhausted", "session token budget exhausted")),
+            )
+            .expect("fixture stale reviewer terminal state persists");
+        orchestrator
+            .store()
+            .put_runtime_metadata(
+                &format!("run-automatic-plan-approval:{run_id}"),
+                &json!(true),
+            )
+            .expect("fixture automatic policy persists");
+        let runtime = Arc::new(RolloutLostPlanReviewRuntime::default());
+        orchestrator.set_runtime(runtime.clone()).await;
+        (orchestrator, temp, runtime, run_id, reviewer_id)
     }
 
     #[test]
@@ -15958,6 +16361,198 @@ mod tests {
         assert!(blocked_plan_review_recovery(&RunSummary {
             phase: "plan_review_deadlocked".to_owned(),
             ..blocked
+        }));
+    }
+
+    #[test]
+    fn missing_app_server_rollout_restarts_only_the_read_only_plan_reviewer() {
+        let missing_rollout = CodexError::Rpc {
+            method: "thread/resume".to_owned(),
+            code: -32600,
+            message: "no rollout found for thread id stale-thread".to_owned(),
+            data: None,
+        };
+        assert!(thread_resume_requires_fresh_reviewer(&missing_rollout));
+
+        let unrelated_resume_error = CodexError::Rpc {
+            method: "thread/resume".to_owned(),
+            code: -32600,
+            message: "thread id is malformed".to_owned(),
+            data: None,
+        };
+        assert!(!thread_resume_requires_fresh_reviewer(
+            &unrelated_resume_error
+        ));
+
+        let start_error = CodexError::Rpc {
+            method: "thread/start".to_owned(),
+            code: -32600,
+            message: "no rollout found for thread id stale-thread".to_owned(),
+            data: None,
+        };
+        assert!(!thread_resume_requires_fresh_reviewer(&start_error));
+    }
+
+    #[test]
+    fn resumed_plan_review_has_a_revision_and_digest_bound_human_approval_gate() {
+        let run_id = RunId::from("run-review");
+        let first = plan_review_recovery_manual_approval_key(&run_id, 2, "digest-a");
+        assert_eq!(
+            first,
+            "plan-review-recovery-manual-approval:run-review:2:digest-a"
+        );
+        assert_ne!(
+            first,
+            plan_review_recovery_manual_approval_key(&run_id, 3, "digest-a")
+        );
+        assert_ne!(
+            first,
+            plan_review_recovery_manual_approval_key(&run_id, 2, "digest-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_rollout_starts_one_fresh_read_only_reviewer_and_keeps_human_approval() {
+        let (orchestrator, _temp, runtime, run_id, stale_reviewer_id) =
+            rollout_lost_plan_review_fixture().await;
+
+        orchestrator
+            .resume_blocked_plan_review(&run_id, "local-user")
+            .await
+            .expect("operator recovery starts a fresh reviewer");
+        let duplicate = orchestrator
+            .resume_blocked_plan_review(&run_id, "local-user")
+            .await
+            .expect_err("a second resume cannot create a duplicate reviewer");
+        assert!(
+            duplicate
+                .to_string()
+                .contains("not awaiting a resumable plan review")
+        );
+
+        let stale = orchestrator.store().agent(&stale_reviewer_id).unwrap();
+        assert_eq!(stale.state, "FAILED");
+        assert_eq!(
+            stale.failure_reason.as_deref(),
+            Some("session token budget exhausted")
+        );
+        let reviewers = orchestrator
+            .store()
+            .list_agents(&run_id)
+            .unwrap()
+            .into_iter()
+            .filter(|agent| agent.role == AgentRole::PlanReviewer)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reviewers.len(),
+            2,
+            "only one replacement reviewer is created"
+        );
+        let fresh = reviewers
+            .iter()
+            .find(|agent| agent.id != stale_reviewer_id)
+            .expect("fresh reviewer exists");
+        assert_eq!(fresh.state, "RUNNING");
+        assert_eq!(fresh.thread_id.as_deref(), Some("fresh-plan-review-thread"));
+        assert_eq!(fresh.sandbox_mode, SandboxMode::ReadOnly);
+
+        let started_threads = runtime.started_threads.lock().unwrap();
+        assert_eq!(started_threads.len(), 1);
+        assert_eq!(started_threads[0].sandbox, "read-only");
+        assert_eq!(started_threads[0].approval_policy, "never");
+        drop(started_threads);
+        let started_turns = runtime.started_turns.lock().unwrap();
+        assert_eq!(started_turns.len(), 1);
+        assert_eq!(started_turns[0].approval_policy, "never");
+        assert_eq!(
+            started_turns[0].sandbox_policy,
+            json!({"type": "readOnly", "networkAccess": false})
+        );
+        drop(started_turns);
+
+        let verdict = PlanReviewVerdict {
+            verdict: "accept".to_owned(),
+            summary: "The bounded fixture plan is safe for a human decision.".to_owned(),
+            findings: Vec::new(),
+            evidence: PlanReviewEvidence {
+                inspected_files: vec!["README.md".to_owned()],
+                critical_path: vec![PlanCriticalPathStep {
+                    task_id: "RECOVERY-001".to_owned(),
+                    why_critical: "It is the only proposed task.".to_owned(),
+                    behavioral_proof: "The plan is available for explicit approval.".to_owned(),
+                }],
+                failure_modes: vec![PlanFailureMode {
+                    failure_mode: "A stale App Server rollout could lose the prior thread."
+                        .to_owned(),
+                    mitigation: "Start a fresh read-only review and require human approval."
+                        .to_owned(),
+                }],
+            },
+        };
+        orchestrator
+            .apply_plan_review_verdict(&run_id, &fresh.id, verdict)
+            .await
+            .expect("replacement verdict is accepted for human approval");
+        let run = orchestrator.store().run(&run_id).unwrap();
+        assert_eq!(run.state, RunState::PlanReviewRequired);
+        assert_eq!(run.phase, "plan_certified");
+        let events = orchestrator
+            .store()
+            .list_domain_events(0, Some(&run_id), 100)
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.event_type == "run.plan.automatic_approval_deferred"
+                && event
+                    .payload
+                    .to_string()
+                    .contains("approval remains an explicit human action")
+        }));
+    }
+
+    #[tokio::test]
+    async fn failed_recovery_gate_write_leaves_the_plan_review_blocked() {
+        let (orchestrator, _temp, runtime, run_id, stale_reviewer_id) =
+            rollout_lost_plan_review_fixture().await;
+        orchestrator
+            .fail_next_plan_review_recovery_gate_write
+            .store(true, Ordering::Release);
+
+        let error = orchestrator
+            .resume_blocked_plan_review(&run_id, "local-user")
+            .await
+            .expect_err("a failed manual-approval gate must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("injected plan-review recovery gate write failure")
+        );
+
+        let run = orchestrator.store().run(&run_id).unwrap();
+        assert_eq!(run.state, RunState::Blocked);
+        assert_eq!(run.phase, "plan_review_budget_exhausted");
+        let Some((_, _, state, _)) = orchestrator.store().latest_plan(&run_id).unwrap() else {
+            panic!("fixture plan remains available");
+        };
+        assert_eq!(state, "PROPOSED");
+        let reviewers = orchestrator
+            .store()
+            .list_agents(&run_id)
+            .unwrap()
+            .into_iter()
+            .filter(|agent| agent.role == AgentRole::PlanReviewer)
+            .collect::<Vec<_>>();
+        assert_eq!(reviewers.len(), 1, "no replacement reviewer is created");
+        assert_eq!(reviewers[0].id, stale_reviewer_id);
+        assert!(runtime.started_threads.lock().unwrap().is_empty());
+        assert!(runtime.started_turns.lock().unwrap().is_empty());
+        let events = orchestrator
+            .store()
+            .list_domain_events(0, Some(&run_id), 100)
+            .unwrap();
+        assert!(events.iter().all(|event| {
+            event.event_type != "run.plan.review_resume_requested"
+                && event.event_type != "run.plan.certified"
+                && event.event_type != "run.plan.approved"
         }));
     }
 

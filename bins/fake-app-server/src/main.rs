@@ -21,6 +21,7 @@ enum Scenario {
     Approval,
     Malformed,
     Crash,
+    MissingRollout,
 }
 
 impl Scenario {
@@ -32,6 +33,7 @@ impl Scenario {
             "approval" => Self::Approval,
             "malformed" => Self::Malformed,
             "crash" => Self::Crash,
+            "missing_rollout" => Self::MissingRollout,
             _ => Self::Normal,
         }
     }
@@ -191,6 +193,20 @@ async fn serve(scenario: Scenario) -> Result<()> {
                     .and_then(Value::as_str)
                     .unwrap_or("fake-thread")
                     .to_owned();
+                if scenario == Scenario::MissingRollout {
+                    send(
+                        &mut stdout,
+                        json!({
+                            "id": id,
+                            "error": {
+                                "code": -32600,
+                                "message": format!("no rollout found for thread id {thread_id}"),
+                            }
+                        }),
+                    )
+                    .await?;
+                    continue;
+                }
                 send(
                     &mut stdout,
                     json!({"id": id, "result": {"thread": thread_value(&thread_id, json!("/tmp"))}}),

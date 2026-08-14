@@ -742,7 +742,7 @@ export default function App() {
                     api.post(
                       `/runs/${currentRun.id}/plan/resume-review`,
                     ),
-                  "Independent final plan review resumed",
+                  "Independent final plan review started",
                 )
               }
               onRequestSupervisorReview={() =>
@@ -3440,7 +3440,7 @@ function BlockedRunRecoveryPanel({
       </header>
       {recovery?.kind === "resume_review" && (
         <p className="blocked-run-recovery-explainer">
-          Resume continues the existing read-only reviewer for a bounded verdict-only turn. It does not approve the plan or begin implementation.
+          Resume starts a bounded, read-only verdict review. If the App Server still has the prior reviewer thread, its evidence is reused; otherwise Harness starts a fresh independent review of the same immutable plan. It does not approve the plan or begin implementation.
         </p>
       )}
       {!detail.plan_digest ? (
