@@ -236,7 +236,7 @@ fn supervisor_review_prompt(
         ));
     }
     Ok(format!(
-        "You are the human-approved BILDR thread supervisor. Analyze only the supplied immutable snapshot. Do not use tools, start child agents, edit files, request approvals, or perform any controller operation. Your output is advisory: the human, never you, chooses whether to apply a recovery control.\n\nThe decision must bind exactly to these controller-owned values:\n- decision_id: {decision_id}\n- snapshot_id: {snapshot_id}\n- run_id: {run_id}\n- snapshot_revision: {snapshot_revision}\n- requested_model: {model}\n- effective_model: {model}\n- requested_effort: {effort}\n- effective_effort: {effort}\n\nChoose only action kinds listed in `allowed_actions`; if the evidence does not justify an intervention, propose a single `wait` action. Do not invent task, attempt, session, evidence, or state identifiers. Explain the concrete blocker, evidence, uncertainty, and the next observable result. The controller will reject a stale or malformed response and will execute nothing automatically. Set `created_at` to the snapshot's `generated_at` value. Return only one JSON object matching the supplied schema.\n\nImmutable snapshot:\n{snapshot_json}",
+        "You are the human-approved BILDR thread supervisor. Analyze only the supplied immutable snapshot. Do not use tools, start child agents, edit files, request approvals, or perform any controller operation. Your output is advisory: the human, never you, chooses whether to apply a recovery control.\n\nThe decision must bind exactly to these controller-owned values:\n- decision_id: {decision_id}\n- snapshot_id: {snapshot_id}\n- run_id: {run_id}\n- snapshot_revision: {snapshot_revision}\n- requested_model: {model}\n- effective_model: {model}\n- requested_effort: {effort}\n- effective_effort: {effort}\n\nChoose only action kinds listed in `allowed_actions`; if the evidence does not justify an intervention, propose a single `wait` action. For `wait`, `continue_attempt`, `request_replan`, and `start_followup_turn`, `target` must be exactly the run target: `{{\"kind\":\"run\",\"id\":\"{run_id}\",\"task_id\":null,\"attempt_id\":null,\"session_id\":null}}`. Only `retry_fresh_attempt` may target a task, and then its `id` and `task_id` must be the same supplied task identifier. Do not invent task, attempt, session, evidence, or state identifiers. Explain the concrete blocker, evidence, uncertainty, and the next observable result. The controller will reject a stale or malformed response and will execute nothing automatically. Set `created_at` to the snapshot's `generated_at` value. Return only one JSON object matching the supplied schema.\n\nImmutable snapshot:\n{snapshot_json}",
         decision_id = review.expected_decision_id,
         snapshot_id = snapshot.id,
         run_id = snapshot.run_id,
@@ -7200,7 +7200,26 @@ impl Orchestrator {
                         .to_owned(),
                 )
             })?;
-        validate_supervisor_decision(&review, &snapshot, &decision)?;
+        if let Err(error) = validate_supervisor_decision(&review, &snapshot, &decision) {
+            let reason = format!("supervisor decision rejected: {error}");
+            self.store.fail_supervisor_review(&review.id, &reason)?;
+            self.store.clear_agent_active_turn(agent_id)?;
+            self.store.update_agent_state(
+                agent_id,
+                "FAILED",
+                Some("Advisory supervisor decision was rejected"),
+                None,
+                None,
+                Some(("protocol_error", &reason)),
+            )?;
+            let run = self.store.run(&review.run_id)?;
+            self.emit_run_event(
+                &run,
+                "run.supervision.review_failed",
+                json!({"agent_id": agent_id, "reason": reason, "automatic_action": false}),
+            )?;
+            return Err(error);
+        }
         let record = self.store.record_current_supervisor_decision(
             &review.id,
             snapshot.event_cursor,
@@ -7751,9 +7770,9 @@ impl Orchestrator {
         if agent.role == AgentRole::Supervisor {
             let review = self.store.supervisor_review_for_agent(agent_id)?;
             if status == "completed"
-                && review
-                    .as_ref()
-                    .is_some_and(|review| matches!(review.state.as_str(), "COMPLETED" | "STALE"))
+                && review.as_ref().is_some_and(|review| {
+                    matches!(review.state.as_str(), "COMPLETED" | "STALE" | "FAILED")
+                })
             {
                 return Ok(());
             }
@@ -15366,7 +15385,7 @@ mod tests {
     #[test]
     fn supervisor_decision_rejects_actions_outside_snapshot_allowlist() {
         let run_id = RunId::from("supervisor-run");
-        let snapshot = SupervisorSnapshotRecord {
+        let mut snapshot = SupervisorSnapshotRecord {
             id: harness_domain::SupervisorSnapshotId::from("supervisor-snapshot"),
             run_id: run_id.clone(),
             revision: 1,
@@ -15420,9 +15439,26 @@ mod tests {
         });
         validate_supervisor_decision(&review, &snapshot, &decision)
             .expect("allowed advisory decision is accepted");
-        let mut forbidden = decision;
+        let mut forbidden = decision.clone();
         forbidden["actions"][0]["kind"] = json!("stop_run");
         assert!(validate_supervisor_decision(&review, &snapshot, &forbidden).is_err());
+
+        let mut invalid_target = decision;
+        invalid_target["actions"][0]["kind"] = json!("request_replan");
+        invalid_target["actions"][0]["target"] = json!({
+            "kind": "task",
+            "id": "task-1",
+            "task_id": "task-1",
+            "attempt_id": null,
+            "session_id": null
+        });
+        snapshot.payload["allowed_actions"] = json!(["request_replan"]);
+        assert!(
+            validate_supervisor_decision(&review, &snapshot, &invalid_target)
+                .expect_err("replan must target the run")
+                .to_string()
+                .contains("invalid target")
+        );
     }
 
     #[tokio::test]
