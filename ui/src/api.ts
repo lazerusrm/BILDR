@@ -14,9 +14,11 @@ import type {
   EvaluationRunSummary,
   EvaluationSampleSummary,
   ExternalCondition,
+  ExternalConditionSummary,
   FailureOverview,
   FailureTrace,
   InvestigationArtifact,
+  InvestigationArtifactSummary,
   OutcomeVector,
   OperatorSettings,
   Repository,
@@ -216,14 +218,14 @@ class HarnessApi {
     const params = new URLSearchParams({ limit: "50" });
     if (runId) params.set("run_id", runId);
     if (taskId) params.set("task_id", taskId);
-    return this.get<InvestigationArtifact[]>(`/investigations?${params}`);
+    return this.get<InvestigationArtifactSummary[]>(`/investigations?${params}`);
   };
   investigation = (artifactId: string) =>
     this.get<InvestigationArtifact>(`/investigations/${encodeURIComponent(artifactId)}`);
   externalConditions = (includeTerminal = false) => {
     const params = new URLSearchParams({ limit: "50" });
     if (includeTerminal) params.set("include_terminal", "true");
-    return this.get<ExternalCondition[]>(`/external-conditions?${params}`);
+    return this.get<ExternalConditionSummary[]>(`/external-conditions?${params}`);
   };
   externalCondition = (conditionId: string) =>
     this.get<ExternalCondition>(`/external-conditions/${encodeURIComponent(conditionId)}`);

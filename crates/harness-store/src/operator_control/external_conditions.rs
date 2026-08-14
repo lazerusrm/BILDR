@@ -5,6 +5,7 @@
 
 use harness_domain::{
     ConditionObservation, ExternalCondition, ExternalConditionId, ExternalConditionState,
+    ExternalConditionSummary,
 };
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
@@ -240,6 +241,23 @@ impl Store {
         Ok(rows)
     }
 
+    /// Lists compact, integrity-checked summaries for browser and snapshot
+    /// projections. Adapter specifications and observation payloads require an
+    /// explicit read of the selected condition or its observation history.
+    pub fn list_external_condition_summaries(
+        &self,
+        include_terminal: bool,
+        limit: u32,
+    ) -> Result<Vec<ExternalConditionSummary>, StoreError> {
+        self.list_external_conditions(include_terminal, limit)
+            .map(|conditions| {
+                conditions
+                    .iter()
+                    .map(ExternalConditionSummary::from)
+                    .collect()
+            })
+    }
+
     pub fn list_condition_observations(
         &self,
         condition_id: &ExternalConditionId,
@@ -394,6 +412,15 @@ mod tests {
             harness_domain::SnapshotSectionState::Current
         );
         assert_eq!(registered_snapshot.external_conditions.rows.len(), 1);
+        assert_eq!(
+            registered_snapshot.external_conditions.rows[0]["schema"],
+            "harness.external-condition-summary.v1"
+        );
+        assert!(
+            registered_snapshot.external_conditions.rows[0]
+                .get("spec")
+                .is_none()
+        );
         let observation = observation(&condition);
         let updated = store
             .record_external_condition_observation(&condition.condition_id, 1, &observation)
@@ -419,6 +446,13 @@ mod tests {
                 .list_external_conditions(false, 10)
                 .expect("open list")
                 .is_empty()
+        );
+        assert_eq!(
+            store
+                .list_external_condition_summaries(true, 10)
+                .expect("summary list")[0]
+                .condition_sha256,
+            updated.sha256
         );
         assert_eq!(
             store

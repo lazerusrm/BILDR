@@ -289,12 +289,73 @@ select:focus-visible {
 .control-plane-support-list li {
   display: grid;
   gap: 3px;
+}
+.control-plane-support-item {
+  display: grid;
+  gap: 3px;
+  width: 100%;
   padding: 9px;
+  border: 1px solid transparent;
   border-radius: 8px;
   background: var(--panel-2);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+.control-plane-support-item:hover,
+.control-plane-support-item.selected {
+  border-color: var(--accent);
+  background: var(--accent-bg);
 }
 .control-plane-support-list span,
 .control-plane-support-list small {
+  color: var(--muted);
+  font-size: 11px;
+}
+.control-plane-empty-detail {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.control-plane-record-detail {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+.control-plane-record-detail h3,
+.control-plane-detail-list h4 {
+  margin: 0;
+  color: var(--soft);
+  font-size: 13px;
+}
+.control-plane-facts.compact {
+  margin: 0;
+  gap: 8px;
+}
+.control-plane-detail-list {
+  display: grid;
+  gap: 6px;
+}
+.control-plane-detail-list ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.control-plane-detail-list li {
+  display: grid;
+  gap: 2px;
+  padding: 8px;
+  border-radius: 7px;
+  background: var(--panel-2);
+  color: var(--soft);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.control-plane-detail-list small {
   color: var(--muted);
   font-size: 11px;
 }

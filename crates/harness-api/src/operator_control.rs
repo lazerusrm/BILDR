@@ -175,14 +175,17 @@ async fn list_investigations(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(query): Query<InvestigationQuery>,
-) -> Result<Json<Vec<harness_domain::InvestigationArtifact>>, ApiError> {
+) -> Result<Json<Vec<harness_domain::InvestigationArtifactSummary>>, ApiError> {
     authenticate(&state, &headers, false)?;
     Ok(Json(
-        state.orchestrator.store().list_investigation_artifacts(
-            query.run_id.as_deref(),
-            query.task_id.as_deref(),
-            query.limit.unwrap_or(50),
-        )?,
+        state
+            .orchestrator
+            .store()
+            .list_investigation_artifact_summaries(
+                query.run_id.as_deref(),
+                query.task_id.as_deref(),
+                query.limit.unwrap_or(50),
+            )?,
     ))
 }
 
@@ -217,12 +220,17 @@ async fn list_external_conditions(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(query): Query<ExternalConditionQuery>,
-) -> Result<Json<Vec<harness_domain::ExternalCondition>>, ApiError> {
+) -> Result<Json<Vec<harness_domain::ExternalConditionSummary>>, ApiError> {
     authenticate(&state, &headers, false)?;
-    Ok(Json(state.orchestrator.store().list_external_conditions(
-        query.include_terminal.unwrap_or(false),
-        query.limit.unwrap_or(50),
-    )?))
+    Ok(Json(
+        state
+            .orchestrator
+            .store()
+            .list_external_condition_summaries(
+                query.include_terminal.unwrap_or(false),
+                query.limit.unwrap_or(50),
+            )?,
+    ))
 }
 
 async fn get_external_condition(

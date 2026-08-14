@@ -901,6 +901,22 @@ export interface InvestigationArtifact {
   sha256: string;
 }
 
+export interface InvestigationArtifactSummary {
+  schema: "harness.investigation-artifact-summary.v1";
+  artifact_id: string;
+  run_id: string;
+  task_id: string;
+  attempt_id: string;
+  question: string;
+  sensitivity: "public" | "internal" | "restricted";
+  base_sha: string;
+  finding_count: number;
+  recommendation_count: number;
+  decision_count: number;
+  created_at_ms: number;
+  artifact_sha256: string;
+}
+
 export interface ConditionObservation {
   schema: "harness.condition-observation.v1";
   observation_id: string;
@@ -930,6 +946,24 @@ export interface ExternalCondition {
   opened_at_ms: number;
   updated_at_ms: number;
   sha256: string;
+}
+
+export interface ExternalConditionSummary {
+  schema: "harness.external-condition-summary.v1";
+  condition_id: string;
+  owner_type: "run" | "task" | "attempt";
+  owner_id: string;
+  adapter: "ci_check" | "review_state" | "credential_availability" | "time_gate" | "hardware_capacity" | "service_availability";
+  source_id: string;
+  state: "open" | "satisfied" | "unsatisfied" | "unknown" | "cancelled";
+  sequence: number;
+  poll_policy: { initial_ms: number; maximum_ms: number; deadline_ms: number | null };
+  last_observation_state: "open" | "satisfied" | "unsatisfied" | "unknown" | "cancelled" | null;
+  last_observed_at_ms: number | null;
+  version: number;
+  opened_at_ms: number;
+  updated_at_ms: number;
+  condition_sha256: string;
 }
 
 export interface ReturnView {

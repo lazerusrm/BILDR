@@ -1,13 +1,16 @@
 import { RefreshCw } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 
 import { api } from "../api";
 import type {
   AttentionItem,
   AttentionPage,
+  ConditionObservation,
   ControlPlaneSnapshot,
   ExternalCondition,
+  ExternalConditionSummary,
   InvestigationArtifact,
+  InvestigationArtifactSummary,
   ReturnView,
   SnapshotSection,
 } from "../types";
@@ -16,11 +19,29 @@ export function AttentionCenter() {
   const [snapshot, setSnapshot] = useState<ControlPlaneSnapshot>();
   const [returnView, setReturnView] = useState<ReturnView>();
   const [page, setPage] = useState<AttentionPage>();
-  const [investigations, setInvestigations] = useState<InvestigationArtifact[]>([]);
-  const [conditions, setConditions] = useState<ExternalCondition[]>([]);
+  const [investigations, setInvestigations] = useState<InvestigationArtifactSummary[]>([]);
+  const [conditions, setConditions] = useState<ExternalConditionSummary[]>([]);
+  const [selectedInvestigationId, setSelectedInvestigationId] = useState<string>();
+  const [selectedConditionId, setSelectedConditionId] = useState<string>();
+  const [conditionHistory, setConditionHistory] = useState<ConditionHistory>({
+    conditionId: undefined,
+    state: "idle",
+    observations: [],
+  });
+  const [investigationDetail, setInvestigationDetail] = useState<InvestigationDetailState>({
+    artifactId: undefined,
+    state: "idle",
+  });
+  const [conditionDetail, setConditionDetail] = useState<ExternalConditionDetailState>({
+    conditionId: undefined,
+    state: "idle",
+  });
   const [selected, setSelected] = useState<AttentionItem>();
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const conditionHistoryRequest = useRef(0);
+  const investigationDetailRequest = useRef(0);
+  const conditionDetailRequest = useRef(0);
 
   const load = useCallback(async () => {
     setBusy("refresh");
@@ -37,6 +58,22 @@ export function AttentionCenter() {
       setPage(nextPage);
       setInvestigations(nextInvestigations);
       setConditions(nextConditions);
+      conditionHistoryRequest.current += 1;
+      setConditionHistory({ conditionId: undefined, state: "idle", observations: [] });
+      conditionDetailRequest.current += 1;
+      setConditionDetail({ conditionId: undefined, state: "idle" });
+      investigationDetailRequest.current += 1;
+      setInvestigationDetail({ artifactId: undefined, state: "idle" });
+      setSelectedInvestigationId((current) =>
+        current && nextInvestigations.some((artifact) => artifact.artifact_id === current)
+          ? current
+          : nextInvestigations[0]?.artifact_id,
+      );
+      setSelectedConditionId((current) =>
+        current && nextConditions.some((condition) => condition.condition_id === current)
+          ? current
+          : nextConditions[0]?.condition_id,
+      );
       setSelected((current) =>
         current
           ? nextPage.items.find((item) => item.attention_id === current.attention_id)
@@ -47,6 +84,61 @@ export function AttentionCenter() {
       setError(displayError(cause, "Could not load operator-control state."));
     } finally {
       setBusy("");
+    }
+  }, []);
+
+  const selectInvestigation = useCallback(async (artifactId: string) => {
+    const request = investigationDetailRequest.current + 1;
+    investigationDetailRequest.current = request;
+    setSelectedInvestigationId(artifactId);
+    setInvestigationDetail({ artifactId, state: "loading" });
+    try {
+      const artifact = await api.investigation(artifactId);
+      if (investigationDetailRequest.current === request) {
+        setInvestigationDetail({ artifactId, state: "loaded", artifact });
+      }
+    } catch (cause) {
+      if (investigationDetailRequest.current === request) {
+        setInvestigationDetail({ artifactId, state: "error" });
+        setError(displayError(cause, "Could not load immutable investigation evidence."));
+      }
+    }
+  }, []);
+
+  const selectCondition = useCallback(async (conditionId: string) => {
+    const request = conditionDetailRequest.current + 1;
+    conditionDetailRequest.current = request;
+    setSelectedConditionId(conditionId);
+    conditionHistoryRequest.current += 1;
+    setConditionHistory({ conditionId: undefined, state: "idle", observations: [] });
+    setConditionDetail({ conditionId, state: "loading" });
+    try {
+      const condition = await api.externalCondition(conditionId);
+      if (conditionDetailRequest.current === request) {
+        setConditionDetail({ conditionId, state: "loaded", condition });
+      }
+    } catch (cause) {
+      if (conditionDetailRequest.current === request) {
+        setConditionDetail({ conditionId, state: "error" });
+        setError(displayError(cause, "Could not load passive condition detail."));
+      }
+    }
+  }, []);
+
+  const loadConditionHistory = useCallback(async (conditionId: string) => {
+    const request = conditionHistoryRequest.current + 1;
+    conditionHistoryRequest.current = request;
+    setConditionHistory({ conditionId, state: "loading", observations: [] });
+    try {
+      const observations = await api.conditionObservations(conditionId);
+      if (conditionHistoryRequest.current === request) {
+        setConditionHistory({ conditionId, state: "loaded", observations });
+      }
+    } catch (cause) {
+      if (conditionHistoryRequest.current === request) {
+        setConditionHistory({ conditionId, state: "error", observations: [] });
+        setError(displayError(cause, "Could not load the recorded condition history."));
+      }
     }
   }, []);
 
@@ -160,8 +252,20 @@ export function AttentionCenter() {
         </button>
       </section>
       <section className="control-plane-support" aria-label="Investigation artifacts and external conditions">
-        <InvestigationArtifacts artifacts={investigations} />
-        <ExternalConditions conditions={conditions} />
+        <InvestigationArtifacts
+          artifacts={investigations}
+          selectedId={selectedInvestigationId}
+          detail={investigationDetail}
+          onSelect={(artifactId) => void selectInvestigation(artifactId)}
+        />
+        <ExternalConditions
+          conditions={conditions}
+          selectedId={selectedConditionId}
+          detail={conditionDetail}
+          history={conditionHistory}
+          onSelect={(conditionId) => void selectCondition(conditionId)}
+          onLoadHistory={(conditionId) => void loadConditionHistory(conditionId)}
+        />
       </section>
       <div className="control-plane-layout">
         <section className="control-plane-list" aria-labelledby="attention-heading">
@@ -207,7 +311,37 @@ export function AttentionCenter() {
   );
 }
 
-function InvestigationArtifacts({ artifacts }: { artifacts: InvestigationArtifact[] }) {
+type ConditionHistory = {
+  conditionId?: string;
+  state: "idle" | "loading" | "loaded" | "error";
+  observations: ConditionObservation[];
+};
+
+type InvestigationDetailState = {
+  artifactId?: string;
+  state: "idle" | "loading" | "loaded" | "error";
+  artifact?: InvestigationArtifact;
+};
+
+type ExternalConditionDetailState = {
+  conditionId?: string;
+  state: "idle" | "loading" | "loaded" | "error";
+  condition?: ExternalCondition;
+};
+
+const DETAIL_ITEM_LIMIT = 20;
+
+function InvestigationArtifacts({
+  artifacts,
+  selectedId,
+  detail,
+  onSelect,
+}: {
+  artifacts: InvestigationArtifactSummary[];
+  selectedId?: string;
+  detail: InvestigationDetailState;
+  onSelect: (artifactId: string) => void;
+}) {
   return (
     <section className="control-plane-support-card" aria-labelledby="investigations-heading">
       <span className="eyebrow">Immutable evidence</span>
@@ -218,21 +352,43 @@ function InvestigationArtifacts({ artifacts }: { artifacts: InvestigationArtifac
         <ul className="control-plane-support-list">
           {artifacts.map((artifact) => (
             <li key={artifact.artifact_id}>
-              <strong>{artifact.question}</strong>
-              <span>{artifact.findings.length} findings · {artifact.recommendations.length} recommendations</span>
-              <small>
-                {localTime(artifact.created_at_ms)} · {artifact.sensitivity} · {artifact.base_sha.slice(0, 12)}
-              </small>
+              <button
+                className={`control-plane-support-item ${selectedId === artifact.artifact_id ? "selected" : ""}`}
+                type="button"
+                aria-pressed={selectedId === artifact.artifact_id}
+                onClick={() => onSelect(artifact.artifact_id)}
+              >
+                <strong>{artifact.question}</strong>
+                <span>{artifact.finding_count} findings · {artifact.recommendation_count} recommendations</span>
+                <small>
+                  {localTime(artifact.created_at_ms)} · {artifact.sensitivity} · {artifact.base_sha.slice(0, 12)}
+                </small>
+              </button>
             </li>
           ))}
         </ul>
       )}
+      <InvestigationDetail artifactId={selectedId} detail={detail} onLoad={onSelect} />
       <p className="control-plane-note">Artifacts are evidence records. They cannot create implementation work or grant mutable custody.</p>
     </section>
   );
 }
 
-function ExternalConditions({ conditions }: { conditions: ExternalCondition[] }) {
+function ExternalConditions({
+  conditions,
+  selectedId,
+  detail,
+  history,
+  onSelect,
+  onLoadHistory,
+}: {
+  conditions: ExternalConditionSummary[];
+  selectedId?: string;
+  detail: ExternalConditionDetailState;
+  history: ConditionHistory;
+  onSelect: (conditionId: string) => void;
+  onLoadHistory: (conditionId: string) => void;
+}) {
   return (
     <section className="control-plane-support-card" aria-labelledby="conditions-heading">
       <span className="eyebrow">Passive waits</span>
@@ -243,16 +399,176 @@ function ExternalConditions({ conditions }: { conditions: ExternalCondition[] })
         <ul className="control-plane-support-list">
           {conditions.map((condition) => (
             <li key={condition.condition_id}>
-              <strong>{condition.adapter.replaceAll("_", " ")} · {condition.state}</strong>
-              <span>{condition.owner_type}:{condition.owner_id} · sequence {condition.sequence}</span>
-              <small>{condition.last_observation ? localTime(condition.last_observation.observed_at_ms) : "No observation recorded"}</small>
+              <button
+                className={`control-plane-support-item ${selectedId === condition.condition_id ? "selected" : ""}`}
+                type="button"
+                aria-pressed={selectedId === condition.condition_id}
+                onClick={() => onSelect(condition.condition_id)}
+              >
+                <strong>{condition.adapter.replaceAll("_", " ")} · {condition.state}</strong>
+                <span>{condition.owner_type}:{condition.owner_id} · sequence {condition.sequence}</span>
+                <small>{condition.last_observed_at_ms !== null ? localTime(condition.last_observed_at_ms) : "No observation recorded"}</small>
+              </button>
             </li>
           ))}
         </ul>
       )}
+      <ExternalConditionDetail
+        conditionId={selectedId}
+        detail={detail}
+        history={history}
+        onLoadDetail={onSelect}
+        onLoadHistory={onLoadHistory}
+      />
       <p className="control-plane-note">These are stored observations only. This view does not poll a provider, wake work, or execute a result.</p>
     </section>
   );
+}
+
+export function InvestigationDetail({
+  artifactId,
+  detail,
+  onLoad,
+}: {
+  artifactId?: string;
+  detail: InvestigationDetailState;
+  onLoad: (artifactId: string) => void;
+}) {
+  if (!artifactId) {
+    return <p className="control-plane-empty-detail">Select an investigation to inspect its bounded evidence and decisions.</p>;
+  }
+  if (detail.artifactId !== artifactId || detail.state === "idle") {
+    return <button className="button secondary" type="button" onClick={() => onLoad(artifactId)}>Load immutable evidence detail</button>;
+  }
+  if (detail.state === "loading") {
+    return <p className="control-plane-empty-detail">Loading immutable evidence detail…</p>;
+  }
+  if (detail.state === "error" || !detail.artifact) {
+    return <button className="button secondary" type="button" onClick={() => onLoad(artifactId)}>Retry immutable evidence detail</button>;
+  }
+  const artifact = detail.artifact;
+  return (
+    <section className="control-plane-record-detail" aria-live="polite" aria-label="Selected investigation detail">
+      <h3>Selected investigation</h3>
+      <dl className="control-plane-facts compact">
+        <div><dt>Artifact</dt><dd className="mono">{artifact.artifact_id}</dd></div>
+        <div><dt>Run / task / attempt</dt><dd className="mono">{artifact.run_id} / {artifact.task_id} / {artifact.attempt_id}</dd></div>
+        <div><dt>Scope</dt><dd>{artifact.scope.owned_read_paths.join(", ")}</dd></div>
+        <div><dt>Forbidden paths</dt><dd>{artifact.scope.forbidden_paths.length ? artifact.scope.forbidden_paths.join(", ") : "None recorded"}</dd></div>
+        <div><dt>Budget</dt><dd>{artifact.scope.time_budget_ms.toLocaleString()} ms · {artifact.scope.token_budget.toLocaleString()} tokens</dd></div>
+      </dl>
+      <DetailList
+        heading="Findings"
+        empty="No findings recorded."
+        values={artifact.findings.map((finding) => (
+          <><strong>{finding.classification} · {finding.confidence_milli / 10}% · {finding.risk}</strong><span>{finding.summary}</span><small>Evidence: {joinOrNone(finding.evidence_refs)} · Affected: {joinOrNone(finding.affected_refs)}</small></>
+        ))}
+      />
+      <DetailList
+        heading="Recommendations"
+        empty="No recommendations recorded."
+        values={artifact.recommendations.map((recommendation) => (
+          <><strong>{recommendation.required_authority} · {recommendation.risk}</strong><span>{recommendation.summary}</span><small>Next verification: {recommendation.next_verification}</small></>
+        ))}
+      />
+      <DetailList
+        heading="Decision inventory"
+        empty="No unresolved decisions recorded."
+        values={artifact.decision_inventory.map((decision) => (
+          <><strong>{decision.required_actor} · {decision.state}</strong><span>{decision.question}</span><small>{decision.independent_work_can_continue ? "Independent work may continue" : "Blocks independent work"} · {decision.recommended_option ? `Recommended: ${decision.recommended_option}` : "No recommendation"}</small></>
+        ))}
+      />
+      <DetailList heading="Limitations" empty="No limitations recorded." values={artifact.limitations.map((value) => <span>{value}</span>)} />
+      <DetailList heading="Rejected hypotheses" empty="No rejected hypotheses recorded." values={artifact.rejected_hypotheses.map((value) => <span>{value}</span>)} />
+    </section>
+  );
+}
+
+export function ExternalConditionDetail({
+  conditionId,
+  detail,
+  history,
+  onLoadDetail,
+  onLoadHistory,
+}: {
+  conditionId?: string;
+  detail: ExternalConditionDetailState;
+  history: ConditionHistory;
+  onLoadDetail: (conditionId: string) => void;
+  onLoadHistory: (conditionId: string) => void;
+}) {
+  if (!conditionId) {
+    return <p className="control-plane-empty-detail">Select an external condition to inspect its source-owned history.</p>;
+  }
+  if (detail.conditionId !== conditionId || detail.state === "idle") {
+    return <button className="button secondary" type="button" onClick={() => onLoadDetail(conditionId)}>Load passive condition detail</button>;
+  }
+  if (detail.state === "loading") {
+    return <p className="control-plane-empty-detail">Loading passive condition detail…</p>;
+  }
+  if (detail.state === "error" || !detail.condition) {
+    return <button className="button secondary" type="button" onClick={() => onLoadDetail(conditionId)}>Retry passive condition detail</button>;
+  }
+  const condition = detail.condition;
+  const hasCurrentHistory = history.conditionId === condition.condition_id;
+  return (
+    <section className="control-plane-record-detail" aria-live="polite" aria-label="Selected external condition detail">
+      <h3>Selected external condition</h3>
+      <dl className="control-plane-facts compact">
+        <div><dt>Owner</dt><dd className="mono">{condition.owner_type}:{condition.owner_id}</dd></div>
+        <div><dt>Source</dt><dd className="mono">{condition.adapter}:{condition.source_id}</dd></div>
+        <div><dt>State</dt><dd>{condition.state} · sequence {condition.sequence} · version {condition.version}</dd></div>
+        <div><dt>Recorded timing</dt><dd>{condition.poll_policy.initial_ms.toLocaleString()}–{condition.poll_policy.maximum_ms.toLocaleString()} ms · {condition.poll_policy.deadline_ms !== null ? localTime(condition.poll_policy.deadline_ms) : "No deadline"}</dd></div>
+        <div><dt>Last observation</dt><dd>{condition.last_observation ? `${condition.last_observation.state} at ${localTime(condition.last_observation.observed_at_ms)}` : "None recorded"}</dd></div>
+      </dl>
+      {!hasCurrentHistory || history.state === "idle" ? (
+        <button className="button secondary" type="button" onClick={() => onLoadHistory(condition.condition_id)}>
+          Load recorded observation history
+        </button>
+      ) : history.state === "loading" ? (
+        <p className="control-plane-note">Loading recorded observation history…</p>
+      ) : history.state === "error" ? (
+        <button className="button secondary" type="button" onClick={() => onLoadHistory(condition.condition_id)}>
+          Retry recorded observation history
+        </button>
+      ) : (
+        <DetailList
+          heading="Observation history"
+          empty="No observations recorded."
+          values={history.observations.map((observation) => (
+            <><strong>{observation.state} · sequence {observation.sequence}</strong><span>{localTime(observation.observed_at_ms)}</span><small className="mono">{observation.source_event_id}</small></>
+          ))}
+        />
+      )}
+    </section>
+  );
+}
+
+function DetailList({
+  heading,
+  empty,
+  values,
+}: {
+  heading: string;
+  empty: string;
+  values: ReactNode[];
+}) {
+  const visible = values.slice(0, DETAIL_ITEM_LIMIT);
+  return (
+    <section className="control-plane-detail-list">
+      <h4>{heading}</h4>
+      {visible.length ? (
+        <ul>
+          {visible.map((value, index) => <li key={index}>{value}</li>)}
+          {values.length > visible.length && <li className="control-plane-note">{values.length - visible.length} additional bounded records are not expanded in this view.</li>}
+        </ul>
+      ) : <p className="control-plane-note">{empty}</p>}
+    </section>
+  );
+}
+
+function joinOrNone(values: string[]) {
+  return values.length ? values.slice(0, DETAIL_ITEM_LIMIT).join(", ") : "None recorded";
 }
 
 function AttentionDetail({

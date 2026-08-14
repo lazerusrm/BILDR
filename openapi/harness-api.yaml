@@ -392,10 +392,10 @@ paths:
           schema: {type: integer, minimum: 1, maximum: 200, default: 50}
       responses:
         '200':
-          description: Immutable investigation artifacts in stable newest-first order.
+          description: Compact immutable artifact summaries in stable newest-first order. Retrieve the selected artifact by ID for bounded evidence detail.
           content:
             application/json:
-              schema: {type: array, items: {$ref: '#/components/schemas/InvestigationArtifact'}}
+              schema: {type: array, items: {$ref: '#/components/schemas/InvestigationArtifactSummary'}}
   /investigations/{artifactId}:
     get:
       tags: [Investigations]
@@ -426,10 +426,10 @@ paths:
           schema: {type: integer, minimum: 1, maximum: 200, default: 50}
       responses:
         '200':
-          description: Current passive condition records in stable newest-first order.
+          description: Compact passive condition summaries in stable newest-first order. Retrieve the selected condition or its history explicitly for adapter detail.
           content:
             application/json:
-              schema: {type: array, items: {$ref: '#/components/schemas/ExternalCondition'}}
+              schema: {type: array, items: {$ref: '#/components/schemas/ExternalConditionSummary'}}
   /external-conditions/{conditionId}:
     get:
       tags: [ExternalConditions]
@@ -1667,6 +1667,24 @@ components:
         artifact_refs: {type: array, maxItems: 1000, items: {type: string, maxLength: 160}}
         created_at_ms: {type: integer, minimum: 0}
         sha256: {$ref: '#/components/schemas/Digest'}
+    InvestigationArtifactSummary:
+      type: object
+      additionalProperties: false
+      required: [schema, artifact_id, run_id, task_id, attempt_id, question, sensitivity, base_sha, finding_count, recommendation_count, decision_count, created_at_ms, artifact_sha256]
+      properties:
+        schema: {const: harness.investigation-artifact-summary.v1}
+        artifact_id: {$ref: '#/components/schemas/OpaqueId'}
+        run_id: {$ref: '#/components/schemas/OpaqueId'}
+        task_id: {$ref: '#/components/schemas/OpaqueId'}
+        attempt_id: {$ref: '#/components/schemas/OpaqueId'}
+        question: {type: string, minLength: 1, maxLength: 4000}
+        sensitivity: {enum: [public, internal, restricted]}
+        base_sha: {type: string, pattern: '^[0-9a-f]{40}$'}
+        finding_count: {type: integer, minimum: 0, maximum: 200}
+        recommendation_count: {type: integer, minimum: 0, maximum: 100}
+        decision_count: {type: integer, minimum: 0, maximum: 100}
+        created_at_ms: {type: integer, minimum: 0}
+        artifact_sha256: {$ref: '#/components/schemas/Digest'}
     ExternalConditionPollPolicy:
       type: object
       additionalProperties: false
@@ -1713,6 +1731,26 @@ components:
         opened_at_ms: {type: integer, minimum: 0}
         updated_at_ms: {type: integer, minimum: 0}
         sha256: {$ref: '#/components/schemas/Digest'}
+    ExternalConditionSummary:
+      type: object
+      additionalProperties: false
+      required: [schema, condition_id, owner_type, owner_id, adapter, source_id, state, sequence, poll_policy, last_observation_state, last_observed_at_ms, version, opened_at_ms, updated_at_ms, condition_sha256]
+      properties:
+        schema: {const: harness.external-condition-summary.v1}
+        condition_id: {$ref: '#/components/schemas/OpaqueId'}
+        owner_type: {enum: [run, task, attempt]}
+        owner_id: {$ref: '#/components/schemas/OpaqueId'}
+        adapter: {enum: [ci_check, review_state, credential_availability, time_gate, hardware_capacity, service_availability]}
+        source_id: {$ref: '#/components/schemas/OpaqueId'}
+        state: {enum: [open, satisfied, unsatisfied, unknown, cancelled]}
+        sequence: {type: integer, minimum: 0}
+        poll_policy: {$ref: '#/components/schemas/ExternalConditionPollPolicy'}
+        last_observation_state: {type: [string, 'null'], enum: [open, satisfied, unsatisfied, unknown, cancelled, null]}
+        last_observed_at_ms: {type: [integer, 'null'], minimum: 0}
+        version: {type: integer, minimum: 1}
+        opened_at_ms: {type: integer, minimum: 0}
+        updated_at_ms: {type: integer, minimum: 0}
+        condition_sha256: {$ref: '#/components/schemas/Digest'}
     AcknowledgeAttentionRequest:
       type: object
       additionalProperties: false

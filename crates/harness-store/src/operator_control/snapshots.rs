@@ -535,8 +535,10 @@ fn investigation_rows(
     let rows = statement
         .query_map([SECTION_ROW_LIMIT], |row| {
             let artifact = checked_artifact_row(row.get(0)?, row.get(1)?)?;
-            serde_json::to_value(artifact)
-                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+            serde_json::to_value(harness_domain::InvestigationArtifactSummary::from(
+                &artifact,
+            ))
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok((
@@ -562,7 +564,7 @@ fn external_condition_rows(
     let rows = statement
         .query_map([SECTION_ROW_LIMIT], |row| {
             let condition = checked_condition_row(row.get(0)?, row.get(1)?)?;
-            serde_json::to_value(condition)
+            serde_json::to_value(harness_domain::ExternalConditionSummary::from(&condition))
                 .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
         })?
         .collect::<Result<Vec<_>, _>>()?;

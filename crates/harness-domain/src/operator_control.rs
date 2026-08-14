@@ -818,6 +818,50 @@ impl InvestigationArtifact {
     }
 }
 
+/// Bounded projection used by list and snapshot views. The full immutable
+/// artifact is retrieved only by its exact ID after an operator explicitly
+/// selects it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvestigationArtifactSummary {
+    pub schema: String,
+    pub artifact_id: InvestigationArtifactId,
+    pub run_id: String,
+    pub task_id: String,
+    pub attempt_id: String,
+    pub question: String,
+    pub sensitivity: InvestigationSensitivity,
+    pub base_sha: String,
+    pub finding_count: u32,
+    pub recommendation_count: u32,
+    pub decision_count: u32,
+    pub created_at_ms: i64,
+    pub artifact_sha256: String,
+}
+
+impl From<&InvestigationArtifact> for InvestigationArtifactSummary {
+    fn from(artifact: &InvestigationArtifact) -> Self {
+        Self {
+            schema: "harness.investigation-artifact-summary.v1".to_owned(),
+            artifact_id: artifact.artifact_id.clone(),
+            run_id: artifact.run_id.clone(),
+            task_id: artifact.task_id.clone(),
+            attempt_id: artifact.attempt_id.clone(),
+            question: artifact.question.clone(),
+            sensitivity: artifact.sensitivity,
+            base_sha: artifact.base_sha.clone(),
+            finding_count: u32::try_from(artifact.findings.len())
+                .expect("investigation finding count is contract-bounded"),
+            recommendation_count: u32::try_from(artifact.recommendations.len())
+                .expect("investigation recommendation count is contract-bounded"),
+            decision_count: u32::try_from(artifact.decision_inventory.len())
+                .expect("investigation decision count is contract-bounded"),
+            created_at_ms: artifact.created_at_ms,
+            artifact_sha256: artifact.sha256.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MaterialProgressKind {
@@ -1141,6 +1185,54 @@ impl ExternalCondition {
             });
         }
         Ok(())
+    }
+}
+
+/// Bounded projection used by condition lists and snapshots. It deliberately
+/// excludes adapter specifications and untrusted observation payloads; those
+/// are available only from the exact condition/observation read endpoints.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalConditionSummary {
+    pub schema: String,
+    pub condition_id: ExternalConditionId,
+    pub owner_type: ExternalConditionOwnerType,
+    pub owner_id: String,
+    pub adapter: ExternalConditionAdapter,
+    pub source_id: String,
+    pub state: ExternalConditionState,
+    pub sequence: u64,
+    pub poll_policy: ExternalConditionPollPolicy,
+    pub last_observation_state: Option<ExternalConditionState>,
+    pub last_observed_at_ms: Option<i64>,
+    pub version: u64,
+    pub opened_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub condition_sha256: String,
+}
+
+impl From<&ExternalCondition> for ExternalConditionSummary {
+    fn from(condition: &ExternalCondition) -> Self {
+        Self {
+            schema: "harness.external-condition-summary.v1".to_owned(),
+            condition_id: condition.condition_id.clone(),
+            owner_type: condition.owner_type,
+            owner_id: condition.owner_id.clone(),
+            adapter: condition.adapter,
+            source_id: condition.source_id.clone(),
+            state: condition.state,
+            sequence: condition.sequence,
+            poll_policy: condition.poll_policy.clone(),
+            last_observation_state: condition.last_observation.as_ref().map(|item| item.state),
+            last_observed_at_ms: condition
+                .last_observation
+                .as_ref()
+                .map(|item| item.observed_at_ms),
+            version: condition.version,
+            opened_at_ms: condition.opened_at_ms,
+            updated_at_ms: condition.updated_at_ms,
+            condition_sha256: condition.sha256.clone(),
+        }
     }
 }
 

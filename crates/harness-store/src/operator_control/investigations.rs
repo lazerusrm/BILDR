@@ -3,7 +3,9 @@
 //! Artifacts are controller-produced evidence records, never browser input and
 //! never a route to task creation, publication, or mutable worktree custody.
 
-use harness_domain::{InvestigationArtifact, InvestigationArtifactId};
+use harness_domain::{
+    InvestigationArtifact, InvestigationArtifactId, InvestigationArtifactSummary,
+};
 use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
@@ -109,6 +111,24 @@ impl Store {
                 .collect::<Result<Vec<_>, _>>()?,
         };
         Ok(rows)
+    }
+
+    /// Lists compact, integrity-checked summaries for browser and snapshot
+    /// projections. Callers must explicitly read one artifact by ID before
+    /// receiving findings, recommendations, or other bounded evidence prose.
+    pub fn list_investigation_artifact_summaries(
+        &self,
+        run_id: Option<&str>,
+        task_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<InvestigationArtifactSummary>, StoreError> {
+        self.list_investigation_artifacts(run_id, task_id, limit)
+            .map(|artifacts| {
+                artifacts
+                    .iter()
+                    .map(InvestigationArtifactSummary::from)
+                    .collect()
+            })
     }
 }
 
@@ -240,12 +260,24 @@ mod tests {
                 .expect("list"),
             vec![artifact]
         );
+        assert_eq!(
+            store
+                .list_investigation_artifact_summaries(Some("run_a"), Some("task_a"), 10)
+                .expect("summary list")[0]
+                .finding_count,
+            1
+        );
         let snapshot = store.control_plane_snapshot().expect("snapshot");
         assert_eq!(
             snapshot.investigations.state,
             harness_domain::SnapshotSectionState::Current
         );
         assert_eq!(snapshot.investigations.rows.len(), 1);
+        assert_eq!(
+            snapshot.investigations.rows[0]["schema"],
+            "harness.investigation-artifact-summary.v1"
+        );
+        assert!(snapshot.investigations.rows[0].get("findings").is_none());
         assert_eq!(snapshot.source_cursors["investigation_artifacts"], 1);
     }
 }
