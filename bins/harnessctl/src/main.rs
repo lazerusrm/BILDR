@@ -87,6 +87,13 @@ enum Command {
     InterventionReceipts { episode_id: String },
     /// Inspect one bounded, immutable causal trace. This cannot create a link or change controller state.
     Trace { trace_id: String },
+    /// Inspect or change the local notification-presentation preference. It never changes controller authority.
+    Presence {
+        #[command(subcommand)]
+        command: PresenceCommand,
+    },
+    /// Inspect bounded in-product notification-mirror receipts. This cannot deliver, retry, suppress, or resolve attention.
+    NotificationDeliveries,
     /// Show the bounded factual topology for one run.
     Topology { run_id: String },
     /// Inspect reconciliation inventory records. These commands cannot apply recovery actions.
@@ -104,6 +111,22 @@ enum RecoveryCommand {
     },
     Show {
         episode_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PresenceCommand {
+    Show {
+        #[arg(long, default_value = "local_operator")]
+        operator_id: String,
+    },
+    Set {
+        #[arg(long, default_value = "local_operator")]
+        operator_id: String,
+        #[arg(value_parser = ["interactive", "focus", "unattended"])]
+        mode: String,
+        #[arg(long)]
+        expected_version: u64,
     },
 }
 
@@ -741,6 +764,8 @@ async fn execute(api: &ApiClient, command: Command) -> Result<Value> {
             operator_control::intervention_receipts(api, episode_id).await
         }
         Command::Trace { trace_id } => operator_control::trace(api, trace_id).await,
+        Command::Presence { command } => operator_control::presence(api, command).await,
+        Command::NotificationDeliveries => operator_control::notification_deliveries(api).await,
         Command::Topology { run_id } => operator_control::topology(api, run_id).await,
         Command::Recovery { command } => operator_control::recovery(api, command).await,
         Command::Worktree { command } => match command {

@@ -102,7 +102,8 @@ trace lookup; this is receipt inspection only, not yet full trace propagation
 through every producer. Supervisor snapshots receive bounded control-plane
 custody facts and restrict recommendations on uncertain custody. The browser
 and CLI can read these projections without acquiring work or changing
-controller state.
+controller state. The CLI can version-check the local presentation-only
+presence preference; it cannot deliver, suppress, retry, or resolve an item.
 
 Desktop notification delivery/batching, active intervention execution,
 reconciliation proof consumption, external wake adapters, adaptive supervisor

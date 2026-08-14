@@ -7,7 +7,10 @@
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use super::{ApiClient, AttentionCommand, ConditionCommand, InvestigationCommand, RecoveryCommand};
+use super::{
+    ApiClient, AttentionCommand, ConditionCommand, InvestigationCommand, PresenceCommand,
+    RecoveryCommand,
+};
 
 pub(super) async fn return_view(api: &ApiClient, operator_id: String) -> Result<Value> {
     let operator_id: String =
@@ -132,6 +135,41 @@ pub(super) async fn trace(api: &ApiClient, trace_id: String) -> Result<Value> {
     let trace_id: String = url::form_urlencoded::byte_serialize(trace_id.as_bytes()).collect();
     api.get(&format!("/api/v1/traces/{trace_id}?limit=50"))
         .await
+}
+
+/// Presentation-only local preference. The expected version prevents the CLI
+/// from overwriting a more recent operator update and the API retains all
+/// session, CSRF, and same-origin protections.
+pub(super) async fn presence(api: &ApiClient, command: PresenceCommand) -> Result<Value> {
+    match command {
+        PresenceCommand::Show { operator_id } => {
+            let operator_id: String =
+                url::form_urlencoded::byte_serialize(operator_id.as_bytes()).collect();
+            api.get(&format!(
+                "/api/v1/operator-presence?operator_id={operator_id}"
+            ))
+            .await
+        }
+        PresenceCommand::Set {
+            operator_id,
+            mode,
+            expected_version,
+        } => {
+            api.post(
+                "/api/v1/operator-presence",
+                json!({
+                    "operator_id": operator_id,
+                    "mode": mode,
+                    "expected_version": expected_version,
+                }),
+            )
+            .await
+        }
+    }
+}
+
+pub(super) async fn notification_deliveries(api: &ApiClient) -> Result<Value> {
+    api.get("/api/v1/notification-deliveries?limit=50").await
 }
 
 pub(super) async fn topology(api: &ApiClient, run_id: String) -> Result<Value> {
