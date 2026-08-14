@@ -99,6 +99,8 @@ describe("AttentionCenter", () => {
     expect(markup).toContain("does not poll a provider, wake work, or execute a result");
     expect(markup).toContain("Material progress");
     expect(markup).toContain("Liveness episodes");
+    expect(markup).toContain("Delivery mirror");
+    expect(markup).toContain("Loading local presence preference");
     expect(markup).toContain("Run topology");
   });
 

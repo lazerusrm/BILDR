@@ -8,7 +8,7 @@ use harness_domain::{
     AttentionItem, AttentionSeverity, NotificationClass, NotificationDelivery,
     NotificationDeliveryId, NotificationState, OperatorPresence, OperatorPresenceMode, now_ms,
 };
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 use crate::{Store, StoreError};
@@ -37,7 +37,20 @@ impl Store {
         mode: OperatorPresenceMode,
         expected_version: u64,
     ) -> Result<OperatorPresence, StoreError> {
-        let current = self.operator_presence(operator_id)?;
+        validate_operator(operator_id)?;
+        // Read and write under one immediate transaction. A missing row still
+        // has the canonical version-one default, so competing first writes
+        // serialize into a success and a normal optimistic-version conflict.
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = transaction
+            .query_row(
+                "SELECT payload_json,payload_sha256 FROM operator_presence WHERE operator_id=?1",
+                [operator_id],
+                |row| checked_presence_row(row.get(0)?, row.get(1)?),
+            )
+            .optional()?
+            .unwrap_or_else(|| default_presence(operator_id));
         if current.version != expected_version {
             return Err(StoreError::Conflict(format!(
                 "operator presence has version {}, expected {expected_version}",
@@ -55,15 +68,15 @@ impl Store {
         next.sha256 = next.digest().map_err(control_error)?;
         next.validate().map_err(control_error)?;
         let raw = serde_json::to_string(&next)?;
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
-        if expected_version == 1
-            && transaction.query_row(
-                "SELECT count(*) FROM operator_presence WHERE operator_id=?1",
+        let exists = transaction
+            .query_row(
+                "SELECT 1 FROM operator_presence WHERE operator_id=?1",
                 [operator_id],
-                |row| row.get::<_, i64>(0),
-            )? == 0
-        {
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
             transaction.execute("INSERT INTO operator_presence(operator_id,mode,version,updated_at,payload_json,payload_sha256) VALUES(?1,?2,?3,?4,?5,?6)", params![operator_id, mode_name(mode), to_i64(next.version)?, next.updated_at_ms, raw, digest(&serde_json::to_string(&next)?)])?;
         } else {
             let changed = transaction.execute("UPDATE operator_presence SET mode=?1,version=?2,updated_at=?3,payload_json=?4,payload_sha256=?5 WHERE operator_id=?6 AND version=?7", params![mode_name(mode), to_i64(next.version)?, next.updated_at_ms, raw, digest(&serde_json::to_string(&next)?), operator_id, to_i64(expected_version)?])?;
@@ -261,6 +274,8 @@ fn digest(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+
     use harness_domain::{
         AttentionCategory, AttentionItemId, AttentionResurfacingPolicy, AttentionSourceRef,
         AttentionSourceType, AttentionState,
@@ -288,6 +303,31 @@ mod tests {
             Err(StoreError::Conflict(_))
         ));
         assert!(store.list_notification_deliveries(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_first_presence_updates_return_a_version_conflict() {
+        let temp = TempDir::new().expect("temp");
+        let store = Arc::new(Store::in_memory(&temp.path().join("artifacts")).expect("store"));
+        let barrier = Arc::new(Barrier::new(2));
+        let first_store = Arc::clone(&store);
+        let first_barrier = Arc::clone(&barrier);
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_store.set_operator_presence("operator-a", OperatorPresenceMode::Focus, 1)
+        });
+        barrier.wait();
+        let second = store.set_operator_presence("operator-a", OperatorPresenceMode::Unattended, 1);
+        let first = first.join().expect("join");
+        let outcomes = [first, second];
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Err(StoreError::Conflict(_))))
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -14,6 +14,9 @@ import type {
   InterventionReceipt,
   LivenessEpisode,
   MaterialProgressEvent,
+  NotificationDelivery,
+  OperatorPresence,
+  OperatorPresenceMode,
   ReturnView,
   SnapshotSection,
   TopologySnapshot,
@@ -27,6 +30,8 @@ export function AttentionCenter() {
   const [conditions, setConditions] = useState<ExternalConditionSummary[]>([]);
   const [progress, setProgress] = useState<MaterialProgressEvent[]>([]);
   const [liveness, setLiveness] = useState<LivenessEpisode[]>([]);
+  const [presence, setPresence] = useState<OperatorPresence>();
+  const [notificationDeliveries, setNotificationDeliveries] = useState<NotificationDelivery[]>([]);
   const [selectedLivenessEpisodeId, setSelectedLivenessEpisodeId] = useState<string>();
   const [interventionHistory, setInterventionHistory] = useState<InterventionHistory>({
     episodeId: undefined,
@@ -61,7 +66,7 @@ export function AttentionCenter() {
   const load = useCallback(async () => {
     setBusy("refresh");
     try {
-      const [nextSnapshot, nextReturnView, nextPage, nextInvestigations, nextConditions, nextProgress, nextLiveness] = await Promise.all([
+      const [nextSnapshot, nextReturnView, nextPage, nextInvestigations, nextConditions, nextProgress, nextLiveness, nextPresence, nextNotificationDeliveries] = await Promise.all([
         api.controlPlaneSnapshot(),
         api.controlPlaneReturnView(),
         api.attention(),
@@ -69,6 +74,8 @@ export function AttentionCenter() {
         api.externalConditions(),
         api.materialProgress(),
         api.liveness(),
+        api.operatorPresence(),
+        api.notificationDeliveries(),
       ]);
       setSnapshot(nextSnapshot);
       setReturnView(nextReturnView);
@@ -77,6 +84,8 @@ export function AttentionCenter() {
       setConditions(nextConditions);
       setProgress(nextProgress);
       setLiveness(nextLiveness);
+      setPresence(nextPresence);
+      setNotificationDeliveries(nextNotificationDeliveries);
       const runIds = nextSnapshot.runs.rows
         .map((row) => typeof row.run_id === "string" ? row.run_id : undefined)
         .filter((value): value is string => Boolean(value));
@@ -257,6 +266,21 @@ export function AttentionCenter() {
     }
   }, []);
 
+  const updatePresence = async (mode: OperatorPresenceMode) => {
+    if (!presence || presence.mode === mode) return;
+    setBusy("presence");
+    try {
+      const updated = await api.setOperatorPresence(mode, presence.version);
+      setPresence(updated);
+      setError("");
+    } catch (cause) {
+      setError(displayError(cause, "Presence changed elsewhere. Refresh before trying again."));
+      await load();
+    } finally {
+      setBusy("");
+    }
+  };
+
   return (
     <div className="page control-plane-page">
       <header className="page-title">
@@ -311,6 +335,12 @@ export function AttentionCenter() {
         </button>
       </section>
       <section className="control-plane-support" aria-label="Operator control records">
+        <PresenceAndNotifications
+          presence={presence}
+          deliveries={notificationDeliveries}
+          busy={busy === "presence"}
+          onPresence={(mode) => void updatePresence(mode)}
+        />
         <MaterialProgressTimeline events={progress} />
         <LivenessEpisodes
           episodes={liveness}
@@ -380,6 +410,41 @@ export function AttentionCenter() {
         </p>
       ) : null}
     </div>
+  );
+}
+
+function PresenceAndNotifications({
+  presence,
+  deliveries,
+  busy,
+  onPresence,
+}: {
+  presence?: OperatorPresence;
+  deliveries: NotificationDelivery[];
+  busy: boolean;
+  onPresence: (mode: OperatorPresenceMode) => void;
+}) {
+  return (
+    <section className="control-plane-support-card" aria-labelledby="notification-heading">
+      <span className="eyebrow">Presentation only</span>
+      <h2 id="notification-heading">Delivery mirror</h2>
+      {!presence ? <p className="empty-state">Loading local presence preference…</p> : (
+        <>
+          <p className="control-plane-note">Local presence is currently <strong>{presence.mode}</strong>. It is version {presence.version} and does not change controller authority.</p>
+          <div className="control-plane-run-picker" aria-label="Set local presence preference">
+            {(["interactive", "focus", "unattended"] as const).map((mode) => (
+              <button key={mode} className={`button secondary ${presence.mode === mode ? "selected" : ""}`} type="button" aria-pressed={presence.mode === mode} disabled={busy} onClick={() => onPresence(mode)}>{mode}</button>
+            ))}
+          </div>
+        </>
+      )}
+      {deliveries.length === 0 ? <p className="empty-state">No visible attention has been mirrored yet.</p> : (
+        <ul className="control-plane-support-list">
+          {deliveries.map((delivery) => <li key={delivery.delivery_id}><div className="control-plane-static-record"><strong>{delivery.class.replaceAll("_", " ")}</strong><span>{delivery.state} · {delivery.channel.replaceAll("_", " ")}</span><small>{localTime(delivery.created_at_ms)} · {delivery.source_event_id}</small></div></li>)}
+        </ul>
+      )}
+      <p className="control-plane-note">This first phase records an in-product mirror only. It does not batch, suppress, send a desktop alert, or close the source attention item.</p>
+    </section>
   );
 }
 

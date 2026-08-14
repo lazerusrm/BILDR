@@ -22,7 +22,10 @@ import type {
   InterventionReceipt,
   LivenessEpisode,
   MaterialProgressEvent,
+  NotificationDelivery,
   OutcomeVector,
+  OperatorPresence,
+  OperatorPresenceMode,
   OperatorSettings,
   Repository,
   RepositoryDiscovery,
@@ -216,6 +219,16 @@ class HarnessApi {
     this.get<InterventionReceipt[]>(
       `/liveness/${encodeURIComponent(episodeId)}/interventions?limit=50`,
     );
+  operatorPresence = () =>
+    this.get<OperatorPresence>("/operator-presence?operator_id=local_operator");
+  setOperatorPresence = (mode: OperatorPresenceMode, expectedVersion: number) =>
+    this.post<OperatorPresence>("/operator-presence", {
+      operator_id: "local_operator",
+      mode,
+      expected_version: expectedVersion,
+    });
+  notificationDeliveries = () =>
+    this.get<NotificationDelivery[]>("/notification-deliveries?limit=50");
   topology = (runId: string) =>
     this.get<TopologySnapshot>(
       `/runs/${encodeURIComponent(runId)}/topology`,

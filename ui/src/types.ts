@@ -848,6 +848,30 @@ export interface InterventionReceipt {
   sha256: string;
 }
 
+export type OperatorPresenceMode = "interactive" | "focus" | "unattended";
+
+export interface OperatorPresence {
+  schema: "harness.operator-presence.v1";
+  operator_id: string;
+  mode: OperatorPresenceMode;
+  version: number;
+  updated_at_ms: number;
+  sha256: string;
+}
+
+export interface NotificationDelivery {
+  schema: "harness.notification-delivery.v1";
+  delivery_id: string;
+  attention_id: string | null;
+  class: "critical" | "action_required" | "routine";
+  state: "pending" | "deferred" | "delivered" | "failed";
+  channel: "in_product_mirror";
+  source_event_id: string;
+  created_at_ms: number;
+  payload_sha256: string;
+  sha256: string;
+}
+
 export interface TopologyNode {
   id: string;
   kind: string;
