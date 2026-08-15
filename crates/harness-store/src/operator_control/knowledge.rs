@@ -6,9 +6,9 @@
 //! separate human-review pipeline accepts it.
 
 use harness_domain::{
-    ImprovementEventId, ImprovementRecordKind, ImprovementSchema, ImprovementState,
-    LivenessEpisode, LivenessObservation, LivenessObservationKind, LivenessState, RetentionClass,
-    SensitivityClass, now_ms,
+    CorrelationLink, CorrelationLinkId, ImprovementEventId, ImprovementRecordKind,
+    ImprovementSchema, ImprovementState, LivenessEpisode, LivenessObservation,
+    LivenessObservationKind, LivenessState, RetentionClass, SensitivityClass, TraceContext, now_ms,
 };
 use harness_learning::{
     CustodyState, KnowledgeFreshness, KnowledgeItemV1, KnowledgeKind, KnowledgeReview,
@@ -187,24 +187,85 @@ impl Store {
         item.verify()
             .map_err(|error| StoreError::Validation(error.to_string()))?;
         let payload = serde_json::to_value(&item)?;
-        let (record, _) = self.append_improvement_revision(&NewImprovementRevision {
-            id: format!("knowledge-revision-{identity}"),
-            aggregate_kind: ImprovementRecordKind::Knowledge,
-            aggregate_id: knowledge_id,
-            schema: ImprovementSchema::KnowledgeItemV1,
-            state: ImprovementState::Candidate,
-            payload_sha256: digest(&serde_json::to_string(&payload)?),
-            payload,
-            sensitivity: SensitivityClass::Internal,
-            retention_class: RetentionClass::Governance,
-            export_allowed: false,
-            idempotency_key: format!("knowledge:liveness:{identity}"),
-            event_id: ImprovementEventId::from(format!("knowledge-event-{identity}")),
-            source_raw_event_id: None,
-            source_domain_event_id: None,
+        let correlation_created_at = i64::try_from(created_at).map_err(|_| {
+            StoreError::Validation("liveness knowledge creation time is out of range".to_owned())
         })?;
+        let correlations = liveness_knowledge_candidate_correlations(
+            &sources,
+            &knowledge_id,
+            correlation_created_at,
+        )?;
+        let (record, _) = self.append_improvement_revision_with_correlations(
+            &NewImprovementRevision {
+                id: format!("knowledge-revision-{identity}"),
+                aggregate_kind: ImprovementRecordKind::Knowledge,
+                aggregate_id: knowledge_id,
+                schema: ImprovementSchema::KnowledgeItemV1,
+                state: ImprovementState::Candidate,
+                payload_sha256: digest(&serde_json::to_string(&payload)?),
+                payload,
+                sensitivity: SensitivityClass::Internal,
+                retention_class: RetentionClass::Governance,
+                export_allowed: false,
+                idempotency_key: format!("knowledge:liveness:{identity}"),
+                event_id: ImprovementEventId::from(format!("knowledge-event-{identity}")),
+                source_raw_event_id: None,
+                source_domain_event_id: None,
+            },
+            &correlations,
+        )?;
         Ok(record)
     }
+}
+
+fn liveness_knowledge_trace_id(knowledge_id: &str) -> String {
+    digest(&format!(
+        "harness.liveness-knowledge.trace.v1:{knowledge_id}"
+    ))[..32]
+        .to_owned()
+}
+
+/// A repeated-recovery candidate has four immutable observation sources. Keep
+/// those fan-in edges explicit on one candidate trace rather than inferring a
+/// recovery pattern from timestamp adjacency in a viewer.
+fn liveness_knowledge_candidate_correlations(
+    sources: &[RecoveredLivenessEpisode],
+    knowledge_id: &str,
+    created_at_ms: i64,
+) -> Result<Vec<CorrelationLink>, StoreError> {
+    let trace_id = liveness_knowledge_trace_id(knowledge_id);
+    let span_id = digest(&format!(
+        "harness.liveness-knowledge.span.v1:{knowledge_id}"
+    ));
+    let mut correlations = Vec::with_capacity(sources.len() * 2);
+    for source in sources {
+        for observation in [&source.confirmed_stall, &source.recovery] {
+            let link_id = CorrelationLinkId::parse(format!(
+                "correlation-{}",
+                &digest(&format!(
+                    "harness.liveness-knowledge.link.v1:{knowledge_id}:{}",
+                    observation.observation_id
+                ))[..48]
+            ))
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+            correlations.push(CorrelationLink {
+                schema: "harness.correlation-link.v1".to_owned(),
+                link_id,
+                trace: TraceContext {
+                    trace_id: trace_id.clone(),
+                    span_id: span_id[..16].to_owned(),
+                    parent_span_id: None,
+                },
+                from_kind: "liveness_observation".to_owned(),
+                from_id: observation.observation_id.to_string(),
+                to_kind: "knowledge_candidate".to_owned(),
+                to_id: knowledge_id.to_owned(),
+                relation: "supports_knowledge_candidate".to_owned(),
+                created_at_ms,
+            });
+        }
+    }
+    Ok(correlations)
 }
 
 fn recovered_liveness_episodes(
@@ -505,6 +566,16 @@ mod tests {
             receipt.kind == ReceiptKind::LivenessObservation
                 && receipt.custody == Some(CustodyState::Clean)
                 && receipt.split.is_none()
+        }));
+        let correlations = store
+            .correlation_links(&liveness_knowledge_trace_id(&item.knowledge_id), 10)
+            .expect("candidate trace");
+        assert_eq!(correlations.len(), 4);
+        assert!(correlations.iter().all(|link| {
+            link.from_kind == "liveness_observation"
+                && link.to_kind == "knowledge_candidate"
+                && link.to_id == item.knowledge_id
+                && link.relation == "supports_knowledge_candidate"
         }));
         assert_eq!(
             store

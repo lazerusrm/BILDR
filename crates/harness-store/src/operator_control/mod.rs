@@ -6,7 +6,7 @@
 
 mod approval;
 mod attention;
-mod correlation;
+pub(crate) mod correlation;
 mod external_conditions;
 mod investigations;
 mod knowledge;

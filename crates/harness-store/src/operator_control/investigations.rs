@@ -156,14 +156,10 @@ impl Store {
             model_family: input.model_family.clone(),
             runtime_class: input.runtime_class.clone(),
         };
-        let identity = digest(&serde_json::to_string(&json!({
-            "schema": "harness.investigation-knowledge-proposal.v1",
-            "artifact_id": artifact.artifact_id.to_string(),
-            "artifact_sha256": artifact.sha256.clone(),
-            "finding_id": finding.finding_id.clone(),
-            "scope": scope.clone(),
-        }))?);
+        let identity = investigation_knowledge_identity(&artifact, &finding.finding_id, &scope)?;
         let knowledge_id = format!("knowledge-investigation-{}", &identity[..32]);
+        let correlation =
+            investigation_knowledge_candidate_correlation_link(&artifact, &knowledge_id)?;
         let sensitivity = match artifact.sensitivity {
             InvestigationSensitivity::Public => SensitivityClass::Public,
             InvestigationSensitivity::Internal => SensitivityClass::Internal,
@@ -203,22 +199,25 @@ impl Store {
             .digest()
             .map_err(|error| StoreError::Validation(error.to_string()))?;
         let payload = serde_json::to_value(&item)?;
-        let (record, _) = self.append_improvement_revision(&NewImprovementRevision {
-            id: format!("knowledge-revision-{identity}"),
-            aggregate_kind: ImprovementRecordKind::Knowledge,
-            aggregate_id: knowledge_id,
-            schema: ImprovementSchema::KnowledgeItemV1,
-            state: ImprovementState::Candidate,
-            payload_sha256: digest(&serde_json::to_string(&payload)?),
-            payload,
-            sensitivity,
-            retention_class: RetentionClass::Governance,
-            export_allowed: false,
-            idempotency_key: format!("knowledge:investigation:{identity}"),
-            event_id: ImprovementEventId::from(format!("knowledge-event-{identity}")),
-            source_raw_event_id: None,
-            source_domain_event_id: None,
-        })?;
+        let (record, _) = self.append_improvement_revision_with_correlations(
+            &NewImprovementRevision {
+                id: format!("knowledge-revision-{identity}"),
+                aggregate_kind: ImprovementRecordKind::Knowledge,
+                aggregate_id: knowledge_id,
+                schema: ImprovementSchema::KnowledgeItemV1,
+                state: ImprovementState::Candidate,
+                payload_sha256: digest(&serde_json::to_string(&payload)?),
+                payload,
+                sensitivity,
+                retention_class: RetentionClass::Governance,
+                export_allowed: false,
+                idempotency_key: format!("knowledge:investigation:{identity}"),
+                event_id: ImprovementEventId::from(format!("knowledge-event-{identity}")),
+                source_raw_event_id: None,
+                source_domain_event_id: None,
+            },
+            &[correlation],
+        )?;
         Ok(record)
     }
 
@@ -327,6 +326,57 @@ fn investigation_artifact_correlation_link(
         to_kind: "investigation_artifact".to_owned(),
         to_id: artifact.artifact_id.to_string(),
         relation: "has_investigation_artifact".to_owned(),
+        created_at_ms: artifact.created_at_ms,
+    })
+}
+
+fn investigation_knowledge_identity(
+    artifact: &InvestigationArtifact,
+    finding_id: &str,
+    scope: &KnowledgeScope,
+) -> Result<String, StoreError> {
+    Ok(digest(&serde_json::to_string(&json!({
+        "schema": "harness.investigation-knowledge-proposal.v1",
+        "artifact_id": artifact.artifact_id.to_string(),
+        "artifact_sha256": artifact.sha256.clone(),
+        "finding_id": finding_id,
+        "scope": scope,
+    }))?))
+}
+
+/// A governed candidate inherits its source artifact's exact attempt trace.
+/// Its child span makes the artifact-to-candidate handoff explicit without
+/// allowing callers to choose a trace context or activate the candidate.
+fn investigation_knowledge_candidate_correlation_link(
+    artifact: &InvestigationArtifact,
+    knowledge_id: &str,
+) -> Result<CorrelationLink, StoreError> {
+    let artifact_correlation = investigation_artifact_correlation_link(artifact)?;
+    let span_id = digest(&format!(
+        "harness.investigation-knowledge.span.v1:{}:{}",
+        artifact.artifact_id, knowledge_id
+    ));
+    let link_id = CorrelationLinkId::parse(format!(
+        "correlation-{}",
+        &digest(&format!(
+            "harness.investigation-knowledge.link.v1:{}:{}",
+            artifact.artifact_id, knowledge_id
+        ))[..48]
+    ))
+    .map_err(|error| StoreError::Validation(error.to_string()))?;
+    Ok(CorrelationLink {
+        schema: "harness.correlation-link.v1".to_owned(),
+        link_id,
+        trace: TraceContext {
+            trace_id: artifact_correlation.trace.trace_id,
+            span_id: span_id[..16].to_owned(),
+            parent_span_id: Some(artifact_correlation.trace.span_id),
+        },
+        from_kind: "investigation_artifact".to_owned(),
+        from_id: artifact.artifact_id.to_string(),
+        to_kind: "knowledge_candidate".to_owned(),
+        to_id: knowledge_id.to_owned(),
+        relation: "proposes_knowledge_candidate".to_owned(),
         created_at_ms: artifact.created_at_ms,
     })
 }
@@ -626,6 +676,16 @@ mod tests {
         assert_eq!(item.evidence[0].kind, ReceiptKind::InvestigationArtifact);
         assert_eq!(item.evidence[0].revision_id, artifact.artifact_id.as_str());
         assert_eq!(item.evidence[0].digest, artifact.sha256);
+        let artifact_correlation =
+            investigation_artifact_correlation_link(&artifact).expect("artifact correlation");
+        let candidate_correlation =
+            investigation_knowledge_candidate_correlation_link(&artifact, &item.knowledge_id)
+                .expect("candidate correlation");
+        let links = store
+            .correlation_links(&artifact_correlation.trace.trace_id, 10)
+            .expect("artifact trace");
+        assert!(links.contains(&artifact_correlation));
+        assert!(links.contains(&candidate_correlation));
         assert_eq!(
             store
                 .current_knowledge_item(&item.knowledge_id)
@@ -644,6 +704,48 @@ mod tests {
                 .expect("idempotent candidate")
                 .id,
             record.id
+        );
+
+        let conflicting_input = NewInvestigationKnowledgeCandidate {
+            task_family: "operator_control_conflict".to_owned(),
+            ..input.clone()
+        };
+        let conflicting_scope = KnowledgeScope {
+            repository_id: repository_id.to_string(),
+            task_family: conflicting_input.task_family.clone(),
+            model_family: None,
+            runtime_class: None,
+        };
+        let conflicting_identity = investigation_knowledge_identity(
+            &artifact,
+            &conflicting_input.finding_id,
+            &conflicting_scope,
+        )
+        .expect("conflicting identity");
+        let conflicting_knowledge_id =
+            format!("knowledge-investigation-{}", &conflicting_identity[..32]);
+        let mut conflicting_link = investigation_knowledge_candidate_correlation_link(
+            &artifact,
+            &conflicting_knowledge_id,
+        )
+        .expect("conflicting correlation");
+        conflicting_link.relation = "different_relation".to_owned();
+        store
+            .record_correlation_link(&conflicting_link)
+            .expect("preexisting conflicting correlation");
+        assert!(matches!(
+            store.propose_knowledge_from_investigation(&conflicting_input),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(
+            store
+                .improvement_current_revision(
+                    ImprovementRecordKind::Knowledge,
+                    &conflicting_knowledge_id,
+                )
+                .expect("candidate rereads")
+                .is_none(),
+            "a correlation conflict must roll back the candidate revision"
         );
 
         let mut stale = input.clone();

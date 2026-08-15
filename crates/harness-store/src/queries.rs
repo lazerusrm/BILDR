@@ -5,13 +5,14 @@ use std::{
 
 use harness_domain::{
     ActivityItem, AgentSessionId, AgentSummary, ApprovalId, ApprovalSummary, ArtifactId, AttemptId,
-    CostConfidence, CostEstimate, DomainEvent, ImprovementRecordKind, ImprovementSchema,
-    ImprovementState, LatestAgentMessage, ModelUsageSummary, OutcomeConfidence, OutcomeHistory,
-    OutcomeId, OutcomeRevisionReceipt, OutcomeRevisionView, OutcomeSource, OutcomeSourceKind,
-    OutcomeVector, OutcomeVectorItem, OutcomeWireV1, PlanRevisionId, RepositoryId,
-    RepositorySummary, RetentionClass, RunId, RunPlan, RunState, RunSummary, SensitivityClass,
-    TaskId, TaskState, TaskSummary, TokenUsage, UsageBreakdown, UsageGroup, UsageSummary,
-    WorktreeId, WorktreeSummary, format_timestamp, now_ms, validate_operator_outcome_label,
+    CorrelationLink, CostConfidence, CostEstimate, DomainEvent, ImprovementRecordKind,
+    ImprovementSchema, ImprovementState, LatestAgentMessage, ModelUsageSummary, OutcomeConfidence,
+    OutcomeHistory, OutcomeId, OutcomeRevisionReceipt, OutcomeRevisionView, OutcomeSource,
+    OutcomeSourceKind, OutcomeVector, OutcomeVectorItem, OutcomeWireV1, PlanRevisionId,
+    RepositoryId, RepositorySummary, RetentionClass, RunId, RunPlan, RunState, RunSummary,
+    SensitivityClass, TaskId, TaskState, TaskSummary, TokenUsage, UsageBreakdown, UsageGroup,
+    UsageSummary, WorktreeId, WorktreeSummary, format_timestamp, now_ms,
+    validate_operator_outcome_label,
 };
 use harness_learning::{
     CostAttribution, EditReason, FailureClass, FailureOccurrence, FailureScope, FailureWireCost,
@@ -22,6 +23,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::operator_control::correlation::record_correlation_link_in_transaction;
 use crate::{
     ArtifactRecord, AuthoritativeOutcomeInput, EvaluationArm, EvaluationInvalidationReason,
     EvaluationInvalidationTarget, EvaluationLaunchPins, EvaluationRunReceipt, EvaluationRunStatus,
@@ -2209,6 +2211,18 @@ impl Store {
         &self,
         input: &NewImprovementRevision,
     ) -> Result<(ImprovementRevisionRecord, ImprovementEventRecord), StoreError> {
+        self.append_improvement_revision_with_correlations(input, &[])
+    }
+
+    /// Appends one immutable improvement revision and its caller-derived
+    /// causal receipts in one SQLite transaction. The generic append path has
+    /// no implicit trace policy; producers must provide only links whose
+    /// durable identities they own.
+    pub(crate) fn append_improvement_revision_with_correlations(
+        &self,
+        input: &NewImprovementRevision,
+        correlations: &[CorrelationLink],
+    ) -> Result<(ImprovementRevisionRecord, ImprovementEventRecord), StoreError> {
         validate_improvement_input(input)?;
         let payload_json = serde_json::to_string(&input.payload)?;
         let now = now_ms();
@@ -2244,6 +2258,9 @@ impl Store {
                     "improvement idempotency key was reused with different event provenance"
                         .to_owned(),
                 ));
+            }
+            for correlation in correlations {
+                record_correlation_link_in_transaction(&transaction, correlation)?;
             }
             transaction.commit()?;
             return Ok((record, event));
@@ -2282,6 +2299,9 @@ impl Store {
         )?;
         let record = read_improvement_revision(&transaction, &input.id)?;
         let event = read_improvement_event(&transaction, input.event_id.as_str())?;
+        for correlation in correlations {
+            record_correlation_link_in_transaction(&transaction, correlation)?;
+        }
         transaction.commit()?;
         Ok((record, event))
     }

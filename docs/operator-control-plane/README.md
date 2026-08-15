@@ -103,9 +103,10 @@ path, and a retry-safe
 in-product notification mirror. Each mirror receipt atomically records its
 source-attention causal link; each material-progress projection atomically
 records its source-event causal link; each investigation artifact atomically
-records its attempt-scoped causal link; each liveness observation atomically
-records its episode-scoped causal link; each reconciliation finding and action
-receipt,
+records its attempt-scoped causal link; each governed knowledge candidate
+atomically records its evidence causal links; each liveness observation
+atomically records its episode-scoped causal link; each reconciliation finding
+and action receipt,
 including proof-consuming fresh-attempt authorization, atomically records its
 episode-scoped causal link; and the API/CLI expose bounded immutable trace
 lookup. This is not yet full trace propagation through every producer.
