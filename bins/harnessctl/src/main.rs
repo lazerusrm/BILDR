@@ -352,6 +352,16 @@ enum ConditionCommand {
         #[arg(long)]
         deadline_ms: Option<i64>,
     },
+    /// Register a wake-only condition for free space on the run's
+    /// controller-owned repository filesystem. This accepts no path or
+    /// command and cannot resume or mutate work.
+    RegisterLocalCapacity {
+        run_id: String,
+        #[arg(long)]
+        minimum_available_bytes: u64,
+        #[arg(long)]
+        deadline_ms: Option<i64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -874,6 +884,29 @@ mod tests {
                 command: ConditionCommand::RegisterTimeGate {
                     run_id,
                     not_before_ms: 1_786_809_600_000,
+                    deadline_ms: None,
+                }
+            } if run_id == "run_a"
+        ));
+    }
+
+    #[test]
+    fn local_capacity_cli_command_never_accepts_a_path() {
+        let cli = Cli::try_parse_from([
+            "harnessctl",
+            "condition",
+            "register-local-capacity",
+            "run_a",
+            "--minimum-available-bytes",
+            "1048576",
+        ])
+        .expect("local capacity command parses");
+        assert!(matches!(
+            cli.command,
+            Command::Condition {
+                command: ConditionCommand::RegisterLocalCapacity {
+                    run_id,
+                    minimum_available_bytes: 1_048_576,
                     deadline_ms: None,
                 }
             } if run_id == "run_a"

@@ -225,9 +225,13 @@ fn classify_source_event(event: &SourceEvent) -> Option<(MaterialProgressKind, &
         )),
         "external_condition.time_gate_satisfied"
         | "external_condition.time_gate_deadline_elapsed"
-        | "external_condition.time_gate_invalid_spec" => Some((
+        | "external_condition.time_gate_invalid_spec"
+        | "external_condition.local_capacity_satisfied"
+        | "external_condition.local_capacity_deadline_elapsed"
+        | "external_condition.local_capacity_source_unavailable"
+        | "external_condition.local_capacity_continuity_break" => Some((
             MaterialProgressKind::ExternalConditionChanged,
-            "Controller recorded a terminal or unknown time-gate observation without changing execution authority.",
+            "Controller recorded a terminal or unknown external-condition observation without changing execution authority.",
         )),
         "task.governor.progress_updated"
             if event

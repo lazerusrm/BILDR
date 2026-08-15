@@ -1013,6 +1013,7 @@ name = "harness-orchestrator"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "fs2",
  "globset",
  "harness-codex",
  "harness-context",

@@ -179,6 +179,15 @@ pub(crate) fn material_trigger(event: &DomainEvent) -> Option<&'static str> {
         | "run.supervision.operator_review_requested" => Some("operator_steered"),
         "run.supervision.expert_completed" => Some("expert_completed"),
         "run.supervision.expert_failed" => Some("expert_failed"),
+        "external_condition.time_gate_satisfied"
+        | "external_condition.time_gate_deadline_elapsed"
+        | "external_condition.time_gate_invalid_spec"
+        | "external_condition.local_capacity_satisfied"
+        | "external_condition.local_capacity_deadline_elapsed"
+        | "external_condition.local_capacity_source_unavailable"
+        | "external_condition.local_capacity_continuity_break" => {
+            Some("external_condition_changed")
+        }
         "task.governor.candidate_materialized" | "run.final_audit.accepted" => {
             Some("agent_completed")
         }
@@ -854,6 +863,13 @@ mod tests {
         assert_eq!(
             material_trigger(&event("task.verified", json!({}))),
             Some("verifier_completed")
+        );
+        assert_eq!(
+            material_trigger(&event(
+                "external_condition.local_capacity_satisfied",
+                json!({"consequential_action": "none"}),
+            )),
+            Some("external_condition_changed")
         );
         assert_eq!(
             material_trigger(&event("run.supervision.expert_completed", json!({}))),

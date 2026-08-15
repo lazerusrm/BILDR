@@ -848,6 +848,31 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/Conflict'}
         '422': {$ref: '#/components/responses/ValidationError'}
+  /runs/{runId}/external-conditions/local-capacity:
+    post:
+      tags: [ExternalConditions]
+      operationId: registerRunLocalCapacityGate
+      description: Registers a run-owned capacity condition for the controller-selected repository filesystem only. This route accepts no path, provider URL, command, credential, or result-to-action mapping. Terminal observations emit a wake-only controller event and cannot resume or mutate work.
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema: {$ref: '#/components/schemas/OpaqueId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RegisterRunLocalCapacityGateRequest'}
+      responses:
+        '200':
+          description: Existing or newly registered immutable source-owned local-capacity condition.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ExternalCondition'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
   /external-conditions/{conditionId}:
     get:
       tags: [ExternalConditions]
@@ -2699,6 +2724,21 @@ components:
       properties:
         not_before_ms: {type: integer, minimum: 0}
         deadline_ms: {type: [integer, 'null'], minimum: 0}
+    RegisterRunLocalCapacityGateRequest:
+      type: object
+      additionalProperties: false
+      required: [minimum_available_bytes, deadline_ms]
+      properties:
+        minimum_available_bytes: {type: integer, minimum: 1, maximum: 1152921504606846976}
+        deadline_ms: {type: [integer, 'null'], minimum: 0}
+    LocalCapacitySpec:
+      type: object
+      additionalProperties: false
+      required: [schema, resource, minimum_available_bytes]
+      properties:
+        schema: {const: harness.local-capacity-spec.v1}
+        resource: {const: repository_root_filesystem}
+        minimum_available_bytes: {type: integer, minimum: 1, maximum: 1152921504606846976}
     ConditionObservation:
       type: object
       additionalProperties: false

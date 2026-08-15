@@ -57,6 +57,10 @@ pub(super) fn routes() -> Router<ApiState> {
             post(register_run_time_gate),
         )
         .route(
+            "/api/v1/runs/{run_id}/external-conditions/local-capacity",
+            post(register_run_local_capacity_gate),
+        )
+        .route(
             "/api/v1/external-conditions/{condition_id}",
             get(get_external_condition),
         )
@@ -477,6 +481,33 @@ async fn register_run_time_gate(
     Ok(Json(state.orchestrator.register_run_time_gate(
         &run_id,
         request.not_before_ms,
+        request.deadline_ms,
+    )?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterRunLocalCapacityGateRequest {
+    minimum_available_bytes: u64,
+    #[serde(deserialize_with = "required_nullable_i64")]
+    deadline_ms: Option<i64>,
+}
+
+/// Registers a wake-only repository-root capacity condition. The controller
+/// resolves the path from the run's durable repository custody; this request
+/// therefore accepts no path, command, provider URL, credential, or action
+/// mapping. Observations cannot resume or mutate the run.
+async fn register_run_local_capacity_gate(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Json(request): Json<RegisterRunLocalCapacityGateRequest>,
+) -> Result<Json<harness_domain::ExternalCondition>, ApiError> {
+    authenticate(&state, &headers, true)?;
+    let run_id = RunId::from(run_id);
+    Ok(Json(state.orchestrator.register_run_local_capacity_gate(
+        &run_id,
+        request.minimum_available_bytes,
         request.deadline_ms,
     )?))
 }
@@ -950,6 +981,22 @@ mod tests {
         assert!(
             serde_json::from_value::<RegisterRunTimeGateRequest>(json!({
                 "not_before_ms": 1,
+            }))
+            .is_err(),
+            "the explicit nullable deadline field cannot silently default"
+        );
+        assert!(
+            serde_json::from_value::<RegisterRunLocalCapacityGateRequest>(json!({
+                "minimum_available_bytes": 1,
+                "deadline_ms": null,
+                "path": "/not-accepted",
+            }))
+            .is_err(),
+            "the local capacity route must never accept a caller-selected path"
+        );
+        assert!(
+            serde_json::from_value::<RegisterRunLocalCapacityGateRequest>(json!({
+                "minimum_available_bytes": 1,
             }))
             .is_err(),
             "the explicit nullable deadline field cannot silently default"

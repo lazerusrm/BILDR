@@ -16,6 +16,7 @@ harness-runner = { path = "../harness-runner" }
 harness-store = { path = "../harness-store" }
 harness-usage = { path = "../harness-usage" }
 async-trait.workspace = true
+fs2.workspace = true
 globset.workspace = true
 hex.workspace = true
 jsonschema.workspace = true

@@ -122,6 +122,18 @@ pub(super) async fn condition(api: &ApiClient, command: ConditionCommand) -> Res
             )
             .await
         }
+        ConditionCommand::RegisterLocalCapacity {
+            run_id,
+            minimum_available_bytes,
+            deadline_ms,
+        } => {
+            let run_id: String = url::form_urlencoded::byte_serialize(run_id.as_bytes()).collect();
+            api.post(
+                &format!("/api/v1/runs/{run_id}/external-conditions/local-capacity"),
+                local_capacity_request(minimum_available_bytes, deadline_ms),
+            )
+            .await
+        }
     }
 }
 
@@ -132,11 +144,18 @@ fn time_gate_request(not_before_ms: i64, deadline_ms: Option<i64>) -> Value {
     })
 }
 
+fn local_capacity_request(minimum_available_bytes: u64, deadline_ms: Option<i64>) -> Value {
+    json!({
+        "minimum_available_bytes": minimum_available_bytes,
+        "deadline_ms": deadline_ms,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::time_gate_request;
+    use super::{local_capacity_request, time_gate_request};
 
     #[test]
     fn time_gate_request_keeps_an_omitted_deadline_explicitly_null() {
@@ -144,6 +163,17 @@ mod tests {
             time_gate_request(1_786_809_600_000, None),
             json!({
                 "not_before_ms": 1_786_809_600_000_i64,
+                "deadline_ms": null,
+            })
+        );
+    }
+
+    #[test]
+    fn local_capacity_request_has_only_the_closed_capacity_shape() {
+        assert_eq!(
+            local_capacity_request(1_048_576, None),
+            json!({
+                "minimum_available_bytes": 1_048_576_u64,
                 "deadline_ms": null,
             })
         );

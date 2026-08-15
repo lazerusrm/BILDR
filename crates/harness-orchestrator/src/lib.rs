@@ -1910,6 +1910,10 @@ impl Orchestrator {
             // They record a controller fact but intentionally do not schedule
             // work, so they remain safe to advance during a runtime outage.
             self.reconcile_time_gate_conditions(run)?;
+            // Local capacity uses the controller-selected repository root and
+            // the same wake-only boundary as a time gate. It has no provider
+            // credential, command, or result-to-action mapping.
+            self.reconcile_local_capacity_conditions(run)?;
             // Deadline failure is controller-owned. It must continue while
             // the App Server is unavailable; an interrupt is only best-effort
             // and cannot extend an investigator's declared time budget.
@@ -7102,6 +7106,7 @@ impl Orchestrator {
         }
         self.enforce_investigation_deadlines(&run).await?;
         self.reconcile_time_gate_conditions(&run)?;
+        self.reconcile_local_capacity_conditions(&run)?;
         self.require_runtime_ready().await?;
         self.store.mark_unblocked_tasks_ready(run_id)?;
         let (mut active_total, mut active_mutable, mut active_verifiers) =
@@ -19193,6 +19198,147 @@ mod tests {
                 .state,
             TaskState::Ready,
             "a registered local wait cannot wake or mutate a task"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_capacity_gate_is_controller_scoped_wake_only_and_idempotent() {
+        let (orchestrator, _temp, _runtime, run_id, task_id) = investigation_fixture().await;
+        let stable_deadline = Some(now_ms().saturating_add(60_000));
+        let first = orchestrator
+            .register_run_local_capacity_gate(&run_id, 1_048_576, stable_deadline)
+            .expect("stable local-capacity gate registers");
+        assert_eq!(
+            orchestrator
+                .register_run_local_capacity_gate(&run_id, 1_048_576, stable_deadline)
+                .expect("stable local-capacity replay"),
+            first
+        );
+        assert_eq!(first.adapter, ExternalConditionAdapter::HardwareCapacity);
+        assert_eq!(first.owner_type, ExternalConditionOwnerType::Run);
+        assert_eq!(first.owner_id, run_id.to_string());
+        assert!(first.source_id.starts_with("operator-local-capacity-"));
+        assert_eq!(first.poll_policy.initial_ms, 1_000);
+        assert_eq!(first.poll_policy.maximum_ms, 60_000);
+        assert_eq!(
+            first.spec["resource"],
+            harness_domain::LocalCapacitySpec::RESOURCE
+        );
+        assert!(matches!(
+            orchestrator.register_run_local_capacity_gate(&run_id, 0, None),
+            Err(OrchestratorError::Validation(_))
+        ));
+
+        let run = orchestrator.store().run(&run_id).expect("run reads");
+        assert_eq!(
+            orchestrator
+                .reconcile_local_capacity_conditions_with_observer(&run, |_| Ok(2_000_000))
+                .expect("local capacity conditions reconcile"),
+            1
+        );
+        assert_eq!(
+            orchestrator
+                .store()
+                .external_condition(&first.condition_id)
+                .expect("condition reads")
+                .expect("condition exists")
+                .state,
+            ExternalConditionState::Satisfied
+        );
+        let events = orchestrator
+            .store()
+            .list_domain_events(0, Some(&run_id), 50)
+            .expect("event ledger reads");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "external_condition.local_capacity_satisfied")
+                .count(),
+            1
+        );
+        assert!(events.iter().all(|event| {
+            event.event_type != "external_condition.local_capacity_satisfied"
+                || event.payload["consequential_action"] == "none"
+        }));
+        assert_eq!(
+            orchestrator
+                .store()
+                .task(&task_id)
+                .expect("task reads")
+                .state,
+            TaskState::Ready,
+            "a capacity observation cannot resume or mutate a task"
+        );
+        assert!(
+            orchestrator
+                .store()
+                .classify_material_progress()
+                .expect("material progress classifies")
+                .iter()
+                .any(|item| item.kind
+                    == harness_domain::MaterialProgressKind::ExternalConditionChanged)
+        );
+        assert_eq!(
+            orchestrator
+                .reconcile_local_capacity_conditions_with_observer(&run, |_| Ok(2_000_000))
+                .expect("terminal conditions do not repeat"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn local_capacity_gate_fails_closed_on_source_loss_or_elapsed_deadline() {
+        let (orchestrator, _temp, _runtime, run_id, task_id) = investigation_fixture().await;
+        let unavailable = orchestrator
+            .register_run_local_capacity_gate(&run_id, 1, None)
+            .expect("local capacity gate registers");
+        let expired = orchestrator
+            .register_run_local_capacity_gate(&run_id, 1, Some(now_ms().saturating_sub(1)))
+            .expect("expired local capacity gate registers");
+        let run = orchestrator.store().run(&run_id).expect("run reads");
+        assert_eq!(
+            orchestrator
+                .reconcile_local_capacity_conditions_with_observer(&run, |_| Err(()))
+                .expect("local capacity conditions reconcile"),
+            2
+        );
+        assert_eq!(
+            orchestrator
+                .store()
+                .external_condition(&unavailable.condition_id)
+                .expect("unavailable condition reads")
+                .expect("unavailable condition exists")
+                .state,
+            ExternalConditionState::Unknown
+        );
+        assert_eq!(
+            orchestrator
+                .store()
+                .external_condition(&expired.condition_id)
+                .expect("expired condition reads")
+                .expect("expired condition exists")
+                .state,
+            ExternalConditionState::Unsatisfied,
+            "deadline takes precedence over a late or unavailable source read"
+        );
+        let events = orchestrator
+            .store()
+            .list_domain_events(0, Some(&run_id), 50)
+            .expect("event ledger reads");
+        assert!(events.iter().any(|event| {
+            event.event_type == "external_condition.local_capacity_source_unavailable"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "external_condition.local_capacity_deadline_elapsed"
+        }));
+        assert_eq!(
+            orchestrator
+                .store()
+                .task(&task_id)
+                .expect("task reads")
+                .state,
+            TaskState::Ready,
+            "failure observations remain non-authorizing"
         );
     }
 

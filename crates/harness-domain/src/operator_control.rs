@@ -1730,6 +1730,47 @@ pub struct ExternalConditionPollPolicy {
     pub deadline_ms: Option<i64>,
 }
 
+/// Closed specification for the local filesystem capacity adapter. The
+/// repository root is selected by controller-owned run custody, never by an
+/// operator-supplied path or a model-generated command.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalCapacitySpec {
+    pub schema: String,
+    pub resource: String,
+    pub minimum_available_bytes: u64,
+}
+
+impl LocalCapacitySpec {
+    pub const SCHEMA: &'static str = "harness.local-capacity-spec.v1";
+    pub const RESOURCE: &'static str = "repository_root_filesystem";
+    const MAX_MINIMUM_AVAILABLE_BYTES: u64 = 1_u64 << 60;
+
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.schema != Self::SCHEMA {
+            return Err(OperatorControlError::InvalidField {
+                field: "local capacity specification schema",
+                reason: "must be harness.local-capacity-spec.v1",
+            });
+        }
+        if self.resource != Self::RESOURCE {
+            return Err(OperatorControlError::InvalidField {
+                field: "local capacity specification resource",
+                reason: "must be the controller-owned repository_root_filesystem",
+            });
+        }
+        if self.minimum_available_bytes == 0
+            || self.minimum_available_bytes > Self::MAX_MINIMUM_AVAILABLE_BYTES
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "local capacity minimum available bytes",
+                reason: "must be between one byte and one exbibyte",
+            });
+        }
+        Ok(())
+    }
+}
+
 impl ExternalConditionPollPolicy {
     fn validate(&self) -> Result<(), OperatorControlError> {
         if self.initial_ms == 0 || self.maximum_ms < self.initial_ms {
@@ -1862,6 +1903,9 @@ impl ExternalCondition {
             });
         }
         self.poll_policy.validate()?;
+        if self.adapter == ExternalConditionAdapter::HardwareCapacity {
+            self.local_capacity_spec()?.validate()?;
+        }
         let spec =
             serde_json::to_vec(&self.spec).map_err(|_| OperatorControlError::InvalidField {
                 field: "external condition spec",
@@ -1908,6 +1952,19 @@ impl ExternalCondition {
             });
         }
         Ok(())
+    }
+
+    pub fn local_capacity_spec(&self) -> Result<LocalCapacitySpec, OperatorControlError> {
+        if self.adapter != ExternalConditionAdapter::HardwareCapacity {
+            return Err(OperatorControlError::InvalidField {
+                field: "local capacity adapter",
+                reason: "must be hardware_capacity",
+            });
+        }
+        serde_json::from_value(self.spec.clone()).map_err(|_| OperatorControlError::InvalidField {
+            field: "local capacity specification",
+            reason: "must be the closed harness.local-capacity-spec.v1 shape",
+        })
     }
 }
 
@@ -2760,6 +2817,31 @@ mod tests {
                 "batching_enabled": false,
                 "suppression_enabled": false,
                 "unexpected": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn local_capacity_spec_is_closed_to_controller_owned_repository_storage() {
+        let valid = LocalCapacitySpec {
+            schema: LocalCapacitySpec::SCHEMA.to_owned(),
+            resource: LocalCapacitySpec::RESOURCE.to_owned(),
+            minimum_available_bytes: 1,
+        };
+        assert!(valid.validate().is_ok());
+        let mut invalid = valid.clone();
+        invalid.resource = "/operator-selected/path".to_owned();
+        assert!(invalid.validate().is_err());
+        let mut invalid = valid;
+        invalid.minimum_available_bytes = 0;
+        assert!(invalid.validate().is_err());
+        assert!(
+            serde_json::from_value::<LocalCapacitySpec>(serde_json::json!({
+                "schema": "harness.local-capacity-spec.v1",
+                "resource": "repository_root_filesystem",
+                "minimum_available_bytes": 1,
+                "path": "/not-accepted"
             }))
             .is_err()
         );

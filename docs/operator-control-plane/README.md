@@ -95,8 +95,8 @@ controlled activation.
 
 The current branch implements durable attention, investigation artifact
 contracts/records, external-condition records, and authenticated run-owned
-absolute-time-gate registration, immutable snapshots/return views, deterministic material
-progress, observe-only liveness episodes, exact-revision intervention receipts,
+absolute-time or controller-owned repository-capacity gate registration, immutable
+snapshots/return views, deterministic material progress, observe-only liveness episodes, exact-revision intervention receipts,
 reconciliation/ownership evidence with immutable inventory findings and action
 receipts, bounded run topology, a proof-consuming authenticated fresh-retry
 path, and a retry-safe
@@ -155,7 +155,8 @@ The sole active intervention is a version-bound `wait` receipt: it records a
 bounded decision against one liveness episode and cannot clear a stall or
 change any task, attempt, ownership, worktree, process, approval, or external
 condition. Desktop notification delivery and active batching, all other
-intervention execution, external provider wake adapters, adaptive supervisor
+intervention execution, external provider wake adapters beyond the local clock
+and repository-capacity adapters, adaptive supervisor
 behavior, empirical evaluation, and rollout activation remain explicitly gated
 until their own evidence passes.
 Do not interpret an empty observe-only section as a healthy or automatically

@@ -19,7 +19,7 @@ not enter active rollout.
 | liveness episode | false/missed stall handling | deterministic observation/episode reducer | OCP-002/007/008 | held-out traces, shadow outcomes | observe -> shadow -> advisory |
 | reconciliation | restart loses work or duplicates writer | reconciliation controller + Git/worktree/runtime owners | OCP-002/009/011/012 | full fault matrix and ownership properties | reports first; safe actions later |
 | typed intervention | unstructured/destructive intervention | policy/action executor with receipts | OCP-008/009/010/015 | replay, stale/dedupe/custody tests | shadow -> advisory -> active-low-risk |
-| external conditions | model polling and lost long waits | adapter registry + scheduler wake | OCP-002/006/011/012 | continuity/restart/rate-limit tests | wake-only after hard gates |
+| external conditions | model polling and lost long waits | adapter registry + scheduler wake | OCP-002/006/011/012 | clock/capacity continuity, restart, rate-limit tests | local wake-only; provider adapters hard-gated |
 | presence/notifications | routine interruption or hidden critical action | deterministic classifier/delivery store | OCP-002/014/011/012 | mirror/shadow/operator study | critical delivery first; batching opt-in |
 | topology | ownership/dependency/evidence difficult to inspect | topology projection | OCP-003/013 | factual comprehension/accessibility study | table active; graph evidence-gated |
 | correlation | slow root cause and poor action explanation | trace/correlation store | OCP-017/011/013 | causal validity/redaction/support study | active read-only after security gates |
@@ -144,7 +144,7 @@ authorizes replacement.
 | attention/snapshot read models | disabled until migration/replay, then active | all source adapters hard-gated |
 | return view | disabled/canary | objective usability improvement |
 | investigation | disabled | custody/evidence/security suites |
-| external conditions | disabled then wake-only | adapter continuity/restart gates |
+| external conditions | local clock/repository-capacity wake-only | adapter continuity/restart and provider policy gates |
 | progress classifier | observe | held-out precision review |
 | liveness | observe | shadow safety/quality, then advisory |
 | reconciliation | report/attention only | fault evidence for each safe action |

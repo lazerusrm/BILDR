@@ -553,29 +553,51 @@ execution.
 {
   "schema": "harness.external-condition.v1",
   "condition_id": "condition-...",
-  "owner_type": "task",
-  "owner_id": "task-...",
-  "adapter": "github_check",
-  "spec": {},
-  "state": "registered",
+  "owner_type": "run",
+  "owner_id": "run-...",
+  "adapter": "hardware_capacity",
+  "source_id": "operator-local-capacity-...",
+  "spec": {
+    "schema": "harness.local-capacity-spec.v1",
+    "resource": "repository_root_filesystem",
+    "minimum_available_bytes": 1073741824
+  },
+  "state": "open",
   "sequence": 0,
-  "poll_policy": {"initial_ms": 15000, "maximum_ms": 300000, "deadline_ms": 1786675200000},
+  "poll_policy": {"initial_ms": 1000, "maximum_ms": 60000, "deadline_ms": 1786675200000},
   "source_identity_digest": "64-hex",
   "last_observation": null,
-  "terminal_result": null,
-  "version": 1
+  "version": 1,
+  "opened_at_ms": 1786671600000,
+  "updated_at_ms": 1786671600000,
+  "sha256": "64-hex"
 }
 ```
 
-States: registered, observing, satisfied, failed, expired, canceled,
-continuity_broken, unknown_completion.
+The active local adapters are deliberately closed:
+
+- `time_gate` accepts only a nonnegative `not_before_ms`; the optional
+  deadline is carried by the poll policy.
+- `hardware_capacity` accepts only
+  `harness.local-capacity-spec.v1`, whose resource is the controller-owned
+  filesystem containing the run's durable repository root. It accepts neither
+  a caller-selected path nor an endpoint, command, credential, or JSONPath.
+
+States are `open`, `satisfied`, `unsatisfied`, `unknown`, and `cancelled`.
+`unknown` is a fail-closed continuity/source state; it does not authorize a
+replacement or a retry.
 
 ### Result and replay
 
 Each observation is stored before its event is published and is keyed by exact
-condition/sequence. Handled acknowledgement stops re-announcement; it does not
-claim exactly-once external effect. Continuity mismatch stops the adapter and
-requires explicit re-registration.
+condition/sequence. The current contract is strict: malformed capacity
+specifications are rejected, not coerced into another shape. Open
+local-capacity samples are bounded by deterministic
+exponential backoff from the declared poll policy. Terminal capacity results,
+deadline expiry, source loss, and identity continuity breaks emit one material
+controller event with `consequential_action: none`; that event is a wake-only
+fact, not a result-to-command mapping. A continuity mismatch stops the adapter
+in `unknown` and requires explicit re-registration.
 
 ## Presence and notification contracts
 
@@ -705,6 +727,7 @@ POST /api/v1/approvals/{source_id}/decide
 POST /api/v1/reconciliation/{id}/apply
 POST /api/v1/external-conditions/{id}/cancel
 POST /api/v1/runs/{run_id}/external-conditions/time-gates
+POST /api/v1/runs/{run_id}/external-conditions/local-capacity
 POST /api/v1/liveness/{episode_id}/knowledge-candidates
 POST /api/v1/notification-shadow-batches
 PUT  /api/v1/operator-presence
@@ -742,7 +765,7 @@ harnessctl attention list|show|acknowledge
 harnessctl decision answer
 harnessctl recovery list|show|findings|actions
 harnessctl investigation create|show|export
-harnessctl condition list|show|observations|register-time-gate
+harnessctl condition list|show|observations|register-time-gate|register-local-capacity
 harnessctl presence get|set
 harnessctl notification-deliveries|notification-health
 harnessctl topology show [--format table|json|dot]

@@ -394,6 +394,13 @@ false terminal classification
 Gate: wake-only; result never executes action. Every adapter passes identity,
 sequence, malformed/oversize, restart, and continuity-break tests.
 
+The currently implemented local clock and repository-capacity adapters are
+controller scoped and wake-only. Repository capacity accepts no path, command,
+credential, or provider result; it records bounded backoff samples and marks a
+source-identity change or read failure `unknown`. GitHub, review, credential,
+and HTTP/service adapters remain disabled pending their separate connector,
+rate-limit, redaction, and continuity evidence.
+
 ## Capability 8: presence and notification policy
 
 ### Hypothesis

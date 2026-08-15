@@ -9,9 +9,11 @@ This status is intentionally a capability boundary, not release evidence.
   cursor acknowledgement;
 - immutable investigation artifact contracts/reducer, passive
   external-condition observations, and authenticated registration of a
-  run-owned local absolute-time gate; production scoped investigation dispatch is
-  fail-closed until the App Server supports readable-root enforcement plus a
-  controller-visible read-event stream;
+  run-owned local absolute-time gate or repository-root capacity gate. Capacity
+  observations use a closed no-path/no-command spec, deterministic bounded
+  backoff, source-identity continuity detection, and wake-only terminal events;
+  production scoped investigation dispatch is fail-closed until the App Server
+  supports readable-root enforcement plus a controller-visible read-event stream;
 - deterministic allow-list material-progress classification;
 - liveness episodes with immutable observations; ordinary activity cannot clear
   degraded/stalled state, plus exact-revision immutable receipts for completed
@@ -58,8 +60,9 @@ This status is intentionally a capability boundary, not release evidence.
   uncertain custody, while only the authenticated proof-consuming retry path
   may authorize a clean replacement;
 - all non-`wait` typed intervention execution;
-- external-condition polling/wake adapters beyond the controller-clock time
-  gate, whose terminal event remains non-authorizing;
+- external-condition polling/wake adapters beyond the controller-clock and
+  controller-owned repository-capacity gates, whose terminal events remain
+  non-authorizing;
 - active opt-in/broader notification batching, desktop delivery, and
   delivery-health rollout;
 - adaptive supervisor policy or any independent control-plane mutation;
