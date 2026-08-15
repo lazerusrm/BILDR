@@ -1,0 +1,18 @@
+{
+  "schema": "harness.notification-delivery-health.v1",
+  "channel": "in_product_mirror",
+  "current_attention_revisions": 3,
+  "examined_current_revisions": 3,
+  "delivered_examined_revisions": 2,
+  "undelivered_examined_revisions": 1,
+  "undelivered_critical_examined_revisions": 1,
+  "undelivered_action_required_examined_revisions": 0,
+  "failed_examined_revisions": 1,
+  "unverified_delivery_examined_revisions": 1,
+  "oldest_undelivered_opened_at_ms": 1786809600000,
+  "latest_verified_mirror_receipt_at_ms": 1786809660000,
+  "truncated": false,
+  "desktop_delivery_enabled": false,
+  "batching_enabled": false,
+  "suppression_enabled": false
+}

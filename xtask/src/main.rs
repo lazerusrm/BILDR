@@ -433,12 +433,23 @@ fn openapi_check(root: &Path) -> Result<()> {
     let runtime_status_schema = runtime_status_schema(&value)?;
     let runtime_status_fixture =
         read_json(&root.join("examples/openapi/runtime-status.example.json"))?;
+    let notification_delivery_health_fixture =
+        read_json(&root.join("examples/openapi/notification-delivery-health.example.json"))?;
     let registry = jsonschema::Registry::new()
         .prepare()
         .context("failed to prepare OpenAPI JSON Schema registry")?;
     let runtime_status_validator = compile_schema(&path, &runtime_status_schema, &registry)?;
     if let Err(error) = runtime_status_validator.validate(&runtime_status_fixture) {
         bail!("RuntimeStatus fixture does not conform to OpenAPI: {error}")
+    }
+    let notification_delivery_health_schema =
+        openapi_component_schema(&value, "NotificationDeliveryHealth")?;
+    let notification_delivery_health_validator =
+        compile_schema(&path, &notification_delivery_health_schema, &registry)?;
+    if let Err(error) =
+        notification_delivery_health_validator.validate(&notification_delivery_health_fixture)
+    {
+        bail!("NotificationDeliveryHealth fixture does not conform to OpenAPI: {error}")
     }
     validate_run_detail_supervision_contract(&value)?;
     validate_operator_settings_supervision_contract(&value)?;
@@ -468,7 +479,7 @@ fn openapi_check(root: &Path) -> Result<()> {
         )
     }
     println!(
-        "openapi-check: {} local references resolved; RuntimeStatus fixture and supervisory RunDetail/operator settings contracts conform; {} router paths match",
+        "openapi-check: {} local references resolved; RuntimeStatus/NotificationDeliveryHealth fixtures and supervisory RunDetail/operator settings contracts conform; {} router paths match",
         pointers.len(),
         documented_routes.len()
     );
@@ -546,6 +557,10 @@ fn validate_operator_settings_supervision_contract(openapi: &serde_yaml::Value) 
 }
 
 fn runtime_status_schema(openapi: &serde_yaml::Value) -> Result<Value> {
+    openapi_component_schema(openapi, "RuntimeStatus")
+}
+
+fn openapi_component_schema(openapi: &serde_yaml::Value, component: &str) -> Result<Value> {
     let mut schema = serde_json::to_value(openapi)
         .context("OpenAPI document cannot be represented as JSON Schema input")?;
     let object = schema
@@ -557,7 +572,7 @@ fn runtime_status_schema(openapi: &serde_yaml::Value) -> Result<Value> {
     );
     object.insert(
         "$ref".to_owned(),
-        Value::String("#/components/schemas/RuntimeStatus".to_owned()),
+        Value::String(format!("#/components/schemas/{component}")),
     );
     Ok(schema)
 }
