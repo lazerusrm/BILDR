@@ -679,6 +679,7 @@ GET /api/v1/reconciliations/{id}
 GET /api/v1/reconciliations/{id}/findings
 GET /api/v1/reconciliations/{id}/actions
 GET /api/v1/investigations/{id}
+GET /api/v1/improvement/knowledge/{knowledge_id}
 GET /api/v1/external-conditions
 GET /api/v1/traces/{trace_id}
 GET /api/v1/notification-deliveries
@@ -696,6 +697,7 @@ POST /api/v1/approvals/{source_id}/decide
 POST /api/v1/reconciliation/{id}/apply
 POST /api/v1/external-conditions/{id}/cancel
 POST /api/v1/runs/{run_id}/external-conditions/time-gates
+POST /api/v1/liveness/{episode_id}/knowledge-candidates
 PUT  /api/v1/operator-presence
 POST /api/v1/runs/{run_id}/investigations
 ```

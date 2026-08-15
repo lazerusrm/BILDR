@@ -435,6 +435,8 @@ fn openapi_check(root: &Path) -> Result<()> {
         read_json(&root.join("examples/openapi/runtime-status.example.json"))?;
     let notification_delivery_health_fixture =
         read_json(&root.join("examples/openapi/notification-delivery-health.example.json"))?;
+    let liveness_knowledge_candidate_fixture =
+        read_json(&root.join("examples/openapi/liveness-knowledge-candidate.example.json"))?;
     let registry = jsonschema::Registry::new()
         .prepare()
         .context("failed to prepare OpenAPI JSON Schema registry")?;
@@ -450,6 +452,15 @@ fn openapi_check(root: &Path) -> Result<()> {
         notification_delivery_health_validator.validate(&notification_delivery_health_fixture)
     {
         bail!("NotificationDeliveryHealth fixture does not conform to OpenAPI: {error}")
+    }
+    let liveness_knowledge_candidate_schema =
+        openapi_component_schema(&value, "LivenessKnowledgeCandidate")?;
+    let liveness_knowledge_candidate_validator =
+        compile_schema(&path, &liveness_knowledge_candidate_schema, &registry)?;
+    if let Err(error) =
+        liveness_knowledge_candidate_validator.validate(&liveness_knowledge_candidate_fixture)
+    {
+        bail!("LivenessKnowledgeCandidate fixture does not conform to OpenAPI: {error}")
     }
     validate_run_detail_supervision_contract(&value)?;
     validate_operator_settings_supervision_contract(&value)?;
@@ -479,7 +490,7 @@ fn openapi_check(root: &Path) -> Result<()> {
         )
     }
     println!(
-        "openapi-check: {} local references resolved; RuntimeStatus/NotificationDeliveryHealth fixtures and supervisory RunDetail/operator settings contracts conform; {} router paths match",
+        "openapi-check: {} local references resolved; RuntimeStatus/NotificationDeliveryHealth/LivenessKnowledgeCandidate fixtures and supervisory RunDetail/operator settings contracts conform; {} router paths match",
         pointers.len(),
         documented_routes.len()
     );

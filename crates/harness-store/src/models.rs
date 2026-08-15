@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use harness_domain::{
     AgentRole, AgentSessionId, ApprovalId, ArtifactId, AttemptId, CommandRunId, EvidenceId,
     ImprovementEventId, ImprovementRecordKind, ImprovementSchema, ImprovementState,
-    InvestigationArtifactId, ProofTier, RepositoryId, ResultClass, RetentionClass, RiskLevel,
-    RunId, SandboxMode, SensitivityClass, TaskId, TaskPacket, ValidationId, WorktreeId,
+    InvestigationArtifactId, LivenessEpisodeId, ProofTier, RepositoryId, ResultClass,
+    RetentionClass, RiskLevel, RunId, SandboxMode, SensitivityClass, TaskId, TaskPacket,
+    ValidationId, WorktreeId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -310,6 +311,19 @@ pub struct NewInvestigationKnowledgeCandidate {
     pub artifact_id: InvestigationArtifactId,
     pub expected_artifact_sha256: String,
     pub finding_id: String,
+    pub task_family: String,
+    pub model_family: Option<String>,
+    pub runtime_class: Option<String>,
+}
+
+/// A narrowly derived, display-only knowledge candidate from repeated,
+/// independently recovered liveness episodes. The controller derives all
+/// statements and evidence from immutable observations; callers cannot submit
+/// free-form learning content or activate the candidate.
+#[derive(Clone, Debug)]
+pub struct NewLivenessKnowledgeCandidate {
+    pub episode_id: LivenessEpisodeId,
+    pub expected_episode_sha256: String,
     pub task_family: String,
     pub model_family: Option<String>,
     pub runtime_class: Option<String>,

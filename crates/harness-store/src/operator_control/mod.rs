@@ -9,6 +9,7 @@ mod attention;
 mod correlation;
 mod external_conditions;
 mod investigations;
+mod knowledge;
 mod liveness;
 mod notifications;
 mod progress;
@@ -17,4 +18,5 @@ mod snapshots;
 mod topology;
 
 pub use attention::*;
+pub(crate) use liveness::checked_observation_row;
 pub use snapshots::*;

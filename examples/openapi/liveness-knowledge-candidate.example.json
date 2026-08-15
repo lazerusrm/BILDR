@@ -1,0 +1,25 @@
+{
+  "schema": "harness.knowledge-item.v1",
+  "knowledge_id": "knowledge-liveness-0123456789abcdef0123456789abcdef",
+  "kind": "heuristic",
+  "statement": "Repeated confirmed liveness stalls recovered only after material progress; heartbeats and command activity did not clear the stall.",
+  "scope": {
+    "repository_id": "repository_fixture",
+    "task_family": "operator_control",
+    "model_family": null,
+    "runtime_class": null
+  },
+  "evidence": [
+    {"kind": "liveness_observation", "revision_id": "liveness_observation_fixture_a", "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "split": null, "custody": "clean"},
+    {"kind": "liveness_observation", "revision_id": "liveness_observation_fixture_b", "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "split": null, "custody": "clean"},
+    {"kind": "liveness_observation", "revision_id": "liveness_observation_fixture_c", "digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "split": null, "custody": "clean"},
+    {"kind": "liveness_observation", "revision_id": "liveness_observation_fixture_d", "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "split": null, "custody": "clean"}
+  ],
+  "confidence_milli": 900,
+  "review": {"state": "unreviewed", "reviewer_id": null, "reviewed_at": null, "receipt": null},
+  "freshness": {"created_at": 1786588800000, "revalidate_after": 1787193600000, "expires_at": 1789180800000},
+  "contradicts": [],
+  "supersedes": [],
+  "state": "candidate",
+  "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+}

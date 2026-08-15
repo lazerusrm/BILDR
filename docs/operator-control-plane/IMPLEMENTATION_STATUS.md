@@ -35,6 +35,9 @@ This status is intentionally a capability boundary, not release evidence.
   from one fresh confirmed investigation finding, with controller-derived
   evidence, repository scope, sensitivity, freshness, identity, and immutable
   readback by that identity;
+- authenticated creation of an unreviewed, display-only heuristic from two
+  independently recovered liveness episodes, with controller-derived exact
+  observation receipts and no activation or context injection;
 - authenticated exact-revision `wait` liveness intervention receipts, which
   only record the bounded decision and increment the episode counter;
 - authenticated localhost API, CLI, and browser control-plane surfaces for the
@@ -51,9 +54,8 @@ This status is intentionally a capability boundary, not release evidence.
   gate, whose terminal event remains non-authorizing;
 - notification batching, desktop delivery, and delivery-health rollout;
 - adaptive supervisor policy or any independent control-plane mutation;
-- liveness/reconciliation-pattern knowledge candidates, knowledge review UI,
-  and any context injection or activation beyond the existing governed
-  pipeline;
+- reconciliation-pattern knowledge candidates, knowledge review UI, and any
+  context injection or activation beyond the existing governed pipeline;
 - evaluation corpus, fault matrix, usability study, canary, rollback drill, and
   production activation.
 

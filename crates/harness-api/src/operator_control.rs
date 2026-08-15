@@ -71,6 +71,10 @@ pub(super) fn routes() -> Router<ApiState> {
             "/api/v1/liveness/{episode_id}/interventions",
             get(list_intervention_receipts).post(execute_wait_intervention),
         )
+        .route(
+            "/api/v1/liveness/{episode_id}/knowledge-candidates",
+            post(propose_knowledge_from_repeated_liveness),
+        )
         .route("/api/v1/traces/{trace_id}", get(list_correlation_links))
         .route("/api/v1/runs/{run_id}/topology", get(run_topology))
         .route("/api/v1/reconciliations", get(list_reconciliations))
@@ -304,6 +308,49 @@ async fn propose_knowledge_from_investigation(
     let item = serde_json::from_value(revision.payload).map_err(|error| {
         ApiError::from(harness_store::StoreError::Validation(format!(
             "stored knowledge candidate has an invalid wire contract: {error}"
+        )))
+    })?;
+    Ok(Json(item))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposeKnowledgeFromLivenessRequest {
+    expected_episode_sha256: String,
+    task_family: String,
+    model_family: Option<String>,
+    runtime_class: Option<String>,
+}
+
+/// Writes a suggestion only from two independently recovered, immutable
+/// liveness episodes. The store derives all evidence, factual statement,
+/// freshness, identity, and sensitivity; this route cannot accept prose,
+/// activate knowledge, or alter task context.
+async fn propose_knowledge_from_repeated_liveness(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(episode_id): Path<String>,
+    Json(request): Json<ProposeKnowledgeFromLivenessRequest>,
+) -> Result<Json<harness_learning::KnowledgeItemV1>, ApiError> {
+    authenticate(&state, &headers, true)?;
+    let episode_id = LivenessEpisodeId::parse(episode_id).map_err(|error| {
+        ApiError::from(harness_store::StoreError::Validation(error.to_string()))
+    })?;
+    let revision = state
+        .orchestrator
+        .store()
+        .propose_knowledge_from_repeated_liveness(
+            &harness_store::NewLivenessKnowledgeCandidate {
+                episode_id,
+                expected_episode_sha256: request.expected_episode_sha256,
+                task_family: request.task_family,
+                model_family: request.model_family,
+                runtime_class: request.runtime_class,
+            },
+        )?;
+    let item = serde_json::from_value(revision.payload).map_err(|error| {
+        ApiError::from(harness_store::StoreError::Validation(format!(
+            "stored liveness knowledge candidate has an invalid wire contract: {error}"
         )))
     })?;
     Ok(Json(item))
@@ -745,6 +792,16 @@ mod tests {
             serde_json::from_value::<ProposeKnowledgeFromInvestigationRequest>(json!({
                 "expected_artifact_sha256": "a".repeat(64),
                 "finding_id": "finding_a",
+                "task_family": "operator_control",
+                "model_family": null,
+                "runtime_class": null,
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ProposeKnowledgeFromLivenessRequest>(json!({
+                "expected_episode_sha256": "a".repeat(64),
                 "task_family": "operator_control",
                 "model_family": null,
                 "runtime_class": null,

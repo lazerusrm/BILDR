@@ -26,6 +26,7 @@ pub enum ReceiptKind {
     Outcome,
     Failure,
     InvestigationArtifact,
+    LivenessObservation,
     EvalCase,
     Taskset,
     GraderBundle,

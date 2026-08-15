@@ -686,7 +686,7 @@ pub(crate) fn checked_episode_row(
     Ok(episode)
 }
 
-fn checked_observation_row(
+pub(crate) fn checked_observation_row(
     raw: String,
     payload_sha256: String,
 ) -> rusqlite::Result<LivenessObservation> {

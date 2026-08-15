@@ -5584,6 +5584,30 @@ fn immutable_revision_from_record<T: serde::de::DeserializeOwned>(
     })
 }
 
+/// Resolves one immutable liveness observation by its durable identifier and
+/// controller-computed payload digest. The stored-row checksum and domain
+/// self-digest must both verify before it can support learning.
+fn resolved_liveness_observation_tx(
+    tx: &rusqlite::Transaction<'_>,
+    receipt: &harness_learning::SourceReceipt,
+) -> Result<(), StoreError> {
+    let (raw, stored_digest): (String, String) = tx
+        .query_row(
+            "SELECT payload_json,payload_sha256 FROM liveness_observations WHERE id=?1",
+            [&receipt.revision_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound(receipt.revision_id.clone()))?;
+    let observation = crate::operator_control::checked_observation_row(raw, stored_digest)?;
+    if observation.sha256 != receipt.digest {
+        return Err(StoreError::Conflict(
+            "liveness observation receipt does not resolve exactly".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve a learning receipt from controller-owned state before using it as
 /// evidence.  A wire's `custody` bit is merely a claim; this rechecks the
 /// referenced immutable record and rejects sources which cannot be cleanly
@@ -5617,6 +5641,10 @@ fn learning_receipt_clean_tx(
         ReceiptKind::InvestigationArtifact => Ok(resolved_investigation_artifact_tx(tx, receipt)?
             .sensitivity
             != harness_domain::InvestigationSensitivity::Restricted),
+        ReceiptKind::LivenessObservation => {
+            resolved_liveness_observation_tx(tx, receipt)?;
+            Ok(true)
+        }
         ReceiptKind::HumanReview => Ok(false),
         kind => {
             let expected = match kind {
@@ -5629,6 +5657,7 @@ fn learning_receipt_clean_tx(
                 ReceiptKind::Failure
                 | ReceiptKind::Runtime
                 | ReceiptKind::InvestigationArtifact
+                | ReceiptKind::LivenessObservation
                 | ReceiptKind::HumanReview => {
                     unreachable!("handled above")
                 }
@@ -5681,6 +5710,10 @@ fn validate_learning_references_tx(
             }
             ReceiptKind::InvestigationArtifact => {
                 resolved_investigation_artifact_tx(tx, receipt)?;
+                return Ok(());
+            }
+            ReceiptKind::LivenessObservation => {
+                resolved_liveness_observation_tx(tx, receipt)?;
                 return Ok(());
             }
             ReceiptKind::HumanReview => {
