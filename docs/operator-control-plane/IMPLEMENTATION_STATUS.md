@@ -14,7 +14,9 @@ This status is intentionally a capability boundary, not release evidence.
 - deterministic allow-list material-progress classification;
 - liveness episodes with immutable observations; ordinary activity cannot clear
   degraded/stalled state, plus exact-revision immutable receipts for completed
-  controller-path interventions; the reducer and UI execute no intervention;
+  controller-path interventions. The only active executor is the authenticated
+  `wait` receipt, which cannot alter custody or recovery; all other typed
+  interventions remain inactive;
 - reconciliation episode, immutable inventory finding/action-receipt, and
   exclusive-ownership proof custody, including one-use transactional
   proof-to-replacement authorization for authenticated retry. It requires a

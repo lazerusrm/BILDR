@@ -431,7 +431,10 @@ fn attention_from_raw(raw: &str) -> Result<AttentionItem, StoreError> {
     Ok(item)
 }
 
-fn checked_attention_row(raw: String, payload_sha256: String) -> rusqlite::Result<AttentionItem> {
+pub(crate) fn checked_attention_row(
+    raw: String,
+    payload_sha256: String,
+) -> rusqlite::Result<AttentionItem> {
     if digest(&raw) != payload_sha256 {
         return Err(rusqlite::Error::FromSqlConversionFailure(
             0,

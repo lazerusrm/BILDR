@@ -93,19 +93,49 @@ impl Store {
         Ok(next)
     }
 
-    /// Mirrors visible source-owned attention into append-only product delivery
-    /// receipts. The id is deterministic per attention version, so retry and
-    /// restart cannot produce duplicate presentation claims.
+    /// Mirrors one bounded oldest-first batch of as-yet-undelivered
+    /// source-owned attention revisions into append-only product delivery
+    /// receipts. Selecting only pending revisions prevents a stable newest
+    /// page from starving an older item forever; the deterministic receipt ID
+    /// still makes retry and restart safe.
     pub fn refresh_notification_mirror(&self) -> Result<Vec<NotificationDelivery>, StoreError> {
-        let attention = self
-            .list_attention(false, MAX_NOTIFICATION_PAGE_SIZE)?
-            .items;
+        let attention = self.pending_notification_attention(MAX_NOTIFICATION_PAGE_SIZE)?;
         let mut written = Vec::new();
         for item in attention {
             let receipt = notification_from_attention(&item)?;
             written.push(self.record_notification_delivery(&receipt)?);
         }
         Ok(written)
+    }
+
+    fn pending_notification_attention(&self, limit: u32) -> Result<Vec<AttentionItem>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT attention.payload_json,attention.payload_sha256
+             FROM attention_items AS attention
+             WHERE attention.state IN ('open','acknowledged','waiting_external')
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM notification_deliveries AS delivery
+                 WHERE delivery.source_event_id =
+                   ('attention-' || attention.id || '-' || attention.version)
+               )
+             ORDER BY
+               CASE attention.severity
+                 WHEN 'critical' THEN 0
+                 WHEN 'high' THEN 1
+                 WHEN 'normal' THEN 2
+                 ELSE 3
+               END,
+               attention.opened_at ASC,
+               attention.id ASC
+             LIMIT ?1",
+        )?;
+        Ok(statement
+            .query_map([i64::from(limit)], |row| {
+                super::attention::checked_attention_row(row.get(0)?, row.get(1)?)
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn record_notification_delivery(
@@ -389,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn notification_mirror_replays_an_attention_revision_exactly() {
+    fn notification_mirror_processes_each_attention_revision_once() {
         let temp = TempDir::new().expect("temp");
         let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
         let attention = AttentionItem {
@@ -429,7 +459,7 @@ mod tests {
 
         let first = store.refresh_notification_mirror().expect("first mirror");
         let replay = store.refresh_notification_mirror().expect("replay mirror");
-        assert_eq!(first, replay);
+        assert!(replay.is_empty());
         assert_eq!(store.list_notification_deliveries(10).unwrap(), first);
         assert_eq!(first[0].created_at_ms, attention.opened_at_ms);
         let correlation = notification_correlation_link(&first[0]).expect("correlation");
@@ -442,6 +472,38 @@ mod tests {
         assert_eq!(
             store.list_attention(false, 10).unwrap().items,
             vec![attention]
+        );
+    }
+
+    #[test]
+    fn notification_refresh_processes_an_older_pending_revision_after_a_full_batch() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        for index in 0..=MAX_NOTIFICATION_PAGE_SIZE {
+            let mut attention = test_attention();
+            attention.source.source_id = format!("approval-{index}");
+            attention.dedupe_key = format!("approval-task-{index}");
+            attention.opened_event_id = format!("event-{index}");
+            attention.opened_at_ms = i64::from(index);
+            attention.validate().expect("valid unique attention");
+            store
+                .upsert_source_attention(&attention)
+                .expect("open attention");
+        }
+
+        let first = store.refresh_notification_mirror().expect("first batch");
+        assert_eq!(first.len(), MAX_NOTIFICATION_PAGE_SIZE as usize);
+        let second = store.refresh_notification_mirror().expect("remaining item");
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            second[0].created_at_ms,
+            i64::from(MAX_NOTIFICATION_PAGE_SIZE)
+        );
+        assert!(
+            store
+                .refresh_notification_mirror()
+                .expect("no pending revisions")
+                .is_empty()
         );
     }
 
