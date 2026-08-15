@@ -100,8 +100,10 @@ progress, observe-only liveness episodes, exact-revision intervention receipts,
 reconciliation/ownership evidence with immutable inventory findings and action
 receipts, bounded run topology, a proof-consuming authenticated fresh-retry
 path, and a retry-safe
-in-product notification mirror. Each mirror receipt atomically records its
-source-attention causal link; each material-progress projection atomically
+in-product notification mirror. Each source-attention lifecycle transaction
+atomically records its opening source, acknowledgement, or terminal authority
+causal link; each mirror receipt atomically records its source-attention causal
+link; each material-progress projection atomically
 records its source-event causal link; each investigation artifact atomically
 records its attempt-scoped causal link; each governed knowledge candidate
 atomically records its evidence causal links; each liveness observation

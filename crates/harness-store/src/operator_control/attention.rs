@@ -1,12 +1,14 @@
 use harness_domain::{
-    AttentionItem, AttentionItemId, AttentionResolution, AttentionState, OperatorControlError,
-    now_ms,
+    AttentionItem, AttentionItemId, AttentionResolution, AttentionState, CorrelationLink,
+    CorrelationLinkId, OperatorControlError, TraceContext, now_ms,
 };
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{Store, StoreError};
+
+use super::correlation::record_correlation_link_in_transaction;
 
 const MAX_ATTENTION_PAGE_SIZE: u32 = 200;
 
@@ -57,6 +59,10 @@ impl Store {
         {
             let existing = attention_from_raw(&existing_raw)?;
             if existing_raw == raw {
+                record_correlation_link_in_transaction(
+                    &transaction,
+                    &attention_correlation_link(&existing, "opened")?,
+                )?;
                 transaction.commit()?;
                 return Ok(existing);
             }
@@ -85,6 +91,10 @@ impl Store {
             ],
         )?;
         insert_attention_event(&transaction, item, "opened", None, &raw, &digest, now)?;
+        record_correlation_link_in_transaction(
+            &transaction,
+            &attention_correlation_link(item, "opened")?,
+        )?;
         transaction.commit()?;
         Ok(item.clone())
     }
@@ -152,6 +162,10 @@ impl Store {
             &updated_raw,
             &updated_digest,
             now,
+        )?;
+        record_correlation_link_in_transaction(
+            &transaction,
+            &attention_correlation_link(&item, "acknowledged")?,
         )?;
         transaction.commit()?;
         Ok(item)
@@ -240,6 +254,10 @@ impl Store {
             &updated_raw,
             &updated_digest,
             now,
+        )?;
+        record_correlation_link_in_transaction(
+            &transaction,
+            &attention_correlation_link(&item, event_kind)?,
         )?;
         transaction.commit()?;
         Ok(item)
@@ -425,6 +443,95 @@ fn insert_attention_event(
     Ok(())
 }
 
+/// Derives an attention-lifecycle trace from controller-owned identities. The
+/// source adapter, acknowledgement request, and terminal authority receipt do
+/// not supply trace context: an exact retry recreates the same immutable edge,
+/// and a failed edge rolls back the corresponding attention state transition.
+fn attention_correlation_link(
+    item: &AttentionItem,
+    event_kind: &str,
+) -> Result<CorrelationLink, StoreError> {
+    let trace_id = digest(&format!("harness.attention.trace.v1:{}", item.attention_id));
+    let opening_span_id = digest(&format!(
+        "harness.attention.span.v1:{}:opened:v1",
+        item.attention_id
+    ));
+    let span_id = digest(&format!(
+        "harness.attention.span.v1:{}:{event_kind}:v{}",
+        item.attention_id, item.version
+    ));
+    let link_id = CorrelationLinkId::parse(format!(
+        "correlation-{}",
+        &digest(&format!(
+            "harness.attention.link.v1:{}:{event_kind}:v{}",
+            item.attention_id, item.version
+        ))[..48]
+    ))
+    .map_err(control_error)?;
+    let (from_kind, from_id, to_kind, to_id, relation, parent_span_id, created_at_ms) =
+        match event_kind {
+            "opened" => (
+                "source_event",
+                item.opened_event_id.clone(),
+                "attention",
+                item.attention_id.to_string(),
+                "opens_attention",
+                None,
+                item.opened_at_ms,
+            ),
+            "acknowledged" => (
+                "attention",
+                item.attention_id.to_string(),
+                "attention_acknowledgement",
+                format!("{}:v{}", item.attention_id, item.version),
+                "acknowledges_attention",
+                Some(opening_span_id[..16].to_owned()),
+                item.acknowledged_at_ms.ok_or_else(|| {
+                    StoreError::Validation(
+                        "acknowledged attention event requires an acknowledgement timestamp"
+                            .to_owned(),
+                    )
+                })?,
+            ),
+            "resolved" | "declined" | "superseded" | "invalidated" => {
+                let resolution = item.resolution.as_ref().ok_or_else(|| {
+                    StoreError::Validation(
+                        "terminal attention event requires a source authority receipt".to_owned(),
+                    )
+                })?;
+                (
+                    "authority_event",
+                    resolution.authority_event_id.clone(),
+                    "attention",
+                    item.attention_id.to_string(),
+                    "resolves_attention",
+                    Some(opening_span_id[..16].to_owned()),
+                    resolution.resolved_at_ms,
+                )
+            }
+            _ => {
+                return Err(StoreError::Validation(
+                    "attention correlation event kind is unsupported".to_owned(),
+                ));
+            }
+        };
+    Ok(CorrelationLink {
+        schema: "harness.correlation-link.v1".to_owned(),
+        link_id,
+        trace: TraceContext {
+            trace_id: trace_id[..32].to_owned(),
+            span_id: span_id[..16].to_owned(),
+            parent_span_id,
+        },
+        from_kind: from_kind.to_owned(),
+        from_id,
+        to_kind: to_kind.to_owned(),
+        to_id,
+        relation: relation.to_owned(),
+        created_at_ms,
+    })
+}
+
 fn attention_from_raw(raw: &str) -> Result<AttentionItem, StoreError> {
     let item: AttentionItem = serde_json::from_str(raw)?;
     item.validate().map_err(control_error)?;
@@ -521,6 +628,19 @@ mod tests {
         Store::in_memory(Path::new(temp.path()).join("artifacts").as_path()).expect("store")
     }
 
+    fn resolution() -> AttentionResolution {
+        AttentionResolution {
+            outcome: "approved".to_owned(),
+            actor_type: "approval_owner".to_owned(),
+            actor_id: "operator_a".to_owned(),
+            resolved_at_ms: 8,
+            authority_event_id: "approval-receipt-a".to_owned(),
+            bound_head_sha: None,
+            worktree_fingerprint: None,
+            receipt_sha256: "a".repeat(64),
+        }
+    }
+
     #[test]
     fn source_open_is_idempotent_and_acknowledgement_is_versioned_only() {
         let temp = TempDir::new().expect("temp");
@@ -547,6 +667,149 @@ mod tests {
         assert_eq!(
             store.list_attention(false, 10).unwrap().items,
             vec![acknowledged]
+        );
+    }
+
+    #[test]
+    fn attention_lifecycle_records_deterministic_causal_receipts() {
+        let temp = TempDir::new().expect("temp");
+        let store = store(&temp);
+        let attention = item(1);
+        let opening = attention_correlation_link(&attention, "opened").expect("opening link");
+        store
+            .upsert_source_attention(&attention)
+            .expect("open attention");
+        assert_eq!(
+            store
+                .correlation_links(&opening.trace.trace_id, 10)
+                .expect("opening trace"),
+            vec![opening.clone()]
+        );
+
+        let acknowledged = store
+            .acknowledge_attention(&attention.attention_id, attention.version, Some(7))
+            .expect("acknowledge attention");
+        let acknowledgement = attention_correlation_link(&acknowledged, "acknowledged")
+            .expect("acknowledgement link");
+        assert_eq!(
+            store
+                .correlation_links(&opening.trace.trace_id, 10)
+                .expect("acknowledgement trace"),
+            vec![opening.clone(), acknowledgement.clone()]
+        );
+
+        let resolved = store
+            .resolve_attention_from_source(
+                &attention.attention_id,
+                acknowledged.version,
+                AttentionState::Resolved,
+                resolution(),
+            )
+            .expect("resolve attention");
+        let closure = attention_correlation_link(&resolved, "resolved").expect("closure link");
+        assert_eq!(
+            store
+                .correlation_links(&opening.trace.trace_id, 10)
+                .expect("full lifecycle trace"),
+            vec![opening, acknowledgement, closure]
+        );
+    }
+
+    #[test]
+    fn correlation_conflict_rolls_back_source_attention_open() {
+        let temp = TempDir::new().expect("temp");
+        let store = store(&temp);
+        let attention = item(1);
+        let mut conflicting =
+            attention_correlation_link(&attention, "opened").expect("opening link");
+        conflicting.relation = "different_relation".to_owned();
+        store
+            .record_correlation_link(&conflicting)
+            .expect("preload conflicting correlation");
+
+        assert!(matches!(
+            store.upsert_source_attention(&attention),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(
+            store
+                .attention_item(&attention.attention_id)
+                .expect("attention read")
+                .is_none()
+        );
+        let connection = store.connection().expect("connection");
+        let event_count: i64 = connection
+            .query_row("SELECT count(*) FROM attention_events", [], |row| {
+                row.get(0)
+            })
+            .expect("event count");
+        assert_eq!(event_count, 0);
+    }
+
+    #[test]
+    fn correlation_conflict_rolls_back_attention_acknowledgement() {
+        let temp = TempDir::new().expect("temp");
+        let store = store(&temp);
+        let attention = item(1);
+        store
+            .upsert_source_attention(&attention)
+            .expect("open attention");
+        let mut acknowledged = attention.clone();
+        acknowledged.state = AttentionState::Acknowledged;
+        acknowledged.acknowledged_at_ms = Some(7);
+        acknowledged.version = 2;
+        let mut conflicting = attention_correlation_link(&acknowledged, "acknowledged")
+            .expect("acknowledgement link");
+        conflicting.relation = "different_relation".to_owned();
+        store
+            .record_correlation_link(&conflicting)
+            .expect("preload conflicting correlation");
+
+        assert!(matches!(
+            store.acknowledge_attention(&attention.attention_id, attention.version, Some(7)),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(
+            store
+                .attention_item(&attention.attention_id)
+                .expect("attention read"),
+            Some(attention)
+        );
+    }
+
+    #[test]
+    fn correlation_conflict_rolls_back_source_attention_closure() {
+        let temp = TempDir::new().expect("temp");
+        let store = store(&temp);
+        let attention = item(1);
+        store
+            .upsert_source_attention(&attention)
+            .expect("open attention");
+        let mut resolved = attention.clone();
+        resolved.state = AttentionState::Resolved;
+        resolved.resolution = Some(resolution());
+        resolved.version = 2;
+        let mut conflicting =
+            attention_correlation_link(&resolved, "resolved").expect("closure link");
+        conflicting.relation = "different_relation".to_owned();
+        store
+            .record_correlation_link(&conflicting)
+            .expect("preload conflicting correlation");
+
+        assert!(matches!(
+            store.resolve_attention_from_source(
+                &attention.attention_id,
+                attention.version,
+                AttentionState::Resolved,
+                resolution(),
+            ),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(
+            store
+                .attention_item(&attention.attention_id)
+                .expect("attention read"),
+            Some(attention)
         );
     }
 
