@@ -585,6 +585,7 @@ paths:
       parameters:
         - name: operator_id
           in: query
+          required: true
           schema: {type: string, maxLength: 160}
       responses:
         '200':
@@ -632,6 +633,7 @@ paths:
       parameters:
         - name: operator_id
           in: query
+          required: true
           schema: {type: string, maxLength: 160}
         - name: limit
           in: query

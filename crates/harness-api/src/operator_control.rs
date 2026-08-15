@@ -793,8 +793,9 @@ fn reconciliation_episode_id(episode_id: String) -> Result<ReconciliationEpisode
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PresenceQuery {
-    operator_id: Option<String>,
+    operator_id: String,
 }
 
 async fn get_operator_presence(
@@ -803,9 +804,12 @@ async fn get_operator_presence(
     Query(query): Query<PresenceQuery>,
 ) -> Result<Json<harness_domain::OperatorPresence>, ApiError> {
     authenticate(&state, &headers, false)?;
-    Ok(Json(state.orchestrator.store().operator_presence(
-        query.operator_id.as_deref().unwrap_or("local_operator"),
-    )?))
+    Ok(Json(
+        state
+            .orchestrator
+            .store()
+            .operator_presence(&query.operator_id)?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -835,8 +839,9 @@ struct NotificationQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NotificationShadowBatchQuery {
-    operator_id: Option<String>,
+    operator_id: String,
     limit: Option<u32>,
 }
 
@@ -868,7 +873,7 @@ async fn list_notification_shadow_batches(
             .orchestrator
             .store()
             .list_notification_shadow_batches(
-                query.operator_id.as_deref(),
+                Some(&query.operator_id),
                 query.limit.unwrap_or(50),
             )?,
     ))
@@ -1054,6 +1059,38 @@ mod tests {
             }))
             .is_err(),
             "unknown query fields are not silently accepted"
+        );
+    }
+
+    #[test]
+    fn notification_reads_require_an_exact_operator_scope() {
+        assert!(
+            serde_json::from_value::<PresenceQuery>(json!({
+                "operator_id": "local_operator",
+            }))
+            .is_ok()
+        );
+        assert!(serde_json::from_value::<PresenceQuery>(json!({})).is_err());
+        assert!(
+            serde_json::from_value::<PresenceQuery>(json!({
+                "operator_id": "local_operator",
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+
+        assert!(
+            serde_json::from_value::<NotificationShadowBatchQuery>(json!({
+                "operator_id": "local_operator",
+                "limit": 50,
+            }))
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<NotificationShadowBatchQuery>(json!({
+                "limit": 50,
+            }))
+            .is_err()
         );
     }
 }

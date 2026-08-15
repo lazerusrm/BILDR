@@ -711,8 +711,9 @@ GET /api/v1/improvement/knowledge?repository_id={repository_id}&limit={1..200}
 GET /api/v1/improvement/knowledge/{knowledge_id}
 GET /api/v1/external-conditions
 GET /api/v1/traces/{trace_id}
+GET /api/v1/operator-presence?operator_id={exact_operator_id}
 GET /api/v1/notification-deliveries
-GET /api/v1/notification-shadow-batches
+GET /api/v1/notification-shadow-batches?operator_id={exact_operator_id}
 GET /api/v1/notification-delivery-health
 ```
 
@@ -730,7 +731,7 @@ POST /api/v1/runs/{run_id}/external-conditions/time-gates
 POST /api/v1/runs/{run_id}/external-conditions/local-capacity
 POST /api/v1/liveness/{episode_id}/knowledge-candidates
 POST /api/v1/notification-shadow-batches
-PUT  /api/v1/operator-presence
+POST /api/v1/operator-presence
 POST /api/v1/runs/{run_id}/investigations
 ```
 
