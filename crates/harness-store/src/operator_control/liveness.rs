@@ -119,6 +119,7 @@ impl Store {
         }
         let observation_raw = serde_json::to_string(observation)?;
         let observation_digest = digest(&observation_raw);
+        let correlation = liveness_observation_correlation_link(observation)?;
         let expected_version = to_i64(expected_version, "liveness expected version")?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
@@ -145,6 +146,7 @@ impl Store {
                 [episode_id.as_str()],
                 |row| checked_episode_row(row.get(0)?, row.get(1)?),
             )?;
+            record_correlation_link_in_transaction(&transaction, &correlation)?;
             transaction.commit()?;
             return Ok(episode);
         }
@@ -215,6 +217,7 @@ impl Store {
                 observation_digest,
             ],
         )?;
+        record_correlation_link_in_transaction(&transaction, &correlation)?;
         transaction.commit()?;
         Ok(episode)
     }
@@ -531,6 +534,46 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?)
     }
+}
+
+/// Derives one episode-scoped causal receipt for each immutable observation.
+/// The source/event adapter cannot provide a trace context: retries recreate
+/// the same link from the observation's durable identity, and the episode is
+/// the explicit causal parent rather than an inferred timestamp adjacency.
+fn liveness_observation_correlation_link(
+    observation: &LivenessObservation,
+) -> Result<CorrelationLink, StoreError> {
+    let trace_id = digest(&format!(
+        "harness.liveness-observation.trace.v1:{}",
+        observation.episode_id
+    ));
+    let span_id = digest(&format!(
+        "harness.liveness-observation.span.v1:{}",
+        observation.observation_id
+    ));
+    let link_id = CorrelationLinkId::parse(format!(
+        "correlation-{}",
+        &digest(&format!(
+            "harness.liveness-observation.link.v1:{}",
+            observation.observation_id
+        ))[..48]
+    ))
+    .map_err(|error| StoreError::Validation(error.to_string()))?;
+    Ok(CorrelationLink {
+        schema: "harness.correlation-link.v1".to_owned(),
+        link_id,
+        trace: TraceContext {
+            trace_id: trace_id[..32].to_owned(),
+            span_id: span_id[..16].to_owned(),
+            parent_span_id: None,
+        },
+        from_kind: "liveness_episode".to_owned(),
+        from_id: observation.episode_id.to_string(),
+        to_kind: "liveness_observation".to_owned(),
+        to_id: observation.observation_id.to_string(),
+        relation: "has_observation".to_owned(),
+        created_at_ms: observation.observed_at_ms,
+    })
 }
 
 /// Derives one controller-owned causal link for an immutable intervention
@@ -907,6 +950,72 @@ mod tests {
             ),
             Err(StoreError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn observation_and_episode_scoped_correlation_commit_together() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let opened = store.open_liveness_episode(&episode()).expect("open");
+        let recorded_observation = observation(
+            opened.episode_id.clone(),
+            LivenessObservationKind::RuntimeHeartbeat,
+            "event-correlation",
+            2_000,
+            json!({"bounded_command_active": true}),
+        );
+        let correlation = liveness_observation_correlation_link(&recorded_observation)
+            .expect("expected correlation");
+        let updated = store
+            .record_liveness_observation(&opened.episode_id, opened.version, &recorded_observation)
+            .expect("observation and correlation");
+        assert_eq!(updated.version, opened.version + 1);
+        assert_eq!(
+            store
+                .correlation_links(&correlation.trace.trace_id, 10)
+                .expect("stored correlation"),
+            vec![correlation]
+        );
+        assert_eq!(
+            store
+                .record_liveness_observation(
+                    &opened.episode_id,
+                    opened.version,
+                    &recorded_observation,
+                )
+                .expect("idempotent replay repairs the same correlation"),
+            updated
+        );
+
+        let conflicting_observation = observation(
+            opened.episode_id.clone(),
+            LivenessObservationKind::CommandActivity,
+            "event-correlation-conflict",
+            3_000,
+            json!({"bounded_command_active": true}),
+        );
+        let mut conflicting_link = liveness_observation_correlation_link(&conflicting_observation)
+            .expect("expected conflicting correlation");
+        conflicting_link.relation = "different_relation".to_owned();
+        store
+            .record_correlation_link(&conflicting_link)
+            .expect("preexisting conflicting link");
+        assert!(matches!(
+            store.record_liveness_observation(
+                &updated.episode_id,
+                updated.version,
+                &conflicting_observation,
+            ),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(
+            store
+                .liveness_episode(&updated.episode_id)
+                .expect("episode rereads")
+                .expect("episode exists"),
+            updated,
+            "a correlation conflict rolls back the observation and episode update"
+        );
     }
 
     #[test]
