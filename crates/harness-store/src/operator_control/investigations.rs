@@ -4,10 +4,10 @@
 //! never a route to task creation, publication, or mutable worktree custody.
 
 use harness_domain::{
-    ImprovementEventId, ImprovementRecordKind, ImprovementSchema, ImprovementState,
-    InvestigationArtifact, InvestigationArtifactId, InvestigationArtifactSummary,
-    InvestigationFindingClassification, InvestigationSensitivity, RetentionClass, SensitivityClass,
-    now_ms,
+    CorrelationLink, CorrelationLinkId, ImprovementEventId, ImprovementRecordKind,
+    ImprovementSchema, ImprovementState, InvestigationArtifact, InvestigationArtifactId,
+    InvestigationArtifactSummary, InvestigationFindingClassification, InvestigationSensitivity,
+    RetentionClass, SensitivityClass, TraceContext, now_ms,
 };
 use harness_learning::{
     CustodyState, KnowledgeFreshness, KnowledgeItemV1, KnowledgeKind, KnowledgeReview,
@@ -18,6 +18,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{NewImprovementRevision, NewInvestigationKnowledgeCandidate, Store, StoreError};
+
+use super::correlation::record_correlation_link_in_transaction;
 
 const MAX_INVESTIGATION_PAGE_SIZE: u32 = 200;
 const MAX_KNOWLEDGE_STATEMENT_BYTES: usize = 4_096;
@@ -35,6 +37,7 @@ impl Store {
         artifact
             .validate_new_record()
             .map_err(|error| StoreError::Validation(error.to_string()))?;
+        let correlation = investigation_artifact_correlation_link(artifact)?;
         let raw = serde_json::to_string(artifact)?;
         let payload_sha256 = digest(&raw);
         let mut connection = self.connection()?;
@@ -49,6 +52,7 @@ impl Store {
         {
             let existing = checked_artifact_row(existing_raw, existing_digest)?;
             if existing == *artifact {
+                record_correlation_link_in_transaction(&transaction, &correlation)?;
                 transaction.commit()?;
                 return Ok(existing);
             }
@@ -70,6 +74,7 @@ impl Store {
                 artifact.created_at_ms,
             ],
         )?;
+        record_correlation_link_in_transaction(&transaction, &correlation)?;
         transaction.commit()?;
         Ok(artifact.clone())
     }
@@ -286,6 +291,46 @@ impl Store {
     }
 }
 
+/// Derives one attempt-scoped causal receipt for each immutable investigation
+/// artifact. The artifact is controller-bound to an exact attempt, and no
+/// untrusted runtime context can choose its trace identity; retries recreate
+/// the same link from the durable attempt and artifact identifiers.
+fn investigation_artifact_correlation_link(
+    artifact: &InvestigationArtifact,
+) -> Result<CorrelationLink, StoreError> {
+    let trace_id = digest(&format!(
+        "harness.investigation-artifact.trace.v1:{}",
+        artifact.attempt_id
+    ));
+    let span_id = digest(&format!(
+        "harness.investigation-artifact.span.v1:{}",
+        artifact.artifact_id
+    ));
+    let link_id = CorrelationLinkId::parse(format!(
+        "correlation-{}",
+        &digest(&format!(
+            "harness.investigation-artifact.link.v1:{}:{}",
+            artifact.attempt_id, artifact.artifact_id
+        ))[..48]
+    ))
+    .map_err(|error| StoreError::Validation(error.to_string()))?;
+    Ok(CorrelationLink {
+        schema: "harness.correlation-link.v1".to_owned(),
+        link_id,
+        trace: TraceContext {
+            trace_id: trace_id[..32].to_owned(),
+            span_id: span_id[..16].to_owned(),
+            parent_span_id: None,
+        },
+        from_kind: "task_attempt".to_owned(),
+        from_id: artifact.attempt_id.clone(),
+        to_kind: "investigation_artifact".to_owned(),
+        to_id: artifact.artifact_id.to_string(),
+        relation: "has_investigation_artifact".to_owned(),
+        created_at_ms: artifact.created_at_ms,
+    })
+}
+
 pub(crate) fn checked_artifact_row(
     raw: String,
     payload_sha256: String,
@@ -396,6 +441,14 @@ mod tests {
                 .expect("first"),
             artifact
         );
+        let correlation =
+            investigation_artifact_correlation_link(&artifact).expect("artifact correlation");
+        assert_eq!(
+            store
+                .correlation_links(&correlation.trace.trace_id, 10)
+                .expect("stored correlation"),
+            vec![correlation]
+        );
         assert_eq!(
             store
                 .record_investigation_artifact(&artifact)
@@ -434,6 +487,32 @@ mod tests {
         );
         assert!(snapshot.investigations.rows[0].get("findings").is_none());
         assert_eq!(snapshot.source_cursors["investigation_artifacts"], 1);
+    }
+
+    #[test]
+    fn correlation_conflict_rolls_back_investigation_artifact() {
+        let temp = TempDir::new().expect("temp");
+        let store =
+            Store::in_memory(Path::new(temp.path()).join("artifacts").as_path()).expect("store");
+        let artifact = artifact();
+        let mut conflicting_link =
+            investigation_artifact_correlation_link(&artifact).expect("expected correlation");
+        conflicting_link.relation = "different_relation".to_owned();
+        store
+            .record_correlation_link(&conflicting_link)
+            .expect("preexisting conflicting correlation");
+
+        assert!(matches!(
+            store.record_investigation_artifact(&artifact),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(
+            store
+                .investigation_artifact(&artifact.artifact_id)
+                .expect("artifact rereads"),
+            None,
+            "a correlation conflict must not persist the artifact"
+        );
     }
 
     #[test]

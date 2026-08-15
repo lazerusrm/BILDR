@@ -4,12 +4,17 @@
 //! events. Routine agent activity, output, tokens, and unrecognized event
 //! names cannot become progress by accident.
 
-use harness_domain::{MaterialProgressEvent, MaterialProgressEventId, MaterialProgressKind};
+use harness_domain::{
+    CorrelationLink, CorrelationLinkId, MaterialProgressEvent, MaterialProgressEventId,
+    MaterialProgressKind, TraceContext,
+};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{Store, StoreError};
+
+use super::correlation::record_correlation_link_in_transaction;
 
 const CLASSIFIER_VERSION: &str = "material-progress-v1";
 const MAX_PROGRESS_PAGE_SIZE: u32 = 200;
@@ -82,6 +87,7 @@ impl Store {
                 continue;
             };
             let progress = material_progress_from_source(&event, kind, summary)?;
+            let correlation = material_progress_correlation_link(&progress)?;
             let raw = serde_json::to_string(&progress)?;
             let existing: Option<(String, String)> = transaction
                 .query_row(
@@ -98,6 +104,7 @@ impl Store {
                         progress.source_event_id
                     )));
                 }
+                record_correlation_link_in_transaction(&transaction, &correlation)?;
                 classified.push(existing);
                 continue;
             }
@@ -115,6 +122,7 @@ impl Store {
                     digest(&serde_json::to_string(&progress)?),
                 ],
             )?;
+            record_correlation_link_in_transaction(&transaction, &correlation)?;
             classified.push(progress);
         }
         if advanced_cursor != cursor {
@@ -159,6 +167,46 @@ impl Store {
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         }
     }
+}
+
+/// Derives one controller-owned causal receipt for each immutable material
+/// progress projection. The classifier receives a durable source event rather
+/// than a trusted inbound trace context, so the source event is the exact root
+/// and retries recreate the same correlation link from stable identities.
+fn material_progress_correlation_link(
+    progress: &MaterialProgressEvent,
+) -> Result<CorrelationLink, StoreError> {
+    let trace_id = digest(&format!(
+        "harness.material-progress.trace.v1:{}",
+        progress.source_event_id
+    ));
+    let span_id = digest(&format!(
+        "harness.material-progress.span.v1:{}",
+        progress.event_id
+    ));
+    let link_id = CorrelationLinkId::parse(format!(
+        "correlation-{}",
+        &digest(&format!(
+            "harness.material-progress.link.v1:{}:{}",
+            progress.source_event_id, progress.event_id
+        ))[..48]
+    ))
+    .map_err(|error| StoreError::Validation(error.to_string()))?;
+    Ok(CorrelationLink {
+        schema: "harness.correlation-link.v1".to_owned(),
+        link_id,
+        trace: TraceContext {
+            trace_id: trace_id[..32].to_owned(),
+            span_id: span_id[..16].to_owned(),
+            parent_span_id: None,
+        },
+        from_kind: "domain_event".to_owned(),
+        from_id: progress.source_event_id.clone(),
+        to_kind: "material_progress".to_owned(),
+        to_id: progress.event_id.to_string(),
+        relation: "derives_progress".to_owned(),
+        created_at_ms: progress.occurred_at_ms,
+    })
 }
 
 fn classify_source_event(event: &SourceEvent) -> Option<(MaterialProgressKind, &'static str)> {
@@ -343,12 +391,76 @@ mod tests {
         let first = store.classify_material_progress().expect("classify");
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].kind, MaterialProgressKind::CandidateChanged);
+        let correlation = material_progress_correlation_link(&first[0]).expect("correlation");
+        assert_eq!(
+            store
+                .correlation_links(&correlation.trace.trace_id, 10)
+                .expect("stored correlation"),
+            vec![correlation]
+        );
         let replay = store.classify_material_progress().expect("replay");
         assert!(
             replay.is_empty(),
             "a fully classified ledger is not replayed"
         );
         assert_eq!(store.list_material_progress(None, 10).unwrap(), first);
+    }
+
+    #[test]
+    fn correlation_conflict_rolls_back_progress_and_classifier_cursor() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let source = store
+            .emit_domain_event(
+                None,
+                "task",
+                "task-correlation-conflict",
+                "task.verified",
+                &json!({}),
+                None,
+            )
+            .expect("material source event");
+        let progress = material_progress_from_source(
+            &SourceEvent {
+                id: source.id,
+                run_id: None,
+                aggregate_type: source.aggregate_type,
+                aggregate_id: source.aggregate_id,
+                event_type: source.event_type,
+                occurred_at_ms: source.occurred_at,
+                payload: source.payload,
+            },
+            MaterialProgressKind::ValidationAdvanced,
+            "Independent verifier recorded a task validation outcome.",
+        )
+        .expect("expected progress");
+        let mut conflicting_link =
+            material_progress_correlation_link(&progress).expect("expected correlation");
+        conflicting_link.relation = "different_relation".to_owned();
+        store
+            .record_correlation_link(&conflicting_link)
+            .expect("preexisting conflicting correlation");
+
+        assert!(matches!(
+            store.classify_material_progress(),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(
+            store.list_material_progress(None, 10).unwrap().is_empty(),
+            "a correlation conflict must not persist material progress"
+        );
+        let connection = store.connection().expect("connection");
+        let cursor: i64 = connection
+            .query_row(
+                "SELECT event_cursor FROM material_progress_classifier_state WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("cursor");
+        assert_eq!(
+            cursor, 0,
+            "a correlation conflict must not advance the cursor"
+        );
     }
 
     #[test]
