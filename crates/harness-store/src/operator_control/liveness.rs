@@ -6,14 +6,17 @@
 //! resulting state but cannot clear it with model prose.
 
 use harness_domain::{
-    InterventionId, InterventionKind, InterventionReceipt, LivenessEpisode, LivenessEpisodeId,
-    LivenessObservation, LivenessObservationKind, LivenessState, now_ms,
+    CorrelationLink, CorrelationLinkId, InterventionId, InterventionKind, InterventionReceipt,
+    LivenessEpisode, LivenessEpisodeId, LivenessObservation, LivenessObservationKind,
+    LivenessState, TraceContext, now_ms,
 };
 use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{Store, StoreError};
+
+use super::correlation::record_correlation_link_in_transaction;
 
 const MAX_LIVENESS_PAGE_SIZE: u32 = 200;
 const OBSERVE_REVIEW_DELAY_MS: i64 = 5 * 60 * 1_000;
@@ -305,9 +308,7 @@ impl Store {
                     "wait intervention identity already has different content".to_owned(),
                 ));
             }
-            return self
-                .liveness_episode(episode_id)?
-                .ok_or_else(|| StoreError::NotFound(format!("liveness episode {episode_id}")));
+            return self.record_intervention_receipt(&receipt);
         }
         let episode = self
             .liveness_episode(episode_id)?
@@ -350,6 +351,7 @@ impl Store {
         receipt
             .validate()
             .map_err(|error| StoreError::Validation(error.to_string()))?;
+        let correlation = intervention_correlation_link(receipt)?;
         let receipt_raw = serde_json::to_string(receipt)?;
         let receipt_digest = digest(&receipt_raw);
         let mut connection = self.connection()?;
@@ -377,6 +379,7 @@ impl Store {
                 )
                 .optional()?
                 .ok_or_else(|| StoreError::NotFound(format!("liveness episode {}", receipt.episode_id)))?;
+            record_correlation_link_in_transaction(&transaction, &correlation)?;
             transaction.commit()?;
             return Ok(episode);
         }
@@ -406,6 +409,7 @@ impl Store {
                 )
                 .optional()?
                 .ok_or_else(|| StoreError::NotFound(format!("liveness episode {}", receipt.episode_id)))?;
+            record_correlation_link_in_transaction(&transaction, &correlation)?;
             transaction.commit()?;
             return Ok(episode);
         }
@@ -489,6 +493,7 @@ impl Store {
                 receipt_digest,
             ],
         )?;
+        record_correlation_link_in_transaction(&transaction, &correlation)?;
         transaction.commit()?;
         Ok(episode)
     }
@@ -526,6 +531,45 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?)
     }
+}
+
+/// Derives one controller-owned causal link for an immutable intervention
+/// receipt. Requests cannot supply trace context: the receipt's exact episode,
+/// intervention identity, and policy record form the sole causal claim.
+fn intervention_correlation_link(
+    receipt: &InterventionReceipt,
+) -> Result<CorrelationLink, StoreError> {
+    let trace_id = digest(&format!(
+        "harness.intervention.trace.v1:{}",
+        receipt.intervention_id
+    ));
+    let span_id = digest(&format!(
+        "harness.intervention.span.v1:{}",
+        receipt.intervention_id
+    ));
+    let link_id = CorrelationLinkId::parse(format!(
+        "correlation-{}",
+        &digest(&format!(
+            "harness.intervention.link.v1:{}",
+            receipt.intervention_id
+        ))[..48]
+    ))
+    .map_err(|error| StoreError::Validation(error.to_string()))?;
+    Ok(CorrelationLink {
+        schema: "harness.correlation-link.v1".to_owned(),
+        link_id,
+        trace: TraceContext {
+            trace_id: trace_id[..32].to_owned(),
+            span_id: span_id[..16].to_owned(),
+            parent_span_id: None,
+        },
+        from_kind: "liveness_episode".to_owned(),
+        from_id: receipt.episode_id.to_string(),
+        to_kind: "intervention_receipt".to_owned(),
+        to_id: receipt.intervention_id.to_string(),
+        relation: "has_intervention".to_owned(),
+        created_at_ms: receipt.created_at_ms,
+    })
 }
 
 fn reduce_episode(
@@ -930,6 +974,13 @@ mod tests {
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].kind, InterventionKind::Wait);
         assert_eq!(receipts[0].target_version, opened.version);
+        let correlation = intervention_correlation_link(&receipts[0]).expect("correlation");
+        assert_eq!(
+            store
+                .correlation_links(&correlation.trace.trace_id, 10)
+                .expect("stored correlation"),
+            vec![correlation]
+        );
         assert!(matches!(
             store.execute_wait_intervention(&opened.episode_id, opened.version, "other_session"),
             Err(StoreError::Conflict(_))
