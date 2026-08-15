@@ -102,6 +102,44 @@ export interface FailureOverview {
   clusters: FailureClusterSummary[];
 }
 
+export type KnowledgeKind = "fact" | "procedure" | "warning" | "heuristic" | "anti_pattern";
+export type KnowledgeReviewState = "unreviewed" | "accepted" | "rejected" | "needs_revalidation";
+export type KnowledgeState = "candidate" | "active" | "expired" | "contradicted" | "superseded" | "rejected";
+
+export interface KnowledgeEvidenceReceipt {
+  kind: string;
+  revision_id: string;
+  digest: string;
+  split: "training" | "development" | "holdout" | "canary" | "quarantine" | null;
+  custody: "clean" | "invalidated" | "restricted" | null;
+}
+
+export interface KnowledgeItem {
+  schema: "harness.knowledge-item.v1";
+  knowledge_id: string;
+  kind: KnowledgeKind;
+  statement: string;
+  scope: {
+    repository_id: string;
+    task_family: string;
+    model_family: string | null;
+    runtime_class: string | null;
+  };
+  evidence: KnowledgeEvidenceReceipt[];
+  confidence_milli: number;
+  review: {
+    state: KnowledgeReviewState;
+    reviewer_id: string | null;
+    reviewed_at: number | null;
+    receipt: KnowledgeEvidenceReceipt | null;
+  };
+  freshness: { created_at: number; revalidate_after: number; expires_at: number };
+  contradicts: string[];
+  supersedes: string[];
+  state: KnowledgeState;
+  sha256: string;
+}
+
 export type FailureClass =
   | "unknown"
   | "policy_blocked"

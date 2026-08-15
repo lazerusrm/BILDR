@@ -20,6 +20,7 @@ import type {
   InvestigationArtifact,
   InvestigationArtifactSummary,
   InterventionReceipt,
+  KnowledgeItem,
   LivenessEpisode,
   MaterialProgressEvent,
   NotificationDelivery,
@@ -138,6 +139,10 @@ class HarnessApi {
   improvementFailures = (repositoryId: string) =>
     this.get<FailureOverview>(
       `/improvement/failures?repository_id=${encodeURIComponent(repositoryId)}`,
+    );
+  knowledgeItems = (repositoryId: string) =>
+    this.get<KnowledgeItem[]>(
+      `/improvement/knowledge?repository_id=${encodeURIComponent(repositoryId)}&limit=50`,
     );
   improvementTrace = (traceId: string) =>
     this.get<FailureTrace>(

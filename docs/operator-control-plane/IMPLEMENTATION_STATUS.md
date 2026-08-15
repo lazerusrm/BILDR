@@ -40,7 +40,9 @@ This status is intentionally a capability boundary, not release evidence.
 - authenticated creation of an unreviewed, display-only knowledge candidate
   from one fresh confirmed investigation finding, with controller-derived
   evidence, repository scope, sensitivity, freshness, identity, and immutable
-  readback by that identity;
+  readback by that identity, plus a bounded integrity-checked current-record
+  collection scoped to one exact repository and displayed in the Improvement
+  Center without any review or activation control;
 - authenticated creation of an unreviewed, display-only heuristic from two
   independently recovered liveness episodes, with controller-derived exact
   observation receipts and no activation or context injection;
@@ -66,8 +68,8 @@ This status is intentionally a capability boundary, not release evidence.
 - active opt-in/broader notification batching, desktop delivery, and
   delivery-health rollout;
 - adaptive supervisor policy or any independent control-plane mutation;
-- knowledge review UI and any context injection or activation beyond the
-  existing governed pipeline;
+- write-capable knowledge review UI and any context injection or activation
+  beyond the existing governed pipeline;
 - evaluation corpus, fault matrix, usability study, canary, rollback drill, and
   production activation.
 

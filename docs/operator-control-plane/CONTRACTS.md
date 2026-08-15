@@ -100,12 +100,11 @@ review
 integration
 ```
 
-Compatibility:
+Requirements:
 
-- legacy stored task packets without the field deserialize as
-  `implementation`;
-- schema writers emit the explicit field after migration;
-- unknown values fail closed;
+- every task packet explicitly carries `execution_kind` and
+  `investigation_scope` (`null` for non-investigation tasks);
+- missing or unknown values fail closed;
 - `investigation` requires an enforceable per-path read sandbox, no mutable
   path lease, and an investigation-artifact completion contract. A generic
   global read-only sandbox and prompt-only scope are insufficient; absent a
@@ -708,6 +707,7 @@ GET /api/v1/reconciliations/{id}
 GET /api/v1/reconciliations/{id}/findings
 GET /api/v1/reconciliations/{id}/actions
 GET /api/v1/investigations/{id}
+GET /api/v1/improvement/knowledge?repository_id={repository_id}&limit={1..200}
 GET /api/v1/improvement/knowledge/{knowledge_id}
 GET /api/v1/external-conditions
 GET /api/v1/traces/{trace_id}

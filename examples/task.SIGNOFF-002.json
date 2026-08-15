@@ -6,6 +6,8 @@
   "state": "ready",
   "priority": "P0",
   "execution_mode": "agent",
+  "execution_kind": "implementation",
+  "investigation_scope": null,
   "owner_profile": "worker",
   "reviewer_profile": "verifier",
   "checklist_rows": ["SIGNOFF-EVIDENCE-001"],

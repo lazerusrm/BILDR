@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { FailureClusterSummary, RuntimeStatus } from "../types";
+import type { FailureClusterSummary, KnowledgeItem, RuntimeStatus } from "../types";
 import {
   compareClusters,
   costDisclosure,
   ImprovementCenter,
   improvementModePresentation,
+  knowledgeDisclosure,
 } from "./ImprovementCenter";
 
 describe("Improvement Center", () => {
@@ -41,5 +42,29 @@ describe("Improvement Center", () => {
     expect(improvementModePresentation(mismatch).label).toBe("Safety anchor mismatch");
     expect(markup).toContain("Safety anchor mismatch");
     expect(markup).toContain("Configured anchor does not match the frozen anchor.");
+  });
+
+  it("keeps governed knowledge display explicit and non-authoritative", () => {
+    const item: KnowledgeItem = {
+      schema: "harness.knowledge-item.v1",
+      knowledge_id: "knowledge_1",
+      kind: "warning",
+      statement: "Preserve the immutable receipt before operator review.",
+      scope: { repository_id: "repository_1", task_family: "operator_control", model_family: null, runtime_class: null },
+      evidence: [{ kind: "reconciliation_episode", revision_id: "episode_1", digest: "a".repeat(64), split: null, custody: "clean" }],
+      confidence_milli: 800,
+      review: { state: "unreviewed", reviewer_id: null, reviewed_at: null, receipt: null },
+      freshness: { created_at: 1, revalidate_after: 2, expires_at: 3 },
+      contradicts: [],
+      supersedes: [],
+      state: "candidate",
+      sha256: "b".repeat(64),
+    };
+    expect(knowledgeDisclosure(item)).toBe(
+      "operator_control · 1 evidence receipt · review unreviewed · revalidate 2",
+    );
+    const markup = renderToStaticMarkup(createElement(ImprovementCenter, { runtime: undefined }));
+    expect(markup).toContain("Governed knowledge");
+    expect(markup).toContain("cannot review, activate, inject, or alter task context");
   });
 });

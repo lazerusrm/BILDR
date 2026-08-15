@@ -9056,7 +9056,7 @@ impl Orchestrator {
                 .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
             if let Some(existing) = self.store.investigation_artifact(&artifact_id)? {
                 existing
-                    .validate_new_record()
+                    .validate()
                     .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
                 validate_investigation_artifact_binding(
                     &existing,
@@ -16887,10 +16887,6 @@ fn canonicalize_architecture_task(
         .or_insert_with(|| json!("verifier"));
     task.entry("state".to_owned())
         .or_insert_with(|| json!("proposed"));
-    task.entry("execution_kind".to_owned())
-        .or_insert_with(|| json!("implementation"));
-    task.entry("investigation_scope".to_owned())
-        .or_insert(Value::Null);
     task.entry("priority".to_owned())
         .or_insert_with(|| json!("P0"));
     task.entry("dependency_shas".to_owned())
@@ -16916,8 +16912,20 @@ fn canonicalize_architecture_task(
     task.entry("handoff_path".to_owned())
         .or_insert_with(|| json!("controller://governor-checkpoint"));
 
-    let is_investigation =
-        task.get("execution_kind").and_then(Value::as_str) == Some("investigation");
+    let execution_kind = task
+        .get("execution_kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            OrchestratorError::Protocol(
+                "architecture task is missing its explicit execution kind".to_owned(),
+            )
+        })?;
+    if !task.contains_key("investigation_scope") {
+        return Err(OrchestratorError::Protocol(
+            "architecture task is missing its explicit investigation scope value".to_owned(),
+        ));
+    }
+    let is_investigation = execution_kind == "investigation";
     let authority_refs_are_empty = task
         .get("authority_refs")
         .and_then(Value::as_array)
@@ -20790,6 +20798,8 @@ mod tests {
                 "title": "Deliver the behavior",
                 "objective": "Implement and prove the requested behavior",
                 "priority": "P1",
+                "execution_kind": "implementation",
+                "investigation_scope": null,
                 "owned_paths": ["src/**", "Cargo.lock"],
                 "reserved_serial_paths": ["Cargo.lock"],
                 "milestones": [
@@ -20808,6 +20818,16 @@ mod tests {
         })
         .to_string();
 
+        let mut missing_execution_kind: Value = serde_json::from_str(&raw).unwrap();
+        missing_execution_kind["tasks"][0]
+            .as_object_mut()
+            .expect("task is an object")
+            .remove("execution_kind");
+        assert!(matches!(
+            parse_architecture_plan(&run, &profile, 80_000, &missing_execution_kind.to_string(),),
+            Err(OrchestratorError::Protocol(_))
+        ));
+
         let plan = parse_architecture_plan(&run, &profile, 80_000, &raw).unwrap();
 
         assert!(validate_plan(&run, &plan, &profile).is_ok());
@@ -20816,6 +20836,8 @@ mod tests {
         assert_eq!(task.base_sha, run.base_sha);
         assert_eq!(task.owner_profile, "governor");
         assert_eq!(task.execution_mode, "controller");
+        assert_eq!(task.execution_kind, TaskExecutionKind::Implementation);
+        assert_eq!(task.investigation_scope, None);
         assert_eq!(task.priority, "P1");
         assert_eq!(task.token_budget, 80_000);
         assert_eq!(task.reserved_serial_paths, ["Cargo.lock"]);

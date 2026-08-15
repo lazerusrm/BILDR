@@ -1403,6 +1403,7 @@ kbd {
   color: var(--muted);
 }
 .improvement-cluster,
+.knowledge-item,
 .trace-row {
   display: grid;
   width: 100%;
@@ -1425,6 +1426,8 @@ kbd {
 }
 .improvement-cluster span,
 .improvement-cluster small,
+.knowledge-item span,
+.knowledge-item small,
 .trace-row span,
 .trace-row small {
   color: var(--muted);

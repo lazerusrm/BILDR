@@ -228,12 +228,12 @@ operator_control_id!(NotificationShadowBatchId);
 operator_control_id!(TopologySnapshotId);
 operator_control_id!(CorrelationLinkId);
 
-/// Closed execution authority for a task. Legacy packets deserialize to the
-/// least surprising existing behavior: an implementation task.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Closed execution authority for a task. Every task packet must declare one
+/// explicit kind; omission is a protocol error rather than an implementation
+/// default.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskExecutionKind {
-    #[default]
     Implementation,
     Investigation,
     Verification,
@@ -507,9 +507,7 @@ impl AttentionItem {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InvestigationScope {
-    #[serde(default)]
     pub owned_read_paths: Vec<String>,
-    #[serde(default)]
     pub forbidden_paths: Vec<String>,
     pub time_budget_ms: u64,
     pub token_budget: u64,
@@ -545,28 +543,6 @@ impl InvestigationScope {
         }
         Ok(())
     }
-
-    /// v1 artifacts are immutable evidence rows. Their historical scope
-    /// contract pre-dates the current operational time/token ceilings, so
-    /// reads preserve that compatibility while still checking the original
-    /// bounded paths, positive budgets, and path syntax.
-    fn validate_persisted_artifact_scope(&self) -> Result<(), OperatorControlError> {
-        if self.owned_read_paths.is_empty()
-            || self.owned_read_paths.len() > MAX_INVESTIGATION_REFS
-            || self.forbidden_paths.len() > MAX_INVESTIGATION_REFS
-            || self.time_budget_ms == 0
-            || self.token_budget == 0
-        {
-            return Err(OperatorControlError::InvalidField {
-                field: "investigation scope",
-                reason: "must have bounded read paths and positive time and token budgets",
-            });
-        }
-        for path in self.owned_read_paths.iter().chain(&self.forbidden_paths) {
-            validate_relative_repo_path(path, "investigation scope path")?;
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -594,12 +570,9 @@ pub struct InvestigationFinding {
     pub classification: InvestigationFindingClassification,
     pub summary: String,
     pub confidence_milli: u16,
-    #[serde(default)]
     pub evidence_refs: Vec<String>,
-    #[serde(default)]
     pub affected_refs: Vec<String>,
     pub risk: AttentionSeverity,
-    #[serde(default)]
     pub limitations: Vec<String>,
 }
 
@@ -644,9 +617,7 @@ pub struct InvestigationRecommendation {
     pub recommendation_id: String,
     pub summary: String,
     pub required_authority: String,
-    #[serde(default)]
     pub evidence_refs: Vec<String>,
-    #[serde(default)]
     pub alternatives: Vec<String>,
     pub risk: AttentionSeverity,
     pub next_verification: String,
@@ -690,14 +661,11 @@ pub struct DecisionInventoryItem {
     pub decision_id: String,
     pub question: String,
     pub state: String,
-    #[serde(default)]
     pub options: Vec<String>,
-    #[serde(default)]
     pub evidence_refs: Vec<String>,
     pub impact: String,
     pub recommended_option: Option<String>,
     pub required_actor: String,
-    #[serde(default)]
     pub blocking_refs: Vec<String>,
     pub independent_work_can_continue: bool,
 }
@@ -760,22 +728,14 @@ pub struct InvestigationArtifact {
     pub scope: InvestigationScope,
     pub base_sha: String,
     pub repository_state_digest: String,
-    #[serde(default)]
     pub methods: Vec<String>,
-    #[serde(default)]
     pub sources: Vec<String>,
-    #[serde(default)]
     pub findings: Vec<InvestigationFinding>,
-    #[serde(default)]
     pub recommendations: Vec<InvestigationRecommendation>,
-    #[serde(default)]
     pub decision_inventory: Vec<DecisionInventoryItem>,
-    #[serde(default)]
     pub limitations: Vec<String>,
-    #[serde(default)]
     pub rejected_hypotheses: Vec<String>,
     pub sensitivity: InvestigationSensitivity,
-    #[serde(default)]
     pub artifact_refs: Vec<String>,
     pub created_at_ms: i64,
     pub sha256: String,
@@ -804,7 +764,7 @@ impl InvestigationArtifact {
             validate_identifier(value, field)?;
         }
         validate_text(&self.question, "investigation question", MAX_SUMMARY_LEN)?;
-        self.scope.validate_persisted_artifact_scope()?;
+        self.scope.validate()?;
         validate_lower_hex(&self.base_sha, "investigation base SHA", 40)?;
         validate_lower_hex(
             &self.repository_state_digest,
@@ -865,42 +825,11 @@ impl InvestigationArtifact {
             MAX_INVESTIGATION_REFS,
             MAX_IDENTIFIER_LEN,
         )?;
-        let raw = serde_json::to_vec(self).map_err(|_| OperatorControlError::InvalidField {
-            field: "investigation artifact",
-            reason: "must serialize as JSON",
-        })?;
-        if raw.len() > MAX_INVESTIGATION_PAYLOAD_BYTES {
-            return Err(OperatorControlError::InvalidField {
-                field: "investigation artifact payload",
-                reason: "exceeds the 2 MiB contract bound",
-            });
-        }
-        validate_lower_hex(
-            &self.sha256,
-            "investigation artifact sha256",
-            SHA256_HEX_LEN,
-        )?;
-        if self.digest()? != self.sha256 {
-            return Err(OperatorControlError::InvalidField {
-                field: "investigation artifact sha256",
-                reason: "does not match the canonical artifact payload",
-            });
-        }
-        Ok(())
-    }
-
-    /// Admission rules for a newly recorded investigation result. The base
-    /// validator deliberately remains compatible with immutable v1 rows on
-    /// read; new controller evidence must additionally meet the current
-    /// bounded-scope and conclusion-evidence contract.
-    pub fn validate_new_record(&self) -> Result<(), OperatorControlError> {
-        self.validate()?;
-        self.scope.validate()?;
         let expected_context_source = format!("context:{}", self.repository_state_digest);
         if self.sources != vec![expected_context_source.clone()] || !self.artifact_refs.is_empty() {
             return Err(OperatorControlError::InvalidField {
                 field: "investigation artifact evidence custody",
-                reason: "new records must cite only their controller-admitted immutable context and no external artifacts",
+                reason: "must cite only its controller-admitted immutable context and no external artifacts",
             });
         }
         if self.findings.is_empty()
@@ -937,6 +866,27 @@ impl InvestigationArtifact {
                     reason: "each conclusion must cite only its controller-admitted immutable context evidence",
                 });
             }
+        }
+        let raw = serde_json::to_vec(self).map_err(|_| OperatorControlError::InvalidField {
+            field: "investigation artifact",
+            reason: "must serialize as JSON",
+        })?;
+        if raw.len() > MAX_INVESTIGATION_PAYLOAD_BYTES {
+            return Err(OperatorControlError::InvalidField {
+                field: "investigation artifact payload",
+                reason: "exceeds the 2 MiB contract bound",
+            });
+        }
+        validate_lower_hex(
+            &self.sha256,
+            "investigation artifact sha256",
+            SHA256_HEX_LEN,
+        )?;
+        if self.digest()? != self.sha256 {
+            return Err(OperatorControlError::InvalidField {
+                field: "investigation artifact sha256",
+                reason: "does not match the canonical artifact payload",
+            });
         }
         Ok(())
     }
@@ -2957,40 +2907,42 @@ mod tests {
     }
 
     #[test]
-    fn legacy_task_packets_default_to_implementation() {
-        let packet: crate::TaskPacket = serde_json::from_value(serde_json::json!({
-            "schema": "harness.orchestration.task.v1",
-            "program_id": "program",
-            "task_id": "task",
-            "title": "Legacy task",
-            "state": "ready",
-            "priority": "P1",
-            "execution_mode": "controller",
-            "owner_profile": "general",
-            "reviewer_profile": "general",
-            "checklist_rows": [],
-            "authority_refs": [],
-            "base_sha": "",
-            "depends_on": [],
-            "owned_paths": [],
-            "forbidden_paths": [],
-            "reserved_serial_paths": [],
-            "objective": "Preserve legacy packets",
-            "milestones": [],
-            "non_goals": [],
-            "success_criteria": [],
-            "required_positive_tests": [],
-            "required_negative_tests": [],
-            "required_metrics": [],
-            "required_evidence": [],
-            "proof_limits": [],
-            "diff_budget": {"files": 1, "lines": 1},
-            "token_budget": 1000,
-            "lease_expires_at": "controller-managed",
-            "stop_conditions": [],
-            "handoff_path": "controller://legacy"
-        }))
-        .expect("legacy packet deserializes");
-        assert_eq!(packet.execution_kind, TaskExecutionKind::Implementation);
+    fn task_packets_require_an_explicit_execution_contract() {
+        assert!(
+            serde_json::from_value::<crate::TaskPacket>(serde_json::json!({
+                "schema": "harness.orchestration.task.v1",
+                "program_id": "program",
+                "task_id": "task",
+                "title": "Explicit task",
+                "state": "ready",
+                "priority": "P1",
+                "execution_mode": "controller",
+                "owner_profile": "general",
+                "reviewer_profile": "general",
+                "checklist_rows": [],
+                "authority_refs": [],
+                "base_sha": "",
+                "depends_on": [],
+                "owned_paths": [],
+                "forbidden_paths": [],
+                "reserved_serial_paths": [],
+                "objective": "Require an explicit execution contract",
+                "milestones": [],
+                "non_goals": [],
+                "success_criteria": [],
+                "required_positive_tests": [],
+                "required_negative_tests": [],
+                "required_metrics": [],
+                "required_evidence": [],
+                "proof_limits": [],
+                "diff_budget": {"files": 1, "lines": 1},
+                "token_budget": 1000,
+                "lease_expires_at": "controller-managed",
+                "stop_conditions": [],
+                "handoff_path": "controller://task"
+            }))
+            .is_err(),
+            "missing execution kind and investigation scope must not default"
+        );
     }
 }

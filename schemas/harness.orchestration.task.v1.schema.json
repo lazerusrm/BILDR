@@ -6,7 +6,7 @@
   "additionalProperties": false,
   "required": [
     "schema", "program_id", "task_id", "title", "state", "priority",
-    "execution_mode", "owner_profile", "reviewer_profile", "checklist_rows",
+    "execution_mode", "execution_kind", "investigation_scope", "owner_profile", "reviewer_profile", "checklist_rows",
     "authority_refs", "base_sha", "depends_on", "owned_paths",
     "forbidden_paths", "reserved_serial_paths", "objective", "milestones", "non_goals",
     "success_criteria", "required_positive_tests", "required_negative_tests",
@@ -28,10 +28,7 @@
     },
     "priority": { "enum": ["P0", "P1", "P2", "P3"] },
     "execution_mode": { "enum": ["controller", "agent", "subagent_required", "manual_operator"] },
-    "execution_kind": {
-      "default": "implementation",
-      "enum": ["implementation", "investigation", "verification", "review", "integration"]
-    },
+    "execution_kind": {"enum": ["implementation", "investigation", "verification", "review", "integration"]},
     "investigation_scope": {
       "type": ["object", "null"],
       "additionalProperties": false,

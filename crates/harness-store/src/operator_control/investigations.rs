@@ -35,7 +35,7 @@ impl Store {
         artifact: &InvestigationArtifact,
     ) -> Result<InvestigationArtifact, StoreError> {
         artifact
-            .validate_new_record()
+            .validate()
             .map_err(|error| StoreError::Validation(error.to_string()))?;
         let correlation = investigation_artifact_correlation_link(artifact)?;
         let raw = serde_json::to_string(artifact)?;
@@ -92,7 +92,7 @@ impl Store {
             .investigation_artifact(&input.artifact_id)?
             .ok_or_else(|| StoreError::NotFound(input.artifact_id.to_string()))?;
         artifact
-            .validate_new_record()
+            .validate()
             .map_err(|error| StoreError::Conflict(error.to_string()))?;
         if artifact.sha256 != input.expected_artifact_sha256 {
             return Err(StoreError::Conflict(
@@ -566,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_artifact_reads_preserve_pre_ceiling_scope_and_empty_evidence() {
+    fn invalid_persisted_artifacts_fail_closed_under_the_current_v1_contract() {
         let temp = TempDir::new().expect("temp");
         let store =
             Store::in_memory(Path::new(temp.path()).join("artifacts").as_path()).expect("store");
@@ -576,13 +576,13 @@ mod tests {
         artifact.findings[0].evidence_refs.clear();
         artifact.recommendations[0].evidence_refs.clear();
         artifact.decision_inventory[0].evidence_refs.clear();
-        artifact.sha256 = artifact.digest().expect("legacy artifact digest");
+        artifact.sha256 = artifact.digest().expect("invalid artifact digest");
 
         assert!(
             store.record_investigation_artifact(&artifact).is_err(),
-            "new artifact intake must not weaken its current evidence/scope contract"
+            "new artifact intake must enforce the one v1 contract"
         );
-        let raw = serde_json::to_string(&artifact).expect("legacy artifact serializes");
+        let raw = serde_json::to_string(&artifact).expect("invalid artifact serializes");
         let raw_digest = digest(&raw);
         store
             .connection()
@@ -600,13 +600,10 @@ mod tests {
                     artifact.created_at_ms,
                 ],
             )
-            .expect("immutable legacy migration row inserts");
-        assert_eq!(
-            store
-                .investigation_artifact(&artifact.artifact_id)
-                .expect("artifact rereads"),
-            Some(artifact),
-            "integrity-checked immutable reads retain the v1 contract"
+            .expect("invalid persisted row inserts for fail-closed read coverage");
+        assert!(
+            store.investigation_artifact(&artifact.artifact_id).is_err(),
+            "persisted rows cannot bypass the current v1 evidence and scope contract"
         );
     }
 
@@ -692,6 +689,24 @@ mod tests {
                 .expect("candidate remains readable by durable knowledge identity"),
             item
         );
+        assert_eq!(
+            store
+                .list_current_knowledge_items(repository_id.as_str(), 10)
+                .expect("candidate list stays within the exact repository scope"),
+            vec![item.clone()]
+        );
+        assert!(
+            store
+                .list_current_knowledge_items("other_repository", 10)
+                .expect("other repository has no implicit knowledge scope")
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_current_knowledge_items(repository_id.as_str(), 201)
+                .is_err(),
+            "knowledge list bounds are enforced at the store boundary"
+        );
         assert!(
             store
                 .resolved_active_knowledge(&repository_id, "operator_control", 0)
@@ -757,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn nonconfirmed_or_legacy_investigation_cannot_seed_knowledge() {
+    fn nonconfirmed_investigation_cannot_seed_knowledge() {
         let temp = TempDir::new().expect("temp");
         let store =
             Store::in_memory(Path::new(temp.path()).join("artifacts").as_path()).expect("store");
@@ -813,40 +828,6 @@ mod tests {
         };
         assert!(matches!(
             store.propose_knowledge_from_investigation(&candidate),
-            Err(StoreError::Conflict(_))
-        ));
-
-        let mut legacy = artifact();
-        legacy.created_at_ms = now_ms();
-        legacy.scope.time_budget_ms = 48 * 60 * 60 * 1_000;
-        legacy.sha256 = legacy.digest().expect("legacy digest");
-        let raw = serde_json::to_string(&legacy).expect("legacy wire");
-        store
-            .connection()
-            .expect("connection")
-            .execute(
-                "INSERT INTO investigation_artifacts(id,run_id,task_id,base_sha,repository_state_digest,payload_json,payload_sha256,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![
-                    legacy.artifact_id.as_str(),
-                    legacy.run_id,
-                    legacy.task_id,
-                    legacy.base_sha,
-                    legacy.repository_state_digest,
-                    raw.clone(),
-                    digest(&raw),
-                    legacy.created_at_ms,
-                ],
-            )
-            .expect("legacy artifact row");
-        assert!(matches!(
-            store.propose_knowledge_from_investigation(&NewInvestigationKnowledgeCandidate {
-                artifact_id: legacy.artifact_id,
-                expected_artifact_sha256: legacy.sha256,
-                finding_id: "finding_a".to_owned(),
-                task_family: "operator_control".to_owned(),
-                model_family: None,
-                runtime_class: None,
-            }),
             Err(StoreError::Conflict(_))
         ));
     }

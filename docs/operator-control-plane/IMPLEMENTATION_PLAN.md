@@ -101,9 +101,9 @@ snapshot/return/topology/correlation DTOs
 transition validators and bounded identifier helpers
 ```
 
-Add explicit compatibility behavior for legacy `TaskPacket` without execution
-kind. Add event names and serialization fixtures. Do not add generic state
-setters.
+Require every `TaskPacket` to declare its execution kind and investigation
+scope explicitly. Add event names and serialization fixtures. Do not add
+generic state setters or omitted-field defaults.
 
 ### Required tests
 
@@ -111,7 +111,7 @@ setters.
 - unknown enum rejection;
 - legal/illegal transition tables;
 - identifier/size bounds;
-- legacy task packet defaults to implementation;
+- missing task execution kind or investigation scope is rejected;
 - investigation cannot request mutable sandbox/lease/candidate;
 - terminal record idempotency with same receipt only.
 

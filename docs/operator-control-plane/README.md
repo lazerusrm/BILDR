@@ -136,6 +136,12 @@ the bounded statement, evidence receipt, repository scope, sensitivity,
 freshness, and deterministic identity from the immutable artifact. This does
 not activate knowledge, change task context, or write global memory.
 
+The Improvement Center and `GET /api/v1/improvement/knowledge` expose a
+bounded, repository-scoped collection of those immutable current records. Each
+listed wire is integrity-checked and keeps candidate state, review, evidence,
+scope, and freshness explicit. The collection remains display-only: it cannot
+review, activate, inject, or otherwise use knowledge as execution authority.
+
 An authenticated operator may also derive an unreviewed, display-only warning
 from two immutable reconciliation episodes for the same trigger when each has
 an exact preserved-candidate finding and authority-neutral preservation

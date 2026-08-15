@@ -805,6 +805,26 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/KnowledgeItem'}
         '404': {$ref: '#/components/responses/NotFound'}
+  /improvement/knowledge:
+    get:
+      tags: [Improvement]
+      operationId: listCurrentKnowledgeItems
+      description: Lists bounded current immutable knowledge records for one exact repository scope. Every item retains its explicit candidate state, review, evidence, freshness, and scope. Reading cannot review, activate, inject, or use knowledge as execution authority.
+      parameters:
+        - name: repository_id
+          in: query
+          required: true
+          schema: {$ref: '#/components/schemas/KnowledgeToken'}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Integrity-checked current knowledge records in stable newest-first order, constrained to the requested repository.
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/KnowledgeItem'}}
+        '422': {$ref: '#/components/responses/ValidationError'}
   /external-conditions:
     get:
       tags: [ExternalConditions]

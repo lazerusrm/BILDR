@@ -5,6 +5,7 @@ import type {
   FailureClusterSummary,
   FailureOverview,
   FailureTrace,
+  KnowledgeItem,
   RuntimeStatus,
 } from "../types";
 import { EvaluationSourceCard } from "./EvaluationSourceCard";
@@ -64,6 +65,8 @@ export function ImprovementCenter({
   const [traceError, setTraceError] = useState("");
   const [evaluationSource, setEvaluationSource] = useState<EvaluationOccurrenceSource>();
   const [evaluationSourceError, setEvaluationSourceError] = useState("");
+  const [knowledgeItems, setKnowledgeItems] = useState<KnowledgeItem[]>();
+  const [knowledgeError, setKnowledgeError] = useState("");
 
   useEffect(() => {
     let active = true;
@@ -82,6 +85,27 @@ export function ImprovementCenter({
           : undefined);
       },
       (cause: unknown) => active && setError(displayError(cause, "Could not load failure observations")),
+    );
+    void load();
+    const timer = window.setInterval(load, 15_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [repositoryId]);
+
+  useEffect(() => {
+    let active = true;
+    setKnowledgeItems(undefined);
+    setKnowledgeError("");
+    if (!repositoryId) return () => { active = false; };
+    const load = () => api.knowledgeItems(repositoryId).then(
+      (value) => {
+        if (!active) return;
+        setKnowledgeItems(value);
+        setKnowledgeError("");
+      },
+      (cause: unknown) => active && setKnowledgeError(displayError(cause, "Could not load governed knowledge")),
     );
     void load();
     const timer = window.setInterval(load, 15_000);
@@ -150,6 +174,23 @@ export function ImprovementCenter({
           />}
         </section>
       </>}
+      <section aria-label="Governed knowledge" className="improvement-section">
+        <header><span className="eyebrow">Display only</span><h2>Governed knowledge</h2></header>
+        <p>Candidate state, review, evidence, scope, and freshness are explicit. This view cannot review, activate, inject, or alter task context.</p>
+        {knowledgeError && <p role="alert" className="form-error">{knowledgeError}</p>}
+        {!repositoryId && <p className="improvement-empty">Select a repository to inspect its governed knowledge records.</p>}
+        {repositoryId && !knowledgeItems && !knowledgeError && <p className="improvement-empty">Loading immutable knowledge records…</p>}
+        {knowledgeItems && !knowledgeItems.length && <p className="improvement-empty">No governed knowledge records have been created for this repository.</p>}
+        {knowledgeItems && knowledgeItems.length > 0 && <VirtualRows
+          items={knowledgeItems}
+          rowHeight={72}
+          renderRow={(item) => <article className="knowledge-item">
+            <strong>{item.kind} · {item.state}</strong>
+            <span>{item.statement}</span>
+            <small>{knowledgeDisclosure(item)}</small>
+          </article>}
+        />}
+      </section>
       {traceError && <p role="alert" className="form-error">{traceError}</p>}
       <TraceExplorer traceId={traceId || undefined} rows={trace?.rows || []} loading={Boolean(traceId && !trace && !traceError)} />
       <EvaluationSourceCard source={evaluationSource} loading={Boolean(occurrenceId && !evaluationSource && !evaluationSourceError)} error={evaluationSourceError} />
@@ -171,6 +212,13 @@ export function costDisclosure(cluster: FailureClusterSummary) {
   if (cluster.cost_upper_microusd === null) return unknown || "cost unavailable";
   const known = `$${(cluster.cost_upper_microusd / 1_000_000).toFixed(2)} upper estimate`;
   return unknown ? `${known} · ${unknown}` : known;
+}
+
+export function knowledgeDisclosure(item: KnowledgeItem) {
+  const review = item.review.reviewer_id
+    ? `${item.review.state} by ${item.review.reviewer_id}`
+    : item.review.state;
+  return `${item.scope.task_family} · ${item.evidence.length} evidence receipt${item.evidence.length === 1 ? "" : "s"} · review ${review} · revalidate ${item.freshness.revalidate_after}`;
 }
 
 function displayError(cause: unknown, fallback: string) {

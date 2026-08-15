@@ -44,6 +44,7 @@ use crate::{
 const TRACE_SNAPSHOT_MAX_RAW_RECEIPTS: i64 = 10_000;
 const TRACE_SNAPSHOT_MAX_DOMAIN_RECEIPTS: i64 = 10_000;
 const TRACE_SNAPSHOT_MAX_PAYLOAD_BYTES: i64 = 32 * 1024 * 1024;
+const MAX_KNOWLEDGE_PAGE_SIZE: u32 = 200;
 
 impl Store {
     pub fn bind_champion_policy(
@@ -816,6 +817,53 @@ impl Store {
             ));
         }
         Ok(item)
+    }
+
+    /// Lists current immutable knowledge records only within one exact
+    /// repository scope. Every returned record is integrity-checked before it
+    /// can reach a display client; this collection cannot review, activate,
+    /// inject, or otherwise use knowledge as execution authority.
+    pub fn list_current_knowledge_items(
+        &self,
+        repository_id: &str,
+        limit: u32,
+    ) -> Result<Vec<harness_learning::KnowledgeItemV1>, StoreError> {
+        safe_eval_id(repository_id, 128)?;
+        if limit == 0 || limit > MAX_KNOWLEDGE_PAGE_SIZE {
+            return Err(StoreError::Validation(format!(
+                "knowledge item page limit must be 1..={MAX_KNOWLEDGE_PAGE_SIZE}"
+            )));
+        }
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_current_revisions WHERE aggregate_kind='knowledge' AND json_extract(payload_json,'$.scope.repository_id')=?1 ORDER BY created_at DESC,aggregate_id DESC LIMIT ?2",
+        )?;
+        statement
+            .query_map(
+                params![repository_id, i64::from(limit)],
+                map_improvement_revision,
+            )?
+            .map(|row| {
+                let record = row?;
+                let item: harness_learning::KnowledgeItemV1 =
+                    serde_json::from_value(record.payload)?;
+                item.verify()
+                    .map_err(|error| StoreError::Validation(error.to_string()))?;
+                if item.knowledge_id != record.aggregate_id {
+                    return Err(StoreError::Conflict(
+                        "knowledge current revision identity does not match its aggregate"
+                            .to_owned(),
+                    ));
+                }
+                if item.scope.repository_id != repository_id {
+                    return Err(StoreError::Conflict(
+                        "knowledge current revision escaped its requested repository scope"
+                            .to_owned(),
+                    ));
+                }
+                Ok(item)
+            })
+            .collect()
     }
 
     fn immutable_revision_wire<T: serde::de::DeserializeOwned>(
@@ -6196,7 +6244,7 @@ fn resolved_investigation_artifact_tx(
     }
     let artifact: harness_domain::InvestigationArtifact = serde_json::from_str(&raw)?;
     artifact
-        .validate_new_record()
+        .validate()
         .map_err(|error| StoreError::Conflict(error.to_string()))?;
     if artifact.artifact_id.as_str() != receipt.revision_id || artifact.sha256 != receipt.digest {
         return Err(StoreError::Conflict(

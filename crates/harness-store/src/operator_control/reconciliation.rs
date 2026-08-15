@@ -1330,7 +1330,7 @@ mod tests {
             state: "ready".to_owned(),
             priority: "P1".to_owned(),
             execution_mode: "controller".to_owned(),
-            execution_kind: Default::default(),
+            execution_kind: harness_domain::TaskExecutionKind::Implementation,
             investigation_scope: None,
             owner_profile: "fixture".to_owned(),
             reviewer_profile: "fixture".to_owned(),

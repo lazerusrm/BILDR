@@ -730,12 +730,10 @@ pub struct TaskPacket {
     pub state: String,
     pub priority: String,
     pub execution_mode: String,
-    #[serde(default)]
     pub execution_kind: TaskExecutionKind,
     /// Required only for a read-only investigation.  It is deliberately
     /// separate from `owned_paths`: an investigation receives no mutable
     /// path custody.
-    #[serde(default)]
     pub investigation_scope: Option<InvestigationScope>,
     pub owner_profile: String,
     pub reviewer_profile: String,

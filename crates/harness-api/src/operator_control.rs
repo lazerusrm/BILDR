@@ -48,6 +48,10 @@ pub(super) fn routes() -> Router<ApiState> {
             post(propose_knowledge_from_investigation),
         )
         .route(
+            "/api/v1/improvement/knowledge",
+            get(list_current_knowledge_items),
+        )
+        .route(
             "/api/v1/improvement/knowledge/{knowledge_id}",
             get(get_current_knowledge_item),
         )
@@ -425,6 +429,30 @@ async fn get_current_knowledge_item(
             .orchestrator
             .store()
             .current_knowledge_item(&knowledge_id)?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KnowledgeQuery {
+    repository_id: String,
+    limit: Option<u32>,
+}
+
+/// Lists the current immutable knowledge records for one exact repository.
+/// This is a display-only collection: it cannot review, activate, inject, or
+/// use an item as execution authority.
+async fn list_current_knowledge_items(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<KnowledgeQuery>,
+) -> Result<Json<Vec<harness_learning::KnowledgeItemV1>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .store()
+            .list_current_knowledge_items(&query.repository_id, query.limit.unwrap_or(50))?,
     ))
 }
 
@@ -1000,6 +1028,32 @@ mod tests {
             }))
             .is_err(),
             "the explicit nullable deadline field cannot silently default"
+        );
+    }
+
+    #[test]
+    fn knowledge_collection_query_requires_an_exact_closed_repository_scope() {
+        assert!(
+            serde_json::from_value::<KnowledgeQuery>(json!({
+                "repository_id": "repository_1",
+                "limit": 50,
+            }))
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<KnowledgeQuery>(json!({
+                "limit": 50,
+            }))
+            .is_err(),
+            "the collection has no cross-repository default scope"
+        );
+        assert!(
+            serde_json::from_value::<KnowledgeQuery>(json!({
+                "repository_id": "repository_1",
+                "unexpected": true,
+            }))
+            .is_err(),
+            "unknown query fields are not silently accepted"
         );
     }
 }

@@ -42,7 +42,7 @@ not enter active rollout.
 | recovery | reconciliation controller | show report/safe actions | force/skip proof |
 | external condition | adapter/registry | show current wait/result | execute result as command |
 | notification delivery | delivery store | show receipt/health | resolve source attention |
-| knowledge | existing governance pipeline | show active scoped item | auto-activate from incident |
+| knowledge | existing governance pipeline | show integrity-checked scoped current items | auto-activate from incident |
 
 ## Contract-to-file matrix
 
@@ -58,6 +58,7 @@ not enter active rollout.
 | notification/presence | same | `notifications.rs` | `notifications.rs` | presence/delivery health | Presence/Health | mirror/shadow/delivery fault |
 | topology | same | optional persisted snapshot | topology compiler | topology route/CLI | table/optional graph | causal/accessibility/perf |
 | correlation | trace crate types | trace store | propagation | trace route/CLI | evidence navigation | parent/link/redaction/restart |
+| governed knowledge | existing knowledge contracts | current revision query | none | knowledge collection route | Improvement Center display | scope/integrity/read-only UI |
 
 ## Attention source-adapter matrix
 
