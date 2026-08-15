@@ -1607,4 +1607,47 @@ mod tests {
                 .is_none()
         );
     }
+
+    #[test]
+    fn proof_consumption_refuses_any_unreconciled_command_history() {
+        let temp = TempDir::new().expect("temp");
+        let (store, episode, proof, task_id, replacement, human_action_id) =
+            fresh_attempt_fixture(&temp);
+        let command_json = r#"{"program":"fixture-command"}"#;
+        store
+            .connection()
+            .expect("connection")
+            .execute(
+                "INSERT INTO command_runs(id,run_id,task_attempt_id,command_json,command_sha256,cwd,resource_class,started_at,timed_out,version) VALUES('command-fresh-prior',?1,?2,?3,?4,'/tmp/fresh-attempt-fixture','control',1,0,1)",
+                rusqlite::params![
+                    &proof.run_id,
+                    &proof.prior_attempt_id,
+                    command_json,
+                    digest(command_json),
+                ],
+            )
+            .expect("recorded command");
+        let prior_attempt_id = harness_domain::AttemptId::from(proof.prior_attempt_id.as_str());
+        assert!(
+            !store
+                .fresh_attempt_custody_is_closed(&prior_attempt_id)
+                .expect("command history blocks custody")
+        );
+        let receipt = fresh_attempt_receipt(
+            episode.episode_id.clone(),
+            &proof,
+            &replacement,
+            human_action_id,
+        );
+        assert!(matches!(
+            store.consume_ownership_proof_for_fresh_attempt(
+                &proof.proof_id,
+                &receipt,
+                episode.version,
+                &replacement,
+                store.task(&task_id).expect("task").version,
+            ),
+            Err(StoreError::Conflict(_))
+        ));
+    }
 }
