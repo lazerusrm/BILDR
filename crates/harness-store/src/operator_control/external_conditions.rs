@@ -6,8 +6,9 @@
 //! material event through the explicit custody method below.
 
 use harness_domain::{
-    ConditionObservation, ExternalCondition, ExternalConditionAdapter, ExternalConditionId,
-    ExternalConditionOwnerType, ExternalConditionState, ExternalConditionSummary, RunId,
+    ConditionObservation, CorrelationLink, CorrelationLinkId, ExternalCondition,
+    ExternalConditionAdapter, ExternalConditionId, ExternalConditionOwnerType,
+    ExternalConditionState, ExternalConditionSummary, RunId, TraceContext,
 };
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
@@ -15,6 +16,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{Store, StoreError};
+
+use super::correlation::record_correlation_link_in_transaction;
 
 const MAX_EXTERNAL_CONDITION_PAGE_SIZE: u32 = 200;
 const MAX_CONDITION_OBSERVATION_PAGE_SIZE: u32 = 200;
@@ -145,6 +148,7 @@ impl Store {
                 "condition observation must bind the requested condition".to_owned(),
             ));
         }
+        let correlation = condition_observation_correlation_link(observation)?;
         let observation_raw = serde_json::to_string(observation)?;
         let observation_digest = digest(&observation_raw);
         let expected_version = to_i64(expected_version, "external condition expected version")?;
@@ -184,6 +188,7 @@ impl Store {
                         ));
                     }
                 }
+                record_correlation_link_in_transaction(&transaction, &correlation)?;
                 transaction.commit()?;
                 return Ok(current);
             }
@@ -309,6 +314,7 @@ impl Store {
                 ],
             )?;
         }
+        record_correlation_link_in_transaction(&transaction, &correlation)?;
         transaction.commit()?;
         Ok(condition)
     }
@@ -452,6 +458,45 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
+}
+
+/// Derives the controller-owned causal edge from one exact condition to its
+/// immutable observation. Adapter payload cannot supply trace context, and an
+/// observation retry repairs a missing old link without creating new facts.
+fn condition_observation_correlation_link(
+    observation: &ConditionObservation,
+) -> Result<CorrelationLink, StoreError> {
+    let trace_id = digest(&format!(
+        "harness.condition-observation.trace.v1:{}",
+        observation.observation_id
+    ));
+    let span_id = digest(&format!(
+        "harness.condition-observation.span.v1:{}",
+        observation.observation_id
+    ));
+    let link_id = CorrelationLinkId::parse(format!(
+        "correlation-{}",
+        &digest(&format!(
+            "harness.condition-observation.link.v1:{}",
+            observation.observation_id
+        ))[..48]
+    ))
+    .map_err(|error| StoreError::Validation(error.to_string()))?;
+    Ok(CorrelationLink {
+        schema: "harness.correlation-link.v1".to_owned(),
+        link_id,
+        trace: TraceContext {
+            trace_id: trace_id[..32].to_owned(),
+            span_id: span_id[..16].to_owned(),
+            parent_span_id: None,
+        },
+        from_kind: "external_condition".to_owned(),
+        from_id: observation.condition_id.to_string(),
+        to_kind: "condition_observation".to_owned(),
+        to_id: observation.observation_id.to_string(),
+        relation: "observed_as".to_owned(),
+        created_at_ms: observation.observed_at_ms,
+    })
 }
 
 struct ConditionMaterialEvent<'a> {
@@ -708,6 +753,14 @@ mod tests {
                 .list_condition_observations(&condition.condition_id, 10)
                 .expect("observation list"),
             vec![observation.clone()]
+        );
+        let correlation =
+            condition_observation_correlation_link(&observation).expect("observation correlation");
+        assert_eq!(
+            store
+                .correlation_links(&correlation.trace.trace_id, 10)
+                .expect("stored observation correlation"),
+            vec![correlation]
         );
         assert_eq!(
             store
