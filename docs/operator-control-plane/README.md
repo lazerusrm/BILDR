@@ -97,7 +97,8 @@ The current branch implements durable attention, investigation artifact
 contracts/records and external-condition records, immutable snapshots/return views, deterministic material
 progress, observe-only liveness episodes, exact-revision intervention receipts,
 reconciliation/ownership evidence with immutable inventory findings and action
-receipts, bounded run topology, and a retry-safe
+receipts, bounded run topology, a proof-consuming authenticated fresh-retry
+path, and a retry-safe
 in-product notification mirror. Each mirror receipt atomically records its
 source-attention causal link, and the API/CLI expose bounded immutable trace
 lookup. This is not yet full trace propagation through every producer.
@@ -112,11 +113,17 @@ controller-visible read-event stream. Therefore production investigation
 dispatch is fail-closed: its artifact reducer is present, but no scoped
 investigator may start until an enforcing runtime is supplied.
 
+The authenticated fresh-retry path is narrow: it requires a terminal prior
+attempt, explicitly preserved clean Git worktree, matching live/controller
+HEAD, no active lease/agent or prior command effect, a durable operator action, and a
+single-use proof/receipt/replacement-attempt transaction. Automatic retries
+remain disabled because they do not yet have an equivalent proof issuer.
+
 Desktop notification delivery/batching, active intervention execution,
-reconciliation proof consumption, external wake adapters, adaptive supervisor
-behavior, empirical evaluation, and rollout activation remain explicitly gated
-until their own evidence passes. Do not interpret an empty observe-only section
-as a healthy or automatically recovered run.
+external wake adapters, adaptive supervisor behavior, empirical evaluation,
+and rollout activation remain explicitly gated until their own evidence passes.
+Do not interpret an empty observe-only section as a healthy or automatically
+recovered run.
 
 ## Critical implementation rules
 

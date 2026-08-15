@@ -1,8 +1,7 @@
 # Operator control plane implementation status
 
-**Current integrated branch:** `implement/pr4-operator-control-foundation`
-(rebased onto deployed PR3 supervisor head `63d6cc3`). This status is intentionally a
-capability boundary, not release evidence.
+**Current implementation branch:** `implement/pr4-operator-control-completion`.
+This status is intentionally a capability boundary, not release evidence.
 
 ## Implemented, read-only/observe-only slices
 
@@ -17,8 +16,11 @@ capability boundary, not release evidence.
   degraded/stalled state, plus exact-revision immutable receipts for completed
   controller-path interventions; the reducer and UI execute no intervention;
 - reconciliation episode, immutable inventory finding/action-receipt, and
-  exclusive-ownership proof custody; records cannot reset work, release leases,
-  or authorize a replacement attempt;
+  exclusive-ownership proof custody, including one-use transactional
+  proof-to-replacement authorization for authenticated retry. It requires a
+  terminal attempt, explicitly preserved clean worktree, matching live HEAD,
+  no active path lease/agent or prior command effect, and a durable operator action; it neither
+  releases custody nor retries unknown effects implicitly;
 - bounded run topology table over durable run/task/attempt/agent/worktree and
   dependency facts; no graph layout or inferred links;
 - versioned local presence and deterministic, retry-safe in-product
@@ -31,9 +33,10 @@ capability boundary, not release evidence.
 
 ## Explicitly not activated or complete
 
-- controller-owned reconciliation actions and proof consumption; restart loss
-  currently records preservation receipts and retains leases/approvals, rather
-  than claiming proof for a release or replacement attempt;
+- automatic reconciliation replacement, lease release, approval invalidation,
+  and session resumption; restart loss records preservation receipts and retains
+  uncertain custody, while only the authenticated proof-consuming retry path
+  may authorize a clean replacement;
 - typed intervention execution;
 - external-condition polling/wake adapters;
 - notification batching, desktop delivery, and delivery-health rollout;
@@ -54,8 +57,8 @@ sections are not evidence that a run is healthy, reconciled, or safe to resume.
 - `cargo run -p xtask -- schema-check`
 - `cargo run -p xtask -- openapi-check`
 
-Temporary test output must use `/mnt/dev-fast`: `/mnt/bulk-fast` was at 100%
-capacity during this implementation and must not be used for new build output.
+Build output is isolated under `/mnt/bulk-fast/agent-builds/nmch-pr4`; do not
+start workspace-wide builds when the controlled capacity policy is unmet.
 
 ## Promotion boundary
 

@@ -26,7 +26,8 @@ use harness_domain::{
     ConditionObservationId, DecisionInventoryItem, DiffBudget, EvidenceId, ExpertRequestId,
     ExpertResponseId, ExternalCondition, ExternalConditionAdapter, ExternalConditionOwnerType,
     ExternalConditionState, InvestigationArtifact, InvestigationArtifactId, InvestigationFinding,
-    InvestigationRecommendation, InvestigationSensitivity, ProofTier, RepositoryId,
+    InvestigationRecommendation, InvestigationSensitivity, OwnershipProof, OwnershipProofId,
+    ProofTier, ReconciliationActionKind, ReconciliationActionReceipt, RepositoryId,
     RepositorySummary, ResourceClass, ResultClass, RiskLevel, RunId, RunPlan, RunState, RunSummary,
     RuntimeStatus, SandboxMode, SchedulerStatus, SupervisorActionId, SupervisorDecisionId,
     SupervisorMode, SupervisorReviewId, TaskExecutionKind, TaskId, TaskPacket, TaskState,
@@ -7231,23 +7232,20 @@ impl Orchestrator {
         let retry_continuity_key = format!("retry-continuity:{}", task.id);
         let retry_packet = self.store.runtime_metadata(&retry_key)?;
         let retry_continuity = self.store.runtime_metadata(&retry_continuity_key)?;
-        if (retry_packet.is_some() || retry_continuity.is_some())
-            && !transactional_fresh_attempt_proof_consumer_available()
-        {
+        if retry_packet.is_some() || retry_continuity.is_some() {
             return Err(OrchestratorError::Blocked(
-                "fresh task attempt refused: retry custody exists but no transactional exclusive-ownership proof consumer is available"
+                "fresh task attempt refused: legacy retry metadata is not an exclusive-ownership proof; use the reconciliation proof-consumption flow"
                     .to_owned(),
             ));
         }
-        let mut packet = retry_packet
-            .map(serde_json::from_value)
-            .transpose()?
+        let authorized_fresh_attempt = self.store.authorized_fresh_attempt(&task.id)?;
+        let fresh_attempt = authorized_fresh_attempt.as_ref();
+        let mut packet = fresh_attempt
+            .map(|attempt| attempt.packet.clone())
             .unwrap_or(planned_packet);
-        let retry_metadata = retry_continuity
-            .map(serde_json::from_value::<RetryContinuityMetadata>)
-            .transpose()?;
+        let retry_metadata = None::<RetryContinuityMetadata>;
         let governing = packet_uses_governor(&packet);
-        if !governing {
+        if !governing && fresh_attempt.is_none() {
             packet.token_budget = controller_task_token_budget(
                 &packet,
                 self.config.orchestration.default_task_token_budget,
@@ -7274,18 +7272,22 @@ impl Orchestrator {
             } else {
                 DEFAULT_GOVERNOR_ATTEMPT_TOKENS.min(settings.governor_attempt_token_ceiling)
             };
-            packet.handoff_path = "controller://attempt-handoff".to_owned();
-            let attempt_ceiling = retry_metadata
-                .as_ref()
-                .filter(|retry| retry.additional_token_budget > 0)
-                .map(|_| MAX_GOVERNOR_ATTEMPT_TOKENS)
-                .unwrap_or(settings.governor_attempt_token_ceiling);
-            packet.token_budget = packet.token_budget.max(recommended).min(attempt_ceiling);
+            if fresh_attempt.is_none() {
+                packet.handoff_path = "controller://attempt-handoff".to_owned();
+                let attempt_ceiling = retry_metadata
+                    .as_ref()
+                    .filter(|retry| retry.additional_token_budget > 0)
+                    .map(|_| MAX_GOVERNOR_ATTEMPT_TOKENS)
+                    .unwrap_or(settings.governor_attempt_token_ceiling);
+                packet.token_budget = packet.token_budget.max(recommended).min(attempt_ceiling);
+            }
         }
-        if packet.base_sha != run.base_sha {
+        let launch_base_sha =
+            fresh_attempt.map_or_else(|| run.base_sha.clone(), |attempt| attempt.base_sha.clone());
+        if packet.base_sha != launch_base_sha {
             return Err(OrchestratorError::Blocked(format!(
-                "task {} base {} differs from pinned run base {}",
-                packet.task_id, packet.base_sha, run.base_sha
+                "task {} base {} differs from its authorized launch base {}",
+                packet.task_id, packet.base_sha, launch_base_sha
             )));
         }
         packet
@@ -7299,31 +7301,43 @@ impl Orchestrator {
                     .to_owned(),
             ));
         }
-        let dependency_commits = dependency_task_commits(
-            task,
-            &self.store.list_tasks(&run.id)?,
-            self.store.verified_task_commits(&run.id)?,
-        )?;
-        let dependency_sha_by_external = dependency_commits
-            .iter()
-            .map(|(external_id, _, sha)| (external_id.clone(), sha.clone()))
-            .collect::<BTreeMap<_, _>>();
-        packet.dependency_shas = task
-            .dependencies
-            .iter()
-            .map(|dependency| {
-                dependency_sha_by_external
-                    .get(dependency)
-                    .cloned()
-                    .map(|sha| (dependency.clone(), sha))
-                    .ok_or_else(|| {
-                        OrchestratorError::Blocked(format!(
-                            "dependency {dependency} has no verified commit"
-                        ))
-                    })
-            })
-            .collect::<Result<_, _>>()?;
-        let prior_context = self.store.latest_attempt_context(&task.id)?;
+        let dependency_commits = if fresh_attempt.is_some() {
+            // The proven preserved head was created from the prior composed
+            // base, so replaying dependencies would duplicate their changes.
+            Vec::new()
+        } else {
+            dependency_task_commits(
+                task,
+                &self.store.list_tasks(&run.id)?,
+                self.store.verified_task_commits(&run.id)?,
+            )?
+        };
+        if fresh_attempt.is_none() {
+            let dependency_sha_by_external = dependency_commits
+                .iter()
+                .map(|(external_id, _, sha)| (external_id.clone(), sha.clone()))
+                .collect::<BTreeMap<_, _>>();
+            packet.dependency_shas = task
+                .dependencies
+                .iter()
+                .map(|dependency| {
+                    dependency_sha_by_external
+                        .get(dependency)
+                        .cloned()
+                        .map(|sha| (dependency.clone(), sha))
+                        .ok_or_else(|| {
+                            OrchestratorError::Blocked(format!(
+                                "dependency {dependency} has no verified commit"
+                            ))
+                        })
+                })
+                .collect::<Result<_, _>>()?;
+        }
+        let prior_context = if fresh_attempt.is_some() {
+            None
+        } else {
+            self.store.latest_attempt_context(&task.id)?
+        };
         if governing
             && self
                 .store
@@ -7351,7 +7365,30 @@ impl Orchestrator {
         } else {
             None
         };
-        let attempt_id = harness_domain::AttemptId::new();
+        let (attempt_id, attempt_number) = if let Some(fresh_attempt) = fresh_attempt {
+            self.store
+                .lease_authorized_fresh_attempt(&task.id, &fresh_attempt.id)?;
+            (fresh_attempt.id.clone(), fresh_attempt.attempt_number)
+        } else {
+            let attempt_id = harness_domain::AttemptId::new();
+            self.store.create_task_attempt(&NewTaskAttempt {
+                id: attempt_id.clone(),
+                task_id: task.id.clone(),
+                attempt_number: task.attempt.saturating_add(1),
+                state: "LEASED".to_owned(),
+                packet: packet.clone(),
+                packet_sha256: packet_digest(&packet)?,
+                base_sha: launch_base_sha.clone(),
+                requested_model_route: if governing {
+                    self.governor_route(run)?.model
+                } else if packet.is_high_risk() || packet.owner_profile == "worker_escalation" {
+                    profile.profile.models.worker_escalation.model.clone()
+                } else {
+                    profile.profile.models.worker.model.clone()
+                },
+            })?;
+            (attempt_id, task.attempt.saturating_add(1))
+        };
         let governor_route = governing.then(|| self.governor_route(run)).transpose()?;
         let route = if governing {
             governor_route
@@ -7362,16 +7399,6 @@ impl Orchestrator {
         } else {
             &profile.profile.models.worker
         };
-        self.store.create_task_attempt(&NewTaskAttempt {
-            id: attempt_id.clone(),
-            task_id: task.id.clone(),
-            attempt_number: task.attempt.saturating_add(1),
-            state: "LEASED".to_owned(),
-            packet: packet.clone(),
-            packet_sha256: packet_digest(&packet)?,
-            base_sha: run.base_sha.clone(),
-            requested_model_route: route.model.clone(),
-        })?;
         let repository = self.store.repository(&run.repository_id)?;
         if packet.execution_kind == TaskExecutionKind::Investigation {
             return self
@@ -7383,6 +7410,8 @@ impl Orchestrator {
                     &repository,
                     &profile,
                     route,
+                    &launch_base_sha,
+                    attempt_number,
                 )
                 .await;
         }
@@ -7390,7 +7419,7 @@ impl Orchestrator {
             "harness/{}/{}/{}",
             short_id(run.id.as_str()),
             sanitize_ref(&packet.task_id),
-            task.attempt.saturating_add(1)
+            attempt_number
         );
         let worktree = match self
             .git
@@ -7399,9 +7428,9 @@ impl Orchestrator {
                 relative_path: PathBuf::from(run.id.as_str()).join("tasks").join(format!(
                     "{}-{}",
                     sanitize_ref(&packet.task_id),
-                    task.attempt + 1
+                    attempt_number
                 )),
-                base_sha: run.base_sha.clone(),
+                base_sha: launch_base_sha.clone(),
                 branch: Some(branch.clone()),
             })
             .await
@@ -7427,7 +7456,7 @@ impl Orchestrator {
             kind: "task".to_owned(),
             path: worktree.path.clone(),
             branch: Some(branch),
-            base_sha: run.base_sha.clone(),
+            base_sha: launch_base_sha.clone(),
             head_sha: Some(worktree.head_sha.clone()),
             state: if dependency_commits.is_empty() {
                 "ACTIVE".to_owned()
@@ -7742,41 +7771,40 @@ impl Orchestrator {
         repository: &RepositorySummary,
         profile: &LoadedProfile,
         route: &ModelRoute,
+        launch_base_sha: &str,
+        attempt_number: u32,
     ) -> Result<(), OrchestratorError> {
         let scope = packet.investigation_scope.as_ref().ok_or_else(|| {
             OrchestratorError::Validation(
                 "investigation task is missing its bounded read-only scope".to_owned(),
             )
         })?;
-        let worktree = match self
-            .git
-            .create_worktree(&WorktreeSpec {
-                repository_root: PathBuf::from(&repository.root_path),
-                relative_path: PathBuf::from(run.id.as_str())
-                    .join("investigations")
-                    .join(format!(
-                        "{}-{}",
-                        sanitize_ref(&packet.task_id),
-                        task.attempt.saturating_add(1)
-                    )),
-                base_sha: run.base_sha.clone(),
-                branch: None,
-            })
-            .await
-        {
-            Ok(worktree) => worktree,
-            Err(error) => {
-                let reason = error.to_string();
-                self.store.set_attempt_result(
-                    attempt_id,
-                    "FAILED",
-                    None,
-                    Some("infrastructure_unavailable"),
-                    Some(&reason),
-                )?;
-                return Err(error.into());
-            }
-        };
+        let worktree =
+            match self
+                .git
+                .create_worktree(&WorktreeSpec {
+                    repository_root: PathBuf::from(&repository.root_path),
+                    relative_path: PathBuf::from(run.id.as_str()).join("investigations").join(
+                        format!("{}-{}", sanitize_ref(&packet.task_id), attempt_number),
+                    ),
+                    base_sha: launch_base_sha.to_owned(),
+                    branch: None,
+                })
+                .await
+            {
+                Ok(worktree) => worktree,
+                Err(error) => {
+                    let reason = error.to_string();
+                    self.store.set_attempt_result(
+                        attempt_id,
+                        "FAILED",
+                        None,
+                        Some("infrastructure_unavailable"),
+                        Some(&reason),
+                    )?;
+                    return Err(error.into());
+                }
+            };
         let worktree_id = WorktreeId::new();
         if let Err(error) = self.store.create_worktree(&NewWorktree {
             id: worktree_id.clone(),
@@ -7785,7 +7813,7 @@ impl Orchestrator {
             kind: "investigation".to_owned(),
             path: worktree.path.clone(),
             branch: None,
-            base_sha: run.base_sha.clone(),
+            base_sha: launch_base_sha.to_owned(),
             head_sha: Some(worktree.head_sha.clone()),
             state: "ACTIVE".to_owned(),
         }) {
@@ -11092,7 +11120,7 @@ impl Orchestrator {
         packet: &TaskPacket,
         reason: &str,
     ) -> Result<bool, OrchestratorError> {
-        if !transactional_fresh_attempt_proof_consumer_available() {
+        if !automatic_fresh_attempt_authorization_available() {
             return Ok(false);
         }
         let settings = self.operator_settings();
@@ -11488,7 +11516,7 @@ impl Orchestrator {
         // Only a failed warm continuation needs a fresh attempt, which stays
         // unavailable until reconciliation can consume ownership proof.
         let cold_retry_allowed =
-            should_continue && transactional_fresh_attempt_proof_consumer_available();
+            should_continue && automatic_fresh_attempt_authorization_available();
 
         if should_continue {
             let next_turn_budget = settings
@@ -12223,7 +12251,7 @@ impl Orchestrator {
             && run.state == RunState::Executing
             && !run.scheduler_paused
             && run_remaining > MIN_GOVERNOR_ATTEMPT_TOKENS
-            && transactional_fresh_attempt_proof_consumer_available();
+            && automatic_fresh_attempt_authorization_available();
         self.store
             .transition_task(&task_id, TaskState::ChangesRequested, None)?;
         self.store.set_attempt_result(
@@ -13657,9 +13685,9 @@ impl Orchestrator {
         findings: &[PlanReviewFinding],
         actor: &str,
     ) -> Result<Vec<TaskId>, OrchestratorError> {
-        if !transactional_fresh_attempt_proof_consumer_available() {
+        if !automatic_fresh_attempt_authorization_available() {
             return Err(OrchestratorError::Blocked(
-                "execution-signoff remediation requires a transactional exclusive-ownership proof consumer before it can create fresh attempts"
+                "execution-signoff remediation cannot automatically authorize fresh attempts; use the operator proof-consumption retry flow for each reconciled task"
                     .to_owned(),
             ));
         }
@@ -13799,12 +13827,6 @@ impl Orchestrator {
         request: RetryTaskRequest,
         actor: &str,
     ) -> Result<OperationAccepted, OrchestratorError> {
-        if !transactional_fresh_attempt_proof_consumer_available() {
-            return Err(OrchestratorError::Blocked(
-                "fresh retry is unavailable until a transactional exclusive-ownership proof consumer is implemented"
-                    .to_owned(),
-            ));
-        }
         if request.reason.chars().count() > 4_000
             || request
                 .revised_objective
@@ -13826,10 +13848,12 @@ impl Orchestrator {
             )));
         }
         let task = self.store.task(task_id)?;
+        if self.store.authorized_fresh_attempt(task_id)?.is_some() {
+            return Ok(operation("retry_task", task_id.as_str()));
+        }
         if !matches!(
             task.state,
             TaskState::NeedsHelp
-                | TaskState::ChangesRequested
                 | TaskState::Interrupted
                 | TaskState::Stalled
                 | TaskState::Blocked
@@ -13844,6 +13868,56 @@ impl Orchestrator {
             .store
             .task_packet(task_id)?
             .ok_or_else(|| OrchestratorError::Blocked("task has no prior packet".to_owned()))?;
+        let prior = self.store.latest_attempt_context(task_id)?.ok_or_else(|| {
+            OrchestratorError::Blocked("task has no prior attempt context".to_owned())
+        })?;
+        if prior.attempt_id != attempt_id
+            || !matches!(prior.state.as_str(), "FAILED" | "INTERRUPTED" | "STALLED")
+        {
+            return Err(OrchestratorError::Blocked(
+                "fresh retry requires a terminal FAILED, INTERRUPTED, or STALLED prior attempt; preserve or reconcile other states first"
+                    .to_owned(),
+            ));
+        }
+        if !self.store.fresh_attempt_custody_is_closed(&attempt_id)? {
+            return Err(OrchestratorError::Blocked(
+                "fresh retry requires no active path lease/agent and no prior command effects; record reconciliation evidence instead of releasing custody or assuming effects are closed"
+                    .to_owned(),
+            ));
+        }
+        let (worktree_id, worktree_path, _, stored_head) =
+            self.store.worktree_for_attempt(&attempt_id)?;
+        let worktree = self
+            .store
+            .list_worktrees(Some(&task.run_id))?
+            .into_iter()
+            .find(|worktree| worktree.id == worktree_id)
+            .ok_or_else(|| OrchestratorError::Protocol("prior worktree disappeared".to_owned()))?;
+        if worktree.state != "PRESERVED" {
+            return Err(OrchestratorError::Blocked(
+                "fresh retry requires an explicitly preserved prior worktree".to_owned(),
+            ));
+        }
+        let head_sha = self.git.head_sha(&worktree_path).await?;
+        if stored_head.as_deref() != Some(head_sha.as_str())
+            || task.head_sha.as_deref() != Some(head_sha.as_str())
+        {
+            return Err(OrchestratorError::Conflict(
+                "preserved worktree HEAD no longer matches the controller-recorded attempt head"
+                    .to_owned(),
+            ));
+        }
+        let diff = self
+            .git
+            .diff_summary(&worktree_path, &worktree.base_sha)
+            .await?;
+        if diff.dirty {
+            return Err(OrchestratorError::Blocked(
+                "fresh retry refuses a dirty preserved worktree; commit or explicitly reconcile the candidate before transferring custody"
+                    .to_owned(),
+            ));
+        }
+        let worktree_fingerprint = self.git.worktree_fingerprint(&worktree_path).await?;
         let governing = packet_uses_governor(&packet);
         if !governing && request.additional_token_budget > 0 {
             return Err(OrchestratorError::Validation(
@@ -13851,29 +13925,8 @@ impl Orchestrator {
                     .to_owned(),
             ));
         }
-        if governing {
-            self.store
-                .delete_runtime_metadata(&format!("governor-continuation-signature:{task_id}"))?;
-            self.store.put_runtime_metadata(
-                &format!("governor-envelope-baseline:{task_id}"),
-                &json!(self.store.task_governor_usage(task_id)?),
-            )?;
-        }
         let reason = if request.reason.trim().is_empty() {
-            self.store
-                .runtime_metadata(&format!("governor-progress:{task_id}"))?
-                .and_then(|value| serde_json::from_value::<GovernorCheckpoint>(value).ok())
-                .and_then(|checkpoint| {
-                    checkpoint.next_action.map(|next| {
-                        format!(
-                            "Controller-selected continuation from durable milestone progress: {next}"
-                        )
-                    })
-                })
-                .unwrap_or_else(|| {
-                    "Controller-selected continuation toward the unchanged goal from durable attempt history"
-                        .to_owned()
-                })
+            "Operator requested a fresh attempt from the proven preserved candidate".to_owned()
         } else {
             format!("Optional operator guidance: {}", request.reason.trim())
         };
@@ -13887,32 +13940,6 @@ impl Orchestrator {
             .token_budget
             .saturating_add(request.additional_token_budget)
             .min(MAX_GOVERNOR_ATTEMPT_TOKENS);
-        let continuation_run_budget = if governing {
-            let settings = self.operator_settings();
-            let next_attempt_allowance =
-                packet
-                    .token_budget
-                    .min(if request.additional_token_budget > 0 {
-                        MAX_GOVERNOR_ATTEMPT_TOKENS
-                    } else {
-                        settings.governor_attempt_token_ceiling
-                    });
-            let current_usage = self.store.run_usage(&task.run_id)?.total_tokens;
-            let child_headroom = GOVERNOR_CHILD_TOKEN_CEILING
-                .saturating_mul(u64::from(self.config.orchestration.max_read_only_discovery));
-            let run = self.store.run(&task.run_id)?;
-            Some(continuation_run_budget(
-                current_usage,
-                Some(
-                    run.run_token_budget
-                        .unwrap_or(settings.governor_goal_token_budget),
-                ),
-                next_attempt_allowance,
-                child_headroom,
-            )?)
-        } else {
-            None
-        };
         if request.model_route == "escalate_terra" && !governing {
             packet.owner_profile = "worker_escalation".to_owned();
         }
@@ -13922,32 +13949,47 @@ impl Orchestrator {
                 self.config.orchestration.default_task_token_budget,
             );
         }
-        self.store
-            .release_path_leases(&attempt_id, "task retry requested")?;
-        if let Ok((worktree_id, _, _, head)) = self.store.worktree_for_attempt(&attempt_id) {
-            self.store.update_worktree(
-                &worktree_id,
-                "PRESERVED",
-                head.as_deref(),
-                Some("superseded by a new immutable retry attempt"),
-            )?;
-        }
-        self.store
-            .put_runtime_metadata(&format!("retry:{task_id}"), &serde_json::to_value(&packet)?)?;
-        self.store.put_runtime_metadata(
-            &format!("retry-continuity:{task_id}"),
-            &serde_json::to_value(RetryContinuityMetadata {
-                source_attempt_id: attempt_id.clone(),
-                reason: reason.clone(),
-                model_route: if governing {
-                    "same".to_owned()
-                } else {
-                    request.model_route.clone()
-                },
-                additional_token_budget: request.additional_token_budget,
-            })?,
-        )?;
-        self.store.record_human_action(
+        packet.base_sha = head_sha.clone();
+        packet
+            .validate_execution_contract()
+            .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
+        let run = self.store.run(&task.run_id)?;
+        let custody_material = serde_json::to_vec(&json!({
+            "run_id": run.id,
+            "task_id": task.id,
+            "prior_attempt_id": attempt_id,
+            "worktree_id": worktree_id,
+            "head_sha": head_sha,
+            "worktree_fingerprint": worktree_fingerprint,
+            "task_version": task.version,
+        }))?;
+        let custody_digest = hex::encode(Sha256::digest(&custody_material));
+        let source_event_id = format!("fresh-attempt-proof-{}", &custody_digest[..40]);
+        let mut proof = OwnershipProof {
+            schema: "harness.exclusive-ownership-proof.v1".to_owned(),
+            proof_id: OwnershipProofId::new(),
+            run_id: run.id.to_string(),
+            task_id: task.id.to_string(),
+            prior_attempt_id: attempt_id.to_string(),
+            worktree_id: worktree_id.to_string(),
+            source_event_id,
+            head_sha: head_sha.clone(),
+            worktree_fingerprint: worktree_fingerprint.clone(),
+            lease_generation: 0,
+            process_state: "proven_absent".to_owned(),
+            session_state: "proven_closed".to_owned(),
+            command_state: "terminal_or_none".to_owned(),
+            external_effect_state: "none_or_reconciled".to_owned(),
+            candidate_state: "preserved".to_owned(),
+            approved_actions: vec!["authorize_fresh_attempt".to_owned()],
+            expires_at_ms: now_ms().saturating_add(60_000),
+            sha256: String::new(),
+        };
+        proof.sha256 = proof
+            .digest()
+            .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
+        let proof = self.store.record_ownership_proof(&proof)?;
+        let human_action_id = self.store.record_human_action(
             Some(&task.run_id),
             Some(&attempt_id),
             actor,
@@ -13959,14 +14001,75 @@ impl Orchestrator {
                 "model_route": if governing { "same" } else { request.model_route.as_str() },
                 "additional_token_budget": request.additional_token_budget,
                 "packet_sha256": packet_digest(&packet)?,
+                "proof_id": proof.proof_id,
+                "worktree_fingerprint": worktree_fingerprint,
             }),
         )?;
-        if let Some(token_budget) = continuation_run_budget {
-            self.store
-                .set_run_token_budget_and_resume(&task.run_id, token_budget)?;
-        }
-        self.store
-            .transition_task(task_id, TaskState::Ready, None)?;
+        let reconciliation =
+            self.record_reconciliation_inventory(&run, "operator fresh-attempt authorization")?;
+        let replacement = NewTaskAttempt {
+            id: AttemptId::new(),
+            task_id: task.id.clone(),
+            attempt_number: task.attempt.saturating_add(1),
+            state: "AUTHORIZED".to_owned(),
+            packet: packet.clone(),
+            packet_sha256: packet_digest(&packet)?,
+            base_sha: head_sha,
+            requested_model_route: if governing {
+                self.governor_route(&run)?.model
+            } else if packet.is_high_risk() || packet.owner_profile == "worker_escalation" {
+                self.profile_for_run(&run)?
+                    .profile
+                    .models
+                    .worker_escalation
+                    .model
+            } else {
+                self.profile_for_run(&run)?.profile.models.worker.model
+            },
+        };
+        let mut receipt = ReconciliationActionReceipt {
+            schema: "harness.reconciliation-action-receipt.v1".to_owned(),
+            episode_id: reconciliation.episode_id.clone(),
+            kind: ReconciliationActionKind::AuthorizeFreshAttempt,
+            source_event_id: format!("fresh-attempt-authorize-{}", proof.proof_id),
+            authority_event_id: Some(proof.source_event_id.clone()),
+            created_at_ms: now_ms(),
+            payload: json!({
+                "proof_id": proof.proof_id,
+                "run_id": proof.run_id,
+                "task_id": proof.task_id,
+                "prior_attempt_id": proof.prior_attempt_id,
+                "worktree_id": proof.worktree_id,
+                "head_sha": proof.head_sha,
+                "worktree_fingerprint": proof.worktree_fingerprint,
+                "lease_generation": proof.lease_generation,
+                "replacement_attempt_id": replacement.id,
+                "human_action_id": human_action_id,
+                "reason": reason,
+            }),
+            sha256: String::new(),
+        };
+        receipt.sha256 = receipt
+            .digest()
+            .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
+        self.store.consume_ownership_proof_for_fresh_attempt(
+            &proof.proof_id,
+            &receipt,
+            reconciliation.version,
+            &replacement,
+            task.version,
+        )?;
+        self.emit_run_event(
+            &run,
+            "task.fresh_attempt_authorized",
+            json!({
+                "task_id": task.id,
+                "prior_attempt_id": attempt_id,
+                "replacement_attempt_id": replacement.id,
+                "proof_id": proof.proof_id,
+                "reconciliation_episode_id": reconciliation.episode_id,
+            }),
+        )?;
         Ok(operation("retry_task", task_id.as_str()))
     }
 
@@ -14854,12 +14957,12 @@ fn runtime_enforces_investigation_read_scope() -> bool {
     cfg!(test)
 }
 
-/// Fresh attempts transfer mutable path and worktree custody. The current
-/// reconciliation receipt ledger records observations and preservation only;
-/// it does not atomically consume an exclusive-ownership proof alongside that
-/// transfer. Keep every route that can create a retry unavailable until that
-/// single transactional boundary exists.
-fn transactional_fresh_attempt_proof_consumer_available() -> bool {
+/// An authenticated operator retry now has a transactional proof consumer,
+/// but automatic governors cannot truthfully establish process/session/
+/// external-effect closure from their own observations. Keep every automatic
+/// fresh-attempt route unavailable until it has an equally strong proof
+/// issuer and an explicit policy authorization.
+fn automatic_fresh_attempt_authorization_available() -> bool {
     false
 }
 
@@ -18357,6 +18460,259 @@ mod tests {
         let runtime = Arc::new(RolloutLostPlanReviewRuntime::default());
         orchestrator.set_runtime(runtime.clone()).await;
         (orchestrator, temp, runtime, run_id, task_id)
+    }
+
+    async fn fresh_retry_fixture() -> (Orchestrator, TempDir, RunId, TaskId, String) {
+        let (orchestrator, temp) = operator_settings_test_orchestrator().await;
+        let repository_root = temp.path().join("fresh-retry-repository");
+        std::fs::create_dir_all(&repository_root).expect("fixture repository directory");
+        std::fs::write(repository_root.join("README.md"), "# fresh retry fixture\n")
+            .expect("fixture README");
+        git_output(&repository_root, &["init", "-q"]);
+        git_output(
+            &repository_root,
+            &["config", "user.email", "test@example.com"],
+        );
+        git_output(&repository_root, &["config", "user.name", "Harness Test"]);
+        git_output(&repository_root, &["add", "README.md"]);
+        git_output(&repository_root, &["commit", "-qm", "base fixture"]);
+        let base_sha = git_output(&repository_root, &["rev-parse", "HEAD"]);
+        std::fs::write(
+            repository_root.join("README.md"),
+            "# fresh retry candidate\n",
+        )
+        .expect("candidate README");
+        git_output(&repository_root, &["add", "README.md"]);
+        git_output(&repository_root, &["commit", "-qm", "preserved candidate"]);
+        let candidate_sha = git_output(&repository_root, &["rev-parse", "HEAD"]);
+
+        let repository_id = RepositoryId::from("fresh-retry-repository");
+        orchestrator
+            .store()
+            .create_repository(&NewRepository {
+                id: repository_id.clone(),
+                profile_id: "general".to_owned(),
+                profile_version: 1,
+                display_name: "Fresh retry fixture".to_owned(),
+                root_path: repository_root.clone(),
+                origin_url: None,
+                default_branch: "main".to_owned(),
+                expected_coordination_branch: None,
+                state: "READY".to_owned(),
+            })
+            .expect("fixture repository persists");
+        let run_id = RunId::from("fresh-retry-run");
+        orchestrator
+            .store()
+            .create_run(&NewRun {
+                id: run_id.clone(),
+                repository_id,
+                title: "Fresh retry fixture".to_owned(),
+                objective: "Retry only after exact preserved-candidate proof.".to_owned(),
+                mode: "plan_and_implement".to_owned(),
+                publication_mode: "local_only".to_owned(),
+                state: RunState::Executing.to_string(),
+                phase: "execution".to_owned(),
+                base_ref: "main".to_owned(),
+                base_sha: base_sha.clone(),
+                authority_digest: "fixture".to_owned(),
+                profile_digest: "fixture".to_owned(),
+                codex_version: None,
+                protocol_schema_sha256: None,
+                requested_by: "test".to_owned(),
+                token_budget: Some(1_000_000),
+            })
+            .expect("fixture run persists");
+        let architect_id = AgentSessionId::from("fresh-retry-architect");
+        orchestrator
+            .store()
+            .create_agent_session(&NewAgentSession {
+                id: architect_id.clone(),
+                run_id: run_id.clone(),
+                task_attempt_id: None,
+                parent_agent_session_id: None,
+                runtime_kind: "test".to_owned(),
+                codex_account_id: None,
+                role: AgentRole::Architect,
+                nickname: Some("architect".to_owned()),
+                requested_model: "gpt-test".to_owned(),
+                requested_reasoning_effort: "high".to_owned(),
+                sandbox_mode: SandboxMode::ReadOnly,
+                approval_policy: "never".to_owned(),
+                cwd: repository_root.clone(),
+                state: "COMPLETED".to_owned(),
+                current_goal: Some("fixture plan".to_owned()),
+                token_budget: Some(10_000),
+            })
+            .expect("fixture architect persists");
+        let packet = TaskPacket {
+            schema: "harness.orchestration.task.v1".to_owned(),
+            program_id: run_id.to_string(),
+            task_id: "FRESH-RETRY-001".to_owned(),
+            title: "Recover a preserved candidate".to_owned(),
+            state: "proposed".to_owned(),
+            priority: "P1".to_owned(),
+            execution_mode: "controller".to_owned(),
+            execution_kind: TaskExecutionKind::Implementation,
+            investigation_scope: None,
+            owner_profile: "worker".to_owned(),
+            reviewer_profile: "verifier".to_owned(),
+            checklist_rows: vec!["Require exact custody proof".to_owned()],
+            authority_refs: vec!["README.md".to_owned()],
+            base_sha: base_sha.clone(),
+            dependency_shas: BTreeMap::new(),
+            depends_on: Vec::new(),
+            owned_paths: vec!["README.md".to_owned()],
+            forbidden_paths: Vec::new(),
+            reserved_serial_paths: Vec::new(),
+            objective: "Resume from the preserved commit only after proof.".to_owned(),
+            milestones: Vec::new(),
+            non_goals: vec!["Do not release an active lease".to_owned()],
+            success_criteria: vec!["One exact fresh attempt is authorized".to_owned()],
+            required_positive_tests: Vec::new(),
+            required_negative_tests: Vec::new(),
+            required_metrics: Vec::new(),
+            required_evidence: vec!["preserved candidate fingerprint".to_owned()],
+            proof_limits: vec!["operator retry only".to_owned()],
+            diff_budget: DiffBudget {
+                files: 1,
+                lines: 20,
+            },
+            token_budget: 20_000,
+            tool_budget: Some(10),
+            lease_expires_at: "controller-managed".to_owned(),
+            stop_conditions: vec!["Custody proof is missing".to_owned()],
+            handoff_path: "controller://attempt-handoff".to_owned(),
+            risk_flags: Vec::new(),
+        };
+        orchestrator
+            .store()
+            .store_plan(
+                &run_id,
+                &architect_id,
+                &RunPlan {
+                    schema: "harness.orchestration.plan.v1".to_owned(),
+                    summary: "One fresh-retry fixture task".to_owned(),
+                    tasks: vec![packet.clone()],
+                },
+            )
+            .expect("fixture plan persists");
+        let task_id = orchestrator
+            .store()
+            .list_tasks(&run_id)
+            .expect("fixture task reads")
+            .into_iter()
+            .next()
+            .expect("fixture task exists")
+            .id;
+        let prior_attempt = AttemptId::from("fresh-retry-prior-attempt");
+        orchestrator
+            .store()
+            .create_task_attempt(&NewTaskAttempt {
+                id: prior_attempt.clone(),
+                task_id: task_id.clone(),
+                attempt_number: 1,
+                state: "LEASED".to_owned(),
+                packet: packet.clone(),
+                packet_sha256: packet_digest(&packet).expect("packet digest"),
+                base_sha: base_sha.clone(),
+                requested_model_route: "gpt-test".to_owned(),
+            })
+            .expect("prior attempt persists");
+        orchestrator
+            .store()
+            .set_attempt_result(
+                &prior_attempt,
+                "FAILED",
+                Some(&candidate_sha),
+                Some("infrastructure_unavailable"),
+                Some("fixture runtime loss"),
+            )
+            .expect("prior attempt terminal");
+        orchestrator
+            .store()
+            .transition_task(&task_id, TaskState::Failed, None)
+            .expect("task fails");
+        orchestrator
+            .store()
+            .create_worktree(&NewWorktree {
+                id: WorktreeId::from("fresh-retry-preserved-worktree"),
+                run_id: run_id.clone(),
+                task_attempt_id: Some(prior_attempt),
+                kind: "task".to_owned(),
+                path: repository_root,
+                branch: Some("harness/fresh-retry".to_owned()),
+                base_sha,
+                head_sha: Some(candidate_sha.clone()),
+                state: "PRESERVED".to_owned(),
+            })
+            .expect("preserved worktree persists");
+        (orchestrator, temp, run_id, task_id, candidate_sha)
+    }
+
+    #[tokio::test]
+    async fn authenticated_retry_consumes_a_proven_preserved_candidate_once() {
+        let (orchestrator, _temp, run_id, task_id, candidate_sha) = fresh_retry_fixture().await;
+        let request = RetryTaskRequest {
+            reason: "Recover the fixture candidate".to_owned(),
+            revised_objective: None,
+            model_route: "same".to_owned(),
+            additional_token_budget: 0,
+        };
+
+        orchestrator
+            .retry_task(&task_id, request, "test-operator")
+            .await
+            .expect("fresh retry is authorized");
+        let authorized = orchestrator
+            .store()
+            .authorized_fresh_attempt(&task_id)
+            .expect("authorized lookup")
+            .expect("one fresh attempt");
+        assert_eq!(authorized.base_sha, candidate_sha);
+        assert_eq!(authorized.packet.base_sha, candidate_sha);
+        assert_eq!(
+            orchestrator.store().task(&task_id).expect("task").state,
+            TaskState::Ready
+        );
+        let episode = orchestrator
+            .store()
+            .list_reconciliation_episodes(Some(run_id.as_str()), 10)
+            .expect("reconciliation episodes")
+            .into_iter()
+            .next()
+            .expect("reconciliation episode");
+        let actions = orchestrator
+            .store()
+            .list_reconciliation_action_receipts(&episode.episode_id, 10)
+            .expect("fresh-attempt receipt");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0].kind,
+            ReconciliationActionKind::AuthorizeFreshAttempt
+        );
+
+        orchestrator
+            .retry_task(
+                &task_id,
+                RetryTaskRequest {
+                    reason: "duplicate request".to_owned(),
+                    revised_objective: None,
+                    model_route: "same".to_owned(),
+                    additional_token_budget: 0,
+                },
+                "test-operator",
+            )
+            .await
+            .expect("duplicate authorization is idempotent");
+        assert_eq!(
+            orchestrator
+                .store()
+                .list_reconciliation_action_receipts(&episode.episode_id, 10)
+                .expect("receipts reread")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

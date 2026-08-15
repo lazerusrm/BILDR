@@ -1,21 +1,134 @@
 //! Closed reconciliation and ownership-proof custody.
 //!
 //! This repository records exact observed inventory and exclusive-ownership
-//! proofs. It does not launch, resume, delete, reset, release, or authorize an
-//! attempt; those controller actions need a later source-specific consumer.
+//! proofs. It can atomically consume an already-recorded proof while
+//! authorizing one exact replacement attempt; it does not itself launch,
+//! resume, delete, reset, or release mutable controller resources.
 
 use harness_domain::{
-    OwnershipProof, ReconciliationActionKind, ReconciliationActionReceipt, ReconciliationEpisode,
-    ReconciliationEpisodeId, ReconciliationFinding, ReconciliationState,
+    OwnershipProof, OwnershipProofId, ReconciliationActionKind, ReconciliationActionReceipt,
+    ReconciliationEpisode, ReconciliationEpisodeId, ReconciliationFinding, ReconciliationState,
+    TaskId, TaskState, now_ms,
 };
 use rusqlite::{OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 
-use crate::{Store, StoreError};
+use crate::{NewTaskAttempt, Store, StoreError};
 
 const MAX_RECONCILIATION_PAGE_SIZE: u32 = 200;
+const FRESH_ATTEMPT_AUTHORIZED_STATE: &str = "AUTHORIZED";
 
 impl Store {
+    /// Returns the one replacement attempt whose exclusive-ownership proof
+    /// was consumed for this task but which the scheduler has not yet leased.
+    /// The packet is revalidated before it can cross the scheduler boundary.
+    pub fn authorized_fresh_attempt(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<NewTaskAttempt>, StoreError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT a.id,a.task_id,a.attempt_number,a.state,a.task_packet_json,a.task_packet_sha256,a.base_sha,a.requested_model_route FROM task_attempts a JOIN tasks t ON t.id=a.task_id JOIN reconciliation_proof_consumptions c ON c.replacement_attempt_id=a.id WHERE a.task_id=?1 AND a.state='AUTHORIZED' AND t.state='READY' AND t.current_attempt_number=a.attempt_number",
+                [task_id.as_str()],
+                |row| {
+                    let packet_raw: String = row.get(4)?;
+                    let packet: harness_domain::TaskPacket = serde_json::from_str(&packet_raw)
+                        .map_err(|error| rusqlite::Error::FromSqlConversionFailure(
+                            packet_raw.len(),
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        ))?;
+                    let packet_sha256: String = row.get(5)?;
+                    if digest(&packet_raw) != packet_sha256 {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Text,
+                            "authorized fresh-attempt packet integrity check failed".into(),
+                        ));
+                    }
+                    packet.validate_execution_contract().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    Ok(NewTaskAttempt {
+                        id: harness_domain::AttemptId::from(row.get::<_, String>(0)?),
+                        task_id: TaskId::from(row.get::<_, String>(1)?),
+                        attempt_number: row.get::<_, i64>(2)? as u32,
+                        state: row.get(3)?,
+                        packet,
+                        packet_sha256,
+                        base_sha: row.get(6)?,
+                        requested_model_route: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Leases exactly an authorization materialized by
+    /// [`Self::consume_ownership_proof_for_fresh_attempt`]. This is separate
+    /// from proof consumption because the scheduler must still perform local
+    /// runtime preflight before it creates a mutable worktree.
+    pub fn lease_authorized_fresh_attempt(
+        &self,
+        task_id: &TaskId,
+        attempt_id: &harness_domain::AttemptId,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let changed_attempt = transaction.execute(
+            "UPDATE task_attempts SET state='LEASED',updated_at=?3,version=version+1 WHERE id=?1 AND task_id=?2 AND state='AUTHORIZED' AND EXISTS(SELECT 1 FROM reconciliation_proof_consumptions WHERE replacement_attempt_id=?1)",
+            params![attempt_id.as_str(), task_id.as_str(), now_ms()],
+        )?;
+        if changed_attempt != 1 {
+            return Err(StoreError::Conflict(format!(
+                "fresh attempt {attempt_id} is no longer authorized for leasing"
+            )));
+        }
+        let changed_task = transaction.execute(
+            "UPDATE tasks SET state='LEASED',failure_reason=NULL,updated_at=?3,version=version+1 WHERE id=?1 AND state='READY' AND current_attempt_number=(SELECT attempt_number FROM task_attempts WHERE id=?2)",
+            params![task_id.as_str(), attempt_id.as_str(), now_ms()],
+        )?;
+        if changed_task != 1 {
+            return Err(StoreError::Conflict(format!(
+                "task {task_id} is no longer ready for its authorized fresh attempt"
+            )));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Returns whether the database has no remaining mutable execution
+    /// records for an attempt. The controller additionally rechecks the
+    /// preserved Git worktree immediately before it records the proof.
+    pub fn fresh_attempt_custody_is_closed(
+        &self,
+        attempt_id: &harness_domain::AttemptId,
+    ) -> Result<bool, StoreError> {
+        let connection = self.connection()?;
+        let active_path_lease: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM path_leases WHERE task_attempt_id=?1 AND released_at IS NULL)",
+            [attempt_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let active_agent: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_sessions WHERE task_attempt_id=?1 AND state NOT IN ('COMPLETED','FAILED','CANCELED','CANCELLED','SHUTDOWN','TERMINATED','TURN_COMPLETE','STALLED','INTERRUPTED'))",
+            [attempt_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let recorded_command: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM command_runs WHERE task_attempt_id=?1)",
+            [attempt_id.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(!active_path_lease && !active_agent && !recorded_command)
+    }
+
     pub fn open_reconciliation_episode(
         &self,
         episode: &ReconciliationEpisode,
@@ -121,6 +234,351 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok(proof.clone())
+    }
+
+    /// Atomically consumes one exclusive ownership proof and materializes the
+    /// exact next attempt that the scheduler may launch.  The attempt starts
+    /// in `AUTHORIZED`, not `LEASED`: no worktree, agent, or mutable lease is
+    /// created by this method.  The scheduler can only consume the attempt
+    /// after the task is returned to `READY` in the same transaction.
+    ///
+    /// This is intentionally the only store boundary that accepts
+    /// `AuthorizeFreshAttempt`.  It prevents a receipt, proof, task state, and
+    /// replacement attempt from becoming durable in different crash windows.
+    pub fn consume_ownership_proof_for_fresh_attempt(
+        &self,
+        proof_id: &OwnershipProofId,
+        receipt: &ReconciliationActionReceipt,
+        expected_episode_version: u64,
+        replacement: &NewTaskAttempt,
+        expected_task_version: u64,
+    ) -> Result<(), StoreError> {
+        receipt.validate().map_err(control_error)?;
+        if receipt.kind != ReconciliationActionKind::AuthorizeFreshAttempt {
+            return Err(StoreError::Validation(
+                "ownership-proof consumption requires an authorize_fresh_attempt receipt"
+                    .to_owned(),
+            ));
+        }
+        if replacement.state != FRESH_ATTEMPT_AUTHORIZED_STATE {
+            return Err(StoreError::Validation(format!(
+                "fresh replacement attempt must begin in {FRESH_ATTEMPT_AUTHORIZED_STATE}"
+            )));
+        }
+        replacement
+            .packet
+            .validate_execution_contract()
+            .map_err(|error| {
+                StoreError::Validation(format!("fresh replacement packet is invalid: {error}"))
+            })?;
+        let packet_json = serde_json::to_string(&replacement.packet)?;
+        if digest(&packet_json) != replacement.packet_sha256 {
+            return Err(StoreError::Validation(
+                "fresh replacement packet sha256 does not match its canonical payload".to_owned(),
+            ));
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let (proof_raw, proof_digest) = transaction
+            .query_row(
+                "SELECT payload_json,payload_sha256 FROM ownership_proofs WHERE id=?1",
+                [proof_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("ownership proof {proof_id}")))?;
+        let proof = checked_ownership_row(proof_raw, proof_digest)?;
+        let now = now_ms();
+        if proof.expires_at_ms < now {
+            return Err(StoreError::Conflict(format!(
+                "ownership proof {proof_id} expired before replacement authorization"
+            )));
+        }
+
+        let existing_consumption: Option<(String, String, String, String)> = transaction
+            .query_row(
+                "SELECT c.replacement_attempt_id,c.task_id,a.payload_json,a.payload_sha256 FROM reconciliation_proof_consumptions c JOIN reconciliation_actions a ON a.id=c.action_id WHERE c.proof_id=?1",
+                [proof_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        if let Some((existing_attempt_id, existing_task_id, existing_raw, existing_digest)) =
+            existing_consumption
+        {
+            if existing_attempt_id == replacement.id.as_str()
+                && existing_task_id == replacement.task_id.as_str()
+                && checked_action_receipt_row(existing_raw, existing_digest)? == *receipt
+            {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(StoreError::Conflict(format!(
+                "ownership proof {proof_id} was already consumed by replacement attempt {existing_attempt_id}"
+            )));
+        }
+
+        let (task_run_id, task_external_id, task_state_raw, task_attempt_number, task_version) =
+            transaction
+            .query_row(
+                "SELECT run_id,external_task_id,state,current_attempt_number,version FROM tasks WHERE id=?1",
+                [replacement.task_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("task {}", replacement.task_id)))?;
+        let task_state: TaskState = task_state_raw.parse().map_err(|error| {
+            StoreError::Validation(format!(
+                "task {} has invalid state: {error}",
+                replacement.task_id
+            ))
+        })?;
+        if task_version != i64::try_from(expected_task_version).unwrap_or(i64::MAX) {
+            return Err(StoreError::Conflict(format!(
+                "task {} changed before ownership-proof consumption",
+                replacement.task_id
+            )));
+        }
+        if !task_state.can_transition_to(TaskState::Ready) {
+            return Err(StoreError::Conflict(format!(
+                "task {} in {task_state} cannot accept a fresh authorized attempt",
+                replacement.task_id
+            )));
+        }
+        if proof.run_id != task_run_id
+            || proof.task_id != replacement.task_id.as_str()
+            || replacement.packet.task_id.is_empty()
+            || replacement.packet.task_id != task_external_id
+        {
+            return Err(StoreError::Validation(
+                "ownership proof, replacement task, and replacement packet must bind the same task/run identity"
+                    .to_owned(),
+            ));
+        }
+        if replacement.base_sha != proof.head_sha
+            || replacement.packet.base_sha != replacement.base_sha
+        {
+            return Err(StoreError::Validation(
+                "replacement packet/base must be pinned to the proven preserved head".to_owned(),
+            ));
+        }
+        let expected_attempt_number = task_attempt_number
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Validation("task attempt number overflow".to_owned()))?;
+        if replacement.attempt_number != u32::try_from(expected_attempt_number).unwrap_or(u32::MAX)
+        {
+            return Err(StoreError::Conflict(format!(
+                "replacement attempt number {} does not follow task attempt {}",
+                replacement.attempt_number, task_attempt_number
+            )));
+        }
+
+        let (prior_number, prior_state, prior_head): (i64, String, Option<String>) = transaction
+            .query_row(
+                "SELECT attempt_number,state,head_sha FROM task_attempts WHERE id=?1 AND task_id=?2",
+                params![proof.prior_attempt_id, replacement.task_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("prior attempt {}", proof.prior_attempt_id)))?;
+        if prior_number != task_attempt_number
+            || !matches!(prior_state.as_str(), "FAILED" | "INTERRUPTED" | "STALLED")
+            || prior_head.as_deref() != Some(proof.head_sha.as_str())
+        {
+            return Err(StoreError::Conflict(
+                "ownership proof no longer matches a terminal preserved prior attempt".to_owned(),
+            ));
+        }
+        let (worktree_attempt_id, worktree_run_id, worktree_head, worktree_state): (
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+        ) = transaction
+            .query_row(
+                "SELECT task_attempt_id,run_id,head_sha,state FROM worktrees WHERE id=?1",
+                [proof.worktree_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::NotFound(format!("proven worktree {}", proof.worktree_id))
+            })?;
+        if worktree_attempt_id.as_deref() != Some(proof.prior_attempt_id.as_str())
+            || worktree_run_id != proof.run_id
+            || worktree_head.as_deref() != Some(proof.head_sha.as_str())
+            || worktree_state != "PRESERVED"
+        {
+            return Err(StoreError::Conflict(
+                "ownership proof no longer matches its preserved worktree".to_owned(),
+            ));
+        }
+        let active_path_lease: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM path_leases WHERE task_attempt_id=?1 AND released_at IS NULL)",
+            [proof.prior_attempt_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if active_path_lease {
+            return Err(StoreError::Conflict(
+                "ownership proof cannot authorize a replacement while the prior path lease remains active"
+                    .to_owned(),
+            ));
+        }
+        let active_agent: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_sessions WHERE task_attempt_id=?1 AND state NOT IN ('COMPLETED','FAILED','CANCELED','CANCELLED','SHUTDOWN','TERMINATED','TURN_COMPLETE','STALLED','INTERRUPTED'))",
+            [proof.prior_attempt_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if active_agent {
+            return Err(StoreError::Conflict(
+                "ownership proof cannot authorize a replacement while the prior agent remains nonterminal"
+                    .to_owned(),
+            ));
+        }
+        let recorded_command: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM command_runs WHERE task_attempt_id=?1)",
+            [proof.prior_attempt_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if recorded_command {
+            return Err(StoreError::Conflict(
+                "ownership proof cannot authorize a replacement while prior command effects remain outside the reconciled proof boundary"
+                    .to_owned(),
+            ));
+        }
+
+        let episode = reconciliation_episode_in_transaction(&transaction, &receipt.episode_id)?;
+        if episode.run_id.as_deref() != Some(proof.run_id.as_str())
+            || matches!(
+                episode.state,
+                ReconciliationState::Resolved | ReconciliationState::Refused
+            )
+        {
+            return Err(StoreError::Conflict(
+                "reconciliation episode is not active for the ownership proof run".to_owned(),
+            ));
+        }
+        if receipt.authority_event_id.as_deref() != Some(proof.source_event_id.as_str())
+            || receipt_payload_string(&receipt.payload, "proof_id")? != proof.proof_id.as_str()
+            || receipt_payload_string(&receipt.payload, "run_id")? != proof.run_id
+            || receipt_payload_string(&receipt.payload, "task_id")? != proof.task_id
+            || receipt_payload_string(&receipt.payload, "prior_attempt_id")?
+                != proof.prior_attempt_id
+            || receipt_payload_string(&receipt.payload, "worktree_id")? != proof.worktree_id
+            || receipt_payload_string(&receipt.payload, "head_sha")? != proof.head_sha
+            || receipt_payload_string(&receipt.payload, "worktree_fingerprint")?
+                != proof.worktree_fingerprint
+            || receipt_payload_u64(&receipt.payload, "lease_generation")? != proof.lease_generation
+            || receipt_payload_string(&receipt.payload, "replacement_attempt_id")?
+                != replacement.id.as_str()
+        {
+            return Err(StoreError::Validation(
+                "fresh-attempt receipt must bind the exact stored proof and replacement identity"
+                    .to_owned(),
+            ));
+        }
+        let human_action_id = receipt_payload_i64(&receipt.payload, "human_action_id")?;
+        let human_authorized: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM human_actions WHERE id=?1 AND run_id=?2 AND task_attempt_id=?3 AND action_type='retry_task' AND target_type='task' AND target_id=?4)",
+            params![
+                human_action_id,
+                proof.run_id,
+                proof.prior_attempt_id,
+                replacement.task_id.as_str(),
+            ],
+            |row| row.get(0),
+        )?;
+        if !human_authorized {
+            return Err(StoreError::Conflict(
+                "fresh-attempt receipt does not bind a durable operator retry action".to_owned(),
+            ));
+        }
+
+        let advanced_episode = advance_reconciliation_episode(
+            &transaction,
+            &receipt.episode_id,
+            expected_episode_version,
+            receipt.created_at_ms,
+            ReconciliationCounter::Action,
+        )?;
+        let receipt_raw = serde_json::to_string(receipt)?;
+        let receipt_digest = digest(&receipt_raw);
+        transaction.execute(
+            "INSERT INTO reconciliation_actions(episode_id,kind,source_event_id,authority_event_id,payload_json,payload_sha256,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                receipt.episode_id.as_str(),
+                action_kind_name(receipt.kind),
+                receipt.source_event_id,
+                receipt.authority_event_id,
+                receipt_raw,
+                receipt_digest,
+                receipt.created_at_ms,
+            ],
+        )?;
+        let action_id = transaction.last_insert_rowid();
+        transaction.execute(
+            "INSERT INTO task_attempts(id,task_id,attempt_number,state,task_packet_json,task_packet_sha256,base_sha,requested_model_route,token_budget,tool_budget,diff_file_budget,diff_line_budget,created_at,updated_at,version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13,1)",
+            params![
+                replacement.id.as_str(),
+                replacement.task_id.as_str(),
+                replacement.attempt_number,
+                FRESH_ATTEMPT_AUTHORIZED_STATE,
+                packet_json,
+                replacement.packet_sha256,
+                replacement.base_sha,
+                replacement.requested_model_route,
+                replacement.packet.token_budget as i64,
+                replacement.packet.tool_budget.map(|value| value as i64),
+                replacement.packet.diff_budget.files,
+                replacement.packet.diff_budget.lines,
+                now,
+            ],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE tasks SET current_attempt_number=?2,state='READY',failure_reason=NULL,updated_at=?3,version=version+1 WHERE id=?1 AND version=?4",
+            params![
+                replacement.task_id.as_str(),
+                replacement.attempt_number,
+                now,
+                i64::try_from(expected_task_version).unwrap_or(i64::MAX),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "task {} changed during ownership-proof consumption",
+                replacement.task_id
+            )));
+        }
+        transaction.execute(
+            "INSERT INTO task_results(task_attempt_id,updated_at) VALUES(?1,?2)",
+            params![replacement.id.as_str(), now],
+        )?;
+        transaction.execute(
+            "INSERT INTO reconciliation_proof_consumptions(proof_id,episode_id,action_id,task_id,prior_attempt_id,replacement_attempt_id,consumed_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                proof.proof_id.as_str(),
+                receipt.episode_id.as_str(),
+                action_id,
+                replacement.task_id.as_str(),
+                proof.prior_attempt_id,
+                replacement.id.as_str(),
+                now,
+            ],
+        )?;
+        transaction.commit()?;
+        debug_assert_eq!(
+            advanced_episode.version,
+            expected_episode_version.saturating_add(1)
+        );
+        Ok(())
     }
 
     /// Appends a controller-observed inventory finding and advances the exact
@@ -513,6 +971,45 @@ fn advance_reconciliation_episode(
 fn control_error(error: harness_domain::OperatorControlError) -> StoreError {
     StoreError::Validation(error.to_string())
 }
+
+fn receipt_payload_string<'a>(
+    payload: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a str, StoreError> {
+    payload
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            StoreError::Validation(format!(
+                "fresh-attempt receipt payload must contain non-empty string {field}"
+            ))
+        })
+}
+
+fn receipt_payload_u64(payload: &serde_json::Value, field: &str) -> Result<u64, StoreError> {
+    payload
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            StoreError::Validation(format!(
+                "fresh-attempt receipt payload must contain unsigned integer {field}"
+            ))
+        })
+}
+
+fn receipt_payload_i64(payload: &serde_json::Value, field: &str) -> Result<i64, StoreError> {
+    payload
+        .get(field)
+        .and_then(serde_json::Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            StoreError::Validation(format!(
+                "fresh-attempt receipt payload must contain positive integer {field}"
+            ))
+        })
+}
+
 fn to_i64(value: u64, field: &str) -> Result<i64, StoreError> {
     i64::try_from(value)
         .map_err(|_| StoreError::Validation(format!("{field} exceeds SQLite integer range")))
@@ -569,14 +1066,19 @@ fn action_kind_name(kind: ReconciliationActionKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use harness_domain::{
-        ReconciliationActionKind, ReconciliationActionReceipt, ReconciliationEpisodeId,
-        ReconciliationFinding, ReconciliationFindingKind, ReconciliationTrigger,
+        AttemptId, DiffBudget, OwnershipProof, ReconciliationActionKind,
+        ReconciliationActionReceipt, ReconciliationEpisodeId, ReconciliationFinding,
+        ReconciliationFindingKind, ReconciliationTrigger, RepositoryId, RunId, TaskId, TaskPacket,
+        WorktreeId, now_ms,
     };
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::*;
+    use crate::{NewRepository, NewRun, NewWorktree};
 
     fn episode() -> ReconciliationEpisode {
         let mut episode = ReconciliationEpisode {
@@ -641,6 +1143,257 @@ mod tests {
             payload: json!({
                 "worktree_id": "worktree-01",
                 "result": "preserved",
+            }),
+            sha256: String::new(),
+        };
+        receipt.sha256 = receipt.digest().expect("receipt digest");
+        receipt
+    }
+
+    fn packet(task_id: &str, base_sha: &str) -> TaskPacket {
+        TaskPacket {
+            schema: "harness.orchestration.task.v1".to_owned(),
+            program_id: "run-fresh-attempt".to_owned(),
+            task_id: task_id.to_owned(),
+            title: "Fresh attempt fixture".to_owned(),
+            state: "ready".to_owned(),
+            priority: "P1".to_owned(),
+            execution_mode: "controller".to_owned(),
+            execution_kind: Default::default(),
+            investigation_scope: None,
+            owner_profile: "fixture".to_owned(),
+            reviewer_profile: "fixture".to_owned(),
+            checklist_rows: vec![],
+            authority_refs: vec![],
+            base_sha: base_sha.to_owned(),
+            dependency_shas: Default::default(),
+            depends_on: vec![],
+            owned_paths: vec!["crates/fresh-attempt/**".to_owned()],
+            forbidden_paths: vec![],
+            reserved_serial_paths: vec![],
+            objective: "Exercise exclusive fresh-attempt custody".to_owned(),
+            milestones: vec![],
+            non_goals: vec![],
+            success_criteria: vec!["An exact proof is consumed once".to_owned()],
+            required_positive_tests: vec![],
+            required_negative_tests: vec![],
+            required_metrics: vec![],
+            required_evidence: vec![],
+            proof_limits: vec![],
+            diff_budget: DiffBudget {
+                files: 4,
+                lines: 400,
+            },
+            token_budget: 4_000,
+            tool_budget: None,
+            lease_expires_at: "controller-managed".to_owned(),
+            stop_conditions: vec![],
+            handoff_path: "controller://attempt-handoff".to_owned(),
+            risk_flags: vec![],
+        }
+    }
+
+    fn fresh_attempt_fixture(
+        temp: &TempDir,
+    ) -> (
+        Store,
+        ReconciliationEpisode,
+        OwnershipProof,
+        TaskId,
+        NewTaskAttempt,
+        i64,
+    ) {
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let repository_id = RepositoryId::from("repository-fresh-attempt");
+        store
+            .create_repository(&NewRepository {
+                id: repository_id.clone(),
+                profile_id: "fixture".to_owned(),
+                profile_version: 1,
+                display_name: "Fresh attempt fixture".to_owned(),
+                root_path: PathBuf::from("/tmp/fresh-attempt-fixture"),
+                origin_url: None,
+                default_branch: "main".to_owned(),
+                expected_coordination_branch: None,
+                state: "READY".to_owned(),
+            })
+            .expect("repository");
+        let run_id = RunId::from("run-fresh-attempt");
+        let head_sha = "a".repeat(40);
+        store
+            .create_run(&NewRun {
+                id: run_id.clone(),
+                repository_id,
+                title: "Fresh attempt fixture".to_owned(),
+                objective: "Exercise exclusive fresh-attempt custody".to_owned(),
+                mode: "standard".to_owned(),
+                publication_mode: "none".to_owned(),
+                state: "EXECUTING".to_owned(),
+                phase: "execution".to_owned(),
+                base_ref: "main".to_owned(),
+                base_sha: head_sha.clone(),
+                authority_digest: "fixture".to_owned(),
+                profile_digest: "fixture".to_owned(),
+                codex_version: None,
+                protocol_schema_sha256: None,
+                requested_by: "test".to_owned(),
+                token_budget: None,
+            })
+            .expect("run");
+        let task_id = TaskId::from("task-fresh-attempt");
+        {
+            let connection = store.connection().expect("connection");
+            connection
+                .pragma_update(None, "foreign_keys", false)
+                .expect("disable task plan foreign key");
+            connection
+                .execute(
+                    "INSERT INTO tasks(id,run_id,plan_revision_id,external_task_id,title,objective,priority,owner_profile,reviewer_profile,state,created_at,updated_at,version) VALUES(?1,?2,'plan-fixture','fresh-attempt','Fresh attempt fixture','Exercise exclusive fresh-attempt custody','P1','fixture','fixture','FAILED',1,1,1)",
+                    rusqlite::params![task_id.as_str(), run_id.as_str()],
+                )
+                .expect("task");
+            connection
+                .pragma_update(None, "foreign_keys", true)
+                .expect("restore task plan foreign key");
+        }
+        let prior_packet = packet("fresh-attempt", &head_sha);
+        let prior_attempt = NewTaskAttempt {
+            id: AttemptId::from("attempt-fresh-prior"),
+            task_id: task_id.clone(),
+            attempt_number: 1,
+            state: "LEASED".to_owned(),
+            packet: prior_packet.clone(),
+            packet_sha256: digest(&serde_json::to_string(&prior_packet).expect("packet")),
+            base_sha: head_sha.clone(),
+            requested_model_route: "fixture-model".to_owned(),
+        };
+        store
+            .create_task_attempt(&prior_attempt)
+            .expect("prior attempt");
+        store
+            .set_attempt_result(
+                &prior_attempt.id,
+                "FAILED",
+                Some(&head_sha),
+                Some("infrastructure_unavailable"),
+                Some("fixture failure"),
+            )
+            .expect("terminal prior attempt");
+        {
+            let connection = store.connection().expect("connection");
+            connection
+                .execute(
+                    "UPDATE tasks SET state='FAILED',failure_reason='fixture failure' WHERE id=?1",
+                    [task_id.as_str()],
+                )
+                .expect("failed task");
+        }
+        let worktree_id = WorktreeId::from("worktree-fresh-prior");
+        store
+            .create_worktree(&NewWorktree {
+                id: worktree_id.clone(),
+                run_id: run_id.clone(),
+                task_attempt_id: Some(prior_attempt.id.clone()),
+                kind: "task".to_owned(),
+                path: temp.path().join("preserved-worktree"),
+                branch: Some("harness/fresh-attempt".to_owned()),
+                base_sha: head_sha.clone(),
+                head_sha: Some(head_sha.clone()),
+                state: "PRESERVED".to_owned(),
+            })
+            .expect("preserved worktree");
+        let opened_at = now_ms();
+        let mut episode = ReconciliationEpisode {
+            schema: "harness.reconciliation-episode.v1".to_owned(),
+            episode_id: "episode-fresh-attempt".parse().expect("episode id"),
+            run_id: Some(run_id.to_string()),
+            trigger_kind: ReconciliationTrigger::AppServerLoss,
+            state: ReconciliationState::Open,
+            version: 1,
+            opened_at_ms: opened_at,
+            updated_at_ms: opened_at,
+            source_event_id: "event-fresh-attempt-recovery".to_owned(),
+            inventory_sha256: "c".repeat(64),
+            finding_count: 0,
+            action_count: 0,
+            report: None,
+            sha256: String::new(),
+        };
+        episode.sha256 = episode.digest().expect("episode digest");
+        let episode = store
+            .open_reconciliation_episode(&episode)
+            .expect("episode");
+        let mut proof = OwnershipProof {
+            schema: "harness.exclusive-ownership-proof.v1".to_owned(),
+            proof_id: "proof-fresh-attempt".parse().expect("proof id"),
+            run_id: run_id.to_string(),
+            task_id: task_id.to_string(),
+            prior_attempt_id: prior_attempt.id.to_string(),
+            worktree_id: worktree_id.to_string(),
+            source_event_id: "event-fresh-attempt-proof".to_owned(),
+            head_sha: head_sha.clone(),
+            worktree_fingerprint: "b".repeat(64),
+            lease_generation: 3,
+            process_state: "proven_absent".to_owned(),
+            session_state: "proven_closed".to_owned(),
+            command_state: "terminal_or_none".to_owned(),
+            external_effect_state: "none_or_reconciled".to_owned(),
+            candidate_state: "preserved".to_owned(),
+            approved_actions: vec!["authorize_fresh_attempt".to_owned()],
+            expires_at_ms: now_ms().saturating_add(60_000),
+            sha256: String::new(),
+        };
+        proof.sha256 = proof.digest().expect("proof digest");
+        let proof = store.record_ownership_proof(&proof).expect("proof");
+        let human_action_id = store
+            .record_human_action(
+                Some(&run_id),
+                Some(&prior_attempt.id),
+                "test-operator",
+                "retry_task",
+                "task",
+                task_id.as_str(),
+                &json!({"reason": "fixture authorization"}),
+            )
+            .expect("operator action");
+        let replacement_packet = packet("fresh-attempt", &head_sha);
+        let replacement = NewTaskAttempt {
+            id: AttemptId::from("attempt-fresh-replacement"),
+            task_id: task_id.clone(),
+            attempt_number: 2,
+            state: FRESH_ATTEMPT_AUTHORIZED_STATE.to_owned(),
+            packet: replacement_packet.clone(),
+            packet_sha256: digest(&serde_json::to_string(&replacement_packet).expect("packet")),
+            base_sha: head_sha,
+            requested_model_route: "fixture-model".to_owned(),
+        };
+        (store, episode, proof, task_id, replacement, human_action_id)
+    }
+
+    fn fresh_attempt_receipt(
+        episode_id: ReconciliationEpisodeId,
+        proof: &OwnershipProof,
+        replacement: &NewTaskAttempt,
+        human_action_id: i64,
+    ) -> ReconciliationActionReceipt {
+        let mut receipt = ReconciliationActionReceipt {
+            schema: "harness.reconciliation-action-receipt.v1".to_owned(),
+            episode_id,
+            kind: ReconciliationActionKind::AuthorizeFreshAttempt,
+            source_event_id: "event-fresh-attempt-authorized".to_owned(),
+            authority_event_id: Some(proof.source_event_id.clone()),
+            created_at_ms: now_ms(),
+            payload: json!({
+                "proof_id": proof.proof_id,
+                "run_id": proof.run_id,
+                "task_id": proof.task_id,
+                "prior_attempt_id": proof.prior_attempt_id,
+                "worktree_id": proof.worktree_id,
+                "head_sha": proof.head_sha,
+                "worktree_fingerprint": proof.worktree_fingerprint,
+                "lease_generation": proof.lease_generation,
+                "replacement_attempt_id": replacement.id,
+                "human_action_id": human_action_id,
             }),
             sha256: String::new(),
         };
@@ -737,6 +1490,121 @@ mod tests {
                 .expect("episode")
                 .expect("present"),
             opened
+        );
+    }
+
+    #[test]
+    fn proof_consumption_authorizes_exactly_one_replacement_and_scheduler_lease() {
+        let temp = TempDir::new().expect("temp");
+        let (store, episode, proof, task_id, replacement, human_action_id) =
+            fresh_attempt_fixture(&temp);
+        let receipt = fresh_attempt_receipt(
+            episode.episode_id.clone(),
+            &proof,
+            &replacement,
+            human_action_id,
+        );
+        let task_version = store.task(&task_id).expect("task").version;
+
+        store
+            .consume_ownership_proof_for_fresh_attempt(
+                &proof.proof_id,
+                &receipt,
+                episode.version,
+                &replacement,
+                task_version,
+            )
+            .expect("consume proof");
+        assert_eq!(
+            store
+                .task(&task_id)
+                .expect("task after authorization")
+                .state,
+            TaskState::Ready
+        );
+        assert_eq!(
+            store
+                .authorized_fresh_attempt(&task_id)
+                .expect("authorized attempt")
+                .expect("one attempt")
+                .id,
+            replacement.id
+        );
+        assert_eq!(
+            store
+                .list_reconciliation_action_receipts(&episode.episode_id, 10)
+                .expect("receipt"),
+            vec![receipt.clone()]
+        );
+
+        store
+            .consume_ownership_proof_for_fresh_attempt(
+                &proof.proof_id,
+                &receipt,
+                episode.version,
+                &replacement,
+                task_version,
+            )
+            .expect("idempotent replay");
+        let conflicting_replacement = NewTaskAttempt {
+            id: AttemptId::from("attempt-fresh-conflict"),
+            ..replacement.clone()
+        };
+        assert!(matches!(
+            store.consume_ownership_proof_for_fresh_attempt(
+                &proof.proof_id,
+                &receipt,
+                episode.version,
+                &conflicting_replacement,
+                task_version,
+            ),
+            Err(StoreError::Conflict(_))
+        ));
+
+        store
+            .lease_authorized_fresh_attempt(&task_id, &replacement.id)
+            .expect("lease authorized attempt");
+        assert_eq!(
+            store.task(&task_id).expect("leased task").state,
+            TaskState::Leased
+        );
+        assert!(
+            store
+                .authorized_fresh_attempt(&task_id)
+                .expect("no longer authorized")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn proof_consumption_refuses_receipt_that_omits_proven_custody() {
+        let temp = TempDir::new().expect("temp");
+        let (store, episode, proof, task_id, replacement, human_action_id) =
+            fresh_attempt_fixture(&temp);
+        let mut receipt = fresh_attempt_receipt(
+            episode.episode_id.clone(),
+            &proof,
+            &replacement,
+            human_action_id,
+        );
+        receipt.payload["worktree_fingerprint"] = json!("c".repeat(64));
+        receipt.sha256 = receipt.digest().expect("receipt digest");
+
+        assert!(matches!(
+            store.consume_ownership_proof_for_fresh_attempt(
+                &proof.proof_id,
+                &receipt,
+                episode.version,
+                &replacement,
+                store.task(&task_id).expect("task").version,
+            ),
+            Err(StoreError::Validation(_))
+        ));
+        assert!(
+            store
+                .authorized_fresh_attempt(&task_id)
+                .expect("no replacement")
+                .is_none()
         );
     }
 }
