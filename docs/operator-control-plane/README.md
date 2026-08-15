@@ -107,10 +107,11 @@ link; each material-progress projection atomically
 records its source-event causal link; each investigation artifact atomically
 records its attempt-scoped causal link; each governed knowledge candidate
 atomically records its evidence causal links; each liveness observation
-atomically records its episode-scoped causal link; each reconciliation finding
-and action receipt,
-including proof-consuming fresh-attempt authorization, atomically records its
-episode-scoped causal link; and the API/CLI expose bounded immutable trace
+atomically records its episode-scoped causal link; each reconciliation episode
+opening and ownership proof atomically records its source-event causal link;
+each reconciliation finding and action receipt, including proof-consuming
+fresh-attempt authorization, atomically records its episode-scoped causal link;
+and the API/CLI expose bounded immutable trace
 lookup. This is not yet full trace propagation through every producer.
 Supervisor snapshots receive bounded control-plane custody facts and restrict
 recommendations on uncertain custody. The browser and CLI can read these

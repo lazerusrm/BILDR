@@ -136,6 +136,7 @@ impl Store {
         episode: &ReconciliationEpisode,
     ) -> Result<ReconciliationEpisode, StoreError> {
         episode.validate().map_err(control_error)?;
+        let correlation = reconciliation_episode_correlation_link(episode)?;
         if episode.state != ReconciliationState::Open
             || episode.version != 1
             || episode.finding_count != 0
@@ -160,6 +161,7 @@ impl Store {
         {
             let existing = checked_reconciliation_row(existing_raw, existing_digest)?;
             if existing == *episode {
+                record_correlation_link_in_transaction(&transaction, &correlation)?;
                 transaction.commit()?;
                 return Ok(existing);
             }
@@ -194,6 +196,7 @@ impl Store {
                 payload_sha256,
             ],
         )?;
+        record_correlation_link_in_transaction(&transaction, &correlation)?;
         transaction.commit()?;
         Ok(episode.clone())
     }
@@ -206,6 +209,7 @@ impl Store {
         proof: &OwnershipProof,
     ) -> Result<OwnershipProof, StoreError> {
         proof.validate().map_err(control_error)?;
+        let correlation = ownership_proof_correlation_link(proof)?;
         let raw = serde_json::to_string(proof)?;
         let payload_sha256 = digest(&raw);
         let mut connection = self.connection()?;
@@ -220,6 +224,7 @@ impl Store {
         {
             let existing = checked_ownership_row(existing_raw, existing_digest)?;
             if existing == *proof {
+                record_correlation_link_in_transaction(&transaction, &correlation)?;
                 transaction.commit()?;
                 return Ok(existing);
             }
@@ -234,6 +239,7 @@ impl Store {
                 proof.source_event_id, raw, payload_sha256, proof.expires_at_ms,
             ],
         )?;
+        record_correlation_link_in_transaction(&transaction, &correlation)?;
         transaction.commit()?;
         Ok(proof.clone())
     }
@@ -527,8 +533,10 @@ impl Store {
                 receipt.created_at_ms,
             ],
         )?;
-        record_correlation_link_in_transaction(&transaction, &correlation)?;
+        // A correlation receipt has its own SQLite row id, so capture the
+        // action id before recording that separate immutable fact.
         let action_id = transaction.last_insert_rowid();
+        record_correlation_link_in_transaction(&transaction, &correlation)?;
         transaction.execute(
             "INSERT INTO task_attempts(id,task_id,attempt_number,state,task_packet_json,task_packet_sha256,base_sha,requested_model_route,token_budget,tool_budget,diff_file_budget,diff_line_budget,created_at,updated_at,version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13,1)",
             params![
@@ -816,6 +824,79 @@ impl Store {
 /// Reconciliation records share one controller-owned trace per episode. The
 /// inventory adapter cannot supply a context: a deterministic causal receipt
 /// ties each durable finding back to the exact reconciliation episode.
+fn reconciliation_episode_correlation_link(
+    episode: &ReconciliationEpisode,
+) -> Result<CorrelationLink, StoreError> {
+    let trace_id = digest(&format!(
+        "harness.reconciliation.trace.v1:{}",
+        episode.episode_id
+    ));
+    let span_id = digest(&format!(
+        "harness.reconciliation.episode.span.v1:{}",
+        episode.episode_id
+    ));
+    let link_id = CorrelationLinkId::parse(format!(
+        "correlation-{}",
+        &digest(&format!(
+            "harness.reconciliation.episode.link.v1:{}",
+            episode.episode_id
+        ))[..48]
+    ))
+    .map_err(|error| StoreError::Validation(error.to_string()))?;
+    Ok(CorrelationLink {
+        schema: "harness.correlation-link.v1".to_owned(),
+        link_id,
+        trace: TraceContext {
+            trace_id: trace_id[..32].to_owned(),
+            span_id: span_id[..16].to_owned(),
+            parent_span_id: None,
+        },
+        from_kind: "source_event".to_owned(),
+        from_id: episode.source_event_id.clone(),
+        to_kind: "reconciliation_episode".to_owned(),
+        to_id: episode.episode_id.to_string(),
+        relation: "opens_reconciliation".to_owned(),
+        created_at_ms: episode.opened_at_ms,
+    })
+}
+
+/// An ownership proof is controller evidence rather than an action. Its source
+/// event gets its own immutable root trace so a future proof-consuming action
+/// cannot be mistaken for the act of establishing exclusive custody.
+fn ownership_proof_correlation_link(proof: &OwnershipProof) -> Result<CorrelationLink, StoreError> {
+    let trace_id = digest(&format!(
+        "harness.ownership-proof.trace.v1:{}",
+        proof.proof_id
+    ));
+    let span_id = digest(&format!(
+        "harness.ownership-proof.span.v1:{}",
+        proof.proof_id
+    ));
+    let link_id = CorrelationLinkId::parse(format!(
+        "correlation-{}",
+        &digest(&format!(
+            "harness.ownership-proof.link.v1:{}",
+            proof.proof_id
+        ))[..48]
+    ))
+    .map_err(|error| StoreError::Validation(error.to_string()))?;
+    Ok(CorrelationLink {
+        schema: "harness.correlation-link.v1".to_owned(),
+        link_id,
+        trace: TraceContext {
+            trace_id: trace_id[..32].to_owned(),
+            span_id: span_id[..16].to_owned(),
+            parent_span_id: None,
+        },
+        from_kind: "source_event".to_owned(),
+        from_id: proof.source_event_id.clone(),
+        to_kind: "ownership_proof".to_owned(),
+        to_id: proof.proof_id.to_string(),
+        relation: "establishes_ownership_proof".to_owned(),
+        created_at_ms: proof.expires_at_ms,
+    })
+}
+
 fn reconciliation_finding_correlation_link(
     finding: &ReconciliationFinding,
 ) -> Result<CorrelationLink, StoreError> {
@@ -1190,6 +1271,14 @@ mod tests {
         let first = episode();
         assert_eq!(store.open_reconciliation_episode(&first).unwrap(), first);
         assert_eq!(store.open_reconciliation_episode(&first).unwrap(), first);
+        let correlation =
+            reconciliation_episode_correlation_link(&first).expect("opening correlation");
+        assert_eq!(
+            store
+                .correlation_links(&correlation.trace.trace_id, 10)
+                .expect("opening trace"),
+            vec![correlation]
+        );
         let second = episode();
         assert!(matches!(
             store.open_reconciliation_episode(&second),
@@ -1525,6 +1614,8 @@ mod tests {
             reconciliation_finding_correlation_link(&finding).expect("finding correlation");
         let action_correlation =
             reconciliation_action_correlation_link(&receipt).expect("action correlation");
+        let opening_correlation =
+            reconciliation_episode_correlation_link(&opened).expect("opening correlation");
         assert_eq!(
             finding_correlation.trace.trace_id,
             action_correlation.trace.trace_id
@@ -1533,7 +1624,7 @@ mod tests {
             store
                 .correlation_links(&finding_correlation.trace.trace_id, 10)
                 .expect("reconciliation trace"),
-            vec![finding_correlation, action_correlation]
+            vec![opening_correlation, finding_correlation, action_correlation]
         );
 
         let mut conflicting = preserve_receipt(opened.episode_id.clone());
@@ -1634,11 +1725,21 @@ mod tests {
         );
         let correlation =
             reconciliation_action_correlation_link(&receipt).expect("fresh-attempt correlation");
+        let opening_correlation =
+            reconciliation_episode_correlation_link(&episode).expect("opening correlation");
+        let proof_correlation =
+            ownership_proof_correlation_link(&proof).expect("proof correlation");
         assert_eq!(
             store
                 .correlation_links(&correlation.trace.trace_id, 10)
                 .expect("fresh-attempt trace"),
-            vec![correlation]
+            vec![opening_correlation, correlation]
+        );
+        assert_eq!(
+            store
+                .correlation_links(&proof_correlation.trace.trace_id, 10)
+                .expect("proof trace"),
+            vec![proof_correlation]
         );
 
         store
@@ -1753,5 +1854,55 @@ mod tests {
             ),
             Err(StoreError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn correlation_conflict_rolls_back_reconciliation_open_and_ownership_proof() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let opening = episode();
+        let mut conflicting_opening =
+            reconciliation_episode_correlation_link(&opening).expect("opening correlation");
+        conflicting_opening.relation = "different_relation".to_owned();
+        store
+            .record_correlation_link(&conflicting_opening)
+            .expect("preload conflicting opening correlation");
+        assert!(matches!(
+            store.open_reconciliation_episode(&opening),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(
+            store
+                .reconciliation_episode(&opening.episode_id)
+                .expect("episode read")
+                .is_none()
+        );
+
+        let (store, _episode, proof, _task_id, _replacement, _human_action_id) =
+            fresh_attempt_fixture(&temp);
+        let mut attempted_proof = proof.clone();
+        attempted_proof.proof_id = "proof-correlation-conflict".parse().expect("proof id");
+        attempted_proof.source_event_id = "event-proof-correlation-conflict".to_owned();
+        attempted_proof.sha256 = attempted_proof.digest().expect("proof digest");
+        let mut conflicting_proof =
+            ownership_proof_correlation_link(&attempted_proof).expect("proof correlation");
+        conflicting_proof.relation = "different_relation".to_owned();
+        store
+            .record_correlation_link(&conflicting_proof)
+            .expect("preload conflicting proof correlation");
+        assert!(matches!(
+            store.record_ownership_proof(&attempted_proof),
+            Err(StoreError::Conflict(_))
+        ));
+        let attempted_count: i64 = store
+            .connection()
+            .expect("connection")
+            .query_row(
+                "SELECT count(*) FROM ownership_proofs WHERE id=?1",
+                [attempted_proof.proof_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("proof count");
+        assert_eq!(attempted_count, 0);
     }
 }
