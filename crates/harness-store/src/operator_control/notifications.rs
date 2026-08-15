@@ -147,7 +147,12 @@ impl Store {
         let payload_sha256 = digest(&raw);
         let correlation = notification_correlation_link(delivery)?;
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        // A refresh first reads a bounded pending page, so two processes may
+        // reach this receipt write for the same revision. Acquire the writer
+        // slot before the idempotency read rather than attempting a deferred
+        // read-to-write upgrade, which SQLite can reject as `database is
+        // locked` despite the immutable replay being safe.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some((existing_raw, existing_digest)) = transaction.query_row(
             "SELECT payload_json,payload_sha256 FROM notification_deliveries WHERE source_event_id=?1",
             [delivery.source_event_id.as_str()],
@@ -415,6 +420,45 @@ mod tests {
                 .filter(|outcome| matches!(outcome, Err(StoreError::Conflict(_))))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn concurrent_notification_refreshes_persist_one_delivery_and_one_causal_link() {
+        let temp = TempDir::new().expect("temp");
+        let database = temp.path().join("harness.sqlite3");
+        let first_store =
+            Store::open(&database, &temp.path().join("artifacts-a")).expect("first store");
+        let attention = test_attention();
+        first_store
+            .upsert_source_attention(&attention)
+            .expect("open attention");
+        let second_store =
+            Store::open(&database, &temp.path().join("artifacts-b")).expect("second store");
+        let barrier = Arc::new(Barrier::new(2));
+        let first_barrier = Arc::clone(&barrier);
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_store
+                .refresh_notification_mirror()
+                .expect("first refresh")
+        });
+        barrier.wait();
+        let second = second_store
+            .refresh_notification_mirror()
+            .expect("second refresh");
+        let first = first.join().expect("refresh thread joins");
+        assert!((first.len() + second.len()) >= 1);
+        let deliveries = second_store
+            .list_notification_deliveries(10)
+            .expect("stored deliveries");
+        assert_eq!(deliveries.len(), 1);
+        let correlation = notification_correlation_link(&deliveries[0]).expect("correlation");
+        assert_eq!(
+            second_store
+                .correlation_links(&correlation.trace.trace_id, 10)
+                .expect("stored correlation"),
+            vec![correlation]
         );
     }
 
