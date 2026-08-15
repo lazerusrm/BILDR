@@ -196,51 +196,60 @@ impl Store {
     /// delivery state. A caller must not interpret a truncated result as a
     /// whole-system delivery guarantee.
     pub fn notification_delivery_health(&self) -> Result<NotificationDeliveryHealth, StoreError> {
-        let connection = self.connection()?;
+        // The count and bounded rows must share one SQLite read snapshot. A
+        // concurrent source update between two autocommit reads could otherwise
+        // make the health counters contradict their own truncation flag.
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
         let current_attention_revisions = non_negative_u64(
-            connection.query_row(
+            transaction.query_row(
                 "SELECT count(*) FROM attention_items WHERE state IN ('open','acknowledged','waiting_external')",
                 [],
                 |row| row.get::<_, i64>(0),
             )?,
             "current notification attention count",
         )?;
-        let mut statement = connection.prepare(
-            "SELECT attention.payload_json,attention.payload_sha256,delivery.payload_json,delivery.payload_sha256
-             FROM attention_items AS attention
-             LEFT JOIN notification_deliveries AS delivery
-               ON delivery.source_event_id = ('attention-' || attention.id || '-' || attention.version)
-             WHERE attention.state IN ('open','acknowledged','waiting_external')
-             ORDER BY
-               CASE attention.severity
-                 WHEN 'critical' THEN 0
-                 WHEN 'high' THEN 1
-                 WHEN 'normal' THEN 2
-                 ELSE 3
-               END,
-               attention.opened_at ASC,
-               attention.id ASC
-             LIMIT ?1",
-        )?;
-        let rows = statement
-            .query_map([i64::from(MAX_NOTIFICATION_HEALTH_ROWS)], |row| {
-                let attention = super::attention::checked_attention_row(row.get(0)?, row.get(1)?)?;
-                let delivery_raw: Option<String> = row.get(2)?;
-                let delivery_digest: Option<String> = row.get(3)?;
-                let delivery = match (delivery_raw, delivery_digest) {
-                    (None, None) => None,
-                    (Some(raw), Some(digest)) => Some(checked_delivery_row(raw, digest)?),
-                    _ => {
-                        return Err(rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            rusqlite::types::Type::Text,
-                            "notification delivery join has incomplete immutable payload".into(),
-                        ));
-                    }
-                };
-                Ok((attention, delivery))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = {
+            let mut statement = transaction.prepare(
+                "SELECT attention.payload_json,attention.payload_sha256,delivery.payload_json,delivery.payload_sha256
+                 FROM attention_items AS attention
+                 LEFT JOIN notification_deliveries AS delivery
+                   ON delivery.source_event_id = ('attention-' || attention.id || '-' || attention.version)
+                 WHERE attention.state IN ('open','acknowledged','waiting_external')
+                 ORDER BY
+                   CASE attention.severity
+                     WHEN 'critical' THEN 0
+                     WHEN 'high' THEN 1
+                     WHEN 'normal' THEN 2
+                     ELSE 3
+                   END,
+                   attention.opened_at ASC,
+                   attention.id ASC
+                 LIMIT ?1",
+            )?;
+            statement
+                .query_map([i64::from(MAX_NOTIFICATION_HEALTH_ROWS)], |row| {
+                    let attention =
+                        super::attention::checked_attention_row(row.get(0)?, row.get(1)?)?;
+                    let delivery_raw: Option<String> = row.get(2)?;
+                    let delivery_digest: Option<String> = row.get(3)?;
+                    let delivery = match (delivery_raw, delivery_digest) {
+                        (None, None) => None,
+                        (Some(raw), Some(digest)) => Some(checked_delivery_row(raw, digest)?),
+                        _ => {
+                            return Err(rusqlite::Error::FromSqlConversionFailure(
+                                2,
+                                rusqlite::types::Type::Text,
+                                "notification delivery join has incomplete immutable payload"
+                                    .into(),
+                            ));
+                        }
+                    };
+                    Ok((attention, delivery))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        transaction.commit()?;
         let mut health = NotificationDeliveryHealth {
             schema: "harness.notification-delivery-health.v1".to_owned(),
             channel: "in_product_mirror".to_owned(),
