@@ -730,6 +730,7 @@ POST /api/v1/external-conditions/{id}/cancel
 POST /api/v1/runs/{run_id}/external-conditions/time-gates
 POST /api/v1/runs/{run_id}/external-conditions/local-capacity
 POST /api/v1/liveness/{episode_id}/knowledge-candidates
+POST /api/v1/improvement/knowledge/{knowledge_id}/review
 POST /api/v1/notification-shadow-batches
 POST /api/v1/operator-presence
 POST /api/v1/runs/{run_id}/investigations
@@ -738,6 +739,13 @@ POST /api/v1/runs/{run_id}/investigations
 There is no generic attention-resolve or recovery-force route. Mutations require
 expected version/revision, local session, CSRF, same-origin, controller policy,
 and source-specific state checks.
+
+Knowledge review is a closed candidate transition: the request carries the
+current candidate SHA and `accept` or `reject`; the authenticated local session
+is the reviewer identity. The immutable human action binds the original
+candidate revision and SHA before the reviewed wire is created. Accepting a
+candidate requires fresh controller-clean evidence. A reviewed item remains
+governed display data and never becomes task context or execution authority.
 
 ### SSE events
 

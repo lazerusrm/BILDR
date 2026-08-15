@@ -103,6 +103,7 @@ export interface FailureOverview {
 }
 
 export type KnowledgeKind = "fact" | "procedure" | "warning" | "heuristic" | "anti_pattern";
+export type KnowledgeReviewDecision = "accept" | "reject";
 export type KnowledgeReviewState = "unreviewed" | "accepted" | "rejected" | "needs_revalidation";
 export type KnowledgeState = "candidate" | "active" | "expired" | "contradicted" | "superseded" | "rejected";
 

@@ -241,6 +241,16 @@ pub enum TaskExecutionKind {
     Integration,
 }
 
+/// An explicit local human decision over one immutable knowledge candidate.
+/// A decision can change only the governed knowledge lifecycle; it does not
+/// alter task context, task custody, or any controller execution state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeReviewDecision {
+    Accept,
+    Reject,
+}
+
 impl crate::TaskPacket {
     /// Enforces the authority boundary for the newly explicit task kind.
     /// Scheduling still owns sandbox and lease creation; this packet-level

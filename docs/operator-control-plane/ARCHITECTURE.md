@@ -449,9 +449,12 @@ truncation, and mixed active/terminal states.
 ## Governed knowledge integration
 
 Investigation, recovery, and repeated liveness evidence may propose candidates
-to the existing `harness.knowledge-item.v1` system. They do not activate memory
-directly. Existing evidence, review, scope, freshness, contradiction,
-supersession, and rollback rules remain authoritative.
+to the existing `harness.knowledge-item.v1` system. An authenticated local
+human may accept or reject exactly the immutable current candidate, with the
+human action bound to its pre-review revision and wire digest. Acceptance
+rechecks fresh controller-clean evidence. This produces governed display data,
+not task context or execution authority. Existing evidence, review, scope,
+freshness, contradiction, supersession, and rollback rules remain authoritative.
 
 ## Future remote execution boundary
 

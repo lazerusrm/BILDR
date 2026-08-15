@@ -6,6 +6,7 @@ import type {
   FailureOverview,
   FailureTrace,
   KnowledgeItem,
+  KnowledgeReviewDecision,
   RuntimeStatus,
 } from "../types";
 import { EvaluationSourceCard } from "./EvaluationSourceCard";
@@ -67,6 +68,7 @@ export function ImprovementCenter({
   const [evaluationSourceError, setEvaluationSourceError] = useState("");
   const [knowledgeItems, setKnowledgeItems] = useState<KnowledgeItem[]>();
   const [knowledgeError, setKnowledgeError] = useState("");
+  const [reviewingKnowledgeId, setReviewingKnowledgeId] = useState("");
 
   useEffect(() => {
     let active = true;
@@ -145,6 +147,18 @@ export function ImprovementCenter({
     () => [...(overview?.clusters || [])].sort(compareClusters),
     [overview],
   );
+  const reviewKnowledge = (item: KnowledgeItem, decision: KnowledgeReviewDecision) => {
+    setReviewingKnowledgeId(item.knowledge_id);
+    setKnowledgeError("");
+    void api.reviewKnowledgeCandidate(item.knowledge_id, item.sha256, decision).then(
+      (reviewed) => {
+        setKnowledgeItems((current) => current?.map((value) => (
+          value.knowledge_id === reviewed.knowledge_id ? reviewed : value
+        )));
+      },
+      (cause: unknown) => setKnowledgeError(displayError(cause, "Could not record knowledge review")),
+    ).finally(() => setReviewingKnowledgeId(""));
+  };
   const mode = improvementModePresentation(runtime);
   return (
     <div className="page improvement-page">
@@ -175,19 +189,37 @@ export function ImprovementCenter({
         </section>
       </>}
       <section aria-label="Governed knowledge" className="improvement-section">
-        <header><span className="eyebrow">Display only</span><h2>Governed knowledge</h2></header>
-        <p>Candidate state, review, evidence, scope, and freshness are explicit. This view cannot review, activate, inject, or alter task context.</p>
+        <header><span className="eyebrow">Human review</span><h2>Governed knowledge</h2></header>
+        <p>Review only the exact immutable candidate shown. Acceptance is a governed display record; neither decision injects task context or changes execution authority.</p>
         {knowledgeError && <p role="alert" className="form-error">{knowledgeError}</p>}
         {!repositoryId && <p className="improvement-empty">Select a repository to inspect its governed knowledge records.</p>}
         {repositoryId && !knowledgeItems && !knowledgeError && <p className="improvement-empty">Loading immutable knowledge records…</p>}
         {knowledgeItems && !knowledgeItems.length && <p className="improvement-empty">No governed knowledge records have been created for this repository.</p>}
         {knowledgeItems && knowledgeItems.length > 0 && <VirtualRows
           items={knowledgeItems}
-          rowHeight={72}
+          rowHeight={104}
           renderRow={(item) => <article className="knowledge-item">
             <strong>{item.kind} · {item.state}</strong>
             <span>{item.statement}</span>
             <small>{knowledgeDisclosure(item)}</small>
+            {canReviewKnowledge(item) && <div className="actions knowledge-item-actions">
+              <button
+                className="button primary"
+                type="button"
+                disabled={Boolean(reviewingKnowledgeId)}
+                onClick={() => reviewKnowledge(item, "accept")}
+              >
+                {reviewingKnowledgeId === item.knowledge_id ? "Recording…" : "Accept candidate"}
+              </button>
+              <button
+                className="button subtle"
+                type="button"
+                disabled={Boolean(reviewingKnowledgeId)}
+                onClick={() => reviewKnowledge(item, "reject")}
+              >
+                Reject candidate
+              </button>
+            </div>}
           </article>}
         />}
       </section>
@@ -219,6 +251,10 @@ export function knowledgeDisclosure(item: KnowledgeItem) {
     ? `${item.review.state} by ${item.review.reviewer_id}`
     : item.review.state;
   return `${item.scope.task_family} · ${item.evidence.length} evidence receipt${item.evidence.length === 1 ? "" : "s"} · review ${review} · revalidate ${item.freshness.revalidate_after}`;
+}
+
+export function canReviewKnowledge(item: KnowledgeItem) {
+  return item.state === "candidate" && item.review.state === "unreviewed";
 }
 
 function displayError(cause: unknown, fallback: string) {

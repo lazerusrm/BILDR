@@ -6,6 +6,7 @@ import {
   compareClusters,
   costDisclosure,
   ImprovementCenter,
+  canReviewKnowledge,
   improvementModePresentation,
   knowledgeDisclosure,
 } from "./ImprovementCenter";
@@ -44,7 +45,7 @@ describe("Improvement Center", () => {
     expect(markup).toContain("Configured anchor does not match the frozen anchor.");
   });
 
-  it("keeps governed knowledge display explicit and non-authoritative", () => {
+  it("offers only exact candidate review without execution authority", () => {
     const item: KnowledgeItem = {
       schema: "harness.knowledge-item.v1",
       knowledge_id: "knowledge_1",
@@ -63,8 +64,12 @@ describe("Improvement Center", () => {
     expect(knowledgeDisclosure(item)).toBe(
       "operator_control · 1 evidence receipt · review unreviewed · revalidate 2",
     );
+    expect(canReviewKnowledge(item)).toBe(true);
+    expect(canReviewKnowledge({ ...item, state: "active", review: { ...item.review, state: "accepted" } })).toBe(false);
+    expect(canReviewKnowledge({ ...item, state: "rejected", review: { ...item.review, state: "rejected" } })).toBe(false);
     const markup = renderToStaticMarkup(createElement(ImprovementCenter, { runtime: undefined }));
     expect(markup).toContain("Governed knowledge");
-    expect(markup).toContain("cannot review, activate, inject, or alter task context");
+    expect(markup).toContain("Human review");
+    expect(markup).toContain("neither decision injects task context or changes execution authority");
   });
 });

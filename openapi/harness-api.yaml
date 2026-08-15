@@ -807,6 +807,31 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/KnowledgeItem'}
         '404': {$ref: '#/components/responses/NotFound'}
+  /improvement/knowledge/{knowledgeId}/review:
+    post:
+      tags: [Improvement, Knowledge]
+      operationId: reviewKnowledgeCandidate
+      description: Records one local-session accept or reject decision over the exact current immutable knowledge candidate. The action binds the pre-review candidate revision and wire digest. Acceptance requires fresh controller-clean evidence. Neither outcome injects task context or changes execution authority.
+      parameters:
+        - name: knowledgeId
+          in: path
+          required: true
+          schema: {$ref: '#/components/schemas/KnowledgeToken'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ReviewKnowledgeCandidateRequest'}
+      responses:
+        '200':
+          description: Idempotent immutable reviewed knowledge wire. An accepted item remains governed display data, not task context.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/KnowledgeItem'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
   /improvement/knowledge:
     get:
       tags: [Improvement]
@@ -2462,6 +2487,13 @@ components:
           anyOf:
             - {$ref: '#/components/schemas/OpaqueId'}
             - {type: 'null'}
+    ReviewKnowledgeCandidateRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_knowledge_sha256, decision]
+      properties:
+        expected_knowledge_sha256: {$ref: '#/components/schemas/Digest'}
+        decision: {enum: [accept, reject]}
     InvestigationKnowledgeEvidenceReceipt:
       type: object
       additionalProperties: false

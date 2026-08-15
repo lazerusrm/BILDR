@@ -3,9 +3,9 @@
 //! Mutations stay deliberately narrow: version-checked presentation
 //! acknowledgement, authority-neutral local presence, and creation of an
 //! unreviewed knowledge candidates from exact investigation, liveness, and
-//! reconciliation evidence, plus an exact-revision liveness wait receipt.
-//! They cannot resolve, approve, activate knowledge, or force recovery;
-//! source-specific controllers retain that authority.
+//! reconciliation evidence, one exact human knowledge review, and an
+//! exact-revision liveness wait receipt. They cannot resolve source attention,
+//! alter task custody, inject knowledge into task context, or force recovery.
 
 use axum::{
     Json, Router,
@@ -14,12 +14,12 @@ use axum::{
     routing::{get, post},
 };
 use harness_domain::{
-    AttentionItemId, ExternalConditionId, InvestigationArtifactId, LivenessEpisodeId,
-    OperatorPresenceMode, ReconciliationEpisodeId, RunId,
+    AttentionItemId, ExternalConditionId, InvestigationArtifactId, KnowledgeReviewDecision,
+    LivenessEpisodeId, OperatorPresenceMode, ReconciliationEpisodeId, RunId,
 };
 use serde::Deserialize;
 
-use super::{ApiError, ApiState, authenticate};
+use super::{ApiError, ApiState, authenticate, authenticated_session_id};
 
 pub(super) fn routes() -> Router<ApiState> {
     Router::new()
@@ -50,6 +50,10 @@ pub(super) fn routes() -> Router<ApiState> {
         .route(
             "/api/v1/improvement/knowledge",
             get(list_current_knowledge_items),
+        )
+        .route(
+            "/api/v1/improvement/knowledge/{knowledge_id}/review",
+            post(review_knowledge_candidate),
         )
         .route(
             "/api/v1/improvement/knowledge/{knowledge_id}",
@@ -415,9 +419,42 @@ async fn propose_knowledge_from_repeated_reconciliation(
     Ok(Json(item))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewKnowledgeCandidateRequest {
+    expected_knowledge_sha256: String,
+    decision: KnowledgeReviewDecision,
+}
+
+/// Records an explicit local-session decision over the exact current candidate.
+/// The Store binds the immutable pre-review revision/hash and rejects stale,
+/// expired, or unclean acceptance evidence. This cannot inject task context or
+/// change task/worktree/controller authority.
+async fn review_knowledge_candidate(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(knowledge_id): Path<String>,
+    Json(request): Json<ReviewKnowledgeCandidateRequest>,
+) -> Result<Json<harness_learning::KnowledgeItemV1>, ApiError> {
+    let reviewer_id = authenticated_session_id(&state, &headers, true)?;
+    let revision = state.orchestrator.store().review_knowledge_candidate(
+        &harness_store::ReviewKnowledgeCandidate {
+            knowledge_id,
+            expected_knowledge_sha256: request.expected_knowledge_sha256,
+            decision: request.decision,
+            reviewer_id,
+        },
+    )?;
+    let item = serde_json::from_value(revision.payload).map_err(|error| {
+        ApiError::from(harness_store::StoreError::Validation(format!(
+            "stored reviewed knowledge has an invalid wire contract: {error}"
+        )))
+    })?;
+    Ok(Json(item))
+}
+
 /// Reads one exact current knowledge wire for display or independent review.
-/// This endpoint cannot record a review, activate the item, alter task
-/// context, or use its contents as execution authority.
+/// Reading cannot alter task context or use the item as execution authority.
 async fn get_current_knowledge_item(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -440,8 +477,7 @@ struct KnowledgeQuery {
 }
 
 /// Lists the current immutable knowledge records for one exact repository.
-/// This is a display-only collection: it cannot review, activate, inject, or
-/// use an item as execution authority.
+/// This read cannot inject or use an item as execution authority.
 async fn list_current_knowledge_items(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -993,6 +1029,21 @@ mod tests {
                 "operator_id": "local_operator",
                 "expected_presence_version": 1,
                 "unexpected": true,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ReviewKnowledgeCandidateRequest>(json!({
+                "expected_knowledge_sha256": "a".repeat(64),
+                "decision": "accept",
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ReviewKnowledgeCandidateRequest>(json!({
+                "expected_knowledge_sha256": "a".repeat(64),
+                "decision": "defer",
             }))
             .is_err()
         );

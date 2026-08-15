@@ -21,6 +21,7 @@ import type {
   InvestigationArtifactSummary,
   InterventionReceipt,
   KnowledgeItem,
+  KnowledgeReviewDecision,
   LivenessEpisode,
   MaterialProgressEvent,
   NotificationDelivery,
@@ -144,6 +145,17 @@ class HarnessApi {
     this.get<KnowledgeItem[]>(
       `/improvement/knowledge?repository_id=${encodeURIComponent(repositoryId)}&limit=50`,
     );
+  reviewKnowledgeCandidate = (
+    knowledgeId: string,
+    expectedKnowledgeSha256: string,
+    decision: KnowledgeReviewDecision,
+  ) => this.post<KnowledgeItem>(
+    `/improvement/knowledge/${encodeURIComponent(knowledgeId)}/review`,
+    {
+      expected_knowledge_sha256: expectedKnowledgeSha256,
+      decision,
+    },
+  );
   improvementTrace = (traceId: string) =>
     this.get<FailureTrace>(
       `/improvement/traces/${encodeURIComponent(traceId)}`,

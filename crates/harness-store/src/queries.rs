@@ -19,7 +19,7 @@ use harness_learning::{
     MembershipAction, Severity, TerminalCode,
 };
 use rusqlite::{OptionalExtension, Row, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -248,23 +248,7 @@ impl Store {
                 .receipt
                 .clone()
                 .ok_or_else(|| StoreError::Conflict("active knowledge lacks review".into()))?;
-            let action_id: i64 = review
-                .revision_id
-                .parse()
-                .map_err(|_| StoreError::Validation("human review ID invalid".into()))?;
-            let reviewer_id = item.review.reviewer_id.as_deref().ok_or_else(|| {
-                StoreError::Conflict("active knowledge lacks reviewer identity".into())
-            })?;
-            let trusted: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM human_actions WHERE id=?1 AND payload_sha256=?2 AND action_type='knowledge_review_accepted' AND target_type='knowledge' AND target_id=?3 AND actor=?4 AND json_extract(payload_json,'$.knowledge_revision_id')=?5 AND json_extract(payload_json,'$.knowledge_wire_sha256')=?6)",
-                params![action_id, review.digest, item.knowledge_id, reviewer_id, revision_id, item.sha256],
-                |r| r.get(0),
-            )?;
-            if !trusted {
-                return Err(StoreError::Conflict(
-                    "knowledge review is not trusted".into(),
-                ));
-            }
+            trusted_accepted_knowledge_review_tx(&tx, item)?;
             let evidence_clean = item.evidence.iter().try_fold(true, |clean, receipt| {
                 learning_receipt_clean_tx(&tx, receipt).map(|value| clean && value)
             })?;
@@ -5700,11 +5684,113 @@ fn resolved_reconciliation_episode_tx(
     Ok(())
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KnowledgeReviewActionPayload {
+    schema: String,
+    candidate_revision_id: String,
+    candidate_wire_sha256: String,
+    decision: String,
+}
+
+/// Verifies the non-circular human-review proof used by active knowledge.
+/// The action binds the immutable candidate revision/hash that existed before
+/// the new active wire was produced; the active wire then carries the action
+/// receipt. This keeps both records immutable without making their digests
+/// recursively depend on one another.
+fn trusted_accepted_knowledge_review_tx(
+    tx: &rusqlite::Transaction<'_>,
+    item: &harness_learning::KnowledgeItemV1,
+) -> Result<(), StoreError> {
+    use harness_learning::{KnowledgeState, ReviewState};
+
+    if item.state != KnowledgeState::Active || item.review.state != ReviewState::Accepted {
+        return Err(StoreError::Conflict(
+            "active knowledge does not carry an accepted review state".into(),
+        ));
+    }
+    let review = item
+        .review
+        .receipt
+        .as_ref()
+        .ok_or_else(|| StoreError::Conflict("active knowledge lacks review receipt".into()))?;
+    let action_id: i64 = review
+        .revision_id
+        .parse()
+        .map_err(|_| StoreError::Validation("human review ID invalid".into()))?;
+    let reviewer_id =
+        item.review.reviewer_id.as_deref().ok_or_else(|| {
+            StoreError::Conflict("active knowledge lacks reviewer identity".into())
+        })?;
+    let (action_raw, action_digest, action_type, target_type, target_id, actor): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = tx
+        .query_row(
+            "SELECT payload_json,payload_sha256,action_type,target_type,target_id,actor FROM human_actions WHERE id=?1",
+            [action_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::Conflict("knowledge review action is missing".into()))?;
+    if sha256(action_raw.as_bytes()) != action_digest
+        || action_digest != review.digest
+        || action_type != "knowledge_review_accepted"
+        || target_type != "knowledge"
+        || target_id != item.knowledge_id
+        || actor != reviewer_id
+    {
+        return Err(StoreError::Conflict(
+            "knowledge review action does not match its immutable receipt".into(),
+        ));
+    }
+    let action: KnowledgeReviewActionPayload = serde_json::from_str(&action_raw).map_err(|_| {
+        StoreError::Conflict("knowledge review action payload is not a closed contract".into())
+    })?;
+    if action.schema != "harness.operator-control.knowledge-review.v1"
+        || action.decision != "accept"
+    {
+        return Err(StoreError::Conflict(
+            "knowledge review action is not an acceptance decision".into(),
+        ));
+    }
+    let candidate = read_improvement_revision(tx, &action.candidate_revision_id)?;
+    if candidate.aggregate_kind != ImprovementRecordKind::Knowledge
+        || candidate.aggregate_id != item.knowledge_id
+        || candidate.state != ImprovementState::Candidate
+    {
+        return Err(StoreError::Conflict(
+            "knowledge review does not bind an immutable candidate revision".into(),
+        ));
+    }
+    let candidate_item: harness_learning::KnowledgeItemV1 =
+        serde_json::from_value(candidate.payload)?;
+    candidate_item
+        .verify()
+        .map_err(|error| StoreError::Conflict(error.to_string()))?;
+    if candidate_item.state != KnowledgeState::Candidate
+        || candidate_item.review.state != ReviewState::Unreviewed
+        || candidate_item.review.reviewer_id.is_some()
+        || candidate_item.review.reviewed_at.is_some()
+        || candidate_item.review.receipt.is_some()
+        || candidate_item.sha256 != action.candidate_wire_sha256
+    {
+        return Err(StoreError::Conflict(
+            "knowledge review candidate proof is not the exact unreviewed wire".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve a learning receipt from controller-owned state before using it as
 /// evidence.  A wire's `custody` bit is merely a claim; this rechecks the
 /// referenced immutable record and rejects sources which cannot be cleanly
 /// resolved by the Store.
-fn learning_receipt_clean_tx(
+pub(crate) fn learning_receipt_clean_tx(
     tx: &rusqlite::Transaction<'_>,
     receipt: &harness_learning::SourceReceipt,
 ) -> Result<bool, StoreError> {
@@ -6130,25 +6216,7 @@ fn validate_learning_references_tx(
                 resolve(receipt)?;
             }
             if item.state == harness_learning::KnowledgeState::Active {
-                let review = item.review.receipt.as_ref().ok_or_else(|| {
-                    StoreError::Conflict("active knowledge lacks review receipt".into())
-                })?;
-                let action_id: i64 = review.revision_id.parse().map_err(|_| {
-                    StoreError::Validation("human review receipt ID is invalid".into())
-                })?;
-                let reviewer_id = item.review.reviewer_id.as_deref().ok_or_else(|| {
-                    StoreError::Conflict("active knowledge lacks reviewer identity".into())
-                })?;
-                let matches: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM human_actions WHERE id=?1 AND payload_sha256=?2 AND action_type='knowledge_review_accepted' AND target_type='knowledge' AND target_id=?3 AND actor=?4 AND json_extract(payload_json,'$.knowledge_revision_id')=?5 AND json_extract(payload_json,'$.knowledge_wire_sha256')=?6)",
-                    params![action_id, review.digest, item.knowledge_id, reviewer_id, input.id, item.sha256],
-                    |r| r.get(0),
-                )?;
-                if !matches {
-                    return Err(StoreError::Conflict(
-                        "knowledge review is not a trusted human action".into(),
-                    ));
-                }
+                trusted_accepted_knowledge_review_tx(tx, &item)?;
                 if !item.evidence.iter().try_fold(true, |clean, receipt| {
                     learning_receipt_clean_tx(tx, receipt).map(|value| clean && value)
                 })? {
@@ -6610,7 +6678,9 @@ fn improvement_transition_allowed(
         )
 }
 
-fn map_improvement_revision(row: &Row<'_>) -> rusqlite::Result<ImprovementRevisionRecord> {
+pub(crate) fn map_improvement_revision(
+    row: &Row<'_>,
+) -> rusqlite::Result<ImprovementRevisionRecord> {
     let record = ImprovementRevisionRecord {
         id: row.get(0)?,
         aggregate_kind: parse_improvement_enum(row.get(1)?)?,

@@ -42,7 +42,10 @@ This status is intentionally a capability boundary, not release evidence.
   evidence, repository scope, sensitivity, freshness, identity, and immutable
   readback by that identity, plus a bounded integrity-checked current-record
   collection scoped to one exact repository and displayed in the Improvement
-  Center without any review or activation control;
+  Center. An authenticated local human may accept or reject only the exact
+  current candidate SHA; the receipt binds its pre-review immutable revision
+  and acceptance requires fresh controller-clean evidence. Reviewed knowledge
+  is still not injected into task context or execution;
 - authenticated creation of an unreviewed, display-only heuristic from two
   independently recovered liveness episodes, with controller-derived exact
   observation receipts and no activation or context injection;
@@ -68,8 +71,8 @@ This status is intentionally a capability boundary, not release evidence.
 - active opt-in/broader notification batching, desktop delivery, and
   delivery-health rollout;
 - adaptive supervisor policy or any independent control-plane mutation;
-- write-capable knowledge review UI and any context injection or activation
-  beyond the existing governed pipeline;
+- any knowledge context injection or execution activation beyond the existing
+  governed display pipeline;
 - evaluation corpus, fault matrix, usability study, canary, rollback drill, and
   production activation.
 

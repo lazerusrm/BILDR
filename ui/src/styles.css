@@ -1433,6 +1433,10 @@ kbd {
   color: var(--muted);
   font-size: 11px;
 }
+.knowledge-item-actions {
+  justify-content: flex-start;
+  gap: 6px;
+}
 .trace-explorer header {
   margin-bottom: 8px;
 }

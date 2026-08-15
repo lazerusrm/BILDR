@@ -316,6 +316,17 @@ pub struct NewInvestigationKnowledgeCandidate {
     pub runtime_class: Option<String>,
 }
 
+/// An exact human review over the current immutable knowledge candidate. The
+/// caller supplies no replacement statement, evidence, scope, or lifecycle
+/// fields: the Store carries all candidate facts into the next revision.
+#[derive(Clone, Debug)]
+pub struct ReviewKnowledgeCandidate {
+    pub knowledge_id: String,
+    pub expected_knowledge_sha256: String,
+    pub decision: harness_domain::KnowledgeReviewDecision,
+    pub reviewer_id: String,
+}
+
 /// A narrowly derived, display-only knowledge candidate from repeated,
 /// independently recovered liveness episodes. The controller derives all
 /// statements and evidence from immutable observations; callers cannot submit

@@ -2061,7 +2061,11 @@ async fn events(
     Ok(Sse::new(stream))
 }
 
-fn authenticate(state: &ApiState, headers: &HeaderMap, mutation: bool) -> Result<(), ApiError> {
+pub(crate) fn authenticated_session_id(
+    state: &ApiState,
+    headers: &HeaderMap,
+    mutation: bool,
+) -> Result<String, ApiError> {
     if mutation {
         validate_origin(headers)?;
     }
@@ -2088,7 +2092,11 @@ fn authenticate(state: &ApiState, headers: &HeaderMap, mutation: bool) -> Result
             return Err(ApiError::forbidden("CSRF token is invalid"));
         }
     }
-    Ok(())
+    Ok(session.id)
+}
+
+fn authenticate(state: &ApiState, headers: &HeaderMap, mutation: bool) -> Result<(), ApiError> {
+    authenticated_session_id(state, headers, mutation).map(|_| ())
 }
 
 fn validate_origin(headers: &HeaderMap) -> Result<(), ApiError> {

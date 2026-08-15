@@ -7,16 +7,17 @@
 
 use harness_domain::{
     CorrelationLink, CorrelationLinkId, ImprovementEventId, ImprovementRecordKind,
-    ImprovementSchema, ImprovementState, LivenessEpisode, LivenessObservation,
-    LivenessObservationKind, LivenessState, ReconciliationActionKind, ReconciliationActionReceipt,
-    ReconciliationEpisode, ReconciliationFinding, ReconciliationFindingKind, ReconciliationTrigger,
-    RetentionClass, SensitivityClass, TraceContext, now_ms,
+    ImprovementSchema, ImprovementState, KnowledgeReviewDecision, LivenessEpisode,
+    LivenessObservation, LivenessObservationKind, LivenessState, ReconciliationActionKind,
+    ReconciliationActionReceipt, ReconciliationEpisode, ReconciliationFinding,
+    ReconciliationFindingKind, ReconciliationTrigger, RetentionClass, SensitivityClass,
+    TraceContext, now_ms,
 };
 use harness_learning::{
     CustodyState, KnowledgeFreshness, KnowledgeItemV1, KnowledgeKind, KnowledgeReview,
     KnowledgeScope, KnowledgeState, ReceiptKind, ReviewState, SourceReceipt,
 };
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -26,7 +27,7 @@ use super::{
 };
 use crate::{
     NewImprovementRevision, NewLivenessKnowledgeCandidate, NewReconciliationKnowledgeCandidate,
-    Store, StoreError,
+    ReviewKnowledgeCandidate, Store, StoreError,
 };
 
 const MAX_LIVENESS_KNOWLEDGE_EPISODES: i64 = 200;
@@ -51,6 +52,205 @@ struct PreservedReconciliationEpisode {
 }
 
 impl Store {
+    /// Records one explicit human decision over the exact current knowledge
+    /// candidate. The immutable review action is bound to the candidate's
+    /// revision and wire digest before the resulting active/rejected revision
+    /// is created, avoiding an authority cycle with the post-review hash.
+    ///
+    /// Acceptance is refused unless all source evidence still resolves cleanly
+    /// and the candidate is still within its revalidation window. Neither
+    /// outcome writes task context, changes controller authority, or executes
+    /// a task.
+    pub fn review_knowledge_candidate(
+        &self,
+        input: &ReviewKnowledgeCandidate,
+    ) -> Result<crate::ImprovementRevisionRecord, StoreError> {
+        validate_knowledge_review_input(input)?;
+        let decision = knowledge_review_decision_name(input.decision);
+        let identity = digest(&format!(
+            "harness.operator-control.knowledge-review.v1\0{}\0{}\0{}\0{}",
+            input.knowledge_id, input.expected_knowledge_sha256, decision, input.reviewer_id,
+        ));
+        let revision_id = format!("knowledge-review-{identity}");
+        let event_id = format!("knowledge-review-event-{identity}");
+        let idempotency_key = format!("knowledge:review:{identity}");
+        let action_type = match input.decision {
+            KnowledgeReviewDecision::Accept => "knowledge_review_accepted",
+            KnowledgeReviewDecision::Reject => "knowledge_review_rejected",
+        };
+        let expected_state = match input.decision {
+            KnowledgeReviewDecision::Accept => ImprovementState::Active,
+            KnowledgeReviewDecision::Reject => ImprovementState::Rejected,
+        };
+        let expected_knowledge_state = match input.decision {
+            KnowledgeReviewDecision::Accept => KnowledgeState::Active,
+            KnowledgeReviewDecision::Reject => KnowledgeState::Rejected,
+        };
+        let expected_review_state = match input.decision {
+            KnowledgeReviewDecision::Accept => ReviewState::Accepted,
+            KnowledgeReviewDecision::Reject => ReviewState::Rejected,
+        };
+
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing_revision_id) = transaction
+            .query_row(
+                "SELECT revision_id FROM improvement_events WHERE idempotency_key=?1",
+                [&idempotency_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let existing: crate::ImprovementRevisionRecord = transaction.query_row(
+                "SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_revisions WHERE id=?1",
+                [&existing_revision_id],
+                crate::queries::map_improvement_revision,
+            )?;
+            let item: KnowledgeItemV1 = serde_json::from_value(existing.payload.clone())?;
+            item.verify()
+                .map_err(|error| StoreError::Conflict(error.to_string()))?;
+            let review = item.review.receipt.as_ref().ok_or_else(|| {
+                StoreError::Conflict(
+                    "knowledge review replay lacks an immutable action receipt".to_owned(),
+                )
+            })?;
+            let action_matches: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM human_actions WHERE id=?1 AND actor=?2 AND action_type=?3 AND target_type='knowledge' AND target_id=?4 AND payload_sha256=?5 AND json_extract(payload_json,'$.schema')='harness.operator-control.knowledge-review.v1' AND json_extract(payload_json,'$.candidate_wire_sha256')=?6 AND json_extract(payload_json,'$.decision')=?7)",
+                params![review.revision_id, input.reviewer_id, action_type, input.knowledge_id, review.digest, input.expected_knowledge_sha256, decision],
+                |row| row.get(0),
+            )?;
+            if existing.id != revision_id
+                || existing.aggregate_kind != ImprovementRecordKind::Knowledge
+                || existing.aggregate_id != input.knowledge_id
+                || existing.state != expected_state
+                || item.knowledge_id != input.knowledge_id
+                || item.sha256.is_empty()
+                || item.state != expected_knowledge_state
+                || item.review.state != expected_review_state
+                || item.review.reviewer_id.as_deref() != Some(input.reviewer_id.as_str())
+                || !action_matches
+            {
+                return Err(StoreError::Conflict(
+                    "knowledge review idempotency key was reused with different content".to_owned(),
+                ));
+            }
+            transaction.commit()?;
+            return Ok(existing);
+        }
+
+        let (candidate_revision_id, lifecycle_state, raw, sensitivity, retention_class, export_allowed): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            bool,
+        ) = transaction
+            .query_row(
+                "SELECT id,lifecycle_state,payload_json,sensitivity,retention_class,export_allowed FROM improvement_current_revisions WHERE aggregate_kind='knowledge' AND aggregate_id=?1",
+                [&input.knowledge_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("knowledge item {}", input.knowledge_id)))?;
+        let candidate: KnowledgeItemV1 = serde_json::from_str(&raw)?;
+        candidate
+            .verify()
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        if lifecycle_state != "candidate"
+            || candidate.state != KnowledgeState::Candidate
+            || candidate.review.state != ReviewState::Unreviewed
+            || candidate.review.reviewer_id.is_some()
+            || candidate.review.reviewed_at.is_some()
+            || candidate.review.receipt.is_some()
+            || candidate.sha256 != input.expected_knowledge_sha256
+        {
+            return Err(StoreError::Conflict(
+                "knowledge review requires the exact current unreviewed candidate".to_owned(),
+            ));
+        }
+
+        let now = now_ms();
+        let now_u64 = u64::try_from(now).map_err(|_| {
+            StoreError::Validation("knowledge review clock must be non-negative".to_owned())
+        })?;
+        if input.decision == KnowledgeReviewDecision::Accept
+            && (now_u64 >= candidate.freshness.revalidate_after
+                || now_u64 >= candidate.freshness.expires_at
+                || !candidate.evidence.iter().try_fold(true, |clean, receipt| {
+                    crate::queries::learning_receipt_clean_tx(&transaction, receipt)
+                        .map(|value| clean && value)
+                })?)
+        {
+            return Err(StoreError::Conflict(
+                "knowledge acceptance requires fresh controller-clean evidence".to_owned(),
+            ));
+        }
+
+        let action_payload = json!({
+            "schema": "harness.operator-control.knowledge-review.v1",
+            "candidate_revision_id": candidate_revision_id,
+            "candidate_wire_sha256": candidate.sha256,
+            "decision": decision,
+        });
+        let action_raw = serde_json::to_string(&action_payload)?;
+        let action_sha256 = digest(&action_raw);
+        transaction.execute(
+            "INSERT INTO human_actions(actor,action_type,target_type,target_id,occurred_at,payload_json,payload_sha256) VALUES(?1,?2,'knowledge',?3,?4,?5,?6)",
+            params![input.reviewer_id, action_type, input.knowledge_id, now, action_raw, action_sha256],
+        )?;
+        let action_id = transaction.last_insert_rowid();
+
+        let mut reviewed = candidate;
+        reviewed.state = expected_knowledge_state;
+        reviewed.review = KnowledgeReview {
+            state: expected_review_state,
+            reviewer_id: Some(input.reviewer_id.clone()),
+            reviewed_at: Some(now_u64),
+            receipt: Some(SourceReceipt {
+                kind: ReceiptKind::HumanReview,
+                revision_id: action_id.to_string(),
+                digest: action_sha256,
+                split: None,
+                custody: Some(CustodyState::Clean),
+            }),
+        };
+        reviewed.sha256 = reviewed
+            .digest()
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        reviewed
+            .verify()
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        let payload = serde_json::to_value(&reviewed)?;
+        let payload_raw = serde_json::to_string(&payload)?;
+        let payload_sha256 = digest(&payload_raw);
+        let next_revision: i64 = transaction.query_row(
+            "SELECT coalesce(max(revision),0)+1 FROM improvement_revisions WHERE aggregate_kind='knowledge' AND aggregate_id=?1",
+            [&input.knowledge_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO improvement_revisions(id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,created_at) VALUES(?1,'knowledge',?2,?3,'harness.knowledge-item.v1',?4,?5,?6,?7,?8,?9,?10)",
+            params![revision_id, input.knowledge_id, next_revision, improvement_state_name(expected_state), payload_raw, payload_sha256, sensitivity, retention_class, export_allowed, now],
+        )?;
+        let event_payload = serde_json::to_string(&json!({
+            "schema": "harness.knowledge-item.v1",
+            "state": improvement_state_name(expected_state),
+        }))?;
+        let event_payload_sha256 = digest(&event_payload);
+        transaction.execute(
+            "INSERT INTO improvement_events(id,aggregate_kind,aggregate_id,revision_id,sequence,event_type,payload_json,payload_sha256,idempotency_key,occurred_at) VALUES(?1,'knowledge',?2,?3,?4,'revision_recorded',?5,?6,?7,?8)",
+            params![event_id, input.knowledge_id, revision_id, next_revision, event_payload, event_payload_sha256, idempotency_key, now],
+        )?;
+        let record: crate::ImprovementRevisionRecord = transaction.query_row(
+            "SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_revisions WHERE id=?1",
+            [&revision_id],
+            crate::queries::map_improvement_revision,
+        )?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
     /// Creates an unreviewed, display-only knowledge candidate from two exact
     /// independently recovered liveness episodes in one repository. The
     /// caller supplies only a selected episode revision and display scope;
@@ -408,6 +608,47 @@ impl Store {
             &correlations,
         )?;
         Ok(record)
+    }
+}
+
+fn validate_knowledge_review_input(input: &ReviewKnowledgeCandidate) -> Result<(), StoreError> {
+    for value in [&input.knowledge_id, &input.reviewer_id] {
+        if value.is_empty()
+            || value.len() > 128
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+            })
+        {
+            return Err(StoreError::Validation(
+                "knowledge review identifiers must be closed bounded tokens".to_owned(),
+            ));
+        }
+    }
+    if input.expected_knowledge_sha256.len() != 64
+        || !input
+            .expected_knowledge_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(StoreError::Validation(
+            "knowledge review requires an exact lowercase candidate digest".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn knowledge_review_decision_name(decision: KnowledgeReviewDecision) -> &'static str {
+    match decision {
+        KnowledgeReviewDecision::Accept => "accept",
+        KnowledgeReviewDecision::Reject => "reject",
+    }
+}
+
+fn improvement_state_name(state: ImprovementState) -> &'static str {
+    match state {
+        ImprovementState::Active => "active",
+        ImprovementState::Rejected => "rejected",
+        _ => unreachable!("knowledge review has one of two closed outcomes"),
     }
 }
 
@@ -775,10 +1016,10 @@ mod tests {
     use std::path::Path;
 
     use harness_domain::{
-        LivenessEpisodeId, LivenessObservationId, ReconciliationActionKind,
-        ReconciliationActionReceipt, ReconciliationEpisode, ReconciliationEpisodeId,
-        ReconciliationFinding, ReconciliationFindingKind, ReconciliationState,
-        ReconciliationTrigger, RepositoryId, RunId,
+        KnowledgeReviewDecision, LivenessEpisodeId, LivenessObservationId,
+        ReconciliationActionKind, ReconciliationActionReceipt, ReconciliationEpisode,
+        ReconciliationEpisodeId, ReconciliationFinding, ReconciliationFindingKind,
+        ReconciliationState, ReconciliationTrigger, RepositoryId, RunId,
     };
     use serde_json::{Value, json};
     use tempfile::TempDir;
@@ -1083,6 +1324,129 @@ mod tests {
             store.propose_knowledge_from_repeated_liveness(&stale),
             Err(StoreError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn human_review_is_candidate_bound_idempotent_and_never_injects_context() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let (repository_id, run_id) = insert_run(&store, temp.path());
+        let base = now_ms().saturating_sub(10_000);
+        recovered_episode(&store, &run_id, "review-one", base);
+        let selected = recovered_episode(&store, &run_id, "review-two", base + 100);
+        let candidate_record = store
+            .propose_knowledge_from_repeated_liveness(&NewLivenessKnowledgeCandidate {
+                episode_id: selected.episode_id.clone(),
+                expected_episode_sha256: selected.sha256.clone(),
+                task_family: "operator_control".to_owned(),
+                model_family: None,
+                runtime_class: None,
+            })
+            .expect("candidate");
+        let candidate: KnowledgeItemV1 =
+            serde_json::from_value(candidate_record.payload.clone()).expect("candidate wire");
+
+        let review = ReviewKnowledgeCandidate {
+            knowledge_id: candidate.knowledge_id.clone(),
+            expected_knowledge_sha256: candidate.sha256.clone(),
+            decision: KnowledgeReviewDecision::Accept,
+            reviewer_id: "local-session-reviewer".to_owned(),
+        };
+        let accepted = store
+            .review_knowledge_candidate(&review)
+            .expect("accepted review");
+        let active: KnowledgeItemV1 =
+            serde_json::from_value(accepted.payload.clone()).expect("active knowledge wire");
+        assert_eq!(accepted.state, ImprovementState::Active);
+        assert_eq!(active.state, KnowledgeState::Active);
+        assert_eq!(active.review.state, ReviewState::Accepted);
+        assert_eq!(
+            active.review.reviewer_id.as_deref(),
+            Some("local-session-reviewer")
+        );
+        assert!(active.review.receipt.is_some());
+        assert_eq!(
+            store
+                .current_knowledge_item(&candidate.knowledge_id)
+                .expect("active current wire"),
+            active
+        );
+        assert_eq!(
+            store
+                .resolved_active_knowledge(
+                    &repository_id,
+                    "operator_control",
+                    u64::try_from(now_ms()).expect("non-negative now"),
+                )
+                .expect("trusted active display")
+                .len(),
+            1,
+            "only the immutable reviewed display projection becomes available"
+        );
+        assert_eq!(
+            store
+                .review_knowledge_candidate(&review)
+                .expect("exact replay")
+                .id,
+            accepted.id
+        );
+        assert!(matches!(
+            store.review_knowledge_candidate(&ReviewKnowledgeCandidate {
+                decision: KnowledgeReviewDecision::Reject,
+                ..review
+            }),
+            Err(StoreError::Conflict(_))
+        ));
+
+        let rejected_candidate_record = store
+            .propose_knowledge_from_repeated_liveness(&NewLivenessKnowledgeCandidate {
+                episode_id: selected.episode_id,
+                expected_episode_sha256: selected.sha256,
+                task_family: "operator_control_rejected".to_owned(),
+                model_family: None,
+                runtime_class: None,
+            })
+            .expect("separate candidate");
+        let rejected_candidate: KnowledgeItemV1 =
+            serde_json::from_value(rejected_candidate_record.payload).expect("candidate wire");
+        let rejected = store
+            .review_knowledge_candidate(&ReviewKnowledgeCandidate {
+                knowledge_id: rejected_candidate.knowledge_id.clone(),
+                expected_knowledge_sha256: rejected_candidate.sha256,
+                decision: KnowledgeReviewDecision::Reject,
+                reviewer_id: "local-session-reviewer".to_owned(),
+            })
+            .expect("rejected review");
+        let rejected_item: KnowledgeItemV1 =
+            serde_json::from_value(rejected.payload).expect("rejected knowledge wire");
+        assert_eq!(rejected.state, ImprovementState::Rejected);
+        assert_eq!(rejected_item.state, KnowledgeState::Rejected);
+        assert_eq!(rejected_item.review.state, ReviewState::Rejected);
+        assert!(
+            store
+                .resolved_active_knowledge(
+                    &repository_id,
+                    "operator_control_rejected",
+                    u64::try_from(now_ms()).expect("non-negative now"),
+                )
+                .expect("rejected knowledge is never displayable")
+                .is_empty()
+        );
+        let action_payload: String = store
+            .connection()
+            .expect("connection")
+            .query_row(
+                "SELECT payload_json FROM human_actions WHERE action_type='knowledge_review_accepted'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("human review action");
+        assert!(action_payload.contains(&candidate_record.id));
+        assert!(action_payload.contains(&candidate.sha256));
+        assert!(
+            !action_payload.contains(&active.sha256),
+            "the action is bound to the pre-review candidate, not recursively to the post-review wire"
+        );
     }
 
     #[test]
