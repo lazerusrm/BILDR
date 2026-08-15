@@ -2,8 +2,9 @@
 //!
 //! Mutations stay deliberately narrow: version-checked presentation
 //! acknowledgement, authority-neutral local presence, and creation of an
-//! unreviewed knowledge candidate from one exact investigation finding. They
-//! cannot resolve, approve, activate knowledge, or force recovery;
+//! unreviewed knowledge candidate from one exact investigation finding, plus
+//! an exact-revision liveness wait receipt. They cannot resolve, approve,
+//! activate knowledge, or force recovery;
 //! source-specific controllers retain that authority.
 
 use axum::{
@@ -60,7 +61,7 @@ pub(super) fn routes() -> Router<ApiState> {
         .route("/api/v1/runs/{run_id}/liveness", get(list_run_liveness))
         .route(
             "/api/v1/liveness/{episode_id}/interventions",
-            get(list_intervention_receipts),
+            get(list_intervention_receipts).post(execute_wait_intervention),
         )
         .route("/api/v1/traces/{trace_id}", get(list_correlation_links))
         .route("/api/v1/runs/{run_id}/topology", get(run_topology))
@@ -438,6 +439,32 @@ async fn list_intervention_receipts(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecuteWaitInterventionRequest {
+    expected_version: u64,
+}
+
+/// The only active intervention route is a bounded wait decision. It binds
+/// the current episode revision and records no work beyond its receipt; it
+/// cannot clear a stall or change any run/task/attempt custody.
+async fn execute_wait_intervention(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(episode_id): Path<String>,
+    Json(request): Json<ExecuteWaitInterventionRequest>,
+) -> Result<Json<harness_domain::LivenessEpisode>, ApiError> {
+    authenticate(&state, &headers, true)?;
+    let episode_id = LivenessEpisodeId::parse(episode_id).map_err(|error| {
+        ApiError::from(harness_store::StoreError::Validation(error.to_string()))
+    })?;
+    Ok(Json(state.orchestrator.store().execute_wait_intervention(
+        &episode_id,
+        request.expected_version,
+        "local_session",
+    )?))
+}
+
+#[derive(Debug, Deserialize)]
 struct LimitQuery {
     limit: Option<u32>,
 }
@@ -645,6 +672,13 @@ mod tests {
                 "task_family": "operator_control",
                 "model_family": null,
                 "runtime_class": null,
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ExecuteWaitInterventionRequest>(json!({
+                "expected_version": 1,
                 "unexpected": true,
             }))
             .is_err()

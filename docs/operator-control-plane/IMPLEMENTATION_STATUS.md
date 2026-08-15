@@ -31,6 +31,8 @@ This status is intentionally a capability boundary, not release evidence.
 - authenticated creation of an unreviewed, display-only knowledge candidate
   from one fresh confirmed investigation finding, with controller-derived
   evidence, repository scope, sensitivity, freshness, and identity;
+- authenticated exact-revision `wait` liveness intervention receipts, which
+  only record the bounded decision and increment the episode counter;
 - authenticated localhost API, CLI, and browser control-plane surfaces for the
   above read models.
 
@@ -40,7 +42,7 @@ This status is intentionally a capability boundary, not release evidence.
   and session resumption; restart loss records preservation receipts and retains
   uncertain custody, while only the authenticated proof-consuming retry path
   may authorize a clean replacement;
-- typed intervention execution;
+- all non-`wait` typed intervention execution;
 - external-condition polling/wake adapters;
 - notification batching, desktop delivery, and delivery-health rollout;
 - adaptive supervisor policy or any independent control-plane mutation;

@@ -397,6 +397,30 @@ paths:
             application/json:
               schema: {type: array, items: {$ref: '#/components/schemas/InterventionReceipt'}}
         '404': {$ref: '#/components/responses/NotFound'}
+    post:
+      tags: [Liveness]
+      operationId: executeWaitIntervention
+      description: "Records the one active low-risk intervention: a revision-bound wait decision. It cannot clear a stall or change task, attempt, owner, worktree, process, approval, or external-condition custody."
+      parameters:
+        - name: episodeId
+          in: path
+          required: true
+          schema: {type: string, maxLength: 160}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ExecuteWaitInterventionRequest'}
+      responses:
+        '200':
+          description: The liveness episode after exactly one immutable wait receipt was recorded. Replaying the same caller and revision is idempotent.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LivenessEpisode'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
   /traces/{traceId}:
     get:
       tags: [ControlPlane]
@@ -1835,6 +1859,12 @@ components:
         requested_by: {type: string, maxLength: 160}
         created_at_ms: {type: integer, minimum: 0}
         sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    ExecuteWaitInterventionRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_version]
+      properties:
+        expected_version: {type: integer, minimum: 1}
     TraceContext:
       type: object
       additionalProperties: false

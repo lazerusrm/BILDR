@@ -125,9 +125,13 @@ the bounded statement, evidence receipt, repository scope, sensitivity,
 freshness, and deterministic identity from the immutable artifact. This does
 not activate knowledge, change task context, or write global memory.
 
-Desktop notification delivery/batching, active intervention execution,
-external wake adapters, adaptive supervisor behavior, empirical evaluation,
-and rollout activation remain explicitly gated until their own evidence passes.
+The sole active intervention is a version-bound `wait` receipt: it records a
+bounded decision against one liveness episode and cannot clear a stall or
+change any task, attempt, ownership, worktree, process, approval, or external
+condition. Desktop notification delivery/batching, all other intervention
+execution, external wake adapters, adaptive supervisor behavior, empirical
+evaluation, and rollout activation remain explicitly gated until their own
+evidence passes.
 Do not interpret an empty observe-only section as a healthy or automatically
 recovered run.
 

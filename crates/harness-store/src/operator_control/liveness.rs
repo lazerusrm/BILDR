@@ -6,8 +6,8 @@
 //! resulting state but cannot clear it with model prose.
 
 use harness_domain::{
-    InterventionKind, InterventionReceipt, LivenessEpisode, LivenessEpisodeId, LivenessObservation,
-    LivenessObservationKind, LivenessState,
+    InterventionId, InterventionKind, InterventionReceipt, LivenessEpisode, LivenessEpisodeId,
+    LivenessObservation, LivenessObservationKind, LivenessState, now_ms,
 };
 use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
@@ -17,6 +17,7 @@ use crate::{Store, StoreError};
 
 const MAX_LIVENESS_PAGE_SIZE: u32 = 200;
 const OBSERVE_REVIEW_DELAY_MS: i64 = 5 * 60 * 1_000;
+const WAIT_INTERVENTION_POLICY_VERSION: &str = "operator_control_wait_v1";
 
 impl Store {
     /// Opens exactly one nonterminal liveness episode for an exact attempt.
@@ -260,6 +261,80 @@ impl Store {
             })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         }
+    }
+
+    /// Executes the one active-low-risk intervention: observe and wait on the
+    /// exact liveness revision. It cannot alter a task, owner, worktree,
+    /// process, approval, external condition, or episode state. Its only
+    /// effect is the immutable receipt and incremented intervention counter.
+    ///
+    /// The deterministic identity makes a browser retry of the same
+    /// `(episode, revision, requester)` operation return the original receipt
+    /// rather than creating another wait decision.
+    pub fn execute_wait_intervention(
+        &self,
+        episode_id: &LivenessEpisodeId,
+        expected_version: u64,
+        requested_by: &str,
+    ) -> Result<LivenessEpisode, StoreError> {
+        let identity = digest(&format!(
+            "harness.liveness-wait.v1\0{episode_id}\0{expected_version}\0{requested_by}"
+        ));
+        let intervention_id = format!("intervention-wait-{}", &identity[..32]);
+        let source_event_id = format!("liveness-wait-{}", &identity[..32]);
+        let existing = {
+            let connection = self.connection()?;
+            connection
+                .query_row(
+                    "SELECT payload_json,payload_sha256 FROM intervention_receipts WHERE id=?1",
+                    [&intervention_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+        };
+        if let Some((raw, payload_sha256)) = existing {
+            let receipt = checked_intervention_receipt(raw, payload_sha256)?;
+            if receipt.episode_id != *episode_id
+                || receipt.kind != InterventionKind::Wait
+                || receipt.source_event_id != source_event_id
+                || receipt.target_version != expected_version
+                || receipt.policy_version != WAIT_INTERVENTION_POLICY_VERSION
+                || receipt.requested_by != requested_by
+            {
+                return Err(StoreError::Conflict(
+                    "wait intervention identity already has different content".to_owned(),
+                ));
+            }
+            return self
+                .liveness_episode(episode_id)?
+                .ok_or_else(|| StoreError::NotFound(format!("liveness episode {episode_id}")));
+        }
+        let episode = self
+            .liveness_episode(episode_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("liveness episode {episode_id}")))?;
+        if episode.version != expected_version {
+            return Err(StoreError::Conflict(format!(
+                "liveness episode {episode_id} has version {}, wait requires {expected_version}",
+                episode.version
+            )));
+        }
+        let mut receipt = InterventionReceipt {
+            schema: "harness.intervention-receipt.v1".to_owned(),
+            intervention_id: InterventionId::parse(&intervention_id)
+                .map_err(|error| StoreError::Validation(error.to_string()))?,
+            episode_id: episode_id.clone(),
+            kind: InterventionKind::Wait,
+            source_event_id,
+            target_version: expected_version,
+            policy_version: WAIT_INTERVENTION_POLICY_VERSION.to_owned(),
+            requested_by: requested_by.to_owned(),
+            created_at_ms: now_ms().max(episode.updated_at_ms),
+            sha256: String::new(),
+        };
+        receipt.sha256 = receipt
+            .digest()
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        self.record_intervention_receipt(&receipt)
     }
 
     /// Records controller-owned evidence for one legal liveness intervention.
@@ -827,6 +902,36 @@ mod tests {
         conflicting.sha256 = conflicting.digest().expect("digest");
         assert!(matches!(
             store.record_intervention_receipt(&conflicting),
+            Err(StoreError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn wait_intervention_is_idempotent_and_cannot_apply_to_a_stale_episode() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let opened = store.open_liveness_episode(&episode()).expect("open");
+
+        let waited = store
+            .execute_wait_intervention(&opened.episode_id, opened.version, "local_session")
+            .expect("wait");
+        assert_eq!(waited.version, opened.version + 1);
+        assert_eq!(waited.state, opened.state);
+        assert_eq!(waited.intervention_count, 1);
+        assert_eq!(
+            store
+                .execute_wait_intervention(&opened.episode_id, opened.version, "local_session")
+                .expect("idempotent replay"),
+            waited
+        );
+        let receipts = store
+            .list_intervention_receipts(&opened.episode_id, 10)
+            .expect("receipts");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].kind, InterventionKind::Wait);
+        assert_eq!(receipts[0].target_version, opened.version);
+        assert!(matches!(
+            store.execute_wait_intervention(&opened.episode_id, opened.version, "other_session"),
             Err(StoreError::Conflict(_))
         ));
     }
