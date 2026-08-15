@@ -5628,6 +5628,30 @@ fn resolved_liveness_observation_tx(
     Ok(())
 }
 
+/// Resolves one immutable reconciliation episode by its durable identifier and
+/// self-digest. A candidate may describe repeated preservation only while each
+/// source episode still passes the Store's integrity and domain validation.
+fn resolved_reconciliation_episode_tx(
+    tx: &rusqlite::Transaction<'_>,
+    receipt: &harness_learning::SourceReceipt,
+) -> Result<(), StoreError> {
+    let (raw, stored_digest): (String, String) = tx
+        .query_row(
+            "SELECT current_payload_json,current_payload_sha256 FROM reconciliation_episodes WHERE id=?1",
+            [&receipt.revision_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound(receipt.revision_id.clone()))?;
+    let episode = crate::operator_control::checked_reconciliation_row(raw, stored_digest)?;
+    if episode.episode_id.as_str() != receipt.revision_id || episode.sha256 != receipt.digest {
+        return Err(StoreError::Conflict(
+            "reconciliation episode receipt does not resolve exactly".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve a learning receipt from controller-owned state before using it as
 /// evidence.  A wire's `custody` bit is merely a claim; this rechecks the
 /// referenced immutable record and rejects sources which cannot be cleanly
@@ -5665,6 +5689,10 @@ fn learning_receipt_clean_tx(
             resolved_liveness_observation_tx(tx, receipt)?;
             Ok(true)
         }
+        ReceiptKind::ReconciliationEpisode => {
+            resolved_reconciliation_episode_tx(tx, receipt)?;
+            Ok(true)
+        }
         ReceiptKind::HumanReview => Ok(false),
         kind => {
             let expected = match kind {
@@ -5678,6 +5706,7 @@ fn learning_receipt_clean_tx(
                 | ReceiptKind::Runtime
                 | ReceiptKind::InvestigationArtifact
                 | ReceiptKind::LivenessObservation
+                | ReceiptKind::ReconciliationEpisode
                 | ReceiptKind::HumanReview => {
                     unreachable!("handled above")
                 }
@@ -5734,6 +5763,10 @@ fn validate_learning_references_tx(
             }
             ReceiptKind::LivenessObservation => {
                 resolved_liveness_observation_tx(tx, receipt)?;
+                return Ok(());
+            }
+            ReceiptKind::ReconciliationEpisode => {
+                resolved_reconciliation_episode_tx(tx, receipt)?;
                 return Ok(());
             }
             ReceiptKind::HumanReview => {

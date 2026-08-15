@@ -44,7 +44,7 @@
   "$defs": {
     "id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
     "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "receipt": {"type": "object", "additionalProperties": false, "required": ["kind", "revision_id", "digest", "split", "custody"], "properties": {"kind": {"enum": ["trace", "outcome", "failure", "investigation_artifact", "liveness_observation", "eval_case", "taskset", "grader_bundle", "runtime", "policy_bundle", "human_review"]}, "revision_id": {"$ref": "#/$defs/id"}, "digest": {"$ref": "#/$defs/digest"}, "split": {"type": ["string", "null"], "enum": ["training", "development", "holdout", "canary", "quarantine", null]}, "custody": {"type": ["string", "null"], "enum": ["clean", "invalidated", "restricted", null]}}},
+    "receipt": {"type": "object", "additionalProperties": false, "required": ["kind", "revision_id", "digest", "split", "custody"], "properties": {"kind": {"enum": ["trace", "outcome", "failure", "investigation_artifact", "liveness_observation", "reconciliation_episode", "eval_case", "taskset", "grader_bundle", "runtime", "policy_bundle", "human_review"]}, "revision_id": {"$ref": "#/$defs/id"}, "digest": {"$ref": "#/$defs/digest"}, "split": {"type": ["string", "null"], "enum": ["training", "development", "holdout", "canary", "quarantine", null]}, "custody": {"type": ["string", "null"], "enum": ["clean", "invalidated", "restricted", null]}}},
     "human_review": {"allOf": [{"$ref": "#/$defs/receipt"}, {"properties": {"kind": {"const": "human_review"}}}]}
   }
 }

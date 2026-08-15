@@ -8,7 +8,9 @@
 use harness_domain::{
     CorrelationLink, CorrelationLinkId, ImprovementEventId, ImprovementRecordKind,
     ImprovementSchema, ImprovementState, LivenessEpisode, LivenessObservation,
-    LivenessObservationKind, LivenessState, RetentionClass, SensitivityClass, TraceContext, now_ms,
+    LivenessObservationKind, LivenessState, ReconciliationActionKind, ReconciliationActionReceipt,
+    ReconciliationEpisode, ReconciliationFinding, ReconciliationFindingKind, ReconciliationTrigger,
+    RetentionClass, SensitivityClass, TraceContext, now_ms,
 };
 use harness_learning::{
     CustodyState, KnowledgeFreshness, KnowledgeItemV1, KnowledgeKind, KnowledgeReview,
@@ -18,11 +20,18 @@ use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use super::liveness::{checked_episode_row, checked_observation_row};
-use crate::{NewImprovementRevision, NewLivenessKnowledgeCandidate, Store, StoreError};
+use super::{
+    checked_action_receipt_row, checked_finding_row, checked_observation_row,
+    checked_reconciliation_row, liveness::checked_episode_row,
+};
+use crate::{
+    NewImprovementRevision, NewLivenessKnowledgeCandidate, NewReconciliationKnowledgeCandidate,
+    Store, StoreError,
+};
 
 const MAX_LIVENESS_KNOWLEDGE_EPISODES: i64 = 200;
 const MAX_LIVENESS_KNOWLEDGE_OBSERVATIONS: i64 = 200;
+const MAX_RECONCILIATION_KNOWLEDGE_EPISODES: i64 = 200;
 const KNOWLEDGE_REVALIDATE_AFTER_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const KNOWLEDGE_EXPIRES_AFTER_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 const LIVENESS_KNOWLEDGE_STATEMENT: &str = "Repeated confirmed liveness stalls recovered only after material progress; heartbeats and command activity did not clear the stall.";
@@ -32,6 +41,13 @@ struct RecoveredLivenessEpisode {
     episode: LivenessEpisode,
     confirmed_stall: LivenessObservation,
     recovery: LivenessObservation,
+}
+
+#[derive(Clone)]
+struct PreservedReconciliationEpisode {
+    episode: ReconciliationEpisode,
+    preserved_candidate: ReconciliationFinding,
+    preservation_receipt: ReconciliationActionReceipt,
 }
 
 impl Store {
@@ -216,6 +232,354 @@ impl Store {
         )?;
         Ok(record)
     }
+
+    /// Creates an unreviewed, display-only knowledge candidate from two exact
+    /// reconciliation episodes in one repository that each preserved custody.
+    /// The candidate records repeated operational evidence only: preservation
+    /// is not a successful recovery, ownership proof, or authorization for a
+    /// fresh attempt. This method never activates knowledge or changes task
+    /// execution state.
+    pub fn propose_knowledge_from_repeated_reconciliation(
+        &self,
+        input: &NewReconciliationKnowledgeCandidate,
+    ) -> Result<crate::ImprovementRevisionRecord, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let selected = transaction
+            .query_row(
+                "SELECT current_payload_json,current_payload_sha256 FROM reconciliation_episodes WHERE id=?1",
+                [input.episode_id.as_str()],
+                |row| checked_reconciliation_row(row.get(0)?, row.get(1)?),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(input.episode_id.to_string()))?;
+        if selected.sha256 != input.expected_episode_sha256 {
+            return Err(StoreError::Conflict(
+                "knowledge proposal reconciliation episode digest is stale".to_owned(),
+            ));
+        }
+        let run_id = selected.run_id.as_deref().ok_or_else(|| {
+            StoreError::Conflict(
+                "knowledge proposal requires a reconciliation episode owned by one run".to_owned(),
+            )
+        })?;
+        let repository_id: String = transaction
+            .query_row(
+                "SELECT repository_id FROM runs WHERE id=?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(run_id.to_owned()))?;
+        let sources =
+            preserved_reconciliation_episodes(&transaction, &repository_id, selected.trigger_kind)?;
+        if sources.len() < 2
+            || !sources
+                .iter()
+                .any(|source| source.episode.episode_id == selected.episode_id)
+        {
+            return Err(StoreError::Conflict(
+                "knowledge proposal requires two independently preserved reconciliation episodes"
+                    .to_owned(),
+            ));
+        }
+        let selected_source = sources
+            .iter()
+            .find(|source| source.episode.episode_id == selected.episode_id)
+            .expect("selected source was checked")
+            .clone();
+        let other_source = sources
+            .into_iter()
+            .find(|source| source.episode.episode_id != selected_source.episode.episode_id)
+            .ok_or_else(|| {
+                StoreError::Conflict(
+                    "knowledge proposal requires preservation evidence from two distinct episodes"
+                        .to_owned(),
+                )
+            })?;
+        let sources = vec![selected_source, other_source];
+        let created_at = sources
+            .iter()
+            .map(reconciliation_source_observed_at)
+            .min()
+            .ok_or_else(|| StoreError::Conflict("no preservation evidence found".to_owned()))?;
+        let created_at = u64::try_from(created_at).map_err(|_| {
+            StoreError::Validation(
+                "reconciliation preservation time must not be negative".to_owned(),
+            )
+        })?;
+        let revalidate_after = created_at
+            .checked_add(KNOWLEDGE_REVALIDATE_AFTER_MS)
+            .ok_or_else(|| StoreError::Validation("knowledge freshness overflow".to_owned()))?;
+        let expires_at = created_at
+            .checked_add(KNOWLEDGE_EXPIRES_AFTER_MS)
+            .ok_or_else(|| StoreError::Validation("knowledge freshness overflow".to_owned()))?;
+        let now = u64::try_from(now_ms()).unwrap_or(u64::MAX);
+        if created_at > now || now >= revalidate_after {
+            return Err(StoreError::Conflict(
+                "reconciliation preservation evidence is no longer fresh enough to seed knowledge"
+                    .to_owned(),
+            ));
+        }
+        let scope = KnowledgeScope {
+            repository_id,
+            task_family: input.task_family.clone(),
+            model_family: input.model_family.clone(),
+            runtime_class: input.runtime_class.clone(),
+        };
+        let identity = digest(&serde_json::to_string(&json!({
+            "schema": "harness.reconciliation-knowledge-proposal.v1",
+            "selected_episode_id": selected.episode_id.to_string(),
+            "selected_episode_sha256": selected.sha256,
+            "scope": scope.clone(),
+            "episodes": sources.iter().map(|source| json!({
+                "episode_id": source.episode.episode_id.to_string(),
+                "episode_sha256": source.episode.sha256,
+                "preserved_candidate_source_event_id": source.preserved_candidate.source_event_id,
+                "preserved_candidate_sha256": source.preserved_candidate.sha256,
+                "preservation_source_event_id": source.preservation_receipt.source_event_id,
+                "preservation_sha256": source.preservation_receipt.sha256,
+            })).collect::<Vec<_>>(),
+        }))?);
+        transaction.commit()?;
+        drop(connection);
+
+        let knowledge_id = format!("knowledge-reconciliation-{}", &identity[..32]);
+        let mut item = KnowledgeItemV1 {
+            schema: "harness.knowledge-item.v1".to_owned(),
+            knowledge_id: knowledge_id.clone(),
+            kind: KnowledgeKind::Warning,
+            statement: reconciliation_knowledge_statement(selected.trigger_kind),
+            scope,
+            evidence: sources
+                .iter()
+                .map(reconciliation_evidence_receipt)
+                .collect(),
+            confidence_milli: 800,
+            review: KnowledgeReview {
+                state: ReviewState::Unreviewed,
+                reviewer_id: None,
+                reviewed_at: None,
+                receipt: None,
+            },
+            freshness: KnowledgeFreshness {
+                created_at,
+                revalidate_after,
+                expires_at,
+            },
+            contradicts: Vec::new(),
+            supersedes: Vec::new(),
+            state: KnowledgeState::Candidate,
+            sha256: String::new(),
+        };
+        item.sha256 = item
+            .digest()
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        item.verify()
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        let payload = serde_json::to_value(&item)?;
+        let correlation_created_at = i64::try_from(created_at).map_err(|_| {
+            StoreError::Validation(
+                "reconciliation knowledge creation time is out of range".to_owned(),
+            )
+        })?;
+        let correlations = reconciliation_knowledge_candidate_correlations(
+            &sources,
+            &knowledge_id,
+            correlation_created_at,
+        )?;
+        let (record, _) = self.append_improvement_revision_with_correlations(
+            &NewImprovementRevision {
+                id: format!("knowledge-revision-{identity}"),
+                aggregate_kind: ImprovementRecordKind::Knowledge,
+                aggregate_id: knowledge_id,
+                schema: ImprovementSchema::KnowledgeItemV1,
+                state: ImprovementState::Candidate,
+                payload_sha256: digest(&serde_json::to_string(&payload)?),
+                payload,
+                sensitivity: SensitivityClass::Internal,
+                retention_class: RetentionClass::Governance,
+                export_allowed: false,
+                idempotency_key: format!("knowledge:reconciliation:{identity}"),
+                event_id: ImprovementEventId::from(format!("knowledge-event-{identity}")),
+                source_raw_event_id: None,
+                source_domain_event_id: None,
+            },
+            &correlations,
+        )?;
+        Ok(record)
+    }
+}
+
+fn reconciliation_knowledge_trace_id(knowledge_id: &str) -> String {
+    digest(&format!(
+        "harness.reconciliation-knowledge.trace.v1:{knowledge_id}"
+    ))[..32]
+        .to_owned()
+}
+
+fn reconciliation_knowledge_candidate_correlations(
+    sources: &[PreservedReconciliationEpisode],
+    knowledge_id: &str,
+    created_at_ms: i64,
+) -> Result<Vec<CorrelationLink>, StoreError> {
+    let trace_id = reconciliation_knowledge_trace_id(knowledge_id);
+    let span_id = digest(&format!(
+        "harness.reconciliation-knowledge.span.v1:{knowledge_id}"
+    ));
+    sources
+        .iter()
+        .map(|source| {
+            let link_id = CorrelationLinkId::parse(format!(
+                "correlation-{}",
+                &digest(&format!(
+                    "harness.reconciliation-knowledge.link.v1:{knowledge_id}:{}",
+                    source.episode.episode_id
+                ))[..48]
+            ))
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+            Ok(CorrelationLink {
+                schema: "harness.correlation-link.v1".to_owned(),
+                link_id,
+                trace: TraceContext {
+                    trace_id: trace_id.clone(),
+                    span_id: span_id[..16].to_owned(),
+                    parent_span_id: None,
+                },
+                from_kind: "reconciliation_episode".to_owned(),
+                from_id: source.episode.episode_id.to_string(),
+                to_kind: "knowledge_candidate".to_owned(),
+                to_id: knowledge_id.to_owned(),
+                relation: "supports_knowledge_candidate".to_owned(),
+                created_at_ms,
+            })
+        })
+        .collect()
+}
+
+fn reconciliation_knowledge_statement(trigger: ReconciliationTrigger) -> String {
+    format!(
+        "Repeated {} reconciliation episodes preserved existing custody without authorizing automatic replacement; review recovery controls before changing policy.",
+        reconciliation_trigger_label(trigger)
+    )
+}
+
+fn reconciliation_trigger_label(trigger: ReconciliationTrigger) -> &'static str {
+    match trigger {
+        ReconciliationTrigger::DaemonRestart => "daemon-restart",
+        ReconciliationTrigger::AppServerLoss => "App Server loss",
+        ReconciliationTrigger::ProcessLoss => "process-loss",
+        ReconciliationTrigger::VersionTransition => "version-transition",
+        ReconciliationTrigger::AccountHandoff => "account-handoff",
+        ReconciliationTrigger::WorktreeMismatch => "worktree-mismatch",
+        ReconciliationTrigger::UncertainCommandCompletion => "uncertain-command-completion",
+    }
+}
+
+fn reconciliation_evidence_receipt(source: &PreservedReconciliationEpisode) -> SourceReceipt {
+    SourceReceipt {
+        kind: ReceiptKind::ReconciliationEpisode,
+        revision_id: source.episode.episode_id.to_string(),
+        digest: source.episode.sha256.clone(),
+        split: None,
+        custody: Some(CustodyState::Clean),
+    }
+}
+
+fn reconciliation_source_observed_at(source: &PreservedReconciliationEpisode) -> i64 {
+    source
+        .episode
+        .updated_at_ms
+        .max(source.preserved_candidate.observed_at_ms)
+        .max(source.preservation_receipt.created_at_ms)
+}
+
+fn preserved_reconciliation_episodes(
+    transaction: &Transaction<'_>,
+    repository_id: &str,
+    trigger: ReconciliationTrigger,
+) -> Result<Vec<PreservedReconciliationEpisode>, StoreError> {
+    let count: i64 = transaction.query_row(
+        "SELECT count(*) FROM reconciliation_episodes episodes JOIN runs ON runs.id=episodes.run_id WHERE runs.repository_id=?1",
+        [repository_id],
+        |row| row.get(0),
+    )?;
+    if count > MAX_RECONCILIATION_KNOWLEDGE_EPISODES {
+        return Err(StoreError::Conflict(format!(
+            "repository has more than {MAX_RECONCILIATION_KNOWLEDGE_EPISODES} reconciliation episodes; bounded knowledge evidence is incomplete"
+        )));
+    }
+    let mut statement = transaction.prepare(
+        "SELECT episodes.current_payload_json,episodes.current_payload_sha256 FROM reconciliation_episodes episodes JOIN runs ON runs.id=episodes.run_id WHERE runs.repository_id=?1 ORDER BY episodes.updated_at DESC,episodes.id DESC LIMIT ?2",
+    )?;
+    let episodes = statement
+        .query_map(
+            params![repository_id, MAX_RECONCILIATION_KNOWLEDGE_EPISODES],
+            |row| checked_reconciliation_row(row.get(0)?, row.get(1)?),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    episodes
+        .into_iter()
+        .filter(|episode| episode.trigger_kind == trigger)
+        .map(|episode| preservation_evidence(transaction, episode))
+        .filter_map(|source| match source {
+            Ok(Some(source)) => Some(Ok(source)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
+}
+
+fn preservation_evidence(
+    transaction: &Transaction<'_>,
+    episode: ReconciliationEpisode,
+) -> Result<Option<PreservedReconciliationEpisode>, StoreError> {
+    let mut findings = transaction
+        .prepare(
+            "SELECT payload_json,payload_sha256 FROM reconciliation_findings WHERE episode_id=?1 AND kind='preserved_candidate' ORDER BY id ASC LIMIT 2",
+        )?
+        .query_map([episode.episode_id.as_str()], |row| {
+            checked_finding_row(row.get(0)?, row.get(1)?)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(preserved_candidate) = findings.pop() else {
+        return Ok(None);
+    };
+    if !findings.is_empty()
+        || preserved_candidate.kind != ReconciliationFindingKind::PreservedCandidate
+    {
+        return Err(StoreError::Conflict(format!(
+            "reconciliation episode {} has ambiguous preservation findings",
+            episode.episode_id
+        )));
+    }
+    let mut actions = transaction
+        .prepare(
+            "SELECT payload_json,payload_sha256 FROM reconciliation_actions WHERE episode_id=?1 AND kind='preserve' ORDER BY id ASC LIMIT 2",
+        )?
+        .query_map([episode.episode_id.as_str()], |row| {
+            checked_action_receipt_row(row.get(0)?, row.get(1)?)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(preservation_receipt) = actions.pop() else {
+        return Ok(None);
+    };
+    if !actions.is_empty()
+        || preservation_receipt.kind != ReconciliationActionKind::Preserve
+        || preservation_receipt.authority_event_id.is_some()
+    {
+        return Err(StoreError::Conflict(format!(
+            "reconciliation episode {} has ambiguous preservation receipts",
+            episode.episode_id
+        )));
+    }
+    Ok(Some(PreservedReconciliationEpisode {
+        episode,
+        preserved_candidate,
+        preservation_receipt,
+    }))
 }
 
 fn liveness_knowledge_trace_id(knowledge_id: &str) -> String {
@@ -410,7 +774,12 @@ fn digest(raw: &str) -> String {
 mod tests {
     use std::path::Path;
 
-    use harness_domain::{LivenessEpisodeId, LivenessObservationId, RepositoryId, RunId};
+    use harness_domain::{
+        LivenessEpisodeId, LivenessObservationId, ReconciliationActionKind,
+        ReconciliationActionReceipt, ReconciliationEpisode, ReconciliationEpisodeId,
+        ReconciliationFinding, ReconciliationFindingKind, ReconciliationState,
+        ReconciliationTrigger, RepositoryId, RunId,
+    };
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
@@ -512,6 +881,92 @@ mod tests {
                 ),
             )
             .expect("material recovery")
+    }
+
+    fn additional_run(store: &Store, repository_id: &RepositoryId, suffix: &str) -> RunId {
+        let run_id = RunId::from(format!("run-reconciliation-knowledge-{suffix}"));
+        store
+            .create_run(&NewRun {
+                id: run_id.clone(),
+                repository_id: repository_id.clone(),
+                title: "Reconciliation knowledge fixture".to_owned(),
+                objective: "Derive a review-only repeated preservation candidate".to_owned(),
+                mode: "observe_only".to_owned(),
+                publication_mode: "none".to_owned(),
+                state: "CREATED".to_owned(),
+                phase: "created".to_owned(),
+                base_ref: "main".to_owned(),
+                base_sha: "a".repeat(40),
+                authority_digest: "c".repeat(64),
+                profile_digest: "d".repeat(64),
+                codex_version: None,
+                protocol_schema_sha256: None,
+                requested_by: "test".to_owned(),
+                token_budget: None,
+            })
+            .expect("additional run");
+        run_id
+    }
+
+    fn preserved_reconciliation_episode(
+        store: &Store,
+        run_id: &RunId,
+        suffix: &str,
+        opened_at_ms: i64,
+    ) -> ReconciliationEpisode {
+        let mut episode = ReconciliationEpisode {
+            schema: "harness.reconciliation-episode.v1".to_owned(),
+            episode_id: ReconciliationEpisodeId::new(),
+            run_id: Some(run_id.to_string()),
+            trigger_kind: ReconciliationTrigger::AppServerLoss,
+            state: ReconciliationState::Open,
+            version: 1,
+            opened_at_ms,
+            updated_at_ms: opened_at_ms,
+            source_event_id: format!("reconciliation-source-{suffix}"),
+            inventory_sha256: "b".repeat(64),
+            finding_count: 0,
+            action_count: 0,
+            report: Some("Inventory recorded before preserving custody".to_owned()),
+            sha256: String::new(),
+        };
+        episode.sha256 = episode.digest().expect("episode digest");
+        let opened = store
+            .open_reconciliation_episode(&episode)
+            .expect("open episode");
+        let mut finding = ReconciliationFinding {
+            schema: "harness.reconciliation-finding.v1".to_owned(),
+            episode_id: opened.episode_id.clone(),
+            kind: ReconciliationFindingKind::PreservedCandidate,
+            source_event_id: format!("reconciliation-preserved-{suffix}"),
+            observed_at_ms: opened_at_ms + 1,
+            payload: json!({
+                "worktree_id": format!("worktree-{suffix}"),
+                "result": "preserved",
+            }),
+            sha256: String::new(),
+        };
+        finding.sha256 = finding.digest().expect("finding digest");
+        let after_finding = store
+            .record_reconciliation_finding(&finding, opened.version)
+            .expect("preserved candidate");
+        let mut receipt = ReconciliationActionReceipt {
+            schema: "harness.reconciliation-action-receipt.v1".to_owned(),
+            episode_id: opened.episode_id,
+            kind: ReconciliationActionKind::Preserve,
+            source_event_id: format!("reconciliation-preservation-{suffix}"),
+            authority_event_id: None,
+            created_at_ms: opened_at_ms + 2,
+            payload: json!({
+                "worktree_id": format!("worktree-{suffix}"),
+                "result": "preserved",
+            }),
+            sha256: String::new(),
+        };
+        receipt.sha256 = receipt.digest().expect("receipt digest");
+        store
+            .record_reconciliation_action_receipt(&receipt, after_finding.version)
+            .expect("preservation receipt")
     }
 
     fn observation(
@@ -645,6 +1100,126 @@ mod tests {
                 model_family: None,
                 runtime_class: None,
             }),
+            Err(StoreError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn repeated_preservations_create_an_unreviewed_candidate_with_exact_episode_evidence() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let (repository_id, _) = insert_run(&store, temp.path());
+        let first_run = additional_run(&store, &repository_id, "one");
+        let second_run = additional_run(&store, &repository_id, "two");
+        let base = now_ms().saturating_sub(10_000);
+        preserved_reconciliation_episode(&store, &first_run, "one", base);
+        let selected = preserved_reconciliation_episode(&store, &second_run, "two", base + 100);
+        let input = NewReconciliationKnowledgeCandidate {
+            episode_id: selected.episode_id.clone(),
+            expected_episode_sha256: selected.sha256.clone(),
+            task_family: "operator_control".to_owned(),
+            model_family: None,
+            runtime_class: None,
+        };
+
+        let record = store
+            .propose_knowledge_from_repeated_reconciliation(&input)
+            .expect("candidate");
+        let item: KnowledgeItemV1 = serde_json::from_value(record.payload.clone()).expect("wire");
+        assert_eq!(record.state, ImprovementState::Candidate);
+        assert_eq!(item.kind, KnowledgeKind::Warning);
+        assert_eq!(item.state, KnowledgeState::Candidate);
+        assert_eq!(item.review.state, ReviewState::Unreviewed);
+        assert_eq!(item.scope.repository_id, repository_id.as_str());
+        assert_eq!(item.evidence.len(), 2);
+        assert!(item.evidence.iter().all(|receipt| {
+            receipt.kind == ReceiptKind::ReconciliationEpisode
+                && receipt.custody == Some(CustodyState::Clean)
+                && receipt.split.is_none()
+        }));
+        let correlations = store
+            .correlation_links(&reconciliation_knowledge_trace_id(&item.knowledge_id), 10)
+            .expect("candidate trace");
+        assert_eq!(correlations.len(), 2);
+        assert!(correlations.iter().all(|link| {
+            link.from_kind == "reconciliation_episode"
+                && link.to_kind == "knowledge_candidate"
+                && link.to_id == item.knowledge_id
+                && link.relation == "supports_knowledge_candidate"
+        }));
+        assert_eq!(
+            store
+                .current_knowledge_item(&item.knowledge_id)
+                .expect("candidate remains readable"),
+            item
+        );
+        assert!(
+            store
+                .resolved_active_knowledge(&repository_id, "operator_control", 0)
+                .expect("candidate never activates itself")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .propose_knowledge_from_repeated_reconciliation(&input)
+                .expect("replay")
+                .id,
+            record.id
+        );
+
+        let mut mismatched = item.clone();
+        mismatched.knowledge_id = "knowledge-reconciliation-mismatched-receipt".to_owned();
+        mismatched.evidence[0].digest = "e".repeat(64);
+        mismatched.sha256 = mismatched.digest().expect("mismatched wire digest");
+        let payload = serde_json::to_value(&mismatched).expect("mismatched payload");
+        assert!(matches!(
+            store.append_improvement_revision(&NewImprovementRevision {
+                id: "knowledge-revision-reconciliation-mismatched-receipt".to_owned(),
+                aggregate_kind: ImprovementRecordKind::Knowledge,
+                aggregate_id: mismatched.knowledge_id.clone(),
+                schema: ImprovementSchema::KnowledgeItemV1,
+                state: ImprovementState::Candidate,
+                payload_sha256: digest(&serde_json::to_string(&payload).expect("payload wire")),
+                payload,
+                sensitivity: SensitivityClass::Internal,
+                retention_class: RetentionClass::Governance,
+                export_allowed: false,
+                idempotency_key: "knowledge:reconciliation:mismatched-receipt".to_owned(),
+                event_id: ImprovementEventId::from(
+                    "knowledge-event-reconciliation-mismatched-receipt",
+                ),
+                source_raw_event_id: None,
+                source_domain_event_id: None,
+            }),
+            Err(StoreError::Conflict(_))
+        ));
+
+        let mut stale = input;
+        stale.expected_episode_sha256 = "e".repeat(64);
+        assert!(matches!(
+            store.propose_knowledge_from_repeated_reconciliation(&stale),
+            Err(StoreError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn one_preservation_cannot_seed_knowledge() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let (repository_id, _) = insert_run(&store, temp.path());
+        let run_id = additional_run(&store, &repository_id, "only");
+        let preserved =
+            preserved_reconciliation_episode(&store, &run_id, "only", now_ms() - 10_000);
+        assert!(matches!(
+            store.propose_knowledge_from_repeated_reconciliation(
+                &NewReconciliationKnowledgeCandidate {
+                    episode_id: preserved.episode_id,
+                    expected_episode_sha256: preserved.sha256,
+                    task_family: "operator_control".to_owned(),
+                    model_family: None,
+                    runtime_class: None,
+                }
+            ),
             Err(StoreError::Conflict(_))
         ));
     }

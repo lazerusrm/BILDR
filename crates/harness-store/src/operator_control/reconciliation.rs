@@ -1002,7 +1002,7 @@ fn checked_ownership_row(raw: String, payload_sha256: String) -> rusqlite::Resul
     Ok(proof)
 }
 
-fn checked_finding_row(
+pub(crate) fn checked_finding_row(
     raw: String,
     payload_sha256: String,
 ) -> rusqlite::Result<ReconciliationFinding> {
@@ -1022,7 +1022,7 @@ fn checked_finding_row(
     Ok(finding)
 }
 
-fn checked_action_receipt_row(
+pub(crate) fn checked_action_receipt_row(
     raw: String,
     payload_sha256: String,
 ) -> rusqlite::Result<ReconciliationActionReceipt> {

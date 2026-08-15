@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use harness_domain::{
     AgentRole, AgentSessionId, ApprovalId, ArtifactId, AttemptId, CommandRunId, EvidenceId,
     ImprovementEventId, ImprovementRecordKind, ImprovementSchema, ImprovementState,
-    InvestigationArtifactId, LivenessEpisodeId, ProofTier, RepositoryId, ResultClass,
-    RetentionClass, RiskLevel, RunId, SandboxMode, SensitivityClass, TaskId, TaskPacket,
-    ValidationId, WorktreeId,
+    InvestigationArtifactId, LivenessEpisodeId, ProofTier, ReconciliationEpisodeId, RepositoryId,
+    ResultClass, RetentionClass, RiskLevel, RunId, SandboxMode, SensitivityClass, TaskId,
+    TaskPacket, ValidationId, WorktreeId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -323,6 +323,20 @@ pub struct NewInvestigationKnowledgeCandidate {
 #[derive(Clone, Debug)]
 pub struct NewLivenessKnowledgeCandidate {
     pub episode_id: LivenessEpisodeId,
+    pub expected_episode_sha256: String,
+    pub task_family: String,
+    pub model_family: Option<String>,
+    pub runtime_class: Option<String>,
+}
+
+/// A narrowly derived, display-only knowledge candidate from repeated
+/// reconciliation episodes that each preserved custody without authorizing a
+/// replacement. The controller derives every factual claim and source receipt;
+/// callers cannot treat a preservation record as a successful recovery or
+/// activate the candidate.
+#[derive(Clone, Debug)]
+pub struct NewReconciliationKnowledgeCandidate {
+    pub episode_id: ReconciliationEpisodeId,
     pub expected_episode_sha256: String,
     pub task_family: String,
     pub model_family: Option<String>,

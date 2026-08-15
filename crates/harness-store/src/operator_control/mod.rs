@@ -19,4 +19,7 @@ mod topology;
 
 pub use attention::*;
 pub(crate) use liveness::checked_observation_row;
+pub(crate) use reconciliation::{
+    checked_action_receipt_row, checked_finding_row, checked_reconciliation_row,
+};
 pub use snapshots::*;

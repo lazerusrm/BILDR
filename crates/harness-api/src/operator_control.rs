@@ -2,9 +2,9 @@
 //!
 //! Mutations stay deliberately narrow: version-checked presentation
 //! acknowledgement, authority-neutral local presence, and creation of an
-//! unreviewed knowledge candidate from one exact investigation finding, plus
-//! an exact-revision liveness wait receipt. They cannot resolve, approve,
-//! activate knowledge, or force recovery;
+//! unreviewed knowledge candidates from exact investigation, liveness, and
+//! reconciliation evidence, plus an exact-revision liveness wait receipt.
+//! They cannot resolve, approve, activate knowledge, or force recovery;
 //! source-specific controllers retain that authority.
 
 use axum::{
@@ -85,6 +85,10 @@ pub(super) fn routes() -> Router<ApiState> {
         .route(
             "/api/v1/reconciliations/{episode_id}/actions",
             get(list_reconciliation_action_receipts),
+        )
+        .route(
+            "/api/v1/reconciliations/{episode_id}/knowledge-candidates",
+            post(propose_knowledge_from_repeated_reconciliation),
         )
         .route(
             "/api/v1/reconciliations/{episode_id}",
@@ -351,6 +355,49 @@ async fn propose_knowledge_from_repeated_liveness(
     let item = serde_json::from_value(revision.payload).map_err(|error| {
         ApiError::from(harness_store::StoreError::Validation(format!(
             "stored liveness knowledge candidate has an invalid wire contract: {error}"
+        )))
+    })?;
+    Ok(Json(item))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposeKnowledgeFromReconciliationRequest {
+    expected_episode_sha256: String,
+    task_family: String,
+    model_family: Option<String>,
+    runtime_class: Option<String>,
+}
+
+/// Writes a suggestion only from two independently preserved reconciliation
+/// episodes. The store derives all evidence, statement, freshness, identity,
+/// and sensitivity; this route cannot treat preservation as recovery, retry a
+/// task, activate knowledge, or alter task context.
+async fn propose_knowledge_from_repeated_reconciliation(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(episode_id): Path<String>,
+    Json(request): Json<ProposeKnowledgeFromReconciliationRequest>,
+) -> Result<Json<harness_learning::KnowledgeItemV1>, ApiError> {
+    authenticate(&state, &headers, true)?;
+    let episode_id = ReconciliationEpisodeId::parse(episode_id).map_err(|error| {
+        ApiError::from(harness_store::StoreError::Validation(error.to_string()))
+    })?;
+    let revision = state
+        .orchestrator
+        .store()
+        .propose_knowledge_from_repeated_reconciliation(
+            &harness_store::NewReconciliationKnowledgeCandidate {
+                episode_id,
+                expected_episode_sha256: request.expected_episode_sha256,
+                task_family: request.task_family,
+                model_family: request.model_family,
+                runtime_class: request.runtime_class,
+            },
+        )?;
+    let item = serde_json::from_value(revision.payload).map_err(|error| {
+        ApiError::from(harness_store::StoreError::Validation(format!(
+            "stored reconciliation knowledge candidate has an invalid wire contract: {error}"
         )))
     })?;
     Ok(Json(item))
@@ -801,6 +848,16 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<ProposeKnowledgeFromLivenessRequest>(json!({
+                "expected_episode_sha256": "a".repeat(64),
+                "task_family": "operator_control",
+                "model_family": null,
+                "runtime_class": null,
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ProposeKnowledgeFromReconciliationRequest>(json!({
                 "expected_episode_sha256": "a".repeat(64),
                 "task_family": "operator_control",
                 "model_family": null,

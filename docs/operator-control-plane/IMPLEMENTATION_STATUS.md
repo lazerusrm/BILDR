@@ -38,6 +38,10 @@ This status is intentionally a capability boundary, not release evidence.
 - authenticated creation of an unreviewed, display-only heuristic from two
   independently recovered liveness episodes, with controller-derived exact
   observation receipts and no activation or context injection;
+- authenticated creation of an unreviewed, display-only warning from two
+  independently preserved reconciliation episodes with the same trigger, using
+  exact episode evidence plus controller-verified preservation findings and
+  receipts; preservation does not imply recovery or retry authority;
 - authenticated exact-revision `wait` liveness intervention receipts, which
   only record the bounded decision and increment the episode counter;
 - authenticated localhost API, CLI, and browser control-plane surfaces for the
@@ -54,8 +58,8 @@ This status is intentionally a capability boundary, not release evidence.
   gate, whose terminal event remains non-authorizing;
 - notification batching, desktop delivery, and delivery-health rollout;
 - adaptive supervisor policy or any independent control-plane mutation;
-- reconciliation-pattern knowledge candidates, knowledge review UI, and any
-  context injection or activation beyond the existing governed pipeline;
+- knowledge review UI and any context injection or activation beyond the
+  existing governed pipeline;
 - evaluation corpus, fault matrix, usability study, canary, rollback drill, and
   production activation.
 
@@ -71,8 +75,9 @@ sections are not evidence that a run is healthy, reconciled, or safe to resume.
 - `cargo run -p xtask -- schema-check`
 - `cargo run -p xtask -- openapi-check`
 
-Build output is isolated under `/mnt/bulk-fast/agent-builds/nmch-pr4`; do not
-start workspace-wide builds when the controlled capacity policy is unmet.
+Build output must use an isolated `CARGO_TARGET_DIR`. Verify available capacity
+at the time of a workspace build; unrelated workload alone is not a reason to
+withhold local validation.
 
 ## Promotion boundary
 

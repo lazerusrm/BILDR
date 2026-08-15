@@ -553,6 +553,31 @@ paths:
             application/json:
               schema: {type: array, items: {$ref: '#/components/schemas/ReconciliationActionReceipt'}}
         '404': {$ref: '#/components/responses/NotFound'}
+  /reconciliations/{episodeId}/knowledge-candidates:
+    post:
+      tags: [Reconciliation, Knowledge]
+      operationId: proposeKnowledgeFromRepeatedReconciliation
+      description: Creates an unreviewed display-only warning from exactly two independently preserved reconciliation episodes with the same trigger in one repository. The controller derives immutable episode receipts, factual statement, scope repository, freshness, sensitivity, and identity. Preservation is not recovery or replacement authority; this endpoint cannot retry a task, activate knowledge, or write prompt memory.
+      parameters:
+        - name: episodeId
+          in: path
+          required: true
+          schema: {$ref: '#/components/schemas/OpaqueId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProposeKnowledgeFromReconciliationRequest'}
+      responses:
+        '200':
+          description: Idempotent unreviewed candidate with exactly two immutable reconciliation episode receipts. It is never active or injected into task context by this operation.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ReconciliationKnowledgeCandidate'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
   /operator-presence:
     get:
       tags: [Notifications]
@@ -2285,6 +2310,21 @@ components:
           anyOf:
             - {$ref: '#/components/schemas/OpaqueId'}
             - {type: 'null'}
+    ProposeKnowledgeFromReconciliationRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_episode_sha256, task_family, model_family, runtime_class]
+      properties:
+        expected_episode_sha256: {$ref: '#/components/schemas/Digest'}
+        task_family: {$ref: '#/components/schemas/OpaqueId'}
+        model_family:
+          anyOf:
+            - {$ref: '#/components/schemas/OpaqueId'}
+            - {type: 'null'}
+        runtime_class:
+          anyOf:
+            - {$ref: '#/components/schemas/OpaqueId'}
+            - {type: 'null'}
     InvestigationKnowledgeEvidenceReceipt:
       type: object
       additionalProperties: false
@@ -2373,6 +2413,53 @@ components:
           maxItems: 4
           items: {$ref: '#/components/schemas/LivenessKnowledgeEvidenceReceipt'}
         confidence_milli: {const: 900}
+        review:
+          type: object
+          additionalProperties: false
+          required: [state, reviewer_id, reviewed_at, receipt]
+          properties:
+            state: {const: unreviewed}
+            reviewer_id: {type: 'null'}
+            reviewed_at: {type: 'null'}
+            receipt: {type: 'null'}
+        freshness:
+          type: object
+          additionalProperties: false
+          required: [created_at, revalidate_after, expires_at]
+          properties:
+            created_at: {type: integer, minimum: 0}
+            revalidate_after: {type: integer, minimum: 0}
+            expires_at: {type: integer, minimum: 0}
+        contradicts: {type: array, maxItems: 0}
+        supersedes: {type: array, maxItems: 0}
+        state: {const: candidate}
+        sha256: {$ref: '#/components/schemas/Digest'}
+    ReconciliationKnowledgeEvidenceReceipt:
+      type: object
+      additionalProperties: false
+      required: [kind, revision_id, digest, split, custody]
+      properties:
+        kind: {const: reconciliation_episode}
+        revision_id: {$ref: '#/components/schemas/OpaqueId'}
+        digest: {$ref: '#/components/schemas/Digest'}
+        split: {type: 'null'}
+        custody: {const: clean}
+    ReconciliationKnowledgeCandidate:
+      type: object
+      additionalProperties: false
+      required: [schema, knowledge_id, kind, statement, scope, evidence, confidence_milli, review, freshness, contradicts, supersedes, state, sha256]
+      properties:
+        schema: {const: harness.knowledge-item.v1}
+        knowledge_id: {$ref: '#/components/schemas/OpaqueId'}
+        kind: {const: warning}
+        statement: {type: string, minLength: 1, maxLength: 4096}
+        scope: {$ref: '#/components/schemas/InvestigationKnowledgeScope'}
+        evidence:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items: {$ref: '#/components/schemas/ReconciliationKnowledgeEvidenceReceipt'}
+        confidence_milli: {const: 800}
         review:
           type: object
           additionalProperties: false
@@ -2496,7 +2583,7 @@ components:
       additionalProperties: false
       required: [kind, revision_id, digest, split, custody]
       properties:
-        kind: {enum: [trace, outcome, failure, investigation_artifact, liveness_observation, eval_case, taskset, grader_bundle, runtime, policy_bundle, human_review]}
+        kind: {enum: [trace, outcome, failure, investigation_artifact, liveness_observation, reconciliation_episode, eval_case, taskset, grader_bundle, runtime, policy_bundle, human_review]}
         revision_id: {$ref: '#/components/schemas/KnowledgeToken'}
         digest: {$ref: '#/components/schemas/Digest'}
         split:

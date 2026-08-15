@@ -136,6 +136,13 @@ the bounded statement, evidence receipt, repository scope, sensitivity,
 freshness, and deterministic identity from the immutable artifact. This does
 not activate knowledge, change task context, or write global memory.
 
+An authenticated operator may also derive an unreviewed, display-only warning
+from two immutable reconciliation episodes for the same trigger when each has
+an exact preserved-candidate finding and authority-neutral preservation
+receipt. The controller derives the statement and two episode receipts; this
+does not call preservation a recovery, create a replacement attempt, activate
+knowledge, change task context, or write global memory.
+
 The sole active intervention is a version-bound `wait` receipt: it records a
 bounded decision against one liveness episode and cannot clear a stall or
 change any task, attempt, ownership, worktree, process, approval, or external
