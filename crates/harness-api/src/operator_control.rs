@@ -15,7 +15,7 @@ use axum::{
 };
 use harness_domain::{
     AttentionItemId, ExternalConditionId, InvestigationArtifactId, LivenessEpisodeId,
-    OperatorPresenceMode, ReconciliationEpisodeId,
+    OperatorPresenceMode, ReconciliationEpisodeId, RunId,
 };
 use serde::Deserialize;
 
@@ -52,6 +52,10 @@ pub(super) fn routes() -> Router<ApiState> {
             get(get_current_knowledge_item),
         )
         .route("/api/v1/external-conditions", get(list_external_conditions))
+        .route(
+            "/api/v1/runs/{run_id}/external-conditions/time-gates",
+            post(register_run_time_gate),
+        )
         .route(
             "/api/v1/external-conditions/{condition_id}",
             get(get_external_condition),
@@ -339,6 +343,40 @@ async fn list_external_conditions(
                 query.limit.unwrap_or(50),
             )?,
     ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterRunTimeGateRequest {
+    not_before_ms: i64,
+    #[serde(deserialize_with = "required_nullable_i64")]
+    deadline_ms: Option<i64>,
+}
+
+fn required_nullable_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<i64>::deserialize(deserializer)
+}
+
+/// Registers the one operator-facing external adapter that is entirely local:
+/// a controller-clock time gate. It contains no provider endpoint, command,
+/// credential, or result-to-action mapping. Terminal observations remain
+/// non-authorizing controller facts and cannot resume or otherwise change work.
+async fn register_run_time_gate(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Json(request): Json<RegisterRunTimeGateRequest>,
+) -> Result<Json<harness_domain::ExternalCondition>, ApiError> {
+    authenticate(&state, &headers, true)?;
+    let run_id = RunId::from(run_id);
+    Ok(Json(state.orchestrator.register_run_time_gate(
+        &run_id,
+        request.not_before_ms,
+        request.deadline_ms,
+    )?))
 }
 
 async fn get_external_condition(
@@ -703,6 +741,21 @@ mod tests {
                 "unexpected": true,
             }))
             .is_err()
+        );
+        assert!(
+            serde_json::from_value::<RegisterRunTimeGateRequest>(json!({
+                "not_before_ms": 1,
+                "deadline_ms": null,
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<RegisterRunTimeGateRequest>(json!({
+                "not_before_ms": 1,
+            }))
+            .is_err(),
+            "the explicit nullable deadline field cannot silently default"
         );
     }
 }

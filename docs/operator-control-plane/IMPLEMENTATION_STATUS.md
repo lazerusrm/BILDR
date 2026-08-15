@@ -7,8 +7,9 @@ This status is intentionally a capability boundary, not release evidence.
 
 - durable source-owned attention, canonical control-plane snapshots, and return
   cursor acknowledgement;
-- immutable investigation artifact contracts/reducer and passive
-  external-condition observations; production scoped investigation dispatch is
+- immutable investigation artifact contracts/reducer, passive
+  external-condition observations, and authenticated registration of a
+  run-owned local absolute-time gate; production scoped investigation dispatch is
   fail-closed until the App Server supports readable-root enforcement plus a
   controller-visible read-event stream;
 - deterministic allow-list material-progress classification;
@@ -46,7 +47,8 @@ This status is intentionally a capability boundary, not release evidence.
   uncertain custody, while only the authenticated proof-consuming retry path
   may authorize a clean replacement;
 - all non-`wait` typed intervention execution;
-- external-condition polling/wake adapters;
+- external-condition polling/wake adapters beyond the controller-clock time
+  gate, whose terminal event remains non-authorizing;
 - notification batching, desktop delivery, and delivery-health rollout;
 - adaptive supervisor policy or any independent control-plane mutation;
 - liveness/reconciliation-pattern knowledge candidates, knowledge review UI,

@@ -10,7 +10,7 @@ use harness_domain::{
     ExternalConditionAdapter, ExternalConditionId, ExternalConditionOwnerType,
     ExternalConditionState, ExternalConditionSummary, RunId, TraceContext,
 };
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -63,6 +63,71 @@ impl Store {
             }
             return Err(StoreError::Conflict(format!(
                 "external condition source {}:{} already has different current content",
+                adapter, condition.source_id
+            )));
+        }
+        transaction.execute(
+            "INSERT INTO external_conditions(id,adapter,source_id,state,version,current_payload_json,current_payload_sha256,opened_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                condition.condition_id.as_str(),
+                adapter,
+                condition.source_id,
+                state,
+                to_i64(condition.version, "external condition version")?,
+                raw,
+                payload_sha256,
+                condition.opened_at_ms,
+                condition.updated_at_ms,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(condition.clone())
+    }
+
+    /// Registers a source fact whose identity was derived by the controller.
+    ///
+    /// Unlike the strict byte-for-byte registration API above, this method
+    /// treats a matching immutable source identity as the same source fact
+    /// after its current condition has advanced. It acquires the SQLite writer
+    /// slot before lookup so concurrent identical requests cannot race into
+    /// distinct random condition ids.
+    pub fn register_or_read_external_condition_by_source_identity(
+        &self,
+        condition: &ExternalCondition,
+    ) -> Result<ExternalCondition, StoreError> {
+        condition
+            .validate()
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        if condition.state != ExternalConditionState::Open
+            || condition.sequence != 0
+            || condition.version != 1
+            || condition.last_observation.is_some()
+        {
+            return Err(StoreError::Validation(
+                "a new external condition must be open at sequence zero, version one, without an observation".to_owned(),
+            ));
+        }
+        let raw = serde_json::to_string(condition)?;
+        let payload_sha256 = digest(&raw);
+        let adapter = enum_name(&condition.adapter)?;
+        let state = enum_name(&condition.state)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((existing_raw, existing_digest)) = transaction
+            .query_row(
+                "SELECT current_payload_json,current_payload_sha256 FROM external_conditions WHERE adapter=?1 AND source_id=?2",
+                params![adapter, condition.source_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            let existing = checked_condition_row(existing_raw, existing_digest)?;
+            if same_registered_source_identity(&existing, condition) {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(StoreError::Conflict(format!(
+                "external condition source {}:{} already has a different immutable identity",
                 adapter, condition.source_id
             )));
         }
@@ -615,6 +680,19 @@ fn checked_observation_row(
     Ok(observation)
 }
 
+fn same_registered_source_identity(
+    existing: &ExternalCondition,
+    requested: &ExternalCondition,
+) -> bool {
+    existing.owner_type == requested.owner_type
+        && existing.owner_id == requested.owner_id
+        && existing.adapter == requested.adapter
+        && existing.source_id == requested.source_id
+        && existing.source_identity_digest == requested.source_identity_digest
+        && existing.spec == requested.spec
+        && existing.poll_policy == requested.poll_policy
+}
+
 fn enum_name(value: &impl Serialize) -> Result<String, StoreError> {
     let encoded = serde_json::to_string(value)?;
     encoded
@@ -637,7 +715,10 @@ fn digest(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{
+        path::Path,
+        sync::{Arc, Barrier},
+    };
 
     use harness_domain::{
         ConditionObservationId, ExternalConditionAdapter, ExternalConditionId,
@@ -791,6 +872,54 @@ mod tests {
                 .is_err(),
             "condition observations must remain append-only"
         );
+    }
+
+    #[test]
+    fn source_identity_registration_serializes_concurrent_replays() {
+        let temp = TempDir::new().expect("temp");
+        let database = temp.path().join("harness.sqlite3");
+        let first_store =
+            Store::open(&database, &temp.path().join("artifacts-a")).expect("first store");
+        let second_store =
+            Store::open(&database, &temp.path().join("artifacts-b")).expect("second store");
+        let first_condition = condition();
+        let mut second_condition = first_condition.clone();
+        second_condition.condition_id = ExternalConditionId::new();
+        second_condition.opened_at_ms = 2;
+        second_condition.updated_at_ms = 2;
+        second_condition.sha256 = second_condition.digest().expect("second digest");
+        let barrier = Arc::new(Barrier::new(2));
+        let first_barrier = Arc::clone(&barrier);
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_store.register_or_read_external_condition_by_source_identity(&first_condition)
+        });
+        let second = std::thread::spawn(move || {
+            barrier.wait();
+            second_store.register_or_read_external_condition_by_source_identity(&second_condition)
+        });
+        let first = first.join().expect("first joins").expect("first registers");
+        let second = second
+            .join()
+            .expect("second joins")
+            .expect("second replays");
+        assert_eq!(first.condition_id, second.condition_id);
+        let reader =
+            Store::open(&database, &temp.path().join("artifacts-c")).expect("reader store");
+        assert_eq!(
+            reader
+                .list_external_conditions(true, 10)
+                .expect("conditions read")
+                .len(),
+            1
+        );
+        let mut conflicting = condition();
+        conflicting.spec = json!({"check_name":"different"});
+        conflicting.sha256 = conflicting.digest().expect("conflicting digest");
+        assert!(matches!(
+            reader.register_or_read_external_condition_by_source_identity(&conflicting),
+            Err(StoreError::Conflict(_))
+        ));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Deterministic orchestration service for controller-owned Codex work.
 
+mod external_conditions;
 mod reconciliation;
 mod supervision;
 
@@ -19143,6 +19144,56 @@ mod tests {
         };
         condition.sha256 = condition.digest().expect("time-gate fixture digest");
         condition
+    }
+
+    #[tokio::test]
+    async fn operator_time_gate_registration_is_idempotent_and_non_authorizing() {
+        let (orchestrator, _temp, _runtime, run_id, task_id) = investigation_fixture().await;
+        let not_before_ms = now_ms().saturating_sub(1);
+        let deadline_ms = Some(now_ms().saturating_add(60_000));
+        let first = orchestrator
+            .register_run_time_gate(&run_id, not_before_ms, deadline_ms)
+            .expect("operator time gate registers");
+        let replay = orchestrator
+            .register_run_time_gate(&run_id, not_before_ms, deadline_ms)
+            .expect("identical operator time gate replays");
+        assert_eq!(replay, first);
+        assert_eq!(first.adapter, ExternalConditionAdapter::TimeGate);
+        assert_eq!(first.owner_type, ExternalConditionOwnerType::Run);
+        assert_eq!(first.owner_id, run_id.to_string());
+        assert!(first.source_id.starts_with("operator-time-gate-"));
+        assert_eq!(first.poll_policy.initial_ms, 1_000);
+        assert_eq!(first.poll_policy.maximum_ms, 60_000);
+        assert!(matches!(
+            orchestrator.register_run_time_gate(&run_id, 10, Some(9)),
+            Err(OrchestratorError::Validation(_))
+        ));
+
+        let run = orchestrator.store().run(&run_id).expect("run reads");
+        assert_eq!(
+            orchestrator
+                .reconcile_time_gate_conditions(&run)
+                .expect("registered gate reconciles"),
+            1
+        );
+        assert_eq!(
+            orchestrator
+                .store()
+                .external_condition(&first.condition_id)
+                .expect("condition reads")
+                .expect("condition exists")
+                .state,
+            ExternalConditionState::Satisfied
+        );
+        assert_eq!(
+            orchestrator
+                .store()
+                .task(&task_id)
+                .expect("task reads")
+                .state,
+            TaskState::Ready,
+            "a registered local wait cannot wake or mutate a task"
+        );
     }
 
     #[tokio::test]

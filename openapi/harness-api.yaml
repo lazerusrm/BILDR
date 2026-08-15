@@ -725,6 +725,31 @@ paths:
           content:
             application/json:
               schema: {type: array, items: {$ref: '#/components/schemas/ExternalConditionSummary'}}
+  /runs/{runId}/external-conditions/time-gates:
+    post:
+      tags: [ExternalConditions]
+      operationId: registerRunTimeGate
+      description: Registers a run-owned controller-clock gate only. No provider URL, command, credential, result-to-action mapping, or task mutation is accepted by this route; terminal observations remain non-authorizing facts.
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema: {$ref: '#/components/schemas/OpaqueId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RegisterRunTimeGateRequest'}
+      responses:
+        '200':
+          description: Existing or newly registered immutable source-owned time-gate condition.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ExternalCondition'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
   /external-conditions/{conditionId}:
     get:
       tags: [ExternalConditions]
@@ -2370,6 +2395,13 @@ components:
       properties:
         initial_ms: {type: integer, minimum: 1}
         maximum_ms: {type: integer, minimum: 1}
+        deadline_ms: {type: [integer, 'null'], minimum: 0}
+    RegisterRunTimeGateRequest:
+      type: object
+      additionalProperties: false
+      required: [not_before_ms, deadline_ms]
+      properties:
+        not_before_ms: {type: integer, minimum: 0}
         deadline_ms: {type: [integer, 'null'], minimum: 0}
     ConditionObservation:
       type: object
