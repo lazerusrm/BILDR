@@ -6,14 +6,16 @@
 //! resume, delete, reset, or release mutable controller resources.
 
 use harness_domain::{
-    OwnershipProof, OwnershipProofId, ReconciliationActionKind, ReconciliationActionReceipt,
-    ReconciliationEpisode, ReconciliationEpisodeId, ReconciliationFinding, ReconciliationState,
-    TaskId, TaskState, now_ms,
+    CorrelationLink, CorrelationLinkId, OwnershipProof, OwnershipProofId, ReconciliationActionKind,
+    ReconciliationActionReceipt, ReconciliationEpisode, ReconciliationEpisodeId,
+    ReconciliationFinding, ReconciliationState, TaskId, TaskState, TraceContext, now_ms,
 };
 use rusqlite::{OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 
 use crate::{NewTaskAttempt, Store, StoreError};
+
+use super::correlation::record_correlation_link_in_transaction;
 
 const MAX_RECONCILIATION_PAGE_SIZE: u32 = 200;
 const FRESH_ATTEMPT_AUTHORIZED_STATE: &str = "AUTHORIZED";
@@ -254,6 +256,7 @@ impl Store {
         expected_task_version: u64,
     ) -> Result<(), StoreError> {
         receipt.validate().map_err(control_error)?;
+        let correlation = reconciliation_action_correlation_link(receipt)?;
         if receipt.kind != ReconciliationActionKind::AuthorizeFreshAttempt {
             return Err(StoreError::Validation(
                 "ownership-proof consumption requires an authorize_fresh_attempt receipt"
@@ -310,6 +313,7 @@ impl Store {
                 && existing_task_id == replacement.task_id.as_str()
                 && checked_action_receipt_row(existing_raw, existing_digest)? == *receipt
             {
+                record_correlation_link_in_transaction(&transaction, &correlation)?;
                 transaction.commit()?;
                 return Ok(());
             }
@@ -523,6 +527,7 @@ impl Store {
                 receipt.created_at_ms,
             ],
         )?;
+        record_correlation_link_in_transaction(&transaction, &correlation)?;
         let action_id = transaction.last_insert_rowid();
         transaction.execute(
             "INSERT INTO task_attempts(id,task_id,attempt_number,state,task_packet_json,task_packet_sha256,base_sha,requested_model_route,token_budget,tool_budget,diff_file_budget,diff_line_budget,created_at,updated_at,version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13,1)",
@@ -593,6 +598,7 @@ impl Store {
         finding.validate().map_err(control_error)?;
         let raw = serde_json::to_string(finding)?;
         let payload_sha256 = digest(&raw);
+        let correlation = reconciliation_finding_correlation_link(finding)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         if let Some((existing_raw, existing_digest)) = transaction
@@ -614,6 +620,7 @@ impl Store {
                 ));
             }
             let episode = reconciliation_episode_in_transaction(&transaction, &finding.episode_id)?;
+            record_correlation_link_in_transaction(&transaction, &correlation)?;
             transaction.commit()?;
             return Ok(episode);
         }
@@ -635,6 +642,7 @@ impl Store {
                 finding.observed_at_ms,
             ],
         )?;
+        record_correlation_link_in_transaction(&transaction, &correlation)?;
         transaction.commit()?;
         Ok(episode)
     }
@@ -659,6 +667,7 @@ impl Store {
         }
         let raw = serde_json::to_string(receipt)?;
         let payload_sha256 = digest(&raw);
+        let correlation = reconciliation_action_correlation_link(receipt)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         if let Some((existing_raw, existing_digest)) = transaction
@@ -680,6 +689,7 @@ impl Store {
                 ));
             }
             let episode = reconciliation_episode_in_transaction(&transaction, &receipt.episode_id)?;
+            record_correlation_link_in_transaction(&transaction, &correlation)?;
             transaction.commit()?;
             return Ok(episode);
         }
@@ -702,6 +712,7 @@ impl Store {
                 receipt.created_at_ms,
             ],
         )?;
+        record_correlation_link_in_transaction(&transaction, &correlation)?;
         transaction.commit()?;
         Ok(episode)
     }
@@ -800,6 +811,77 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// Reconciliation records share one controller-owned trace per episode. The
+/// inventory adapter cannot supply a context: a deterministic causal receipt
+/// ties each durable finding back to the exact reconciliation episode.
+fn reconciliation_finding_correlation_link(
+    finding: &ReconciliationFinding,
+) -> Result<CorrelationLink, StoreError> {
+    reconciliation_correlation_link(
+        &finding.episode_id,
+        "finding",
+        finding_kind_name(finding.kind),
+        &finding.source_event_id,
+        "reconciliation_finding",
+        "has_finding",
+        finding.observed_at_ms,
+    )
+}
+
+/// A reconciliation action receipt is a causal child of its exact inventory
+/// episode. The link is recorded in the same transaction as the receipt and,
+/// for fresh attempts, the proof-consumption/attempt materialization.
+fn reconciliation_action_correlation_link(
+    receipt: &ReconciliationActionReceipt,
+) -> Result<CorrelationLink, StoreError> {
+    reconciliation_correlation_link(
+        &receipt.episode_id,
+        "action",
+        action_kind_name(receipt.kind),
+        &receipt.source_event_id,
+        "reconciliation_action",
+        "has_action",
+        receipt.created_at_ms,
+    )
+}
+
+fn reconciliation_correlation_link(
+    episode_id: &ReconciliationEpisodeId,
+    record_class: &str,
+    record_kind: &str,
+    source_event_id: &str,
+    to_kind: &str,
+    relation: &str,
+    created_at_ms: i64,
+) -> Result<CorrelationLink, StoreError> {
+    let trace_id = digest(&format!("harness.reconciliation.trace.v1:{episode_id}"));
+    let span_id = digest(&format!(
+        "harness.reconciliation.{record_class}.span.v1:{episode_id}:{record_kind}:{source_event_id}"
+    ));
+    let link_id = CorrelationLinkId::parse(format!(
+        "correlation-{}",
+        &digest(&format!(
+            "harness.reconciliation.{record_class}.link.v1:{episode_id}:{record_kind}:{source_event_id}"
+        ))[..48]
+    ))
+    .map_err(|error| StoreError::Validation(error.to_string()))?;
+    Ok(CorrelationLink {
+        schema: "harness.correlation-link.v1".to_owned(),
+        link_id,
+        trace: TraceContext {
+            trace_id: trace_id[..32].to_owned(),
+            span_id: span_id[..16].to_owned(),
+            parent_span_id: None,
+        },
+        from_kind: "reconciliation_episode".to_owned(),
+        from_id: episode_id.to_string(),
+        to_kind: to_kind.to_owned(),
+        to_id: source_event_id.to_owned(),
+        relation: relation.to_owned(),
+        created_at_ms,
+    })
 }
 
 pub(crate) fn checked_reconciliation_row(
@@ -1423,7 +1505,7 @@ mod tests {
             store
                 .list_reconciliation_findings(&opened.episode_id, 10)
                 .expect("findings"),
-            vec![finding]
+            vec![finding.clone()]
         );
 
         let receipt = preserve_receipt(opened.episode_id.clone());
@@ -1437,7 +1519,21 @@ mod tests {
             store
                 .list_reconciliation_action_receipts(&opened.episode_id, 10)
                 .expect("receipts"),
-            vec![receipt]
+            vec![receipt.clone()]
+        );
+        let finding_correlation =
+            reconciliation_finding_correlation_link(&finding).expect("finding correlation");
+        let action_correlation =
+            reconciliation_action_correlation_link(&receipt).expect("action correlation");
+        assert_eq!(
+            finding_correlation.trace.trace_id,
+            action_correlation.trace.trace_id
+        );
+        assert_eq!(
+            store
+                .correlation_links(&finding_correlation.trace.trace_id, 10)
+                .expect("reconciliation trace"),
+            vec![finding_correlation, action_correlation]
         );
 
         let mut conflicting = preserve_receipt(opened.episode_id.clone());
@@ -1535,6 +1631,14 @@ mod tests {
                 .list_reconciliation_action_receipts(&episode.episode_id, 10)
                 .expect("receipt"),
             vec![receipt.clone()]
+        );
+        let correlation =
+            reconciliation_action_correlation_link(&receipt).expect("fresh-attempt correlation");
+        assert_eq!(
+            store
+                .correlation_links(&correlation.trace.trace_id, 10)
+                .expect("fresh-attempt trace"),
+            vec![correlation]
         );
 
         store

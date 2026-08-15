@@ -102,6 +102,8 @@ receipts, bounded run topology, a proof-consuming authenticated fresh-retry
 path, and a retry-safe
 in-product notification mirror. Each mirror receipt atomically records its
 source-attention causal link; each liveness observation atomically records its
+episode-scoped causal link; each reconciliation finding and action receipt,
+including proof-consuming fresh-attempt authorization, atomically records its
 episode-scoped causal link; and the API/CLI expose bounded immutable trace
 lookup. This is not yet full trace propagation through every producer.
 Supervisor snapshots receive bounded control-plane custody facts and restrict
