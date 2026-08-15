@@ -47,6 +47,10 @@ pub(super) fn routes() -> Router<ApiState> {
             "/api/v1/investigations/{artifact_id}/knowledge-candidates",
             post(propose_knowledge_from_investigation),
         )
+        .route(
+            "/api/v1/improvement/knowledge/{knowledge_id}",
+            get(get_current_knowledge_item),
+        )
         .route("/api/v1/external-conditions", get(list_external_conditions))
         .route(
             "/api/v1/external-conditions/{condition_id}",
@@ -295,6 +299,23 @@ async fn propose_knowledge_from_investigation(
         )))
     })?;
     Ok(Json(item))
+}
+
+/// Reads one exact current knowledge wire for display or independent review.
+/// This endpoint cannot record a review, activate the item, alter task
+/// context, or use its contents as execution authority.
+async fn get_current_knowledge_item(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(knowledge_id): Path<String>,
+) -> Result<Json<harness_learning::KnowledgeItemV1>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .store()
+            .current_knowledge_item(&knowledge_id)?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]

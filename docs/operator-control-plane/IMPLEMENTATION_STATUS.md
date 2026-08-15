@@ -32,7 +32,8 @@ This status is intentionally a capability boundary, not release evidence.
   restricting actions to wait/pause-for-human whenever ownership is uncertain;
 - authenticated creation of an unreviewed, display-only knowledge candidate
   from one fresh confirmed investigation finding, with controller-derived
-  evidence, repository scope, sensitivity, freshness, and identity;
+  evidence, repository scope, sensitivity, freshness, identity, and immutable
+  readback by that identity;
 - authenticated exact-revision `wait` liveness intervention receipts, which
   only record the bounded decision and increment the episode counter;
 - authenticated localhost API, CLI, and browser control-plane surfaces for the

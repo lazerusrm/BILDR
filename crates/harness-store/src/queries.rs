@@ -787,6 +787,35 @@ impl Store {
     ) -> Result<ImmutableRevision<harness_learning::KnowledgeItemV1>, StoreError> {
         self.immutable_revision_wire(id, ImprovementRecordKind::Knowledge)
     }
+
+    /// Reads the current immutable knowledge wire by its durable knowledge
+    /// identity. This is a display-only lookup: it cannot review, activate,
+    /// inject, or otherwise use knowledge as execution authority.
+    pub fn current_knowledge_item(
+        &self,
+        knowledge_id: &str,
+    ) -> Result<harness_learning::KnowledgeItemV1, StoreError> {
+        safe_eval_id(knowledge_id, 128)?;
+        let connection = self.connection()?;
+        let record = connection
+            .query_row(
+                "SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_current_revisions WHERE aggregate_kind='knowledge' AND aggregate_id=?1",
+                [knowledge_id],
+                map_improvement_revision,
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("knowledge item {knowledge_id}")))?;
+        let item: harness_learning::KnowledgeItemV1 = serde_json::from_value(record.payload)?;
+        item.verify()
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        if item.knowledge_id != knowledge_id {
+            return Err(StoreError::Conflict(
+                "knowledge current revision identity does not match its aggregate".to_owned(),
+            ));
+        }
+        Ok(item)
+    }
+
     fn immutable_revision_wire<T: serde::de::DeserializeOwned>(
         &self,
         id: &str,

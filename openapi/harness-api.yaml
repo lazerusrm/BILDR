@@ -690,6 +690,23 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/Conflict'}
         '422': {$ref: '#/components/responses/ValidationError'}
+  /improvement/knowledge/{knowledgeId}:
+    get:
+      tags: [Improvement]
+      operationId: getCurrentKnowledgeItem
+      description: Reads one exact current immutable knowledge record by durable knowledge identity. Reading cannot review, activate, inject, or use knowledge as execution authority.
+      parameters:
+        - name: knowledgeId
+          in: path
+          required: true
+          schema: {$ref: '#/components/schemas/OpaqueId'}
+      responses:
+        '200':
+          description: Current immutable knowledge wire. Candidate, review, freshness, and scope remain explicit rather than inferred.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/KnowledgeItem'}
+        '404': {$ref: '#/components/responses/NotFound'}
   /external-conditions:
     get:
       tags: [ExternalConditions]
@@ -2233,6 +2250,119 @@ components:
         supersedes: {type: array, maxItems: 0}
         state: {const: candidate}
         sha256: {$ref: '#/components/schemas/Digest'}
+    KnowledgeItem:
+      type: object
+      additionalProperties: false
+      required: [schema, knowledge_id, kind, statement, scope, evidence, confidence_milli, review, freshness, contradicts, supersedes, state, sha256]
+      properties:
+        schema: {const: harness.knowledge-item.v1}
+        knowledge_id: {$ref: '#/components/schemas/KnowledgeToken'}
+        kind: {enum: [fact, procedure, warning, heuristic, anti_pattern]}
+        statement: {type: string, minLength: 1}
+        scope: {$ref: '#/components/schemas/KnowledgeScope'}
+        evidence:
+          type: array
+          minItems: 1
+          items: {$ref: '#/components/schemas/KnowledgeEvidenceReceipt'}
+        confidence_milli: {type: integer, minimum: 0, maximum: 1000}
+        review:
+          type: object
+          additionalProperties: false
+          required: [state, reviewer_id, reviewed_at, receipt]
+          properties:
+            state: {enum: [unreviewed, accepted, rejected, needs_revalidation]}
+            reviewer_id:
+              anyOf:
+                - {$ref: '#/components/schemas/KnowledgeToken'}
+                - {type: 'null'}
+            reviewed_at: {type: [integer, 'null'], minimum: 0}
+            receipt:
+              anyOf:
+                - type: object
+                  additionalProperties: false
+                  required: [kind, revision_id, digest, split, custody]
+                  properties:
+                    kind: {const: human_review}
+                    revision_id: {$ref: '#/components/schemas/KnowledgeToken'}
+                    digest: {$ref: '#/components/schemas/Digest'}
+                    split:
+                      anyOf:
+                        - {enum: [training, development, holdout, canary, quarantine]}
+                        - {type: 'null'}
+                    custody:
+                      anyOf:
+                        - {enum: [clean, invalidated, restricted]}
+                        - {type: 'null'}
+                - {type: 'null'}
+        freshness:
+          type: object
+          additionalProperties: false
+          required: [created_at, revalidate_after, expires_at]
+          properties:
+            created_at: {type: integer, minimum: 0}
+            revalidate_after: {type: integer, minimum: 0}
+            expires_at: {type: integer, minimum: 0}
+        contradicts:
+          type: array
+          uniqueItems: true
+          items: {$ref: '#/components/schemas/KnowledgeToken'}
+        supersedes:
+          type: array
+          uniqueItems: true
+          items: {$ref: '#/components/schemas/KnowledgeToken'}
+        state: {enum: [candidate, active, expired, contradicted, superseded, rejected]}
+        sha256: {$ref: '#/components/schemas/Digest'}
+      allOf:
+        - if:
+            properties:
+              state: {const: active}
+          then:
+            properties:
+              review:
+                allOf:
+                  - properties:
+                      state: {const: accepted}
+                      reviewer_id: {$ref: '#/components/schemas/KnowledgeToken'}
+                      reviewed_at: {type: integer, minimum: 0}
+                      receipt:
+                        allOf:
+                          - {$ref: '#/components/schemas/KnowledgeEvidenceReceipt'}
+                          - properties:
+                              kind: {const: human_review}
+    KnowledgeToken:
+      type: string
+      pattern: '^[A-Za-z0-9_.:-]{1,128}$'
+    KnowledgeScope:
+      type: object
+      additionalProperties: false
+      required: [repository_id, task_family, model_family, runtime_class]
+      properties:
+        repository_id: {$ref: '#/components/schemas/KnowledgeToken'}
+        task_family: {$ref: '#/components/schemas/KnowledgeToken'}
+        model_family:
+          anyOf:
+            - {$ref: '#/components/schemas/KnowledgeToken'}
+            - {type: 'null'}
+        runtime_class:
+          anyOf:
+            - {$ref: '#/components/schemas/KnowledgeToken'}
+            - {type: 'null'}
+    KnowledgeEvidenceReceipt:
+      type: object
+      additionalProperties: false
+      required: [kind, revision_id, digest, split, custody]
+      properties:
+        kind: {enum: [trace, outcome, failure, investigation_artifact, eval_case, taskset, grader_bundle, runtime, policy_bundle, human_review]}
+        revision_id: {$ref: '#/components/schemas/KnowledgeToken'}
+        digest: {$ref: '#/components/schemas/Digest'}
+        split:
+          anyOf:
+            - {enum: [training, development, holdout, canary, quarantine]}
+            - {type: 'null'}
+        custody:
+          anyOf:
+            - {enum: [clean, invalidated, restricted]}
+            - {type: 'null'}
     ExternalConditionPollPolicy:
       type: object
       additionalProperties: false

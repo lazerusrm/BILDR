@@ -547,6 +547,12 @@ mod tests {
         assert_eq!(item.evidence[0].kind, ReceiptKind::InvestigationArtifact);
         assert_eq!(item.evidence[0].revision_id, artifact.artifact_id.as_str());
         assert_eq!(item.evidence[0].digest, artifact.sha256);
+        assert_eq!(
+            store
+                .current_knowledge_item(&item.knowledge_id)
+                .expect("candidate remains readable by durable knowledge identity"),
+            item
+        );
         assert!(
             store
                 .resolved_active_knowledge(&repository_id, "operator_control", 0)
