@@ -794,6 +794,42 @@ mod tests {
     }
 
     #[test]
+    fn observation_and_causal_link_roll_back_together_on_a_conflicting_trace() {
+        let temp = TempDir::new().expect("temp");
+        let store =
+            Store::in_memory(Path::new(temp.path()).join("artifacts").as_path()).expect("store");
+        let condition = condition();
+        store
+            .register_external_condition(&condition)
+            .expect("registration");
+        let observation = observation(&condition);
+        let mut conflicting =
+            condition_observation_correlation_link(&observation).expect("expected link");
+        conflicting.relation = "different_relation".to_owned();
+        store
+            .record_correlation_link(&conflicting)
+            .expect("preexisting conflicting link");
+
+        assert!(matches!(
+            store.record_external_condition_observation(&condition.condition_id, 1, &observation),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(
+            store
+                .external_condition(&condition.condition_id)
+                .expect("condition reads")
+                .expect("condition remains"),
+            condition
+        );
+        assert!(
+            store
+                .list_condition_observations(&condition.condition_id, 10)
+                .expect("no observation written")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn owner_filtered_open_page_cannot_starve_an_older_condition() {
         let temp = TempDir::new().expect("temp");
         let store =
