@@ -344,6 +344,14 @@ enum ConditionCommand {
     Show { condition_id: String },
     /// Show immutable observations captured for one condition.
     Observations { condition_id: String },
+    /// Register a run-owned absolute UTC time gate. Its terminal observation remains non-authorizing.
+    RegisterTimeGate {
+        run_id: String,
+        #[arg(long)]
+        not_before_ms: i64,
+        #[arg(long)]
+        deadline_ms: Option<i64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -840,13 +848,36 @@ fn validate_local_url(url: &Url) -> Result<()> {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command};
+    use super::{Cli, Command, ConditionCommand};
 
     #[test]
     fn notification_health_is_a_read_only_cli_command() {
         let cli = Cli::try_parse_from(["harnessctl", "notification-health"])
             .expect("notification health command parses");
         assert!(matches!(cli.command, Command::NotificationHealth));
+    }
+
+    #[test]
+    fn time_gate_cli_command_keeps_the_deadline_explicitly_nullable() {
+        let cli = Cli::try_parse_from([
+            "harnessctl",
+            "condition",
+            "register-time-gate",
+            "run_a",
+            "--not-before-ms",
+            "1786809600000",
+        ])
+        .expect("time gate command parses");
+        assert!(matches!(
+            cli.command,
+            Command::Condition {
+                command: ConditionCommand::RegisterTimeGate {
+                    run_id,
+                    not_before_ms: 1_786_809_600_000,
+                    deadline_ms: None,
+                }
+            } if run_id == "run_a"
+        ));
     }
 }
 

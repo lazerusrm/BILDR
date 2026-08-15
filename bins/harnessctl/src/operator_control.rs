@@ -110,6 +110,21 @@ pub(super) async fn condition(api: &ApiClient, command: ConditionCommand) -> Res
             ))
             .await
         }
+        ConditionCommand::RegisterTimeGate {
+            run_id,
+            not_before_ms,
+            deadline_ms,
+        } => {
+            let run_id: String = url::form_urlencoded::byte_serialize(run_id.as_bytes()).collect();
+            api.post(
+                &format!("/api/v1/runs/{run_id}/external-conditions/time-gates"),
+                json!({
+                    "not_before_ms": not_before_ms,
+                    "deadline_ms": deadline_ms,
+                }),
+            )
+            .await
+        }
     }
 }
 

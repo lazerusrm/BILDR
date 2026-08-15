@@ -695,6 +695,7 @@ POST /api/v1/decisions/{source_id}/answer
 POST /api/v1/approvals/{source_id}/decide
 POST /api/v1/reconciliation/{id}/apply
 POST /api/v1/external-conditions/{id}/cancel
+POST /api/v1/runs/{run_id}/external-conditions/time-gates
 PUT  /api/v1/operator-presence
 POST /api/v1/runs/{run_id}/investigations
 ```
@@ -730,7 +731,7 @@ harnessctl attention list|show|acknowledge
 harnessctl decision answer
 harnessctl recovery list|show|findings|actions
 harnessctl investigation create|show|export
-harnessctl condition list|show|cancel
+harnessctl condition list|show|observations|register-time-gate
 harnessctl presence get|set
 harnessctl notification-deliveries|notification-health
 harnessctl topology show [--format table|json|dot]
