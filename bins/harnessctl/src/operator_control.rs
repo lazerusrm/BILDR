@@ -118,13 +118,35 @@ pub(super) async fn condition(api: &ApiClient, command: ConditionCommand) -> Res
             let run_id: String = url::form_urlencoded::byte_serialize(run_id.as_bytes()).collect();
             api.post(
                 &format!("/api/v1/runs/{run_id}/external-conditions/time-gates"),
-                json!({
-                    "not_before_ms": not_before_ms,
-                    "deadline_ms": deadline_ms,
-                }),
+                time_gate_request(not_before_ms, deadline_ms),
             )
             .await
         }
+    }
+}
+
+fn time_gate_request(not_before_ms: i64, deadline_ms: Option<i64>) -> Value {
+    json!({
+        "not_before_ms": not_before_ms,
+        "deadline_ms": deadline_ms,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::time_gate_request;
+
+    #[test]
+    fn time_gate_request_keeps_an_omitted_deadline_explicitly_null() {
+        assert_eq!(
+            time_gate_request(1_786_809_600_000, None),
+            json!({
+                "not_before_ms": 1_786_809_600_000_i64,
+                "deadline_ms": null,
+            })
+        );
     }
 }
 
