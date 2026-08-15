@@ -1,15 +1,16 @@
 //! Read-first operator-control CLI commands.
 //!
 //! This module deliberately exposes bounded snapshots, source-owned attention,
-//! and immutable controller receipts. It cannot resolve a source, approve work,
-//! request an intervention, or resume a run.
+//! immutable controller receipts, and exact governed-knowledge reviews. It
+//! cannot resolve a source, approve work, request an intervention, inject task
+//! context, or resume a run.
 
 use anyhow::Result;
 use serde_json::{Value, json};
 
 use super::{
-    ApiClient, AttentionCommand, ConditionCommand, InvestigationCommand, PresenceCommand,
-    RecoveryCommand,
+    ApiClient, AttentionCommand, ConditionCommand, InvestigationCommand, KnowledgeCommand,
+    PresenceCommand, RecoveryCommand,
 };
 
 pub(super) async fn return_view(api: &ApiClient, operator_id: String) -> Result<Value> {
@@ -81,6 +82,44 @@ pub(super) async fn investigation(api: &ApiClient, command: InvestigationCommand
                 url::form_urlencoded::byte_serialize(artifact_id.as_bytes()).collect();
             api.get(&format!("/api/v1/investigations/{artifact_id}"))
                 .await
+        }
+    }
+}
+
+/// Reads exact governed knowledge or records an explicit local-session review
+/// against the current candidate SHA. The server derives reviewer identity from
+/// the session and rejects stale, unclean, or non-candidate records.
+pub(super) async fn knowledge(api: &ApiClient, command: KnowledgeCommand) -> Result<Value> {
+    match command {
+        KnowledgeCommand::List { repository_id } => {
+            let repository_id: String =
+                url::form_urlencoded::byte_serialize(repository_id.as_bytes()).collect();
+            api.get(&format!(
+                "/api/v1/improvement/knowledge?repository_id={repository_id}&limit=50"
+            ))
+            .await
+        }
+        KnowledgeCommand::Show { knowledge_id } => {
+            let knowledge_id: String =
+                url::form_urlencoded::byte_serialize(knowledge_id.as_bytes()).collect();
+            api.get(&format!("/api/v1/improvement/knowledge/{knowledge_id}"))
+                .await
+        }
+        KnowledgeCommand::Review {
+            knowledge_id,
+            expected_knowledge_sha256,
+            decision,
+        } => {
+            let knowledge_id: String =
+                url::form_urlencoded::byte_serialize(knowledge_id.as_bytes()).collect();
+            api.post(
+                &format!("/api/v1/improvement/knowledge/{knowledge_id}/review"),
+                json!({
+                    "expected_knowledge_sha256": expected_knowledge_sha256,
+                    "decision": decision,
+                }),
+            )
+            .await
         }
     }
 }

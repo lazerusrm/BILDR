@@ -68,6 +68,11 @@ enum Command {
         #[command(subcommand)]
         command: InvestigationCommand,
     },
+    /// Inspect or review governed knowledge. A review decides only the exact current candidate SHA and never injects task context.
+    Knowledge {
+        #[command(subcommand)]
+        command: KnowledgeCommand,
+    },
     /// Inspect source-owned external conditions and their observations.
     Condition {
         #[command(subcommand)]
@@ -331,6 +336,22 @@ enum InvestigationCommand {
     },
     /// Show one immutable investigation artifact.
     Show { artifact_id: String },
+}
+
+#[derive(Subcommand)]
+enum KnowledgeCommand {
+    /// List immutable current knowledge wires in one exact repository scope.
+    List { repository_id: String },
+    /// Show one immutable current knowledge wire.
+    Show { knowledge_id: String },
+    /// Accept or reject only the exact current unreviewed candidate SHA.
+    Review {
+        knowledge_id: String,
+        #[arg(long)]
+        expected_knowledge_sha256: String,
+        #[arg(value_parser = ["accept", "reject"])]
+        decision: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -786,6 +807,7 @@ async fn execute(api: &ApiClient, command: Command) -> Result<Value> {
         Command::Return { operator_id } => operator_control::return_view(api, operator_id).await,
         Command::Attention { command } => operator_control::attention(api, command).await,
         Command::Investigation { command } => operator_control::investigation(api, command).await,
+        Command::Knowledge { command } => operator_control::knowledge(api, command).await,
         Command::Condition { command } => operator_control::condition(api, command).await,
         Command::Progress { run_id } => operator_control::progress(api, run_id).await,
         Command::Liveness { run_id } => operator_control::liveness(api, run_id).await,
@@ -858,7 +880,7 @@ fn validate_local_url(url: &Url) -> Result<()> {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, ConditionCommand};
+    use super::{Cli, Command, ConditionCommand, KnowledgeCommand};
 
     #[test]
     fn notification_health_is_a_read_only_cli_command() {
@@ -911,6 +933,44 @@ mod tests {
                 }
             } if run_id == "run_a"
         ));
+    }
+
+    #[test]
+    fn knowledge_review_requires_an_exact_sha_and_closed_decision() {
+        let cli = Cli::try_parse_from([
+            "harnessctl",
+            "knowledge",
+            "review",
+            "knowledge_1",
+            "--expected-knowledge-sha256",
+            &"a".repeat(64),
+            "accept",
+        ])
+        .expect("knowledge review command parses");
+        assert!(matches!(
+            cli.command,
+            Command::Knowledge {
+                command: KnowledgeCommand::Review {
+                    knowledge_id,
+                    expected_knowledge_sha256,
+                    decision,
+                }
+            } if knowledge_id == "knowledge_1"
+                && expected_knowledge_sha256 == "a".repeat(64)
+                && decision == "accept"
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "harnessctl",
+                "knowledge",
+                "review",
+                "knowledge_1",
+                "--expected-knowledge-sha256",
+                &"a".repeat(64),
+                "defer",
+            ])
+            .is_err()
+        );
     }
 }
 

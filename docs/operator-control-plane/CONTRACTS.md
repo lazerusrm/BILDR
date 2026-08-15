@@ -774,6 +774,7 @@ harnessctl attention list|show|acknowledge
 harnessctl decision answer
 harnessctl recovery list|show|findings|actions
 harnessctl investigation create|show|export
+harnessctl knowledge list {repository_id}|show {knowledge_id}|review {knowledge_id} --expected-knowledge-sha256 {sha256} {accept|reject}
 harnessctl condition list|show|observations|register-time-gate|register-local-capacity
 harnessctl presence get|set
 harnessctl notification-deliveries|notification-health

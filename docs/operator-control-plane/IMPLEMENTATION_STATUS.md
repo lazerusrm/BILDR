@@ -45,7 +45,8 @@ This status is intentionally a capability boundary, not release evidence.
   Center. An authenticated local human may accept or reject only the exact
   current candidate SHA; the receipt binds its pre-review immutable revision
   and acceptance requires fresh controller-clean evidence. Reviewed knowledge
-  is still not injected into task context or execution;
+  is still not injected into task context or execution. The same exact-SHA
+  review is available through the authenticated API, browser, and `harnessctl`;
 - authenticated creation of an unreviewed, display-only heuristic from two
   independently recovered liveness episodes, with controller-derived exact
   observation receipts and no activation or context injection;

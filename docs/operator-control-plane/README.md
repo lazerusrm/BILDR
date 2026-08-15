@@ -144,7 +144,8 @@ scope, and freshness explicit. An authenticated local operator may use
 only the exact current unreviewed candidate SHA. The durable action binds that
 pre-review revision and digest; acceptance requires fresh controller-clean
 evidence. Neither outcome injects task context or otherwise uses knowledge as
-execution authority.
+execution authority. `harnessctl knowledge list|show|review` uses that same
+authenticated local API and requires an explicit candidate SHA and decision.
 
 An authenticated operator may also derive an unreviewed, display-only warning
 from two immutable reconciliation episodes for the same trigger when each has
