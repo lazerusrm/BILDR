@@ -119,6 +119,12 @@ HEAD, no active lease/agent or prior command effect, a durable operator action, 
 single-use proof/receipt/replacement-attempt transaction. Automatic retries
 remain disabled because they do not yet have an equivalent proof issuer.
 
+An authenticated operator may turn one fresh confirmed investigation finding
+into an unreviewed, display-only knowledge candidate. The controller derives
+the bounded statement, evidence receipt, repository scope, sensitivity,
+freshness, and deterministic identity from the immutable artifact. This does
+not activate knowledge, change task context, or write global memory.
+
 Desktop notification delivery/batching, active intervention execution,
 external wake adapters, adaptive supervisor behavior, empirical evaluation,
 and rollout activation remain explicitly gated until their own evidence passes.

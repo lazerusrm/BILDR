@@ -886,6 +886,7 @@ dependencies = [
  "futures",
  "harness-domain",
  "harness-eval",
+ "harness-learning",
  "harness-orchestrator",
  "harness-store",
  "hex",

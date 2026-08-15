@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use harness_domain::{
     AgentRole, AgentSessionId, ApprovalId, ArtifactId, AttemptId, CommandRunId, EvidenceId,
-    ImprovementEventId, ImprovementRecordKind, ImprovementSchema, ImprovementState, ProofTier,
-    RepositoryId, ResultClass, RetentionClass, RiskLevel, RunId, SandboxMode, SensitivityClass,
-    TaskId, TaskPacket, ValidationId, WorktreeId,
+    ImprovementEventId, ImprovementRecordKind, ImprovementSchema, ImprovementState,
+    InvestigationArtifactId, ProofTier, RepositoryId, ResultClass, RetentionClass, RiskLevel,
+    RunId, SandboxMode, SensitivityClass, TaskId, TaskPacket, ValidationId, WorktreeId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -300,6 +300,19 @@ pub struct NewImprovementRevision {
     pub event_id: ImprovementEventId,
     pub source_raw_event_id: Option<i64>,
     pub source_domain_event_id: Option<i64>,
+}
+
+/// A narrowly derived knowledge candidate from one immutable investigation
+/// finding.  The controller, rather than the caller, derives the statement,
+/// evidence receipt, sensitivity, retention, and deterministic identity.
+#[derive(Clone, Debug)]
+pub struct NewInvestigationKnowledgeCandidate {
+    pub artifact_id: InvestigationArtifactId,
+    pub expected_artifact_sha256: String,
+    pub finding_id: String,
+    pub task_family: String,
+    pub model_family: Option<String>,
+    pub runtime_class: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

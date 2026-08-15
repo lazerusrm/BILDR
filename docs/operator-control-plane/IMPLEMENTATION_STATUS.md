@@ -28,6 +28,9 @@ This status is intentionally a capability boundary, not release evidence.
   controller authority;
 - bounded supervisor snapshots carrying control-plane custody facts and
   restricting actions to wait/pause-for-human whenever ownership is uncertain;
+- authenticated creation of an unreviewed, display-only knowledge candidate
+  from one fresh confirmed investigation finding, with controller-derived
+  evidence, repository scope, sensitivity, freshness, and identity;
 - authenticated localhost API, CLI, and browser control-plane surfaces for the
   above read models.
 
@@ -41,7 +44,9 @@ This status is intentionally a capability boundary, not release evidence.
 - external-condition polling/wake adapters;
 - notification batching, desktop delivery, and delivery-health rollout;
 - adaptive supervisor policy or any independent control-plane mutation;
-- governed-knowledge candidate integration;
+- liveness/reconciliation-pattern knowledge candidates, knowledge review UI,
+  and any context injection or activation beyond the existing governed
+  pipeline;
 - evaluation corpus, fault matrix, usability study, canary, rollback drill, and
   production activation.
 

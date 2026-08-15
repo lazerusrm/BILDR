@@ -464,6 +464,46 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/ReconciliationEpisode'}
         '404': {$ref: '#/components/responses/NotFound'}
+  /reconciliations/{episodeId}/findings:
+    get:
+      tags: [Reconciliation]
+      operationId: listReconciliationFindings
+      description: Immutable controller-recorded reconciliation inventory facts. Listing cannot apply, retry, release, or reset any custody.
+      parameters:
+        - name: episodeId
+          in: path
+          required: true
+          schema: {$ref: '#/components/schemas/OpaqueId'}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Bounded newest-first immutable findings for one exact reconciliation episode.
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/ReconciliationFinding'}}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /reconciliations/{episodeId}/actions:
+    get:
+      tags: [Reconciliation]
+      operationId: listReconciliationActionReceipts
+      description: Immutable receipts for actions already performed by a controller path. This route cannot request, replay, or apply recovery.
+      parameters:
+        - name: episodeId
+          in: path
+          required: true
+          schema: {$ref: '#/components/schemas/OpaqueId'}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Bounded newest-first immutable reconciliation action receipts for one exact episode.
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/ReconciliationActionReceipt'}}
+        '404': {$ref: '#/components/responses/NotFound'}
   /operator-presence:
     get:
       tags: [Notifications]
@@ -601,6 +641,31 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/InvestigationArtifact'}
         '404': {$ref: '#/components/responses/NotFound'}
+  /investigations/{artifactId}/knowledge-candidates:
+    post:
+      tags: [Investigations, Knowledge]
+      operationId: proposeKnowledgeFromInvestigation
+      description: Creates an unreviewed display-only knowledge candidate from one exact fresh confirmed finding. The controller derives statement, evidence, scope repository, sensitivity, freshness, and identity; this endpoint cannot activate knowledge or write prompt memory.
+      parameters:
+        - name: artifactId
+          in: path
+          required: true
+          schema: {$ref: '#/components/schemas/OpaqueId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProposeKnowledgeFromInvestigationRequest'}
+      responses:
+        '200':
+          description: Idempotent unreviewed knowledge candidate. It is not active and is never injected into task context by this operation.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/InvestigationKnowledgeCandidate'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
   /external-conditions:
     get:
       tags: [ExternalConditions]
@@ -1811,6 +1876,34 @@ components:
         action_count: {type: integer, minimum: 0}
         report: {type: [string, 'null'], maxLength: 4000}
         sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    ReconciliationFinding:
+      type: object
+      additionalProperties: false
+      required: [schema, episode_id, kind, source_event_id, observed_at_ms, payload, sha256]
+      properties:
+        schema: {const: harness.reconciliation-finding.v1}
+        episode_id: {$ref: '#/components/schemas/OpaqueId'}
+        kind: {enum: [live_owner, unknown_owner, preserved_candidate, stale_approval, ambiguous_external_effect]}
+        source_event_id: {$ref: '#/components/schemas/OpaqueId'}
+        observed_at_ms: {type: integer, minimum: 0}
+        payload: {type: object, additionalProperties: true, maxProperties: 128}
+        sha256: {$ref: '#/components/schemas/Digest'}
+    ReconciliationActionReceipt:
+      type: object
+      additionalProperties: false
+      required: [schema, episode_id, kind, source_event_id, authority_event_id, created_at_ms, payload, sha256]
+      properties:
+        schema: {const: harness.reconciliation-action-receipt.v1}
+        episode_id: {$ref: '#/components/schemas/OpaqueId'}
+        kind: {enum: [preserve, resume_proven_owner, invalidate_stale_approval, release_proven_dead_lease, authorize_fresh_attempt, open_attention]}
+        source_event_id: {$ref: '#/components/schemas/OpaqueId'}
+        authority_event_id:
+          anyOf:
+            - {$ref: '#/components/schemas/OpaqueId'}
+            - {type: 'null'}
+        created_at_ms: {type: integer, minimum: 0}
+        payload: {type: object, additionalProperties: true, maxProperties: 128}
+        sha256: {$ref: '#/components/schemas/Digest'}
     TopologyNode:
       type: object
       additionalProperties: false
@@ -2032,6 +2125,84 @@ components:
         decision_count: {type: integer, minimum: 0, maximum: 100}
         created_at_ms: {type: integer, minimum: 0}
         artifact_sha256: {$ref: '#/components/schemas/Digest'}
+    ProposeKnowledgeFromInvestigationRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_artifact_sha256, finding_id, task_family, model_family, runtime_class]
+      properties:
+        expected_artifact_sha256: {$ref: '#/components/schemas/Digest'}
+        finding_id: {$ref: '#/components/schemas/OpaqueId'}
+        task_family: {$ref: '#/components/schemas/OpaqueId'}
+        model_family:
+          anyOf:
+            - {$ref: '#/components/schemas/OpaqueId'}
+            - {type: 'null'}
+        runtime_class:
+          anyOf:
+            - {$ref: '#/components/schemas/OpaqueId'}
+            - {type: 'null'}
+    InvestigationKnowledgeEvidenceReceipt:
+      type: object
+      additionalProperties: false
+      required: [kind, revision_id, digest, split, custody]
+      properties:
+        kind: {const: investigation_artifact}
+        revision_id: {$ref: '#/components/schemas/OpaqueId'}
+        digest: {$ref: '#/components/schemas/Digest'}
+        split: {type: 'null'}
+        custody: {const: clean}
+    InvestigationKnowledgeScope:
+      type: object
+      additionalProperties: false
+      required: [repository_id, task_family, model_family, runtime_class]
+      properties:
+        repository_id: {$ref: '#/components/schemas/OpaqueId'}
+        task_family: {$ref: '#/components/schemas/OpaqueId'}
+        model_family:
+          anyOf:
+            - {$ref: '#/components/schemas/OpaqueId'}
+            - {type: 'null'}
+        runtime_class:
+          anyOf:
+            - {$ref: '#/components/schemas/OpaqueId'}
+            - {type: 'null'}
+    InvestigationKnowledgeCandidate:
+      type: object
+      additionalProperties: false
+      required: [schema, knowledge_id, kind, statement, scope, evidence, confidence_milli, review, freshness, contradicts, supersedes, state, sha256]
+      properties:
+        schema: {const: harness.knowledge-item.v1}
+        knowledge_id: {$ref: '#/components/schemas/OpaqueId'}
+        kind: {const: fact}
+        statement: {type: string, minLength: 1, maxLength: 4096}
+        scope: {$ref: '#/components/schemas/InvestigationKnowledgeScope'}
+        evidence:
+          type: array
+          minItems: 1
+          maxItems: 1
+          items: {$ref: '#/components/schemas/InvestigationKnowledgeEvidenceReceipt'}
+        confidence_milli: {type: integer, minimum: 0, maximum: 1000}
+        review:
+          type: object
+          additionalProperties: false
+          required: [state, reviewer_id, reviewed_at, receipt]
+          properties:
+            state: {const: unreviewed}
+            reviewer_id: {type: 'null'}
+            reviewed_at: {type: 'null'}
+            receipt: {type: 'null'}
+        freshness:
+          type: object
+          additionalProperties: false
+          required: [created_at, revalidate_after, expires_at]
+          properties:
+            created_at: {type: integer, minimum: 0}
+            revalidate_after: {type: integer, minimum: 0}
+            expires_at: {type: integer, minimum: 0}
+        contradicts: {type: array, maxItems: 0}
+        supersedes: {type: array, maxItems: 0}
+        state: {const: candidate}
+        sha256: {$ref: '#/components/schemas/Digest'}
     ExternalConditionPollPolicy:
       type: object
       additionalProperties: false

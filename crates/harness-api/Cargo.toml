@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 harness-domain = { path = "../harness-domain" }
 harness-eval = { path = "../harness-eval" }
+harness-learning = { path = "../harness-learning" }
 harness-orchestrator = { path = "../harness-orchestrator" }
 harness-store = { path = "../harness-store" }
 async-stream.workspace = true

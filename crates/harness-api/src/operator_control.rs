@@ -1,9 +1,10 @@
 //! Read-first operator-control API surface.
 //!
-//! The only mutations are version-checked presentation acknowledgement and
-//! authority-neutral local presence. They deliberately cannot resolve,
-//! approve, or force recovery; source-specific controllers retain that
-//! authority.
+//! Mutations stay deliberately narrow: version-checked presentation
+//! acknowledgement, authority-neutral local presence, and creation of an
+//! unreviewed knowledge candidate from one exact investigation finding. They
+//! cannot resolve, approve, activate knowledge, or force recovery;
+//! source-specific controllers retain that authority.
 
 use axum::{
     Json, Router,
@@ -40,6 +41,10 @@ pub(super) fn routes() -> Router<ApiState> {
         .route(
             "/api/v1/investigations/{artifact_id}",
             get(get_investigation),
+        )
+        .route(
+            "/api/v1/investigations/{artifact_id}/knowledge-candidates",
+            post(propose_knowledge_from_investigation),
         )
         .route("/api/v1/external-conditions", get(list_external_conditions))
         .route(
@@ -244,6 +249,51 @@ async fn get_investigation(
                 "investigation artifact {artifact_id}"
             )))
         })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposeKnowledgeFromInvestigationRequest {
+    expected_artifact_sha256: String,
+    finding_id: String,
+    task_family: String,
+    model_family: Option<String>,
+    runtime_class: Option<String>,
+}
+
+/// Writes a suggestion only. The Store derives the statement, evidence,
+/// sensitivity, retention, scope repository, freshness, and immutable
+/// identity from the selected controller-admitted artifact. This route cannot
+/// accept free-text knowledge or activate it for context use.
+async fn propose_knowledge_from_investigation(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(artifact_id): Path<String>,
+    Json(request): Json<ProposeKnowledgeFromInvestigationRequest>,
+) -> Result<Json<harness_learning::KnowledgeItemV1>, ApiError> {
+    authenticate(&state, &headers, true)?;
+    let artifact_id = InvestigationArtifactId::parse(&artifact_id).map_err(|error| {
+        ApiError::from(harness_store::StoreError::Validation(error.to_string()))
+    })?;
+    let revision = state
+        .orchestrator
+        .store()
+        .propose_knowledge_from_investigation(
+            &harness_store::NewInvestigationKnowledgeCandidate {
+                artifact_id,
+                expected_artifact_sha256: request.expected_artifact_sha256,
+                finding_id: request.finding_id,
+                task_family: request.task_family,
+                model_family: request.model_family,
+                runtime_class: request.runtime_class,
+            },
+        )?;
+    let item = serde_json::from_value(revision.payload).map_err(|error| {
+        ApiError::from(harness_store::StoreError::Validation(format!(
+            "stored knowledge candidate has an invalid wire contract: {error}"
+        )))
+    })?;
+    Ok(Json(item))
 }
 
 #[derive(Debug, Deserialize)]
@@ -584,6 +634,17 @@ mod tests {
                 "operator_id": "local_operator",
                 "mode": "interactive",
                 "expected_version": 0,
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ProposeKnowledgeFromInvestigationRequest>(json!({
+                "expected_artifact_sha256": "a".repeat(64),
+                "finding_id": "finding_a",
+                "task_family": "operator_control",
+                "model_family": null,
+                "runtime_class": null,
                 "unexpected": true,
             }))
             .is_err()

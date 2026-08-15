@@ -25,6 +25,7 @@ pub enum ReceiptKind {
     Trace,
     Outcome,
     Failure,
+    InvestigationArtifact,
     EvalCase,
     Taskset,
     GraderBundle,
@@ -116,6 +117,10 @@ pub struct KnowledgeItemV1 {
     pub sha256: String,
 }
 impl KnowledgeItemV1 {
+    pub fn digest(&self) -> Result<String, LearningContractError> {
+        digest(self)
+    }
+
     pub fn displayable(&self, now: u64) -> bool {
         self.verify().is_ok()
             && self.state == KnowledgeState::Active
@@ -168,7 +173,7 @@ impl KnowledgeItemV1 {
                     || self.review.reviewer_id.is_none()
                     || self.review.reviewed_at.is_none()
                     || self.review.receipt.is_none()))
-            || digest(self)? != self.sha256
+            || self.digest()? != self.sha256
         {
             return Err(LearningContractError::InvalidKnowledge);
         }

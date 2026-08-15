@@ -5585,6 +5585,9 @@ fn learning_receipt_clean_tx(
             )?;
             Ok(exists)
         }
+        ReceiptKind::InvestigationArtifact => Ok(resolved_investigation_artifact_tx(tx, receipt)?
+            .sensitivity
+            != harness_domain::InvestigationSensitivity::Restricted),
         ReceiptKind::HumanReview => Ok(false),
         kind => {
             let expected = match kind {
@@ -5594,7 +5597,10 @@ fn learning_receipt_clean_tx(
                 ReceiptKind::Taskset => ImprovementRecordKind::Taskset,
                 ReceiptKind::GraderBundle => ImprovementRecordKind::GraderBundle,
                 ReceiptKind::PolicyBundle => ImprovementRecordKind::PolicyBundle,
-                ReceiptKind::Failure | ReceiptKind::Runtime | ReceiptKind::HumanReview => {
+                ReceiptKind::Failure
+                | ReceiptKind::Runtime
+                | ReceiptKind::InvestigationArtifact
+                | ReceiptKind::HumanReview => {
                     unreachable!("handled above")
                 }
             };
@@ -5642,6 +5648,10 @@ fn validate_learning_references_tx(
                         "runtime receipt does not resolve to controller run authority".into(),
                     ));
                 }
+                return Ok(());
+            }
+            ReceiptKind::InvestigationArtifact => {
+                resolved_investigation_artifact_tx(tx, receipt)?;
                 return Ok(());
             }
             ReceiptKind::HumanReview => {
@@ -6047,6 +6057,38 @@ fn validate_learning_references_tx(
         _ => {}
     }
     Ok(())
+}
+
+/// Resolve a newly admissible investigation artifact for learning evidence.
+/// Historical v1 rows remain readable as immutable evidence, but only the
+/// current new-record contract can seed a new knowledge candidate.
+fn resolved_investigation_artifact_tx(
+    tx: &rusqlite::Transaction<'_>,
+    receipt: &harness_learning::SourceReceipt,
+) -> Result<harness_domain::InvestigationArtifact, StoreError> {
+    let (raw, stored_digest): (String, String) = tx
+        .query_row(
+            "SELECT payload_json,payload_sha256 FROM investigation_artifacts WHERE id=?1",
+            [&receipt.revision_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound(receipt.revision_id.clone()))?;
+    if sha256(raw.as_bytes()) != stored_digest {
+        return Err(StoreError::Conflict(
+            "investigation artifact payload integrity check failed".into(),
+        ));
+    }
+    let artifact: harness_domain::InvestigationArtifact = serde_json::from_str(&raw)?;
+    artifact
+        .validate_new_record()
+        .map_err(|error| StoreError::Conflict(error.to_string()))?;
+    if artifact.artifact_id.as_str() != receipt.revision_id || artifact.sha256 != receipt.digest {
+        return Err(StoreError::Conflict(
+            "investigation artifact receipt does not resolve exactly".into(),
+        ));
+    }
+    Ok(artifact)
 }
 
 fn read_policy_binding(
