@@ -595,6 +595,13 @@ failed_terminal, canceled, superseded.
 Critical categories have zero configurable defer window. Delivery never resolves
 the source item.
 
+`NotificationShadowBatch` is separate immutable phase-two evidence. It binds a
+complete control-plane snapshot, one exact local-presence revision, a hashed
+policy, every current attention revision, and each pre-existing immediate
+mirror receipt. It records a theoretical `immediate`, `batch`, `defer`, or
+`digest` disposition only. Truncation is refused and critical entries are
+always `immediate`; a shadow batch never changes delivery timing or authority.
+
 ## Control-plane snapshot contract
 
 ```json
@@ -683,6 +690,7 @@ GET /api/v1/improvement/knowledge/{knowledge_id}
 GET /api/v1/external-conditions
 GET /api/v1/traces/{trace_id}
 GET /api/v1/notification-deliveries
+GET /api/v1/notification-shadow-batches
 GET /api/v1/notification-delivery-health
 ```
 
@@ -698,6 +706,7 @@ POST /api/v1/reconciliation/{id}/apply
 POST /api/v1/external-conditions/{id}/cancel
 POST /api/v1/runs/{run_id}/external-conditions/time-gates
 POST /api/v1/liveness/{episode_id}/knowledge-candidates
+POST /api/v1/notification-shadow-batches
 PUT  /api/v1/operator-presence
 POST /api/v1/runs/{run_id}/investigations
 ```

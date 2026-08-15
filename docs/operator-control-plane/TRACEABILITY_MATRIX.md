@@ -149,7 +149,7 @@ authorizes replacement.
 | liveness | observe | shadow safety/quality, then advisory |
 | reconciliation | report/attention only | fault evidence for each safe action |
 | interventions | shadow | advisory evaluation, then reversible canary |
-| notification batching | mirror only | opt-in study and critical bypass proof |
+| notification batching | mirror plus immutable shadow plans | opt-in study and critical bypass proof |
 | topology graph | disabled | table+graph usability/accessibility win |
 | knowledge proposals | candidate-only | existing promotion governance |
 | remote execution | absent | separate accepted RFC and protocol evidence |

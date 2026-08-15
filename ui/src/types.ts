@@ -872,6 +872,45 @@ export interface NotificationDelivery {
   sha256: string;
 }
 
+/** Immutable phase-two comparison evidence; it cannot change delivery. */
+export interface NotificationShadowPolicy {
+  policy_id: string;
+  focus_routine_delay_ms: number;
+  unattended_action_required_delay_ms: number;
+  unattended_routine_digest_delay_ms: number;
+  sha256: string;
+}
+
+export interface NotificationShadowEntry {
+  attention_id: string;
+  attention_version: number;
+  source_event_id: string;
+  attention_sha256: string;
+  delivery_id: string;
+  delivery_sha256: string;
+  class: "critical" | "action_required" | "routine";
+  disposition: "immediate" | "batch" | "defer" | "digest";
+  scheduled_at_ms: number;
+}
+
+/** Complete snapshot-bound shadow plan; desktop delivery and suppression stay off. */
+export interface NotificationShadowBatch {
+  schema: "harness.notification-shadow-batch.v1";
+  batch_id: string;
+  presence: OperatorPresence;
+  snapshot_id: string;
+  snapshot_revision: number;
+  snapshot_sha256: string;
+  generated_at_ms: number;
+  coverage_opened_at_ms: number | null;
+  coverage_closed_at_ms: number | null;
+  policy: NotificationShadowPolicy;
+  entries: NotificationShadowEntry[];
+  omitted_attention_revisions: 0;
+  truncated: false;
+  sha256: string;
+}
+
 /** Bounded, read-only integrity health for the in-product delivery mirror. */
 export interface NotificationDeliveryHealth {
   schema: "harness.notification-delivery-health.v1";

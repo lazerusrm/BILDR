@@ -29,6 +29,10 @@ This status is intentionally a capability boundary, not release evidence.
 - versioned local presence and deterministic, retry-safe in-product
   notification-mirror receipts, plus bounded integrity-checked current-revision
   delivery health; delivery cannot close attention or change controller authority;
+- authenticated, immutable notification shadow plans bound to one complete
+  control-plane snapshot, exact local-presence revision, policy digest, and
+  already-durable mirror receipts. They prove critical bypass and theoretical
+  bounded cadence only; they cannot defer, suppress, send, or resolve anything;
 - bounded supervisor snapshots carrying control-plane custody facts and
   restricting actions to wait/pause-for-human whenever ownership is uncertain;
 - authenticated creation of an unreviewed, display-only knowledge candidate
@@ -56,7 +60,8 @@ This status is intentionally a capability boundary, not release evidence.
 - all non-`wait` typed intervention execution;
 - external-condition polling/wake adapters beyond the controller-clock time
   gate, whose terminal event remains non-authorizing;
-- notification batching, desktop delivery, and delivery-health rollout;
+- active opt-in/broader notification batching, desktop delivery, and
+  delivery-health rollout;
 - adaptive supervisor policy or any independent control-plane mutation;
 - knowledge review UI and any context injection or activation beyond the
   existing governed pipeline;

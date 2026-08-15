@@ -624,6 +624,43 @@ paths:
           content:
             application/json:
               schema: {type: array, items: {$ref: '#/components/schemas/NotificationDelivery'}}
+  /notification-shadow-batches:
+    get:
+      tags: [Notifications]
+      operationId: listNotificationShadowBatches
+      description: Bounded immutable shadow-only notification plans. They compare a complete snapshot and exact local presence revision with the existing immediate mirror; they cannot defer, suppress, send, or resolve a source.
+      parameters:
+        - name: operator_id
+          in: query
+          schema: {type: string, maxLength: 160}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Bounded newest-first immutable shadow plans.
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/NotificationShadowBatch'}}
+    post:
+      tags: [Notifications]
+      operationId: createNotificationShadowBatch
+      description: Records an exact snapshot-bound comparison plan after verifying every immediate mirror receipt. The plan is evidence only and fails closed on a truncated attention snapshot; it cannot alter delivery timing or source state.
+      parameters:
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateNotificationShadowBatchRequest'}
+      responses:
+        '200':
+          description: Idempotent immutable shadow plan with complete attention coverage.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NotificationShadowBatch'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
   /notification-delivery-health:
     get:
       tags: [Notifications]
@@ -2085,6 +2122,13 @@ components:
         operator_id: {type: string, maxLength: 160}
         mode: {enum: [interactive, focus, unattended]}
         expected_version: {type: integer, minimum: 1}
+    CreateNotificationShadowBatchRequest:
+      type: object
+      additionalProperties: false
+      required: [operator_id, expected_presence_version]
+      properties:
+        operator_id: {type: string, maxLength: 160}
+        expected_presence_version: {type: integer, minimum: 1}
     NotificationDelivery:
       type: object
       additionalProperties: false
@@ -2121,6 +2165,52 @@ components:
         desktop_delivery_enabled: {const: false}
         batching_enabled: {const: false}
         suppression_enabled: {const: false}
+    NotificationShadowPolicy:
+      type: object
+      additionalProperties: false
+      required: [policy_id, focus_routine_delay_ms, unattended_action_required_delay_ms, unattended_routine_digest_delay_ms, sha256]
+      properties:
+        policy_id: {type: string, maxLength: 160}
+        focus_routine_delay_ms: {type: integer, minimum: 1}
+        unattended_action_required_delay_ms: {type: integer, minimum: 1}
+        unattended_routine_digest_delay_ms: {type: integer, minimum: 1}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    NotificationShadowEntry:
+      type: object
+      additionalProperties: false
+      required: [attention_id, attention_version, source_event_id, attention_sha256, delivery_id, delivery_sha256, class, disposition, scheduled_at_ms]
+      properties:
+        attention_id: {type: string, maxLength: 160}
+        attention_version: {type: integer, minimum: 0}
+        source_event_id: {type: string, maxLength: 160}
+        attention_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        delivery_id: {type: string, maxLength: 160}
+        delivery_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        class: {enum: [critical, action_required, routine]}
+        disposition: {enum: [immediate, batch, defer, digest]}
+        scheduled_at_ms: {type: integer, minimum: 0}
+    NotificationShadowBatch:
+      type: object
+      additionalProperties: false
+      required: [schema, batch_id, presence, snapshot_id, snapshot_revision, snapshot_sha256, generated_at_ms, coverage_opened_at_ms, coverage_closed_at_ms, policy, entries, omitted_attention_revisions, truncated, sha256]
+      properties:
+        schema: {const: harness.notification-shadow-batch.v1}
+        batch_id: {type: string, maxLength: 160}
+        presence: {$ref: '#/components/schemas/OperatorPresence'}
+        snapshot_id: {type: string, maxLength: 160}
+        snapshot_revision: {type: integer, minimum: 1}
+        snapshot_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        generated_at_ms: {type: integer, minimum: 0}
+        coverage_opened_at_ms: {type: [integer, 'null'], minimum: 0}
+        coverage_closed_at_ms: {type: [integer, 'null'], minimum: 0}
+        policy: {$ref: '#/components/schemas/NotificationShadowPolicy'}
+        entries:
+          type: array
+          maxItems: 100
+          items: {$ref: '#/components/schemas/NotificationShadowEntry'}
+        omitted_attention_revisions: {const: 0}
+        truncated: {const: false}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
     AttentionSourceRef:
       type: object
       additionalProperties: false

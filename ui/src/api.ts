@@ -24,6 +24,7 @@ import type {
   MaterialProgressEvent,
   NotificationDelivery,
   NotificationDeliveryHealth,
+  NotificationShadowBatch,
   OutcomeVector,
   OperatorPresence,
   OperatorPresenceMode,
@@ -230,6 +231,13 @@ class HarnessApi {
     });
   notificationDeliveries = () =>
     this.get<NotificationDelivery[]>("/notification-deliveries?limit=50");
+  notificationShadowBatches = () =>
+    this.get<NotificationShadowBatch[]>("/notification-shadow-batches?operator_id=local_operator&limit=20");
+  createNotificationShadowBatch = (expectedPresenceVersion: number) =>
+    this.post<NotificationShadowBatch>("/notification-shadow-batches", {
+      operator_id: "local_operator",
+      expected_presence_version: expectedPresenceVersion,
+    });
   notificationDeliveryHealth = () =>
     this.get<NotificationDeliveryHealth>("/notification-delivery-health");
   topology = (runId: string) =>

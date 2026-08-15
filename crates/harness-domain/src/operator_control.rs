@@ -224,6 +224,7 @@ operator_control_id!(ConditionObservationId);
 operator_control_id!(ControlPlaneSnapshotId);
 operator_control_id!(ReturnViewId);
 operator_control_id!(NotificationDeliveryId);
+operator_control_id!(NotificationShadowBatchId);
 operator_control_id!(TopologySnapshotId);
 operator_control_id!(CorrelationLinkId);
 
@@ -1984,6 +1985,18 @@ pub enum NotificationState {
     Failed,
 }
 
+/// A theoretical notification outcome recorded by the shadow policy. These
+/// values describe no delivery-side effect: a shadow batch cannot defer,
+/// suppress, send, or resolve its source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationShadowDisposition {
+    Immediate,
+    Batch,
+    Defer,
+    Digest,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorPresence {
@@ -2068,6 +2081,212 @@ impl NotificationDelivery {
         if self.digest()? != self.sha256 {
             return Err(OperatorControlError::InvalidField {
                 field: "notification delivery sha256",
+                reason: "does not match the canonical payload",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Versioned, controller-owned parameters used only to compare a proposed
+/// notification cadence with the always-immediate in-product mirror.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationShadowPolicy {
+    pub policy_id: String,
+    pub focus_routine_delay_ms: u64,
+    pub unattended_action_required_delay_ms: u64,
+    pub unattended_routine_digest_delay_ms: u64,
+    pub sha256: String,
+}
+
+impl NotificationShadowPolicy {
+    pub fn digest(&self) -> Result<String, OperatorControlError> {
+        let mut unsigned = self.clone();
+        unsigned.sha256.clear();
+        digest_json(&unsigned)
+    }
+
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        validate_identifier(&self.policy_id, "notification shadow policy id")?;
+        if self.focus_routine_delay_ms == 0
+            || self.unattended_action_required_delay_ms == 0
+            || self.unattended_routine_digest_delay_ms == 0
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "notification shadow policy delays",
+                reason: "must be positive bounded durations",
+            });
+        }
+        validate_lower_hex(
+            &self.sha256,
+            "notification shadow policy sha256",
+            SHA256_HEX_LEN,
+        )?;
+        if self.digest()? != self.sha256 {
+            return Err(OperatorControlError::InvalidField {
+                field: "notification shadow policy sha256",
+                reason: "does not match the canonical payload",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One exact current attention revision as evaluated by a shadow-only
+/// notification policy. `delivery_*` always refers to the already durable,
+/// immediate in-product mirror receipt used as the comparison baseline.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationShadowEntry {
+    pub attention_id: AttentionItemId,
+    pub attention_version: u64,
+    pub source_event_id: String,
+    pub attention_sha256: String,
+    pub delivery_id: NotificationDeliveryId,
+    pub delivery_sha256: String,
+    pub class: NotificationClass,
+    pub disposition: NotificationShadowDisposition,
+    pub scheduled_at_ms: i64,
+}
+
+impl NotificationShadowEntry {
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        validate_identifier(
+            self.attention_id.as_str(),
+            "notification shadow attention id",
+        )?;
+        validate_identifier(&self.source_event_id, "notification shadow source event id")?;
+        validate_lower_hex(
+            &self.attention_sha256,
+            "notification shadow attention sha256",
+            SHA256_HEX_LEN,
+        )?;
+        validate_identifier(self.delivery_id.as_str(), "notification shadow delivery id")?;
+        validate_lower_hex(
+            &self.delivery_sha256,
+            "notification shadow delivery sha256",
+            SHA256_HEX_LEN,
+        )?;
+        if self.scheduled_at_ms < 0 {
+            return Err(OperatorControlError::InvalidField {
+                field: "notification shadow schedule",
+                reason: "must be non-negative",
+            });
+        }
+        if matches!(self.class, NotificationClass::Critical)
+            && self.disposition != NotificationShadowDisposition::Immediate
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "notification shadow critical disposition",
+                reason: "critical attention must bypass every batch and defer path",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Immutable phase-two notification evidence. It binds the policy, exact
+/// local presence revision, control-plane snapshot, and immediate mirror
+/// receipts, but is deliberately incapable of changing notification delivery
+/// or any source-owned attention lifecycle.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationShadowBatch {
+    pub schema: String,
+    pub batch_id: NotificationShadowBatchId,
+    pub presence: OperatorPresence,
+    pub snapshot_id: ControlPlaneSnapshotId,
+    pub snapshot_revision: u64,
+    pub snapshot_sha256: String,
+    pub generated_at_ms: i64,
+    pub coverage_opened_at_ms: Option<i64>,
+    pub coverage_closed_at_ms: Option<i64>,
+    pub policy: NotificationShadowPolicy,
+    pub entries: Vec<NotificationShadowEntry>,
+    pub omitted_attention_revisions: u64,
+    pub truncated: bool,
+    pub sha256: String,
+}
+
+impl NotificationShadowBatch {
+    pub fn digest(&self) -> Result<String, OperatorControlError> {
+        let mut unsigned = self.clone();
+        unsigned.sha256.clear();
+        digest_json(&unsigned)
+    }
+
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.schema != "harness.notification-shadow-batch.v1"
+            || self.snapshot_revision == 0
+            || self.generated_at_ms < 0
+            || self.entries.len() > 100
+            || self.omitted_attention_revisions != 0
+            || self.truncated
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "notification shadow batch",
+                reason: "must be a complete bounded v1 shadow plan",
+            });
+        }
+        validate_identifier(self.batch_id.as_str(), "notification shadow batch id")?;
+        self.presence.validate()?;
+        validate_identifier(self.snapshot_id.as_str(), "notification shadow snapshot id")?;
+        validate_lower_hex(
+            &self.snapshot_sha256,
+            "notification shadow snapshot sha256",
+            SHA256_HEX_LEN,
+        )?;
+        self.policy.validate()?;
+        match (self.coverage_opened_at_ms, self.coverage_closed_at_ms) {
+            (Some(start), Some(end))
+                if start >= 0 && end >= start && end <= self.generated_at_ms => {}
+            (None, None) if self.entries.is_empty() => {}
+            _ => {
+                return Err(OperatorControlError::InvalidField {
+                    field: "notification shadow coverage",
+                    reason: "must exactly bound the complete entry set",
+                });
+            }
+        }
+        let mut source_events = std::collections::BTreeSet::new();
+        for entry in &self.entries {
+            entry.validate()?;
+            if !source_events.insert(entry.source_event_id.as_str()) {
+                return Err(OperatorControlError::InvalidField {
+                    field: "notification shadow entries",
+                    reason: "cannot repeat an exact attention revision",
+                });
+            }
+            let expected = match self.presence.mode {
+                OperatorPresenceMode::Interactive => NotificationShadowDisposition::Immediate,
+                OperatorPresenceMode::Focus => match entry.class {
+                    NotificationClass::Critical | NotificationClass::ActionRequired => {
+                        NotificationShadowDisposition::Immediate
+                    }
+                    NotificationClass::Routine => NotificationShadowDisposition::Batch,
+                },
+                OperatorPresenceMode::Unattended => match entry.class {
+                    NotificationClass::Critical => NotificationShadowDisposition::Immediate,
+                    NotificationClass::ActionRequired => NotificationShadowDisposition::Defer,
+                    NotificationClass::Routine => NotificationShadowDisposition::Digest,
+                },
+            };
+            if entry.disposition != expected {
+                return Err(OperatorControlError::InvalidField {
+                    field: "notification shadow disposition",
+                    reason: "does not match the exact local presence policy",
+                });
+            }
+        }
+        validate_lower_hex(
+            &self.sha256,
+            "notification shadow batch sha256",
+            SHA256_HEX_LEN,
+        )?;
+        if self.digest()? != self.sha256 {
+            return Err(OperatorControlError::InvalidField {
+                field: "notification shadow batch sha256",
                 reason: "does not match the canonical payload",
             });
         }

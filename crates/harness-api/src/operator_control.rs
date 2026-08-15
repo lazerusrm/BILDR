@@ -103,6 +103,10 @@ pub(super) fn routes() -> Router<ApiState> {
             get(list_notification_deliveries),
         )
         .route(
+            "/api/v1/notification-shadow-batches",
+            get(list_notification_shadow_batches).post(create_notification_shadow_batch),
+        )
+        .route(
             "/api/v1/notification-delivery-health",
             get(notification_delivery_health),
         )
@@ -771,6 +775,12 @@ struct NotificationQuery {
     limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct NotificationShadowBatchQuery {
+    operator_id: Option<String>,
+    limit: Option<u32>,
+}
+
 async fn list_notification_deliveries(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -782,6 +792,54 @@ async fn list_notification_deliveries(
             .orchestrator
             .store()
             .list_notification_deliveries(query.limit.unwrap_or(50))?,
+    ))
+}
+
+/// Reads immutable shadow-only notification plans. They compare a presence
+/// policy against immediate mirror receipts but cannot change delivery timing,
+/// suppress a source, or trigger an external notification channel.
+async fn list_notification_shadow_batches(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<NotificationShadowBatchQuery>,
+) -> Result<Json<Vec<harness_domain::NotificationShadowBatch>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .store()
+            .list_notification_shadow_batches(
+                query.operator_id.as_deref(),
+                query.limit.unwrap_or(50),
+            )?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateNotificationShadowBatchRequest {
+    operator_id: String,
+    expected_presence_version: u64,
+}
+
+/// Records a complete snapshot-bound shadow plan only. The Store requires the
+/// existing immediate mirror receipt for every source and refuses truncated
+/// attention snapshots, so this route never creates a hidden defer or
+/// suppression path.
+async fn create_notification_shadow_batch(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateNotificationShadowBatchRequest>,
+) -> Result<Json<harness_domain::NotificationShadowBatch>, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok(Json(
+        state
+            .orchestrator
+            .store()
+            .create_notification_shadow_batch(
+                &request.operator_id,
+                request.expected_presence_version,
+            )?,
     ))
 }
 
@@ -862,6 +920,14 @@ mod tests {
                 "task_family": "operator_control",
                 "model_family": null,
                 "runtime_class": null,
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CreateNotificationShadowBatchRequest>(json!({
+                "operator_id": "local_operator",
+                "expected_presence_version": 1,
                 "unexpected": true,
             }))
             .is_err()

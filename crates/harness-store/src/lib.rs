@@ -58,6 +58,8 @@ const OPERATOR_CONTROL_MIGRATION: &str =
     include_str!("../../../migrations/0017_operator_control_plane.sql");
 const RECONCILIATION_PROOF_CONSUMPTION_MIGRATION: &str =
     include_str!("../../../migrations/0018_reconciliation_proof_consumption.sql");
+const NOTIFICATION_SHADOW_BATCHES_MIGRATION: &str =
+    include_str!("../../../migrations/0019_notification_shadow_batches.sql");
 
 #[derive(Clone)]
 pub struct Store {
@@ -392,6 +394,21 @@ fn apply_runtime_migrations(connection: &mut Connection) -> Result<(), StoreErro
     } else {
         set_runtime_schema_version(connection, "17")?;
     }
+    let notification_shadow_batches_table_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='notification_shadow_batches')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !notification_shadow_batches_schema_current(connection)? {
+        if notification_shadow_batches_table_exists {
+            return Err(StoreError::Migration(
+                "notification shadow batch schema is incomplete; restore a compatible backup or repair it before opening this database".to_owned(),
+            ));
+        }
+        apply_notification_shadow_batches_migration(connection, || Ok(()))?;
+    } else {
+        set_runtime_schema_version(connection, "18")?;
+    }
     Ok(())
 }
 
@@ -484,6 +501,62 @@ where
     set_runtime_schema_version(&transaction, "16")?;
     transaction.commit()?;
     Ok(())
+}
+
+/// Install the immutable notification-shadow evidence table and v18 marker as
+/// one transaction. A restart must not observe a schema marker for shadow
+/// batching without the exact snapshot-bound evidence table and its immutable
+/// guards.
+fn apply_notification_shadow_batches_migration<F>(
+    connection: &mut Connection,
+    after_schema: F,
+) -> Result<(), StoreError>
+where
+    F: FnOnce() -> Result<(), StoreError>,
+{
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(NOTIFICATION_SHADOW_BATCHES_MIGRATION)?;
+    after_schema()?;
+    set_runtime_schema_version(&transaction, "18")?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn notification_shadow_batches_schema_current(connection: &Connection) -> Result<bool, StoreError> {
+    let required_columns = [
+        "id",
+        "operator_id",
+        "snapshot_id",
+        "snapshot_revision",
+        "policy_id",
+        "identity_sha256",
+        "payload_json",
+        "payload_sha256",
+        "created_at",
+    ];
+    let required_triggers = [
+        "notification_shadow_batches_no_update",
+        "notification_shadow_batches_no_delete",
+    ];
+    let has_columns = required_columns
+        .into_iter()
+        .map(|column| table_has_column(connection, "notification_shadow_batches", column))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .all(|present| present);
+    let has_triggers = required_triggers
+        .into_iter()
+        .map(|trigger| {
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)",
+                [trigger],
+                |row| row.get::<_, bool>(0),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .all(|present| present);
+    Ok(has_columns && has_triggers)
 }
 
 fn set_runtime_schema_version(connection: &Connection, version: &str) -> Result<(), StoreError> {
@@ -602,7 +675,7 @@ mod tests {
         assert!(store.check().unwrap().ready);
         drop(store);
         let reopened = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(reopened.migration_version().unwrap(), "17");
+        assert_eq!(reopened.migration_version().unwrap(), "18");
         let has_worktree_fingerprint: bool = reopened
             .connection()
             .unwrap()
@@ -683,6 +756,60 @@ mod tests {
             .unwrap();
         assert!(!attention_table_exists);
         assert_ne!(version, "16");
+    }
+
+    #[test]
+    fn notification_shadow_schema_and_v18_marker_roll_back_together_on_failure() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(INITIAL_MIGRATION).unwrap();
+        connection.execute_batch(RUNTIME_MIGRATION).unwrap();
+        connection
+            .execute_batch(OPERATOR_CONTROL_MIGRATION)
+            .unwrap();
+        let error = apply_notification_shadow_batches_migration(&mut connection, || {
+            Err(StoreError::Migration(
+                "injected failure after notification shadow DDL".to_owned(),
+            ))
+        })
+        .expect_err("a migration failure must roll back its schema marker");
+        assert!(error.to_string().contains("injected failure"));
+        let table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='notification_shadow_batches')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let version: String = connection
+            .query_row(
+                "SELECT value FROM schema_migrations_meta WHERE key='runtime_schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!table_exists);
+        assert_ne!(version, "18");
+    }
+
+    #[test]
+    fn incomplete_notification_shadow_schema_fails_closed_before_v18_marker() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("harness.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        connection.execute_batch(INITIAL_MIGRATION).unwrap();
+        connection
+            .execute_batch("CREATE TABLE notification_shadow_batches (id TEXT PRIMARY KEY);")
+            .unwrap();
+        drop(connection);
+        let error = match Store::open(&database, &temp.path().join("artifacts")) {
+            Ok(_) => panic!("incomplete shadow schema must not receive a v18 marker"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("notification shadow batch schema is incomplete")
+        );
     }
 
     #[test]
@@ -1149,7 +1276,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let store = Store::open(&database, &temp.path().join("artifacts")).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "17");
+        assert_eq!(store.migration_version().unwrap(), "18");
         for name in [
             "improvement_revisions",
             "improvement_events",
@@ -1219,7 +1346,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "17");
+        assert_eq!(store.migration_version().unwrap(), "18");
         for name in [
             "failure_occurrences",
             "failure_clusters",
@@ -1279,7 +1406,7 @@ mod tests {
         );
         drop(store);
         let reopened = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(reopened.migration_version().unwrap(), "17");
+        assert_eq!(reopened.migration_version().unwrap(), "18");
         assert!(
             reopened
                 .backup(&temp.path().join("v6-backup.sqlite3"))
@@ -1318,7 +1445,7 @@ mod tests {
         drop(connection);
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "17");
+        assert_eq!(store.migration_version().unwrap(), "18");
         for name in [
             "taskset_revision_memberships",
             "evaluation_runs",
@@ -1352,7 +1479,7 @@ mod tests {
                 .unwrap()
                 .migration_version()
                 .unwrap(),
-            "17"
+            "18"
         );
         assert!(
             Store::open(&backup, &temp.path().join("backup-artifacts"))
@@ -1398,7 +1525,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "17");
+        assert_eq!(store.migration_version().unwrap(), "18");
         for name in [
             "policy_champion_bindings",
             "policy_current_champions",
@@ -1547,7 +1674,7 @@ mod tests {
                 .unwrap()
                 .migration_version()
                 .unwrap(),
-            "17"
+            "18"
         );
     }
 
@@ -1636,7 +1763,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "17");
+        assert_eq!(store.migration_version().unwrap(), "18");
         for (table, column) in [
             ("evaluation_runs", "controller_run_id"),
             ("evaluation_samples", "controller_evidence_id"),
@@ -1779,7 +1906,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "17");
+        assert_eq!(store.migration_version().unwrap(), "18");
         let backfilled: bool = store
             .connection()
             .unwrap()
@@ -1806,7 +1933,7 @@ mod tests {
                 .unwrap()
                 .migration_version()
                 .unwrap(),
-            "17"
+            "18"
         );
     }
 

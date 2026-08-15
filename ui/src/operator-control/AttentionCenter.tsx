@@ -16,6 +16,7 @@ import type {
   MaterialProgressEvent,
   NotificationDelivery,
   NotificationDeliveryHealth,
+  NotificationShadowBatch,
   OperatorPresence,
   OperatorPresenceMode,
   ReturnView,
@@ -34,6 +35,7 @@ export function AttentionCenter() {
   const [presence, setPresence] = useState<OperatorPresence>();
   const [notificationDeliveries, setNotificationDeliveries] = useState<NotificationDelivery[]>([]);
   const [notificationHealth, setNotificationHealth] = useState<NotificationDeliveryHealth>();
+  const [notificationShadowBatches, setNotificationShadowBatches] = useState<NotificationShadowBatch[]>([]);
   const [selectedLivenessEpisodeId, setSelectedLivenessEpisodeId] = useState<string>();
   const [interventionHistory, setInterventionHistory] = useState<InterventionHistory>({
     episodeId: undefined,
@@ -68,7 +70,7 @@ export function AttentionCenter() {
   const load = useCallback(async () => {
     setBusy("refresh");
     try {
-      const [nextSnapshot, nextReturnView, nextPage, nextInvestigations, nextConditions, nextProgress, nextLiveness, nextPresence, nextNotificationDeliveries, nextNotificationHealth] = await Promise.all([
+      const [nextSnapshot, nextReturnView, nextPage, nextInvestigations, nextConditions, nextProgress, nextLiveness, nextPresence, nextNotificationDeliveries, nextNotificationHealth, nextNotificationShadowBatches] = await Promise.all([
         api.controlPlaneSnapshot(),
         api.controlPlaneReturnView(),
         api.attention(),
@@ -79,6 +81,7 @@ export function AttentionCenter() {
         api.operatorPresence(),
         api.notificationDeliveries(),
         api.notificationDeliveryHealth(),
+        api.notificationShadowBatches(),
       ]);
       setSnapshot(nextSnapshot);
       setReturnView(nextReturnView);
@@ -90,6 +93,7 @@ export function AttentionCenter() {
       setPresence(nextPresence);
       setNotificationDeliveries(nextNotificationDeliveries);
       setNotificationHealth(nextNotificationHealth);
+      setNotificationShadowBatches(nextNotificationShadowBatches);
       const runIds = nextSnapshot.runs.rows
         .map((row) => typeof row.run_id === "string" ? row.run_id : undefined)
         .filter((value): value is string => Boolean(value));
@@ -285,6 +289,19 @@ export function AttentionCenter() {
     }
   };
 
+  const recordNotificationShadowBatch = async () => {
+    if (!presence) return;
+    setBusy("notification-shadow");
+    try {
+      await api.createNotificationShadowBatch(presence.version);
+      await load();
+    } catch (cause) {
+      setError(displayError(cause, "The shadow plan could not be recorded. Refresh before trying again."));
+    } finally {
+      setBusy("");
+    }
+  };
+
   return (
     <div className="page control-plane-page">
       <header className="page-title">
@@ -343,8 +360,10 @@ export function AttentionCenter() {
           presence={presence}
           deliveries={notificationDeliveries}
           health={notificationHealth}
-          busy={busy === "presence"}
+          shadowBatches={notificationShadowBatches}
+          busy={busy === "presence" || busy === "notification-shadow"}
           onPresence={(mode) => void updatePresence(mode)}
+          onRecordShadowBatch={() => void recordNotificationShadowBatch()}
         />
         <MaterialProgressTimeline events={progress} />
         <LivenessEpisodes
@@ -422,14 +441,18 @@ function PresenceAndNotifications({
   presence,
   deliveries,
   health,
+  shadowBatches,
   busy,
   onPresence,
+  onRecordShadowBatch,
 }: {
   presence?: OperatorPresence;
   deliveries: NotificationDelivery[];
   health?: NotificationDeliveryHealth;
+  shadowBatches: NotificationShadowBatch[];
   busy: boolean;
   onPresence: (mode: OperatorPresenceMode) => void;
+  onRecordShadowBatch: () => void;
 }) {
   return (
     <section className="control-plane-support-card" aria-labelledby="notification-heading">
@@ -443,6 +466,7 @@ function PresenceAndNotifications({
               <button key={mode} className={`button secondary ${presence.mode === mode ? "selected" : ""}`} type="button" aria-pressed={presence.mode === mode} disabled={busy} onClick={() => onPresence(mode)}>{mode}</button>
             ))}
           </div>
+          <button className="button secondary" type="button" disabled={busy} onClick={onRecordShadowBatch}>Record shadow plan</button>
         </>
       )}
       {deliveries.length === 0 ? <p className="empty-state">No visible attention has been mirrored yet.</p> : (
@@ -458,7 +482,12 @@ function PresenceAndNotifications({
           {health.truncated ? " Results are bounded; unexamined current revisions are unknown." : ""}
         </p>
       )}
-      <p className="control-plane-note">This first phase records an in-product mirror only. It does not batch, suppress, send a desktop alert, or close the source attention item.</p>
+      {shadowBatches[0] ? (
+        <p className="control-plane-note">
+          Latest shadow plan <strong>{shadowBatches[0].batch_id}</strong> covers <strong>{shadowBatches[0].entries.length}</strong> current revisions at presence version {shadowBatches[0].presence.version}. Critical entries remain immediate; this is comparison evidence only.
+        </p>
+      ) : <p className="control-plane-note">No shadow plan has been recorded for this local presence preference.</p>}
+      <p className="control-plane-note">The immediate in-product mirror remains active. Shadow plans do not batch, suppress, send a desktop alert, or close the source attention item.</p>
     </section>
   );
 }

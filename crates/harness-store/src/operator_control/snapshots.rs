@@ -163,9 +163,16 @@ impl Store {
             "notification cursor",
         )?;
         let presence_cursor = non_negative(
-            transaction.query_row("SELECT count(*) FROM operator_presence", [], |row| {
-                row.get::<_, i64>(0)
-            })?,
+            transaction.query_row(
+                // Presence rows are versioned updates, not append-only facts.
+                // Counting rows leaves a snapshot falsely reusable after an
+                // operator changes focus/unattended preference. Each version
+                // only increases, so their bounded sum invalidates the
+                // snapshot on every update.
+                "SELECT coalesce(sum(version),0) FROM operator_presence",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
             "operator presence cursor",
         )?;
         let mut source_cursors = BTreeMap::new();
@@ -974,6 +981,7 @@ fn digest(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use harness_domain::OperatorPresenceMode;
     use tempfile::TempDir;
 
     use super::*;
@@ -989,6 +997,33 @@ mod tests {
         assert_eq!(first.accounts.state, SnapshotSectionState::Unknown);
         assert!(first.accounts.rows.is_empty());
         assert!(first.limits.detail.is_some());
+    }
+
+    #[test]
+    fn presence_revision_invalidates_a_control_plane_snapshot() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let first = store.control_plane_snapshot().expect("first snapshot");
+        let initial = store.operator_presence("operator-a").expect("presence");
+        let focus = store
+            .set_operator_presence("operator-a", OperatorPresenceMode::Focus, initial.version)
+            .expect("focus");
+        let second = store.control_plane_snapshot().expect("presence snapshot");
+        assert_ne!(second.snapshot_id, first.snapshot_id);
+        assert_eq!(second.source_cursors["operator_presence"], focus.version);
+        let unattended = store
+            .set_operator_presence(
+                "operator-a",
+                OperatorPresenceMode::Unattended,
+                focus.version,
+            )
+            .expect("unattended");
+        let third = store.control_plane_snapshot().expect("changed snapshot");
+        assert_ne!(third.snapshot_id, second.snapshot_id);
+        assert_eq!(
+            third.source_cursors["operator_presence"],
+            unattended.version
+        );
     }
 
     #[test]

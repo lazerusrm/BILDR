@@ -5,11 +5,14 @@
 //! notifications, or update a source-owned lifecycle.
 
 use harness_domain::{
-    AttentionItem, AttentionSeverity, CorrelationLink, CorrelationLinkId, NotificationClass,
-    NotificationDelivery, NotificationDeliveryHealth, NotificationDeliveryId, NotificationState,
-    OperatorPresence, OperatorPresenceMode, TraceContext, now_ms,
+    AttentionItem, AttentionSeverity, ControlPlaneSnapshot, CorrelationLink, CorrelationLinkId,
+    NotificationClass, NotificationDelivery, NotificationDeliveryHealth, NotificationDeliveryId,
+    NotificationShadowBatch, NotificationShadowBatchId, NotificationShadowDisposition,
+    NotificationShadowEntry, NotificationShadowPolicy, NotificationState, OperatorPresence,
+    OperatorPresenceMode, SnapshotSectionState, TraceContext, now_ms,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{Store, StoreError};
@@ -18,6 +21,11 @@ use super::correlation::record_correlation_link_in_transaction;
 
 const MAX_NOTIFICATION_PAGE_SIZE: u32 = 200;
 const MAX_NOTIFICATION_HEALTH_ROWS: u32 = 200;
+const MAX_NOTIFICATION_SHADOW_ENTRIES: usize = 100;
+const NOTIFICATION_SHADOW_POLICY_ID: &str = "notification-shadow-policy-v1";
+const FOCUS_ROUTINE_DELAY_MS: u64 = 15 * 60 * 1_000;
+const UNATTENDED_ACTION_REQUIRED_DELAY_MS: u64 = 5 * 60 * 1_000;
+const UNATTENDED_ROUTINE_DIGEST_DELAY_MS: u64 = 60 * 60 * 1_000;
 
 impl Store {
     pub fn operator_presence(&self, operator_id: &str) -> Result<OperatorPresence, StoreError> {
@@ -135,6 +143,232 @@ impl Store {
         Ok(statement
             .query_map([i64::from(limit)], |row| {
                 super::attention::checked_attention_row(row.get(0)?, row.get(1)?)
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Produces a phase-two shadow plan from one complete, immutable
+    /// control-plane snapshot and one exact local-presence revision. The
+    /// existing immediate mirror remains the only delivery record: this method
+    /// only persists the theoretical batching comparison for later evaluation.
+    pub fn create_notification_shadow_batch(
+        &self,
+        operator_id: &str,
+        expected_presence_version: u64,
+    ) -> Result<NotificationShadowBatch, StoreError> {
+        validate_operator(operator_id)?;
+        let snapshot = self.control_plane_snapshot()?;
+        if snapshot.attention.state != SnapshotSectionState::Current || snapshot.attention.truncated
+        {
+            return Err(StoreError::Conflict(
+                "notification shadow batching requires one complete current attention snapshot"
+                    .to_owned(),
+            ));
+        }
+        if snapshot.attention.rows.len() > MAX_NOTIFICATION_SHADOW_ENTRIES {
+            return Err(StoreError::Conflict(
+                "notification shadow batching exceeds its bounded attention input".to_owned(),
+            ));
+        }
+        let attention = snapshot
+            .attention
+            .rows
+            .iter()
+            .cloned()
+            .map(serde_json::from_value::<AttentionItem>)
+            .collect::<Result<Vec<_>, _>>()?;
+        for item in &attention {
+            item.validate().map_err(control_error)?;
+        }
+        let presence = self.operator_presence(operator_id)?;
+        if presence.version != expected_presence_version {
+            return Err(StoreError::Conflict(format!(
+                "operator presence has version {}, expected {expected_presence_version}",
+                presence.version
+            )));
+        }
+        let policy = notification_shadow_policy()?;
+        let entries = attention
+            .iter()
+            .map(|item| notification_shadow_entry(item, presence.mode, &policy))
+            .collect::<Result<Vec<_>, _>>()?;
+        let coverage_opened_at_ms = attention.iter().map(|item| item.opened_at_ms).min();
+        let coverage_closed_at_ms = attention.iter().map(|item| item.opened_at_ms).max();
+        let identity = digest(&serde_json::to_string(&json!({
+            "schema": "harness.notification-shadow-batch-identity.v1",
+            "snapshot_id": snapshot.snapshot_id,
+            "snapshot_revision": snapshot.revision,
+            "snapshot_sha256": snapshot.sha256,
+            "presence": presence,
+            "policy": policy,
+            "entries": entries,
+        }))?);
+        let mut batch = NotificationShadowBatch {
+            schema: "harness.notification-shadow-batch.v1".to_owned(),
+            batch_id: NotificationShadowBatchId::parse(format!(
+                "notification-shadow-{}",
+                &identity[..32]
+            ))
+            .map_err(control_error)?,
+            presence,
+            snapshot_id: snapshot.snapshot_id,
+            snapshot_revision: snapshot.revision,
+            snapshot_sha256: snapshot.sha256,
+            generated_at_ms: snapshot.compiled_at_ms,
+            coverage_opened_at_ms,
+            coverage_closed_at_ms,
+            policy,
+            entries,
+            omitted_attention_revisions: 0,
+            truncated: false,
+            sha256: String::new(),
+        };
+        batch.sha256 = batch.digest().map_err(control_error)?;
+        batch.validate().map_err(control_error)?;
+        self.record_notification_shadow_batch(&batch, &identity)
+    }
+
+    fn record_notification_shadow_batch(
+        &self,
+        batch: &NotificationShadowBatch,
+        identity_sha256: &str,
+    ) -> Result<NotificationShadowBatch, StoreError> {
+        batch.validate().map_err(control_error)?;
+        if batch.presence.operator_id.is_empty() || batch.presence.operator_id.len() > 160 {
+            return Err(StoreError::Validation(
+                "notification shadow batch has an invalid operator identity".to_owned(),
+            ));
+        }
+        let raw = serde_json::to_string(batch)?;
+        let payload_sha256 = digest(&raw);
+        let correlations = notification_shadow_correlations(batch)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored_presence = transaction
+            .query_row(
+                "SELECT payload_json,payload_sha256 FROM operator_presence WHERE operator_id=?1",
+                [batch.presence.operator_id.as_str()],
+                |row| checked_presence_row(row.get(0)?, row.get(1)?),
+            )
+            .optional()?
+            .unwrap_or_else(|| default_presence(&batch.presence.operator_id));
+        if stored_presence != batch.presence {
+            return Err(StoreError::Conflict(
+                "notification shadow batch presence changed before recording".to_owned(),
+            ));
+        }
+        let (snapshot_raw, snapshot_payload_sha256): (String, String) = transaction
+            .query_row(
+                "SELECT payload_json,payload_sha256 FROM control_plane_snapshots WHERE id=?1 AND revision=?2",
+                params![
+                    batch.snapshot_id.as_str(),
+                    i64::try_from(batch.snapshot_revision).map_err(|_| StoreError::Validation("notification shadow snapshot revision exceeds SQLite range".to_owned()))?,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::Conflict(
+                    "notification shadow batch snapshot does not resolve exactly".to_owned(),
+                )
+            })?;
+        if digest(&snapshot_raw) != snapshot_payload_sha256 {
+            return Err(StoreError::Conflict(
+                "notification shadow batch snapshot payload integrity failed".to_owned(),
+            ));
+        }
+        let stored_snapshot: ControlPlaneSnapshot = serde_json::from_str(&snapshot_raw)?;
+        stored_snapshot.validate().map_err(control_error)?;
+        if stored_snapshot.snapshot_id != batch.snapshot_id
+            || stored_snapshot.revision != batch.snapshot_revision
+            || stored_snapshot.sha256 != batch.snapshot_sha256
+        {
+            return Err(StoreError::Conflict(
+                "notification shadow batch snapshot does not resolve exactly".to_owned(),
+            ));
+        }
+        for entry in &batch.entries {
+            let (raw, payload_sha256): (String, String) = transaction
+                .query_row(
+                    "SELECT payload_json,payload_sha256 FROM notification_deliveries WHERE id=?1 AND source_event_id=?2",
+                    params![entry.delivery_id.as_str(), entry.source_event_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    StoreError::Conflict(
+                        "notification shadow batch requires the exact immediate mirror receipt"
+                            .to_owned(),
+                    )
+                })?;
+            let delivery = checked_delivery_row(raw, payload_sha256)?;
+            if delivery.sha256 != entry.delivery_sha256 {
+                return Err(StoreError::Conflict(
+                    "notification shadow batch delivery receipt changed".to_owned(),
+                ));
+            }
+        }
+        if let Some((existing_raw, existing_digest)) = transaction
+            .query_row(
+                "SELECT payload_json,payload_sha256 FROM notification_shadow_batches WHERE identity_sha256=?1",
+                [identity_sha256],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            let existing = checked_shadow_batch_row(existing_raw, existing_digest)?;
+            if existing != *batch {
+                return Err(StoreError::Conflict(
+                    "notification shadow batch identity already has different content".to_owned(),
+                ));
+            }
+            for correlation in &correlations {
+                record_correlation_link_in_transaction(&transaction, correlation)?;
+            }
+            transaction.commit()?;
+            return Ok(existing);
+        }
+        transaction.execute(
+            "INSERT INTO notification_shadow_batches(id,operator_id,snapshot_id,snapshot_revision,policy_id,identity_sha256,payload_json,payload_sha256,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                batch.batch_id.as_str(),
+                batch.presence.operator_id.as_str(),
+                batch.snapshot_id.as_str(),
+                i64::try_from(batch.snapshot_revision).map_err(|_| StoreError::Validation("notification shadow snapshot revision exceeds SQLite range".to_owned()))?,
+                batch.policy.policy_id.as_str(),
+                identity_sha256,
+                raw,
+                payload_sha256,
+                batch.generated_at_ms,
+            ],
+        )?;
+        for correlation in &correlations {
+            record_correlation_link_in_transaction(&transaction, correlation)?;
+        }
+        transaction.commit()?;
+        Ok(batch.clone())
+    }
+
+    pub fn list_notification_shadow_batches(
+        &self,
+        operator_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<NotificationShadowBatch>, StoreError> {
+        if limit == 0 || limit > MAX_NOTIFICATION_PAGE_SIZE {
+            return Err(StoreError::Validation(format!(
+                "notification shadow batch page limit must be 1..={MAX_NOTIFICATION_PAGE_SIZE}"
+            )));
+        }
+        if let Some(operator_id) = operator_id {
+            validate_operator(operator_id)?;
+        }
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT payload_json,payload_sha256 FROM notification_shadow_batches WHERE (?1 IS NULL OR operator_id=?1) ORDER BY created_at DESC,id DESC LIMIT ?2",
+        )?;
+        Ok(statement
+            .query_map(params![operator_id, i64::from(limit)], |row| {
+                checked_shadow_batch_row(row.get(0)?, row.get(1)?)
             })?
             .collect::<Result<Vec<_>, _>>()?)
     }
@@ -355,6 +589,72 @@ fn notification_from_attention(item: &AttentionItem) -> Result<NotificationDeliv
     Ok(delivery)
 }
 
+fn notification_shadow_policy() -> Result<NotificationShadowPolicy, StoreError> {
+    let mut policy = NotificationShadowPolicy {
+        policy_id: NOTIFICATION_SHADOW_POLICY_ID.to_owned(),
+        focus_routine_delay_ms: FOCUS_ROUTINE_DELAY_MS,
+        unattended_action_required_delay_ms: UNATTENDED_ACTION_REQUIRED_DELAY_MS,
+        unattended_routine_digest_delay_ms: UNATTENDED_ROUTINE_DIGEST_DELAY_MS,
+        sha256: String::new(),
+    };
+    policy.sha256 = policy.digest().map_err(control_error)?;
+    policy.validate().map_err(control_error)?;
+    Ok(policy)
+}
+
+fn notification_shadow_entry(
+    attention: &AttentionItem,
+    presence: OperatorPresenceMode,
+    policy: &NotificationShadowPolicy,
+) -> Result<NotificationShadowEntry, StoreError> {
+    let delivery = notification_from_attention(attention)?;
+    let (disposition, delay_ms) = match presence {
+        OperatorPresenceMode::Interactive => (NotificationShadowDisposition::Immediate, 0),
+        OperatorPresenceMode::Focus => match delivery.class {
+            NotificationClass::Critical | NotificationClass::ActionRequired => {
+                (NotificationShadowDisposition::Immediate, 0)
+            }
+            NotificationClass::Routine => (
+                NotificationShadowDisposition::Batch,
+                policy.focus_routine_delay_ms,
+            ),
+        },
+        OperatorPresenceMode::Unattended => match delivery.class {
+            NotificationClass::Critical => (NotificationShadowDisposition::Immediate, 0),
+            NotificationClass::ActionRequired => (
+                NotificationShadowDisposition::Defer,
+                policy.unattended_action_required_delay_ms,
+            ),
+            NotificationClass::Routine => (
+                NotificationShadowDisposition::Digest,
+                policy.unattended_routine_digest_delay_ms,
+            ),
+        },
+    };
+    let delay_ms = i64::try_from(delay_ms).map_err(|_| {
+        StoreError::Validation("notification shadow delay exceeds SQLite range".to_owned())
+    })?;
+    let scheduled_at_ms = attention
+        .opened_at_ms
+        .checked_add(delay_ms)
+        .ok_or_else(|| {
+            StoreError::Validation("notification shadow scheduled time overflow".to_owned())
+        })?;
+    let entry = NotificationShadowEntry {
+        attention_id: attention.attention_id.clone(),
+        attention_version: attention.version,
+        source_event_id: delivery.source_event_id.clone(),
+        attention_sha256: digest(&serde_json::to_string(attention)?),
+        delivery_id: delivery.delivery_id,
+        delivery_sha256: delivery.sha256,
+        class: delivery.class,
+        disposition,
+        scheduled_at_ms,
+    };
+    entry.validate().map_err(control_error)?;
+    Ok(entry)
+}
+
 fn notification_delivery_matches_attention(
     delivery: &NotificationDelivery,
     attention: &AttentionItem,
@@ -409,6 +709,71 @@ fn notification_correlation_link(
         relation: "presented_as".to_owned(),
         created_at_ms: delivery.created_at_ms,
     })
+}
+
+/// Each shadow entry is explicitly downstream of the durable immediate mirror
+/// receipt it compares. The trace is evidence only and cannot cause delivery,
+/// state transition, or acknowledgement.
+fn notification_shadow_correlations(
+    batch: &NotificationShadowBatch,
+) -> Result<Vec<CorrelationLink>, StoreError> {
+    let trace_id = digest(&format!(
+        "harness.notification-shadow.trace.v1:{}",
+        batch.batch_id
+    ));
+    let span_id = digest(&format!(
+        "harness.notification-shadow.span.v1:{}",
+        batch.batch_id
+    ));
+    batch
+        .entries
+        .iter()
+        .map(|entry| {
+            let link_id = CorrelationLinkId::parse(format!(
+                "correlation-{}",
+                &digest(&format!(
+                    "harness.notification-shadow.link.v1:{}:{}",
+                    batch.batch_id, entry.delivery_id
+                ))[..48]
+            ))
+            .map_err(control_error)?;
+            Ok(CorrelationLink {
+                schema: "harness.correlation-link.v1".to_owned(),
+                link_id,
+                trace: TraceContext {
+                    trace_id: trace_id[..32].to_owned(),
+                    span_id: span_id[..16].to_owned(),
+                    parent_span_id: None,
+                },
+                from_kind: "notification_delivery".to_owned(),
+                from_id: entry.delivery_id.to_string(),
+                to_kind: "notification_shadow_batch".to_owned(),
+                to_id: batch.batch_id.to_string(),
+                relation: "shadow_plans".to_owned(),
+                created_at_ms: batch.generated_at_ms,
+            })
+        })
+        .collect()
+}
+
+fn checked_shadow_batch_row(
+    raw: String,
+    payload_sha256: String,
+) -> rusqlite::Result<NotificationShadowBatch> {
+    if digest(&raw) != payload_sha256 {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            "notification shadow batch payload integrity check failed".into(),
+        ));
+    }
+    let batch: NotificationShadowBatch = serde_json::from_str(&raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    batch.validate().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(batch)
 }
 pub(crate) fn checked_delivery_row(
     raw: String,
@@ -670,6 +1035,160 @@ mod tests {
         assert_eq!(
             store.list_attention(false, 10).unwrap().items,
             vec![attention]
+        );
+    }
+
+    #[test]
+    fn shadow_batch_is_exact_idempotent_and_keeps_critical_attention_immediate() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let mut critical = test_attention();
+        critical.source.source_id = "shadow-critical".to_owned();
+        critical.dedupe_key = "shadow-critical".to_owned();
+        critical.opened_event_id = "shadow-critical-event".to_owned();
+        critical.opened_at_ms = 1_000;
+        critical.severity = AttentionSeverity::Critical;
+        critical.validate().expect("critical attention");
+        let mut action_required = test_attention();
+        action_required.source.source_id = "shadow-high".to_owned();
+        action_required.dedupe_key = "shadow-high".to_owned();
+        action_required.opened_event_id = "shadow-high-event".to_owned();
+        action_required.opened_at_ms = 2_000;
+        action_required.severity = AttentionSeverity::High;
+        action_required.validate().expect("high attention");
+        let mut routine = test_attention();
+        routine.source.source_id = "shadow-routine".to_owned();
+        routine.dedupe_key = "shadow-routine".to_owned();
+        routine.opened_event_id = "shadow-routine-event".to_owned();
+        routine.opened_at_ms = 3_000;
+        routine.severity = AttentionSeverity::Normal;
+        routine.validate().expect("routine attention");
+        for attention in [&critical, &action_required, &routine] {
+            store
+                .upsert_source_attention(attention)
+                .expect("open attention");
+        }
+        let initial = store.operator_presence("operator-a").expect("presence");
+        let focus = store
+            .set_operator_presence("operator-a", OperatorPresenceMode::Focus, initial.version)
+            .expect("focus preference");
+
+        let first = store
+            .create_notification_shadow_batch("operator-a", focus.version)
+            .expect("complete shadow plan");
+        assert_eq!(first.presence, focus);
+        assert_eq!(first.entries.len(), 3);
+        assert_eq!(first.coverage_opened_at_ms, Some(1_000));
+        assert_eq!(first.coverage_closed_at_ms, Some(3_000));
+        assert!(!first.truncated);
+        assert_eq!(first.omitted_attention_revisions, 0);
+        assert!(first.entries.iter().any(|entry| {
+            entry.attention_id == critical.attention_id
+                && entry.class == NotificationClass::Critical
+                && entry.disposition == NotificationShadowDisposition::Immediate
+                && entry.scheduled_at_ms == critical.opened_at_ms
+        }));
+        assert!(first.entries.iter().any(|entry| {
+            entry.attention_id == action_required.attention_id
+                && entry.class == NotificationClass::ActionRequired
+                && entry.disposition == NotificationShadowDisposition::Immediate
+                && entry.scheduled_at_ms == action_required.opened_at_ms
+        }));
+        assert!(first.entries.iter().any(|entry| {
+            entry.attention_id == routine.attention_id
+                && entry.class == NotificationClass::Routine
+                && entry.disposition == NotificationShadowDisposition::Batch
+                && entry.scheduled_at_ms
+                    == routine.opened_at_ms + i64::try_from(FOCUS_ROUTINE_DELAY_MS).unwrap()
+        }));
+        assert_eq!(store.list_notification_deliveries(10).unwrap().len(), 3);
+        assert!(
+            !store
+                .notification_delivery_health()
+                .unwrap()
+                .batching_enabled
+        );
+        assert_eq!(
+            store
+                .create_notification_shadow_batch("operator-a", focus.version)
+                .expect("idempotent replay"),
+            first
+        );
+        assert_eq!(
+            store
+                .list_notification_shadow_batches(Some("operator-a"), 10)
+                .expect("stored batch"),
+            vec![first.clone()]
+        );
+        let correlations = store
+            .correlation_links(
+                &notification_shadow_correlations(&first).expect("shadow links")[0]
+                    .trace
+                    .trace_id,
+                10,
+            )
+            .expect("shadow trace");
+        assert_eq!(correlations.len(), 3);
+        assert!(correlations.iter().all(|link| {
+            link.from_kind == "notification_delivery"
+                && link.to_kind == "notification_shadow_batch"
+                && link.to_id == first.batch_id.to_string()
+                && link.relation == "shadow_plans"
+        }));
+
+        let unattended = store
+            .set_operator_presence(
+                "operator-a",
+                OperatorPresenceMode::Unattended,
+                focus.version,
+            )
+            .expect("unattended preference");
+        assert!(matches!(
+            store.create_notification_shadow_batch("operator-a", focus.version),
+            Err(StoreError::Conflict(_))
+        ));
+        let changed = store
+            .create_notification_shadow_batch("operator-a", unattended.version)
+            .expect("unattended plan");
+        assert!(changed.entries.iter().any(|entry| {
+            entry.attention_id == critical.attention_id
+                && entry.disposition == NotificationShadowDisposition::Immediate
+        }));
+        assert!(changed.entries.iter().any(|entry| {
+            entry.attention_id == action_required.attention_id
+                && entry.disposition == NotificationShadowDisposition::Defer
+        }));
+        assert!(changed.entries.iter().any(|entry| {
+            entry.attention_id == routine.attention_id
+                && entry.disposition == NotificationShadowDisposition::Digest
+        }));
+    }
+
+    #[test]
+    fn shadow_batch_refuses_a_truncated_attention_snapshot() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        for index in 0..=MAX_NOTIFICATION_SHADOW_ENTRIES {
+            let mut attention = test_attention();
+            attention.source.source_id = format!("shadow-truncated-{index}");
+            attention.dedupe_key = format!("shadow-truncated-{index}");
+            attention.opened_event_id = format!("shadow-truncated-event-{index}");
+            attention.opened_at_ms = i64::try_from(index).expect("bounded test index");
+            attention.validate().expect("valid bounded attention");
+            store
+                .upsert_source_attention(&attention)
+                .expect("open attention");
+        }
+        let presence = store.operator_presence("operator-a").expect("presence");
+        assert!(matches!(
+            store.create_notification_shadow_batch("operator-a", presence.version),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(
+            store
+                .list_notification_shadow_batches(Some("operator-a"), 10)
+                .expect("no shadow batch")
+                .is_empty()
         );
     }
 

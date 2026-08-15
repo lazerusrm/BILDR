@@ -143,13 +143,21 @@ receipt. The controller derives the statement and two episode receipts; this
 does not call preservation a recovery, create a replacement attempt, activate
 knowledge, change task context, or write global memory.
 
+An authenticated operator may record an immutable notification shadow plan from
+one complete control-plane snapshot and exact local-presence revision. It binds
+every current attention revision to its already-durable immediate mirror receipt
+and records the theoretical focus/unattended cadence, with critical attention
+forced to immediate. A truncated snapshot is refused. The plan neither defers
+nor suppresses delivery, sends no desktop notification, and cannot close its
+source attention.
+
 The sole active intervention is a version-bound `wait` receipt: it records a
 bounded decision against one liveness episode and cannot clear a stall or
 change any task, attempt, ownership, worktree, process, approval, or external
-condition. Desktop notification delivery/batching, all other intervention
-execution, external provider wake adapters, adaptive supervisor behavior, empirical
-evaluation, and rollout activation remain explicitly gated until their own
-evidence passes.
+condition. Desktop notification delivery and active batching, all other
+intervention execution, external provider wake adapters, adaptive supervisor
+behavior, empirical evaluation, and rollout activation remain explicitly gated
+until their own evidence passes.
 Do not interpret an empty observe-only section as a healthy or automatically
 recovered run.
 
