@@ -94,6 +94,10 @@ pub(super) fn routes() -> Router<ApiState> {
             "/api/v1/notification-deliveries",
             get(list_notification_deliveries),
         )
+        .route(
+            "/api/v1/notification-delivery-health",
+            get(notification_delivery_health),
+        )
 }
 
 async fn control_plane_snapshot(
@@ -684,6 +688,19 @@ async fn list_notification_deliveries(
             .orchestrator
             .store()
             .list_notification_deliveries(query.limit.unwrap_or(50))?,
+    ))
+}
+
+/// Bounded, integrity-checked health for current attention revisions. This
+/// read does not refresh the mirror, send or batch a notification, suppress a
+/// source item, or turn a delivery receipt into execution authority.
+async fn notification_delivery_health(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<harness_domain::NotificationDeliveryHealth>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(
+        state.orchestrator.store().notification_delivery_health()?,
     ))
 }
 

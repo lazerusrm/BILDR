@@ -872,6 +872,26 @@ export interface NotificationDelivery {
   sha256: string;
 }
 
+/** Bounded, read-only integrity health for the in-product delivery mirror. */
+export interface NotificationDeliveryHealth {
+  schema: "harness.notification-delivery-health.v1";
+  channel: "in_product_mirror";
+  current_attention_revisions: number;
+  examined_current_revisions: number;
+  delivered_examined_revisions: number;
+  undelivered_examined_revisions: number;
+  undelivered_critical_examined_revisions: number;
+  undelivered_action_required_examined_revisions: number;
+  failed_examined_revisions: number;
+  unverified_delivery_examined_revisions: number;
+  oldest_undelivered_opened_at_ms: number | null;
+  latest_verified_mirror_receipt_at_ms: number | null;
+  truncated: boolean;
+  desktop_delivery_enabled: false;
+  batching_enabled: false;
+  suppression_enabled: false;
+}
+
 export interface TopologyNode {
   id: string;
   kind: string;

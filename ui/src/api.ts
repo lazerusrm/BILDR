@@ -23,6 +23,7 @@ import type {
   LivenessEpisode,
   MaterialProgressEvent,
   NotificationDelivery,
+  NotificationDeliveryHealth,
   OutcomeVector,
   OperatorPresence,
   OperatorPresenceMode,
@@ -229,6 +230,8 @@ class HarnessApi {
     });
   notificationDeliveries = () =>
     this.get<NotificationDelivery[]>("/notification-deliveries?limit=50");
+  notificationDeliveryHealth = () =>
+    this.get<NotificationDeliveryHealth>("/notification-delivery-health");
   topology = (runId: string) =>
     this.get<TopologySnapshot>(
       `/runs/${encodeURIComponent(runId)}/topology`,

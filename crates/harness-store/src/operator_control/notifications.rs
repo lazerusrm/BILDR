@@ -6,8 +6,8 @@
 
 use harness_domain::{
     AttentionItem, AttentionSeverity, CorrelationLink, CorrelationLinkId, NotificationClass,
-    NotificationDelivery, NotificationDeliveryId, NotificationState, OperatorPresence,
-    OperatorPresenceMode, TraceContext, now_ms,
+    NotificationDelivery, NotificationDeliveryHealth, NotificationDeliveryId, NotificationState,
+    OperatorPresence, OperatorPresenceMode, TraceContext, now_ms,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -17,6 +17,7 @@ use crate::{Store, StoreError};
 use super::correlation::record_correlation_link_in_transaction;
 
 const MAX_NOTIFICATION_PAGE_SIZE: u32 = 200;
+const MAX_NOTIFICATION_HEALTH_ROWS: u32 = 200;
 
 impl Store {
     pub fn operator_presence(&self, operator_id: &str) -> Result<OperatorPresence, StoreError> {
@@ -189,6 +190,116 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?)
     }
+
+    /// Computes a bounded health projection for the current source-owned
+    /// attention revisions without refreshing the mirror or changing any
+    /// delivery state. A caller must not interpret a truncated result as a
+    /// whole-system delivery guarantee.
+    pub fn notification_delivery_health(&self) -> Result<NotificationDeliveryHealth, StoreError> {
+        let connection = self.connection()?;
+        let current_attention_revisions = non_negative_u64(
+            connection.query_row(
+                "SELECT count(*) FROM attention_items WHERE state IN ('open','acknowledged','waiting_external')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            "current notification attention count",
+        )?;
+        let mut statement = connection.prepare(
+            "SELECT attention.payload_json,attention.payload_sha256,delivery.payload_json,delivery.payload_sha256
+             FROM attention_items AS attention
+             LEFT JOIN notification_deliveries AS delivery
+               ON delivery.source_event_id = ('attention-' || attention.id || '-' || attention.version)
+             WHERE attention.state IN ('open','acknowledged','waiting_external')
+             ORDER BY
+               CASE attention.severity
+                 WHEN 'critical' THEN 0
+                 WHEN 'high' THEN 1
+                 WHEN 'normal' THEN 2
+                 ELSE 3
+               END,
+               attention.opened_at ASC,
+               attention.id ASC
+             LIMIT ?1",
+        )?;
+        let rows = statement
+            .query_map([i64::from(MAX_NOTIFICATION_HEALTH_ROWS)], |row| {
+                let attention = super::attention::checked_attention_row(row.get(0)?, row.get(1)?)?;
+                let delivery_raw: Option<String> = row.get(2)?;
+                let delivery_digest: Option<String> = row.get(3)?;
+                let delivery = match (delivery_raw, delivery_digest) {
+                    (None, None) => None,
+                    (Some(raw), Some(digest)) => Some(checked_delivery_row(raw, digest)?),
+                    _ => {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            "notification delivery join has incomplete immutable payload".into(),
+                        ));
+                    }
+                };
+                Ok((attention, delivery))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut health = NotificationDeliveryHealth {
+            schema: "harness.notification-delivery-health.v1".to_owned(),
+            channel: "in_product_mirror".to_owned(),
+            current_attention_revisions,
+            examined_current_revisions: rows.len() as u64,
+            delivered_examined_revisions: 0,
+            undelivered_examined_revisions: 0,
+            undelivered_critical_examined_revisions: 0,
+            undelivered_action_required_examined_revisions: 0,
+            failed_examined_revisions: 0,
+            unverified_delivery_examined_revisions: 0,
+            oldest_undelivered_opened_at_ms: None,
+            latest_verified_mirror_receipt_at_ms: None,
+            truncated: (rows.len() as u64) < current_attention_revisions,
+            desktop_delivery_enabled: false,
+            batching_enabled: false,
+            suppression_enabled: false,
+        };
+        for (attention, delivery) in rows {
+            let verified = delivery.as_ref().is_some_and(|delivery| {
+                notification_delivery_matches_attention(delivery, &attention)
+            });
+            if verified {
+                health.delivered_examined_revisions += 1;
+                let delivery = delivery.expect("verified delivery is present");
+                health.latest_verified_mirror_receipt_at_ms = Some(
+                    health
+                        .latest_verified_mirror_receipt_at_ms
+                        .map_or(delivery.created_at_ms, |current| {
+                            current.max(delivery.created_at_ms)
+                        }),
+                );
+                continue;
+            }
+            health.undelivered_examined_revisions += 1;
+            health.oldest_undelivered_opened_at_ms = Some(
+                health
+                    .oldest_undelivered_opened_at_ms
+                    .map_or(attention.opened_at_ms, |current| {
+                        current.min(attention.opened_at_ms)
+                    }),
+            );
+            match attention.severity {
+                AttentionSeverity::Critical => health.undelivered_critical_examined_revisions += 1,
+                AttentionSeverity::High => {
+                    health.undelivered_action_required_examined_revisions += 1
+                }
+                AttentionSeverity::Normal | AttentionSeverity::Info => {}
+            }
+            if let Some(delivery) = delivery {
+                health.unverified_delivery_examined_revisions += 1;
+                if delivery.state == NotificationState::Failed {
+                    health.failed_examined_revisions += 1;
+                }
+            }
+        }
+        health.validate().map_err(control_error)?;
+        Ok(health)
+    }
 }
 
 fn default_presence(operator_id: &str) -> OperatorPresence {
@@ -233,6 +344,13 @@ fn notification_from_attention(item: &AttentionItem) -> Result<NotificationDeliv
     delivery.sha256 = delivery.digest().map_err(control_error)?;
     delivery.validate().map_err(control_error)?;
     Ok(delivery)
+}
+
+fn notification_delivery_matches_attention(
+    delivery: &NotificationDelivery,
+    attention: &AttentionItem,
+) -> bool {
+    notification_from_attention(attention).is_ok_and(|expected| *delivery == expected)
 }
 
 /// Derives a controller-owned correlation root from the immutable receipt ID.
@@ -338,6 +456,10 @@ fn to_i64(value: u64) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| {
         StoreError::Validation("operator presence version exceeds SQLite integer range".to_owned())
     })
+}
+
+fn non_negative_u64(value: i64, field: &str) -> Result<u64, StoreError> {
+    u64::try_from(value).map_err(|_| StoreError::Validation(format!("{field} is negative")))
 }
 fn mode_name(mode: OperatorPresenceMode) -> &'static str {
     match mode {
@@ -506,6 +628,29 @@ mod tests {
         assert!(replay.is_empty());
         assert_eq!(store.list_notification_deliveries(10).unwrap(), first);
         assert_eq!(first[0].created_at_ms, attention.opened_at_ms);
+        assert_eq!(
+            store
+                .notification_delivery_health()
+                .expect("delivery health"),
+            NotificationDeliveryHealth {
+                schema: "harness.notification-delivery-health.v1".to_owned(),
+                channel: "in_product_mirror".to_owned(),
+                current_attention_revisions: 1,
+                examined_current_revisions: 1,
+                delivered_examined_revisions: 1,
+                undelivered_examined_revisions: 0,
+                undelivered_critical_examined_revisions: 0,
+                undelivered_action_required_examined_revisions: 0,
+                failed_examined_revisions: 0,
+                unverified_delivery_examined_revisions: 0,
+                oldest_undelivered_opened_at_ms: None,
+                latest_verified_mirror_receipt_at_ms: Some(attention.opened_at_ms),
+                truncated: false,
+                desktop_delivery_enabled: false,
+                batching_enabled: false,
+                suppression_enabled: false,
+            }
+        );
         let correlation = notification_correlation_link(&first[0]).expect("correlation");
         assert_eq!(
             store
@@ -548,6 +693,64 @@ mod tests {
                 .refresh_notification_mirror()
                 .expect("no pending revisions")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn notification_delivery_health_is_bounded_and_does_not_refresh_the_mirror() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        for index in 0..=MAX_NOTIFICATION_HEALTH_ROWS {
+            let mut attention = test_attention();
+            attention.source.source_id = format!("health-approval-{index}");
+            attention.dedupe_key = format!("health-approval-task-{index}");
+            attention.opened_event_id = format!("health-event-{index}");
+            attention.opened_at_ms = i64::from(index);
+            attention.validate().expect("valid unique attention");
+            store
+                .upsert_source_attention(&attention)
+                .expect("open attention");
+        }
+
+        let health = store
+            .notification_delivery_health()
+            .expect("delivery health");
+        assert_eq!(health.current_attention_revisions, 201);
+        assert_eq!(health.examined_current_revisions, 200);
+        assert_eq!(health.delivered_examined_revisions, 0);
+        assert_eq!(health.undelivered_examined_revisions, 200);
+        assert_eq!(health.undelivered_action_required_examined_revisions, 200);
+        assert!(health.truncated);
+        assert_eq!(health.oldest_undelivered_opened_at_ms, Some(0));
+        assert!(store.list_notification_deliveries(200).unwrap().is_empty());
+    }
+
+    #[test]
+    fn notification_delivery_health_does_not_treat_a_failed_receipt_as_delivered() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let attention = test_attention();
+        store
+            .upsert_source_attention(&attention)
+            .expect("open attention");
+        let mut failed = notification_from_attention(&attention).expect("delivery");
+        failed.state = NotificationState::Failed;
+        failed.sha256 = failed.digest().expect("failed delivery digest");
+        store
+            .record_notification_delivery(&failed)
+            .expect("record failed receipt");
+
+        let health = store
+            .notification_delivery_health()
+            .expect("delivery health");
+        assert_eq!(health.delivered_examined_revisions, 0);
+        assert_eq!(health.undelivered_examined_revisions, 1);
+        assert_eq!(health.undelivered_action_required_examined_revisions, 1);
+        assert_eq!(health.failed_examined_revisions, 1);
+        assert_eq!(health.unverified_delivery_examined_revisions, 1);
+        assert_eq!(
+            health.oldest_undelivered_opened_at_ms,
+            Some(attention.opened_at_ms)
         );
     }
 

@@ -2075,6 +2075,70 @@ impl NotificationDelivery {
     }
 }
 
+/// Bounded, read-only health of the current in-product notification mirror.
+///
+/// Counters describe only the integrity-checked current attention revisions
+/// examined by the controller. A truncated result intentionally makes no
+/// whole-system health claim. This projection cannot send, defer, suppress,
+/// batch, or resolve a notification source.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationDeliveryHealth {
+    pub schema: String,
+    pub channel: String,
+    pub current_attention_revisions: u64,
+    pub examined_current_revisions: u64,
+    pub delivered_examined_revisions: u64,
+    pub undelivered_examined_revisions: u64,
+    pub undelivered_critical_examined_revisions: u64,
+    pub undelivered_action_required_examined_revisions: u64,
+    pub failed_examined_revisions: u64,
+    pub unverified_delivery_examined_revisions: u64,
+    pub oldest_undelivered_opened_at_ms: Option<i64>,
+    pub latest_verified_mirror_receipt_at_ms: Option<i64>,
+    pub truncated: bool,
+    pub desktop_delivery_enabled: bool,
+    pub batching_enabled: bool,
+    pub suppression_enabled: bool,
+}
+
+impl NotificationDeliveryHealth {
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.schema != "harness.notification-delivery-health.v1"
+            || self.channel != "in_product_mirror"
+            || self.examined_current_revisions > self.current_attention_revisions
+            || self.delivered_examined_revisions + self.undelivered_examined_revisions
+                != self.examined_current_revisions
+            || self.undelivered_critical_examined_revisions
+                + self.undelivered_action_required_examined_revisions
+                > self.undelivered_examined_revisions
+            || self.failed_examined_revisions > self.undelivered_examined_revisions
+            || self.unverified_delivery_examined_revisions > self.undelivered_examined_revisions
+            || self
+                .oldest_undelivered_opened_at_ms
+                .is_some_and(|value| value < 0)
+            || self
+                .latest_verified_mirror_receipt_at_ms
+                .is_some_and(|value| value < 0)
+            || self.desktop_delivery_enabled
+            || self.batching_enabled
+            || self.suppression_enabled
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "notification delivery health",
+                reason: "must be a bounded in-product mirror-only projection with internally consistent counters",
+            });
+        }
+        if self.truncated != (self.examined_current_revisions < self.current_attention_revisions) {
+            return Err(OperatorControlError::InvalidField {
+                field: "notification delivery health truncation",
+                reason: "must exactly report whether all current attention revisions were examined",
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotSectionState {
@@ -2428,6 +2492,57 @@ mod tests {
             AttentionState::Resolved
                 .validate_transition(AttentionState::Resolved, true)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn notification_delivery_health_is_closed_and_cannot_claim_disabled_capabilities() {
+        let health = NotificationDeliveryHealth {
+            schema: "harness.notification-delivery-health.v1".to_owned(),
+            channel: "in_product_mirror".to_owned(),
+            current_attention_revisions: 2,
+            examined_current_revisions: 2,
+            delivered_examined_revisions: 1,
+            undelivered_examined_revisions: 1,
+            undelivered_critical_examined_revisions: 1,
+            undelivered_action_required_examined_revisions: 0,
+            failed_examined_revisions: 0,
+            unverified_delivery_examined_revisions: 0,
+            oldest_undelivered_opened_at_ms: Some(1),
+            latest_verified_mirror_receipt_at_ms: Some(2),
+            truncated: false,
+            desktop_delivery_enabled: false,
+            batching_enabled: false,
+            suppression_enabled: false,
+        };
+        assert!(health.validate().is_ok());
+        let mut invalid = health.clone();
+        invalid.desktop_delivery_enabled = true;
+        assert!(invalid.validate().is_err());
+        let mut invalid = health;
+        invalid.current_attention_revisions = 3;
+        assert!(invalid.validate().is_err());
+        assert!(
+            serde_json::from_value::<NotificationDeliveryHealth>(serde_json::json!({
+                "schema": "harness.notification-delivery-health.v1",
+                "channel": "in_product_mirror",
+                "current_attention_revisions": 0,
+                "examined_current_revisions": 0,
+                "delivered_examined_revisions": 0,
+                "undelivered_examined_revisions": 0,
+                "undelivered_critical_examined_revisions": 0,
+                "undelivered_action_required_examined_revisions": 0,
+                "failed_examined_revisions": 0,
+                "unverified_delivery_examined_revisions": 0,
+                "oldest_undelivered_opened_at_ms": null,
+                "latest_verified_mirror_receipt_at_ms": null,
+                "truncated": false,
+                "desktop_delivery_enabled": false,
+                "batching_enabled": false,
+                "suppression_enabled": false,
+                "unexpected": true
+            }))
+            .is_err()
         );
     }
 

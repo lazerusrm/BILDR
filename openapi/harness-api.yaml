@@ -574,6 +574,17 @@ paths:
           content:
             application/json:
               schema: {type: array, items: {$ref: '#/components/schemas/NotificationDelivery'}}
+  /notification-delivery-health:
+    get:
+      tags: [Notifications]
+      operationId: getNotificationDeliveryHealth
+      description: Bounded integrity-checked health for current attention revisions. This read does not refresh, batch, suppress, send, or resolve a notification source.
+      responses:
+        '200':
+          description: Mirror-only delivery health. Counters are limited to examined revisions and are not a whole-system guarantee when truncated is true.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NotificationDeliveryHealth'}
   /attention:
     get:
       tags: [Attention]
@@ -2039,6 +2050,27 @@ components:
         created_at_ms: {type: integer, minimum: 0}
         payload_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
         sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    NotificationDeliveryHealth:
+      type: object
+      additionalProperties: false
+      required: [schema, channel, current_attention_revisions, examined_current_revisions, delivered_examined_revisions, undelivered_examined_revisions, undelivered_critical_examined_revisions, undelivered_action_required_examined_revisions, failed_examined_revisions, unverified_delivery_examined_revisions, oldest_undelivered_opened_at_ms, latest_verified_mirror_receipt_at_ms, truncated, desktop_delivery_enabled, batching_enabled, suppression_enabled]
+      properties:
+        schema: {const: harness.notification-delivery-health.v1}
+        channel: {const: in_product_mirror}
+        current_attention_revisions: {type: integer, minimum: 0}
+        examined_current_revisions: {type: integer, minimum: 0, maximum: 200}
+        delivered_examined_revisions: {type: integer, minimum: 0, maximum: 200}
+        undelivered_examined_revisions: {type: integer, minimum: 0, maximum: 200}
+        undelivered_critical_examined_revisions: {type: integer, minimum: 0, maximum: 200}
+        undelivered_action_required_examined_revisions: {type: integer, minimum: 0, maximum: 200}
+        failed_examined_revisions: {type: integer, minimum: 0, maximum: 200}
+        unverified_delivery_examined_revisions: {type: integer, minimum: 0, maximum: 200}
+        oldest_undelivered_opened_at_ms: {type: [integer, 'null'], minimum: 0}
+        latest_verified_mirror_receipt_at_ms: {type: [integer, 'null'], minimum: 0}
+        truncated: {type: boolean}
+        desktop_delivery_enabled: {const: false}
+        batching_enabled: {const: false}
+        suppression_enabled: {const: false}
     AttentionSourceRef:
       type: object
       additionalProperties: false

@@ -27,8 +27,8 @@ This status is intentionally a capability boundary, not release evidence.
 - bounded run topology table over durable run/task/attempt/agent/worktree and
   dependency facts; no graph layout or inferred links;
 - versioned local presence and deterministic, retry-safe in-product
-  notification-mirror receipts; delivery cannot close attention or change
-  controller authority;
+  notification-mirror receipts, plus bounded integrity-checked current-revision
+  delivery health; delivery cannot close attention or change controller authority;
 - bounded supervisor snapshots carrying control-plane custody facts and
   restricting actions to wait/pause-for-human whenever ownership is uncertain;
 - authenticated creation of an unreviewed, display-only knowledge candidate

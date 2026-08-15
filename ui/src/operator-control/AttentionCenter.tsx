@@ -15,6 +15,7 @@ import type {
   LivenessEpisode,
   MaterialProgressEvent,
   NotificationDelivery,
+  NotificationDeliveryHealth,
   OperatorPresence,
   OperatorPresenceMode,
   ReturnView,
@@ -32,6 +33,7 @@ export function AttentionCenter() {
   const [liveness, setLiveness] = useState<LivenessEpisode[]>([]);
   const [presence, setPresence] = useState<OperatorPresence>();
   const [notificationDeliveries, setNotificationDeliveries] = useState<NotificationDelivery[]>([]);
+  const [notificationHealth, setNotificationHealth] = useState<NotificationDeliveryHealth>();
   const [selectedLivenessEpisodeId, setSelectedLivenessEpisodeId] = useState<string>();
   const [interventionHistory, setInterventionHistory] = useState<InterventionHistory>({
     episodeId: undefined,
@@ -66,7 +68,7 @@ export function AttentionCenter() {
   const load = useCallback(async () => {
     setBusy("refresh");
     try {
-      const [nextSnapshot, nextReturnView, nextPage, nextInvestigations, nextConditions, nextProgress, nextLiveness, nextPresence, nextNotificationDeliveries] = await Promise.all([
+      const [nextSnapshot, nextReturnView, nextPage, nextInvestigations, nextConditions, nextProgress, nextLiveness, nextPresence, nextNotificationDeliveries, nextNotificationHealth] = await Promise.all([
         api.controlPlaneSnapshot(),
         api.controlPlaneReturnView(),
         api.attention(),
@@ -76,6 +78,7 @@ export function AttentionCenter() {
         api.liveness(),
         api.operatorPresence(),
         api.notificationDeliveries(),
+        api.notificationDeliveryHealth(),
       ]);
       setSnapshot(nextSnapshot);
       setReturnView(nextReturnView);
@@ -86,6 +89,7 @@ export function AttentionCenter() {
       setLiveness(nextLiveness);
       setPresence(nextPresence);
       setNotificationDeliveries(nextNotificationDeliveries);
+      setNotificationHealth(nextNotificationHealth);
       const runIds = nextSnapshot.runs.rows
         .map((row) => typeof row.run_id === "string" ? row.run_id : undefined)
         .filter((value): value is string => Boolean(value));
@@ -338,6 +342,7 @@ export function AttentionCenter() {
         <PresenceAndNotifications
           presence={presence}
           deliveries={notificationDeliveries}
+          health={notificationHealth}
           busy={busy === "presence"}
           onPresence={(mode) => void updatePresence(mode)}
         />
@@ -416,11 +421,13 @@ export function AttentionCenter() {
 function PresenceAndNotifications({
   presence,
   deliveries,
+  health,
   busy,
   onPresence,
 }: {
   presence?: OperatorPresence;
   deliveries: NotificationDelivery[];
+  health?: NotificationDeliveryHealth;
   busy: boolean;
   onPresence: (mode: OperatorPresenceMode) => void;
 }) {
@@ -442,6 +449,14 @@ function PresenceAndNotifications({
         <ul className="control-plane-support-list">
           {deliveries.map((delivery) => <li key={delivery.delivery_id}><div className="control-plane-static-record"><strong>{delivery.class.replaceAll("_", " ")}</strong><span>{delivery.state} · {delivery.channel.replaceAll("_", " ")}</span><small>{localTime(delivery.created_at_ms)} · {delivery.source_event_id}</small></div></li>)}
         </ul>
+      )}
+      {!health ? <p className="empty-state">Loading current delivery health…</p> : (
+        <p className="control-plane-note">
+          Mirror health examined <strong>{health.examined_current_revisions}</strong> of <strong>{health.current_attention_revisions}</strong> current attention revisions: <strong>{health.delivered_examined_revisions}</strong> verified receipt{health.delivered_examined_revisions === 1 ? "" : "s"} and <strong>{health.undelivered_examined_revisions}</strong> not currently verified.
+          {health.undelivered_critical_examined_revisions > 0 ? ` ${health.undelivered_critical_examined_revisions} critical revision${health.undelivered_critical_examined_revisions === 1 ? " is" : "s are"} not verified.` : ""}
+          {health.failed_examined_revisions > 0 ? ` ${health.failed_examined_revisions} examined receipt${health.failed_examined_revisions === 1 ? " is" : "s are"} recorded failed.` : ""}
+          {health.truncated ? " Results are bounded; unexamined current revisions are unknown." : ""}
+        </p>
       )}
       <p className="control-plane-note">This first phase records an in-product mirror only. It does not batch, suppress, send a desktop alert, or close the source attention item.</p>
     </section>
