@@ -172,6 +172,13 @@ pub(super) async fn notification_deliveries(api: &ApiClient) -> Result<Value> {
     api.get("/api/v1/notification-deliveries?limit=50").await
 }
 
+/// Read-only bounded health for the in-product mirror. The server computes
+/// integrity status from immutable receipts; this CLI command never refreshes
+/// a receipt or affects a source-owned attention lifecycle.
+pub(super) async fn notification_delivery_health(api: &ApiClient) -> Result<Value> {
+    api.get("/api/v1/notification-delivery-health").await
+}
+
 pub(super) async fn topology(api: &ApiClient, run_id: String) -> Result<Value> {
     let run_id: String = url::form_urlencoded::byte_serialize(run_id.as_bytes()).collect();
     api.get(&format!("/api/v1/runs/{run_id}/topology")).await

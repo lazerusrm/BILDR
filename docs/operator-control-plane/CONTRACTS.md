@@ -681,6 +681,8 @@ GET /api/v1/reconciliations/{id}/actions
 GET /api/v1/investigations/{id}
 GET /api/v1/external-conditions
 GET /api/v1/traces/{trace_id}
+GET /api/v1/notification-deliveries
+GET /api/v1/notification-delivery-health
 ```
 
 All list routes use stable cursor pagination and explicit limits.
@@ -730,6 +732,7 @@ harnessctl recovery list|show|findings|actions
 harnessctl investigation create|show|export
 harnessctl condition list|show|cancel
 harnessctl presence get|set
+harnessctl notification-deliveries|notification-health
 harnessctl topology show [--format table|json|dot]
 harnessctl trace show
 ```

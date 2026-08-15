@@ -94,6 +94,8 @@ enum Command {
     },
     /// Inspect bounded in-product notification-mirror receipts. This cannot deliver, retry, suppress, or resolve attention.
     NotificationDeliveries,
+    /// Inspect bounded integrity-checked health for current in-product mirror revisions. This cannot refresh, deliver, batch, suppress, or resolve attention.
+    NotificationHealth,
     /// Show the bounded factual topology for one run.
     Topology { run_id: String },
     /// Inspect reconciliation inventory records. These commands cannot apply recovery actions.
@@ -775,6 +777,7 @@ async fn execute(api: &ApiClient, command: Command) -> Result<Value> {
         Command::Trace { trace_id } => operator_control::trace(api, trace_id).await,
         Command::Presence { command } => operator_control::presence(api, command).await,
         Command::NotificationDeliveries => operator_control::notification_deliveries(api).await,
+        Command::NotificationHealth => operator_control::notification_delivery_health(api).await,
         Command::Topology { run_id } => operator_control::topology(api, run_id).await,
         Command::Recovery { command } => operator_control::recovery(api, command).await,
         Command::Worktree { command } => match command {
@@ -831,6 +834,20 @@ fn validate_local_url(url: &Url) -> Result<()> {
         bail!("harnessctl refuses non-loopback endpoint {host}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+
+    #[test]
+    fn notification_health_is_a_read_only_cli_command() {
+        let cli = Cli::try_parse_from(["harnessctl", "notification-health"])
+            .expect("notification health command parses");
+        assert!(matches!(cli.command, Command::NotificationHealth));
+    }
 }
 
 async fn integration_head(
