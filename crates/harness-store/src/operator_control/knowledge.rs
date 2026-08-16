@@ -15,7 +15,8 @@ use harness_domain::{
 };
 use harness_learning::{
     CustodyState, KnowledgeFreshness, KnowledgeItemV1, KnowledgeKind, KnowledgeReview,
-    KnowledgeScope, KnowledgeState, ReceiptKind, ReviewState, SourceReceipt,
+    KnowledgeScope, KnowledgeState, MAX_KNOWLEDGE_TOKEN_LEN, ReceiptKind, ReviewState,
+    SourceReceipt,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::json;
@@ -614,7 +615,7 @@ impl Store {
 fn validate_knowledge_review_input(input: &ReviewKnowledgeCandidate) -> Result<(), StoreError> {
     for value in [&input.knowledge_id, &input.reviewer_id] {
         if value.is_empty()
-            || value.len() > 128
+            || value.len() > MAX_KNOWLEDGE_TOKEN_LEN
             || !value.bytes().all(|byte| {
                 byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
             })
@@ -1332,13 +1333,15 @@ mod tests {
         let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
         let (repository_id, run_id) = insert_run(&store, temp.path());
         let base = now_ms().saturating_sub(10_000);
+        let task_family = "t".repeat(MAX_KNOWLEDGE_TOKEN_LEN);
+        let reviewer_id = "r".repeat(MAX_KNOWLEDGE_TOKEN_LEN);
         recovered_episode(&store, &run_id, "review-one", base);
         let selected = recovered_episode(&store, &run_id, "review-two", base + 100);
         let candidate_record = store
             .propose_knowledge_from_repeated_liveness(&NewLivenessKnowledgeCandidate {
                 episode_id: selected.episode_id.clone(),
                 expected_episode_sha256: selected.sha256.clone(),
-                task_family: "operator_control".to_owned(),
+                task_family: task_family.clone(),
                 model_family: None,
                 runtime_class: None,
             })
@@ -1350,7 +1353,7 @@ mod tests {
             knowledge_id: candidate.knowledge_id.clone(),
             expected_knowledge_sha256: candidate.sha256.clone(),
             decision: KnowledgeReviewDecision::Accept,
-            reviewer_id: "local-session-reviewer".to_owned(),
+            reviewer_id: reviewer_id.clone(),
         };
         let accepted = store
             .review_knowledge_candidate(&review)
@@ -1362,7 +1365,7 @@ mod tests {
         assert_eq!(active.review.state, ReviewState::Accepted);
         assert_eq!(
             active.review.reviewer_id.as_deref(),
-            Some("local-session-reviewer")
+            Some(reviewer_id.as_str())
         );
         assert!(active.review.receipt.is_some());
         assert_eq!(
@@ -1375,7 +1378,7 @@ mod tests {
             store
                 .resolved_active_knowledge(
                     &repository_id,
-                    "operator_control",
+                    &task_family,
                     u64::try_from(now_ms()).expect("non-negative now"),
                 )
                 .expect("trusted active display")

@@ -16,7 +16,7 @@ use harness_domain::{
 };
 use harness_learning::{
     CostAttribution, EditReason, FailureClass, FailureOccurrence, FailureScope, FailureWireCost,
-    MembershipAction, Severity, TerminalCode,
+    MAX_KNOWLEDGE_TOKEN_LEN, MembershipAction, Severity, TerminalCode,
 };
 use rusqlite::{OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
@@ -203,9 +203,10 @@ impl Store {
         runtime_class: Option<&str>,
         now: u64,
     ) -> Result<Vec<harness_learning::DisplayKnowledge>, StoreError> {
-        safe_eval_id(task_family, 128)?;
-        if model_family.is_some_and(|value| safe_eval_id(value, 128).is_err())
-            || runtime_class.is_some_and(|value| safe_eval_id(value, 128).is_err())
+        safe_eval_id(task_family, MAX_KNOWLEDGE_TOKEN_LEN)?;
+        if model_family.is_some_and(|value| safe_eval_id(value, MAX_KNOWLEDGE_TOKEN_LEN).is_err())
+            || runtime_class
+                .is_some_and(|value| safe_eval_id(value, MAX_KNOWLEDGE_TOKEN_LEN).is_err())
         {
             return Err(StoreError::Validation("invalid knowledge scope".into()));
         }
@@ -782,7 +783,7 @@ impl Store {
         &self,
         knowledge_id: &str,
     ) -> Result<harness_learning::KnowledgeItemV1, StoreError> {
-        safe_eval_id(knowledge_id, 128)?;
+        safe_eval_id(knowledge_id, MAX_KNOWLEDGE_TOKEN_LEN)?;
         let connection = self.connection()?;
         let record = connection
             .query_row(
@@ -812,7 +813,7 @@ impl Store {
         repository_id: &str,
         limit: u32,
     ) -> Result<Vec<harness_learning::KnowledgeItemV1>, StoreError> {
-        safe_eval_id(repository_id, 128)?;
+        safe_eval_id(repository_id, MAX_KNOWLEDGE_TOKEN_LEN)?;
         if limit == 0 || limit > MAX_KNOWLEDGE_PAGE_SIZE {
             return Err(StoreError::Validation(format!(
                 "knowledge item page limit must be 1..={MAX_KNOWLEDGE_PAGE_SIZE}"

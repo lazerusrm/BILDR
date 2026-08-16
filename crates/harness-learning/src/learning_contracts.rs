@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+/// The canonical `harness.knowledge-item.v1` and OpenAPI knowledge-token
+/// ceiling. Other learning/evaluation identifiers intentionally retain their
+/// narrower contract.
+pub const MAX_KNOWLEDGE_TOKEN_LEN: usize = 160;
+
 const SHA: usize = 64;
 const MAX_REJECTED_SUGGESTIONS: usize = 256;
 
@@ -133,27 +138,27 @@ impl KnowledgeItemV1 {
     }
     pub fn verify(&self) -> Result<(), LearningContractError> {
         if self.schema != "harness.knowledge-item.v1"
-            || !token(&self.knowledge_id)
+            || !knowledge_token(&self.knowledge_id)
             || self.statement.is_empty()
-            || !token(&self.scope.repository_id)
-            || !token(&self.scope.task_family)
+            || !knowledge_token(&self.scope.repository_id)
+            || !knowledge_token(&self.scope.task_family)
             || self
                 .scope
                 .model_family
                 .as_deref()
-                .is_some_and(|id| !token(id))
+                .is_some_and(|id| !knowledge_token(id))
             || self
                 .scope
                 .runtime_class
                 .as_deref()
-                .is_some_and(|id| !token(id))
+                .is_some_and(|id| !knowledge_token(id))
             || self.evidence.is_empty()
             || self.confidence_milli > 1000
             || self.freshness.created_at > self.freshness.revalidate_after
             || self.freshness.revalidate_after > self.freshness.expires_at
-            || !unique_tokens(&self.contradicts)
-            || !unique_tokens(&self.supersedes)
-            || self.evidence.iter().any(|e| !valid_receipt(e))
+            || !unique_knowledge_tokens(&self.contradicts)
+            || !unique_knowledge_tokens(&self.supersedes)
+            || self.evidence.iter().any(|e| !valid_knowledge_receipt(e))
             || self
                 .evidence
                 .iter()
@@ -164,9 +169,9 @@ impl KnowledgeItemV1 {
                 .review
                 .reviewer_id
                 .as_deref()
-                .is_some_and(|id| !token(id))
+                .is_some_and(|id| !knowledge_token(id))
             || self.review.receipt.as_ref().is_some_and(|r| {
-                !valid_receipt(r)
+                !valid_knowledge_receipt(r)
                     || r.kind != ReceiptKind::HumanReview
                     || r.revision_id == self.knowledge_id
             })
@@ -539,12 +544,22 @@ pub fn suggest_candidates(
 fn valid_receipt(r: &SourceReceipt) -> bool {
     token(&r.revision_id) && hash(&r.digest)
 }
+fn valid_knowledge_receipt(r: &SourceReceipt) -> bool {
+    knowledge_token(&r.revision_id) && hash(&r.digest)
+}
 fn clean_development(r: &SourceReceipt) -> bool {
     r.split == Some(EvalSplit::Development) && r.custody == Some(CustodyState::Clean)
 }
 fn token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+}
+fn knowledge_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_KNOWLEDGE_TOKEN_LEN
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
@@ -563,6 +578,10 @@ fn hash40(value: &str) -> bool {
 }
 fn unique_tokens(values: &[String]) -> bool {
     values.iter().all(|v| token(v)) && values.iter().collect::<BTreeSet<_>>().len() == values.len()
+}
+fn unique_knowledge_tokens(values: &[String]) -> bool {
+    values.iter().all(|v| knowledge_token(v))
+        && values.iter().collect::<BTreeSet<_>>().len() == values.len()
 }
 fn digest<T: Serialize>(value: &T) -> Result<String, LearningContractError> {
     let mut v = serde_json::to_value(value).map_err(|_| LearningContractError::Digest)?;
@@ -665,6 +684,28 @@ mod tests {
         item.review.receipt = None;
         item.sha256 = digest(&item).unwrap();
         assert!(item.verify().is_err());
+    }
+    #[test]
+    fn knowledge_tokens_accept_the_contract_ceiling_and_reject_one_more_byte() {
+        let mut at_ceiling = active(10);
+        let token = |byte| byte.to_string().repeat(MAX_KNOWLEDGE_TOKEN_LEN);
+        at_ceiling.knowledge_id = token('a');
+        at_ceiling.scope.repository_id = token('b');
+        at_ceiling.scope.task_family = token('c');
+        at_ceiling.scope.model_family = Some(token('d'));
+        at_ceiling.scope.runtime_class = Some(token('e'));
+        at_ceiling.evidence[0].revision_id = token('f');
+        at_ceiling.review.reviewer_id = Some(token('g'));
+        at_ceiling.review.receipt.as_mut().unwrap().revision_id = token('h');
+        at_ceiling.contradicts = vec![token('i')];
+        at_ceiling.supersedes = vec![token('j')];
+        at_ceiling.sha256 = digest(&at_ceiling).unwrap();
+        assert!(at_ceiling.verify().is_ok());
+
+        let mut too_long = at_ceiling;
+        too_long.knowledge_id.push('a');
+        too_long.sha256 = digest(&too_long).unwrap();
+        assert!(too_long.verify().is_err());
     }
     #[test]
     fn bundle_and_candidate_are_exactly_one_safe_edit() {

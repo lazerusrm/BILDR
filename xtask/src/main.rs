@@ -2141,6 +2141,15 @@ mod tests {
         let mut free_text_reviewer = example;
         free_text_reviewer["review"]["reviewer_id"] = json!("operator name");
         assert!(!validator.is_valid(&free_text_reviewer));
+
+        let mut at_contract_ceiling: Value = serde_json::from_str(include_str!(
+            "../../examples/self-improvement/knowledge-item.example.json"
+        ))
+        .unwrap();
+        at_contract_ceiling["knowledge_id"] = json!("a".repeat(160));
+        assert!(validator.is_valid(&at_contract_ceiling));
+        at_contract_ceiling["knowledge_id"] = json!("a".repeat(161));
+        assert!(!validator.is_valid(&at_contract_ceiling));
     }
 
     #[test]
