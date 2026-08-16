@@ -37,6 +37,7 @@ const IMPROVEMENT_RUST_FILE_LINE_BUDGET: usize = 1_200;
 const IMPROVEMENT_UI_FILE_LINE_BUDGET: usize = 1_200;
 const OPERATOR_CONTROL_FAULT_TIMEOUT: Duration = Duration::from_secs(300);
 const OPERATOR_CONTROL_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const OPERATOR_CONTROL_FAULT_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_OPERATOR_CONTROL_PIPE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -320,6 +321,7 @@ enum FaultExecution {
     TimedOut {
         stdout: FaultPipe,
         stderr: FaultPipe,
+        containment_issue: Option<String>,
     },
     SpawnFailed(String),
     WaitFailed {
@@ -364,21 +366,38 @@ fn run_fault_command(command: &mut Command) -> FaultExecution {
                 thread::sleep(Duration::from_millis(25));
             }
             Ok(None) => {
-                terminate_fault_command(&mut child);
-                let _ = child.wait();
-                break;
+                let containment_issue = terminate_fault_command(&mut child);
+                let reap_issue = reap_fault_child(&mut child).err();
+                let stdout = collect_child_pipe(stdout);
+                let stderr = collect_child_pipe(stderr);
+                return FaultExecution::TimedOut {
+                    stdout,
+                    stderr,
+                    containment_issue: combine_fault_issues(containment_issue, reap_issue),
+                };
             }
             Err(error) => {
-                wait_error = Some(error.to_string());
-                terminate_fault_command(&mut child);
-                let _ = child.wait();
+                let containment_issue = terminate_fault_command(&mut child);
+                let reap_issue = reap_fault_child(&mut child).err();
+                wait_error = Some(
+                    combine_fault_issues(Some(error.to_string()), containment_issue)
+                        .map(|issue| {
+                            combine_fault_issues(Some(issue), reap_issue)
+                                .expect("combined wait issue remains present")
+                        })
+                        .expect("wait failure remains present"),
+                );
                 break;
             }
         }
     }
-    let completion_issue = terminal
-        .as_ref()
-        .and_then(|_| terminate_fault_process_group(child.id()));
+    let completion_issue =
+        terminal
+            .as_ref()
+            .and_then(|_| match terminate_fault_process_group(child.id()) {
+                Ok(issue) => issue,
+                Err(error) => Some(error),
+            });
     let stdout = collect_child_pipe(stdout);
     let stderr = collect_child_pipe(stderr);
     if let Some(error) = wait_error {
@@ -395,21 +414,70 @@ fn run_fault_command(command: &mut Command) -> FaultExecution {
             completion_issue,
         }
     } else {
-        FaultExecution::TimedOut { stdout, stderr }
+        FaultExecution::TimedOut {
+            stdout,
+            stderr,
+            containment_issue: Some(
+                "fault command ended without a terminal process status".to_owned(),
+            ),
+        }
     }
 }
 
-fn terminate_fault_command(child: &mut Child) {
-    if terminate_fault_process_group(child.id()).is_some() {
-        return;
+fn combine_fault_issues(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+        (Some(issue), None) | (None, Some(issue)) => Some(issue),
+        (None, None) => None,
     }
-    let _ = child.kill();
 }
 
-/// Returns a diagnostic when a process group required active containment. A
-/// normal completed test has no group members after Cargo exits, so any member
-/// left here turns the receipt into infrastructure-unavailable evidence.
-fn terminate_fault_process_group(pid: u32) -> Option<String> {
+/// Contain the process group and then the direct child if group containment
+/// could not prove closure. The caller must still use [`reap_fault_child`] so
+/// an unkillable process cannot block the promotion runner forever.
+fn terminate_fault_command(child: &mut Child) -> Option<String> {
+    match terminate_fault_process_group(child.id()) {
+        Ok(Some(issue)) => Some(issue),
+        Ok(None) => match child.kill() {
+            Ok(()) => {
+                Some("fault process group was absent; direct child was terminated".to_owned())
+            }
+            Err(error) => Some(format!(
+                "fault process group was absent and direct child termination failed: {error}"
+            )),
+        },
+        Err(group_error) => match child.kill() {
+            Ok(()) => Some(format!(
+                "{group_error}; direct child termination was required"
+            )),
+            Err(child_error) => Some(format!(
+                "{group_error}; direct child termination failed: {child_error}"
+            )),
+        },
+    }
+}
+
+fn reap_fault_child(child: &mut Child) -> Result<ExitStatus, String> {
+    let deadline = Instant::now() + OPERATOR_CONTROL_FAULT_REAP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                return Err(format!(
+                    "fault child did not exit within {} seconds after containment",
+                    OPERATOR_CONTROL_FAULT_REAP_TIMEOUT.as_secs()
+                ));
+            }
+            Err(error) => return Err(format!("fault child reaping failed: {error}")),
+        }
+    }
+}
+
+/// A normal completed test has no group members after Cargo exits. Any member
+/// left here is forcibly contained and marks the evidence unavailable; an OS
+/// error is distinct because it leaves closure unproven.
+fn terminate_fault_process_group(pid: u32) -> Result<Option<String>, String> {
     #[cfg(unix)]
     {
         use rustix::{
@@ -419,17 +487,17 @@ fn terminate_fault_process_group(pid: u32) -> Option<String> {
 
         if let Some(group) = pid.try_into().ok().and_then(Pid::from_raw) {
             return match kill_process_group(group, Signal::KILL) {
-                Ok(()) => {
-                    Some("fault process group retained descendants after Cargo exited".to_owned())
-                }
-                Err(Errno::SRCH) => None,
-                Err(error) => Some(format!(
-                    "could not prove the fault process group was empty: {error}"
+                Ok(()) => Ok(Some(
+                    "fault process group retained descendants after Cargo exited".to_owned(),
+                )),
+                Err(Errno::SRCH) => Ok(None),
+                Err(error) => Err(format!(
+                    "could not prove fault process-group closure: {error}"
                 )),
             };
         }
     }
-    None
+    Ok(None)
 }
 
 fn read_child_pipe<R>(mut pipe: R) -> Receiver<Result<FaultPipe, std::io::Error>>
@@ -505,15 +573,25 @@ fn fault_transcript(selector: &str, execution: &FaultExecution) -> String {
                     |issue| Some(format!("capture: incomplete\n{issue}")),
                 ),
         ),
-        FaultExecution::TimedOut { stdout, stderr } => (
+        FaultExecution::TimedOut {
+            stdout,
+            stderr,
+            containment_issue,
+        } => (
             "timed_out",
             "unavailable".to_owned(),
             stdout.bytes.as_slice(),
             stderr.bytes.as_slice(),
-            Some(format!(
-                "timeout_seconds: {}",
-                OPERATOR_CONTROL_FAULT_TIMEOUT.as_secs()
-            )),
+            Some(match containment_issue {
+                Some(issue) => format!(
+                    "timeout_seconds: {}\ncontainment: {issue}",
+                    OPERATOR_CONTROL_FAULT_TIMEOUT.as_secs()
+                ),
+                None => format!(
+                    "timeout_seconds: {}\ncontainment: complete",
+                    OPERATOR_CONTROL_FAULT_TIMEOUT.as_secs()
+                ),
+            }),
         ),
         FaultExecution::SpawnFailed(error) => (
             "spawn_failed",
@@ -862,6 +940,21 @@ fn schema_check(root: &Path) -> Result<()> {
         compile_schema(&schema.path, &schema.value, &registry)?;
     }
     let examples = validate_schema_examples(&root.join("examples"), &schemas, &registry)?;
+    let investigation_schema = schemas
+        .get("harness.investigation-artifact.v1")
+        .context("investigation artifact schema is missing")?;
+    let investigation_validator = compile_schema(
+        &investigation_schema.path,
+        &investigation_schema.value,
+        &registry,
+    )?;
+    let investigation_fixture =
+        read_json(&root.join("examples/investigation-artifact.example.json"))?;
+    for (label, invalid) in investigation_artifact_invalid_static_cases(&investigation_fixture) {
+        if investigation_validator.validate(&invalid).is_ok() {
+            bail!("Investigation artifact JSON Schema accepted {label}")
+        }
+    }
     let _: toml::Value = toml::from_str(&fs::read_to_string(
         root.join("config/harness.example.toml"),
     )?)?;
@@ -1049,6 +1142,8 @@ fn openapi_check(root: &Path) -> Result<()> {
         read_json(&root.join("examples/openapi/notification-delivery-health.example.json"))?;
     let liveness_knowledge_candidate_fixture =
         read_json(&root.join("examples/openapi/liveness-knowledge-candidate.example.json"))?;
+    let investigation_artifact_fixture =
+        read_json(&root.join("examples/openapi/investigation-artifact.example.json"))?;
     let registry = jsonschema::Registry::new()
         .prepare()
         .context("failed to prepare OpenAPI JSON Schema registry")?;
@@ -1073,6 +1168,19 @@ fn openapi_check(root: &Path) -> Result<()> {
         liveness_knowledge_candidate_validator.validate(&liveness_knowledge_candidate_fixture)
     {
         bail!("LivenessKnowledgeCandidate fixture does not conform to OpenAPI: {error}")
+    }
+    let investigation_artifact_schema = openapi_component_schema(&value, "InvestigationArtifact")?;
+    let investigation_artifact_validator =
+        compile_schema(&path, &investigation_artifact_schema, &registry)?;
+    if let Err(error) = investigation_artifact_validator.validate(&investigation_artifact_fixture) {
+        bail!("InvestigationArtifact fixture does not conform to OpenAPI: {error}")
+    }
+    for (label, invalid) in
+        investigation_artifact_invalid_static_cases(&investigation_artifact_fixture)
+    {
+        if investigation_artifact_validator.validate(&invalid).is_ok() {
+            bail!("InvestigationArtifact OpenAPI contract accepted {label}")
+        }
     }
     validate_run_detail_supervision_contract(&value)?;
     validate_operator_settings_supervision_contract(&value)?;
@@ -1102,11 +1210,30 @@ fn openapi_check(root: &Path) -> Result<()> {
         )
     }
     println!(
-        "openapi-check: {} local references resolved; RuntimeStatus/NotificationDeliveryHealth/LivenessKnowledgeCandidate fixtures and supervisory RunDetail/operator settings contracts conform; {} router paths match",
+        "openapi-check: {} local references resolved; RuntimeStatus/NotificationDeliveryHealth/LivenessKnowledgeCandidate/InvestigationArtifact fixtures and supervisory RunDetail/operator settings contracts conform; {} router paths match",
         pointers.len(),
         documented_routes.len()
     );
     Ok(())
+}
+
+fn investigation_artifact_invalid_static_cases(fixture: &Value) -> Vec<(&'static str, Value)> {
+    let mut empty_conclusions = fixture.clone();
+    empty_conclusions["findings"] = json!([]);
+    empty_conclusions["recommendations"] = json!([]);
+    empty_conclusions["decision_inventory"] = json!([]);
+
+    let mut external_evidence = fixture.clone();
+    external_evidence["findings"][0]["evidence_refs"] = json!(["artifact:external"]);
+
+    let mut external_artifact = fixture.clone();
+    external_artifact["artifact_refs"] = json!(["artifact:external"]);
+
+    vec![
+        ("empty conclusions", empty_conclusions),
+        ("external conclusion evidence", external_evidence),
+        ("external artifact reference", external_artifact),
+    ]
 }
 
 fn validate_run_detail_supervision_contract(openapi: &serde_yaml::Value) -> Result<()> {

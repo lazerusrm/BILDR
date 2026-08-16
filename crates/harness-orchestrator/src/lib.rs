@@ -28,8 +28,7 @@ use harness_domain::{
     ConditionObservationId, DecisionInventoryItem, DiffBudget, EvidenceId, ExpertRequestId,
     ExpertResponseId, ExternalCondition, ExternalConditionAdapter, ExternalConditionOwnerType,
     ExternalConditionState, InvestigationArtifact, InvestigationArtifactId, InvestigationFinding,
-    InvestigationRecommendation, InvestigationSensitivity, OwnershipProof, OwnershipProofId,
-    ProofTier, ReconciliationActionKind, ReconciliationActionReceipt, RepositoryId,
+    InvestigationRecommendation, InvestigationSensitivity, ProofTier, RepositoryId,
     RepositorySummary, ResourceClass, ResultClass, RiskLevel, RunId, RunPlan, RunState, RunSummary,
     RuntimeStatus, SandboxMode, SchedulerStatus, SupervisorActionId, SupervisorDecisionId,
     SupervisorMode, SupervisorReviewId, TaskExecutionKind, TaskId, TaskPacket, TaskState,
@@ -13653,7 +13652,7 @@ impl Orchestrator {
         &self,
         task_id: &TaskId,
         request: RetryTaskRequest,
-        actor: &str,
+        _actor: &str,
     ) -> Result<OperationAccepted, OrchestratorError> {
         if request.reason.chars().count() > 4_000
             || request
@@ -13692,213 +13691,10 @@ impl Orchestrator {
                 task.state
             )));
         }
-        let (attempt_id, mut packet) = self
-            .store
-            .task_packet(task_id)?
-            .ok_or_else(|| OrchestratorError::Blocked("task has no prior packet".to_owned()))?;
-        let prior = self.store.latest_attempt_context(task_id)?.ok_or_else(|| {
-            OrchestratorError::Blocked("task has no prior attempt context".to_owned())
-        })?;
-        if prior.attempt_id != attempt_id
-            || !matches!(prior.state.as_str(), "FAILED" | "INTERRUPTED" | "STALLED")
-        {
-            return Err(OrchestratorError::Blocked(
-                "fresh retry requires a terminal FAILED, INTERRUPTED, or STALLED prior attempt; preserve or reconcile other states first"
-                    .to_owned(),
-            ));
-        }
-        if !self.store.fresh_attempt_custody_is_closed(&attempt_id)? {
-            return Err(OrchestratorError::Blocked(
-                "fresh retry requires no active path lease/agent and no prior command effects; record reconciliation evidence instead of releasing custody or assuming effects are closed"
-                    .to_owned(),
-            ));
-        }
-        let (worktree_id, worktree_path, _, stored_head) =
-            self.store.worktree_for_attempt(&attempt_id)?;
-        let worktree = self
-            .store
-            .list_worktrees(Some(&task.run_id))?
-            .into_iter()
-            .find(|worktree| worktree.id == worktree_id)
-            .ok_or_else(|| OrchestratorError::Protocol("prior worktree disappeared".to_owned()))?;
-        if worktree.state != "PRESERVED" {
-            return Err(OrchestratorError::Blocked(
-                "fresh retry requires an explicitly preserved prior worktree".to_owned(),
-            ));
-        }
-        let head_sha = self.git.head_sha(&worktree_path).await?;
-        if stored_head.as_deref() != Some(head_sha.as_str())
-            || task.head_sha.as_deref() != Some(head_sha.as_str())
-        {
-            return Err(OrchestratorError::Conflict(
-                "preserved worktree HEAD no longer matches the controller-recorded attempt head"
-                    .to_owned(),
-            ));
-        }
-        let diff = self
-            .git
-            .diff_summary(&worktree_path, &worktree.base_sha)
-            .await?;
-        if diff.dirty {
-            return Err(OrchestratorError::Blocked(
-                "fresh retry refuses a dirty preserved worktree; commit or explicitly reconcile the candidate before transferring custody"
-                    .to_owned(),
-            ));
-        }
-        let worktree_fingerprint = self.git.worktree_fingerprint(&worktree_path).await?;
-        let governing = packet_uses_governor(&packet);
-        if !governing && request.additional_token_budget > 0 {
-            return Err(OrchestratorError::Validation(
-                "additional token budget is available only for governor retries; worker retries use the controller-assigned role budget"
-                    .to_owned(),
-            ));
-        }
-        let reason = if request.reason.trim().is_empty() {
-            "Operator requested a fresh attempt from the proven preserved candidate".to_owned()
-        } else {
-            format!("Optional operator guidance: {}", request.reason.trim())
-        };
-        if let Some(objective) = request
-            .revised_objective
-            .filter(|objective| !objective.trim().is_empty())
-        {
-            packet.objective = objective;
-        }
-        packet.token_budget = packet
-            .token_budget
-            .saturating_add(request.additional_token_budget)
-            .min(MAX_GOVERNOR_ATTEMPT_TOKENS);
-        if request.model_route == "escalate_terra" && !governing {
-            packet.owner_profile = "worker_escalation".to_owned();
-        }
-        if !governing {
-            packet.token_budget = controller_task_token_budget(
-                &packet,
-                self.config.orchestration.default_task_token_budget,
-            );
-        }
-        packet.base_sha = head_sha.clone();
-        packet
-            .validate_execution_contract()
-            .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
-        let run = self.store.run(&task.run_id)?;
-        let custody_material = serde_json::to_vec(&json!({
-            "run_id": run.id,
-            "task_id": task.id,
-            "prior_attempt_id": attempt_id,
-            "worktree_id": worktree_id,
-            "head_sha": head_sha,
-            "worktree_fingerprint": worktree_fingerprint,
-            "task_version": task.version,
-        }))?;
-        let custody_digest = hex::encode(Sha256::digest(&custody_material));
-        let source_event_id = format!("fresh-attempt-proof-{}", &custody_digest[..40]);
-        let mut proof = OwnershipProof {
-            schema: "harness.exclusive-ownership-proof.v1".to_owned(),
-            proof_id: OwnershipProofId::new(),
-            run_id: run.id.to_string(),
-            task_id: task.id.to_string(),
-            prior_attempt_id: attempt_id.to_string(),
-            worktree_id: worktree_id.to_string(),
-            source_event_id,
-            head_sha: head_sha.clone(),
-            worktree_fingerprint: worktree_fingerprint.clone(),
-            lease_generation: 0,
-            process_state: "proven_absent".to_owned(),
-            session_state: "proven_closed".to_owned(),
-            command_state: "terminal_or_none".to_owned(),
-            external_effect_state: "none_or_reconciled".to_owned(),
-            candidate_state: "preserved".to_owned(),
-            approved_actions: vec!["authorize_fresh_attempt".to_owned()],
-            expires_at_ms: now_ms().saturating_add(60_000),
-            sha256: String::new(),
-        };
-        proof.sha256 = proof
-            .digest()
-            .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
-        let proof = self.store.record_ownership_proof(&proof)?;
-        let human_action_id = self.store.record_human_action(
-            Some(&task.run_id),
-            Some(&attempt_id),
-            actor,
-            "retry_task",
-            "task",
-            task_id.as_str(),
-            &json!({
-                "reason": reason,
-                "model_route": if governing { "same" } else { request.model_route.as_str() },
-                "additional_token_budget": request.additional_token_budget,
-                "packet_sha256": packet_digest(&packet)?,
-                "proof_id": proof.proof_id,
-                "worktree_fingerprint": worktree_fingerprint,
-            }),
-        )?;
-        let reconciliation =
-            self.record_reconciliation_inventory(&run, "operator fresh-attempt authorization")?;
-        let replacement = NewTaskAttempt {
-            id: AttemptId::new(),
-            task_id: task.id.clone(),
-            attempt_number: task.attempt.saturating_add(1),
-            state: "AUTHORIZED".to_owned(),
-            packet: packet.clone(),
-            packet_sha256: packet_digest(&packet)?,
-            base_sha: head_sha,
-            requested_model_route: if governing {
-                self.governor_route(&run)?.model
-            } else if packet.is_high_risk() || packet.owner_profile == "worker_escalation" {
-                self.profile_for_run(&run)?
-                    .profile
-                    .models
-                    .worker_escalation
-                    .model
-            } else {
-                self.profile_for_run(&run)?.profile.models.worker.model
-            },
-        };
-        let mut receipt = ReconciliationActionReceipt {
-            schema: "harness.reconciliation-action-receipt.v1".to_owned(),
-            episode_id: reconciliation.episode_id.clone(),
-            kind: ReconciliationActionKind::AuthorizeFreshAttempt,
-            source_event_id: format!("fresh-attempt-authorize-{}", proof.proof_id),
-            authority_event_id: Some(proof.source_event_id.clone()),
-            created_at_ms: now_ms(),
-            payload: json!({
-                "proof_id": proof.proof_id,
-                "run_id": proof.run_id,
-                "task_id": proof.task_id,
-                "prior_attempt_id": proof.prior_attempt_id,
-                "worktree_id": proof.worktree_id,
-                "head_sha": proof.head_sha,
-                "worktree_fingerprint": proof.worktree_fingerprint,
-                "lease_generation": proof.lease_generation,
-                "replacement_attempt_id": replacement.id,
-                "human_action_id": human_action_id,
-                "reason": reason,
-            }),
-            sha256: String::new(),
-        };
-        receipt.sha256 = receipt
-            .digest()
-            .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
-        self.store.consume_ownership_proof_for_fresh_attempt(
-            &proof.proof_id,
-            &receipt,
-            reconciliation.version,
-            &replacement,
-            task.version,
-        )?;
-        self.emit_run_event(
-            &run,
-            "task.fresh_attempt_authorized",
-            json!({
-                "task_id": task.id,
-                "prior_attempt_id": attempt_id,
-                "replacement_attempt_id": replacement.id,
-                "proof_id": proof.proof_id,
-                "reconciliation_episode_id": reconciliation.episode_id,
-            }),
-        )?;
-        Ok(operation("retry_task", task_id.as_str()))
+        Err(OrchestratorError::Blocked(
+            "fresh retry is unavailable until an authoritative runtime reconciliation issuer records custody closure evidence; the operator route cannot self-issue exclusive-ownership proof"
+                .to_owned(),
+        ))
     }
 
     pub async fn request_task_review(
@@ -18518,8 +18314,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_retry_consumes_a_proven_preserved_candidate_once() {
-        let (orchestrator, _temp, run_id, task_id, candidate_sha) = fresh_retry_fixture().await;
+    async fn retry_task_refuses_to_self_issue_an_exclusive_ownership_proof() {
+        let (orchestrator, _temp, run_id, task_id, _candidate_sha) = fresh_retry_fixture().await;
         let request = RetryTaskRequest {
             reason: "Recover the fixture candidate".to_owned(),
             revised_objective: None,
@@ -18527,58 +18323,32 @@ mod tests {
             additional_token_budget: 0,
         };
 
-        orchestrator
+        let error = orchestrator
             .retry_task(&task_id, request, "test-operator")
             .await
-            .expect("fresh retry is authorized");
-        let authorized = orchestrator
-            .store()
-            .authorized_fresh_attempt(&task_id)
-            .expect("authorized lookup")
-            .expect("one fresh attempt");
-        assert_eq!(authorized.base_sha, candidate_sha);
-        assert_eq!(authorized.packet.base_sha, candidate_sha);
+            .expect_err("operator retry cannot mint exclusive ownership proof");
+        assert!(matches!(
+            error,
+            OrchestratorError::Blocked(message)
+                if message.contains("cannot self-issue exclusive-ownership proof")
+        ));
         assert_eq!(
             orchestrator.store().task(&task_id).expect("task").state,
-            TaskState::Ready
+            TaskState::Failed
         );
-        let episode = orchestrator
-            .store()
-            .list_reconciliation_episodes(Some(run_id.as_str()), 10)
-            .expect("reconciliation episodes")
-            .into_iter()
-            .next()
-            .expect("reconciliation episode");
-        let actions = orchestrator
-            .store()
-            .list_reconciliation_action_receipts(&episode.episode_id, 10)
-            .expect("fresh-attempt receipt");
-        assert_eq!(actions.len(), 1);
-        assert_eq!(
-            actions[0].kind,
-            ReconciliationActionKind::AuthorizeFreshAttempt
-        );
-
-        orchestrator
-            .retry_task(
-                &task_id,
-                RetryTaskRequest {
-                    reason: "duplicate request".to_owned(),
-                    revised_objective: None,
-                    model_route: "same".to_owned(),
-                    additional_token_budget: 0,
-                },
-                "test-operator",
-            )
-            .await
-            .expect("duplicate authorization is idempotent");
-        assert_eq!(
+        assert!(
             orchestrator
                 .store()
-                .list_reconciliation_action_receipts(&episode.episode_id, 10)
-                .expect("receipts reread")
-                .len(),
-            1
+                .authorized_fresh_attempt(&task_id)
+                .expect("authorized lookup")
+                .is_none()
+        );
+        assert!(
+            orchestrator
+                .store()
+                .list_reconciliation_episodes(Some(run_id.as_str()), 10)
+                .expect("reconciliation episodes")
+                .is_empty()
         );
     }
 

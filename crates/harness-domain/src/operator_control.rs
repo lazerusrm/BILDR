@@ -2931,6 +2931,65 @@ mod tests {
     }
 
     #[test]
+    fn investigation_artifacts_require_one_bound_context_and_real_conclusions() {
+        let context = "b".repeat(SHA256_HEX_LEN);
+        let context_ref = format!("context:{context}");
+        let mut artifact = InvestigationArtifact {
+            schema: "harness.investigation-artifact.v1".to_owned(),
+            artifact_id: InvestigationArtifactId::parse("investigation-artifact").unwrap(),
+            run_id: "run-1".to_owned(),
+            task_id: "task-1".to_owned(),
+            attempt_id: "attempt-1".to_owned(),
+            question: "Why is the controller rejecting this contract?".to_owned(),
+            scope: InvestigationScope {
+                owned_read_paths: vec!["crates/harness-domain/src/operator_control.rs".to_owned()],
+                forbidden_paths: vec![],
+                time_budget_ms: 60_000,
+                token_budget: 8_000,
+            },
+            base_sha: "a".repeat(40),
+            repository_state_digest: context,
+            methods: vec!["bounded immutable-context review".to_owned()],
+            sources: vec![context_ref.clone()],
+            findings: vec![InvestigationFinding {
+                finding_id: "finding-1".to_owned(),
+                classification: InvestigationFindingClassification::Confirmed,
+                summary: "The evidence is controller-bound.".to_owned(),
+                confidence_milli: 900,
+                evidence_refs: vec![context_ref],
+                affected_refs: vec!["task:task-1".to_owned()],
+                risk: AttentionSeverity::High,
+                limitations: vec![],
+            }],
+            recommendations: vec![],
+            decision_inventory: vec![],
+            limitations: vec![],
+            rejected_hypotheses: vec![],
+            sensitivity: InvestigationSensitivity::Internal,
+            artifact_refs: vec![],
+            created_at_ms: 1,
+            sha256: String::new(),
+        };
+        artifact.sha256 = artifact.digest().unwrap();
+        assert!(artifact.validate().is_ok());
+
+        let mut unbound = artifact.clone();
+        unbound.findings[0].evidence_refs = vec![format!("context:{}", "c".repeat(SHA256_HEX_LEN))];
+        unbound.sha256 = unbound.digest().unwrap();
+        assert!(unbound.validate().is_err());
+
+        let mut external = artifact.clone();
+        external.artifact_refs = vec!["artifact:external".to_owned()];
+        external.sha256 = external.digest().unwrap();
+        assert!(external.validate().is_err());
+
+        let mut empty = artifact;
+        empty.findings.clear();
+        empty.sha256 = empty.digest().unwrap();
+        assert!(empty.validate().is_err());
+    }
+
+    #[test]
     fn investigation_packets_require_a_bounded_scope_and_direct_base() {
         let mut packet: crate::TaskPacket = serde_json::from_value(serde_json::json!({
             "schema": "harness.orchestration.task.v1",

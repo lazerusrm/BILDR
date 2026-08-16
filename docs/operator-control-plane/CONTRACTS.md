@@ -268,7 +268,7 @@ A browser acknowledgement, task terminal state, model statement, or free-form
 ```json
 {
   "schema": "harness.investigation-artifact.v1",
-  "investigation_id": "investigation-...",
+  "artifact_id": "investigation-artifact-1",
   "run_id": "run-...",
   "task_id": "task-...",
   "attempt_id": "attempt-...",
@@ -279,19 +279,28 @@ A browser acknowledgement, task terminal state, model statement, or free-form
     "time_budget_ms": 1800000,
     "token_budget": 40000
   },
-  "base_sha": "40-hex",
-  "repository_state_digest": "64-hex",
-  "methods": [],
-  "sources": [],
-  "findings": [],
+  "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "repository_state_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "methods": ["bounded immutable-context review"],
+  "sources": ["context:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+  "findings": [{
+    "finding_id": "finding-1",
+    "classification": "confirmed",
+    "summary": "The two components validate different schema revisions.",
+    "confidence_milli": 930,
+    "evidence_refs": ["context:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+    "affected_refs": ["task:..."],
+    "risk": "high",
+    "limitations": []
+  }],
   "rejected_hypotheses": [],
   "recommendations": [],
-  "unresolved_decisions": [],
+  "decision_inventory": [],
   "limitations": [],
   "sensitivity": "internal",
   "artifact_refs": [],
   "created_at_ms": 1786588800000,
-  "sha256": "64-hex"
+  "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 }
 ```
 
@@ -300,10 +309,10 @@ A browser acknowledgement, task terminal state, model statement, or free-form
 ```json
 {
   "finding_id": "finding-...",
-  "statement": "The two components validate different schema revisions.",
+  "summary": "The two components validate different schema revisions.",
   "classification": "confirmed",
   "confidence_milli": 930,
-  "evidence_refs": ["artifact:...#L10-L40"],
+  "evidence_refs": ["context:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
   "affected_refs": ["task:..."],
   "risk": "high",
   "limitations": []
@@ -317,9 +326,12 @@ Confidence is descriptive, not authority.
 
 A recommendation includes proposed outcome, evidence, alternatives, risk,
 required authority, and next verification. It cannot directly create a task or
-execute a change.
+execute a change. The artifact contains exactly one `sources` entry,
+`context:<repository_state_digest>`; every conclusion has at least one
+`evidence_refs` entry and each must equal that same context value. External
+artifact references are forbidden.
 
-### Unresolved decision inventory
+### Decision inventory
 
 Every discovered decision includes stable key, question, options, evidence,
 impact, recommended option if any, required actor, blocking scope, and whether
@@ -334,10 +346,9 @@ Initial limits:
 structured payload <= 2 MiB
 findings <= 200
 recommendations <= 100
-unresolved decisions <= 100
-source refs <= 1,000
-inline excerpt <= 8 KiB each
-large output only by content-addressed artifact reference
+decision inventory <= 100
+sources = exactly one controller-admitted immutable context reference
+artifact_refs = empty
 ```
 
 ## Material progress contract
@@ -454,8 +465,9 @@ queue_read_only_review
 Only `wait` and `pause_for_operator` are currently executable. The pause is
 limited to an exact confirmed-stall or recovery-required episode and commits
 the scheduler pause, immutable receipt, and local-session audit row together.
-`retry_fresh_attempt` is owned by reconciliation and requires exclusive
-ownership proof.
+`retry_fresh_attempt` is owned by reconciliation and requires an
+authoritatively issued exclusive-ownership proof; no such issuer is active, so
+the operator retry route rejects it.
 
 ## Mutable ownership contract
 
@@ -484,7 +496,8 @@ ownership proof.
 ```
 
 Any unknown field invalidates the proof for replacement. Proof is short-lived
-and consumed transactionally.
+and consumed transactionally. A controller-recorded terminal state, lease
+absence, or operator request cannot issue this proof.
 
 ## Reconciliation contracts
 

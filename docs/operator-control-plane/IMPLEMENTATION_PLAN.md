@@ -501,9 +501,11 @@ artifacts/evidence/candidate lineage
 external effects and condition state
 ```
 
-Exclusive ownership proof requires all previous mutable owner and ambiguous
-effect fields to be terminal/reconciled. Consume proof transactionally when
-authorizing a fresh attempt.
+Exclusive ownership proof requires authoritative runtime evidence that all
+previous mutable owner and ambiguous effect fields are terminal/reconciled.
+Consume a previously issued proof transactionally when authorizing a fresh
+attempt. Until that issuer exists, fresh attempt is unavailable rather than
+inferred from controller records.
 
 ### Preservation rules
 
@@ -539,7 +541,8 @@ idempotent restart, and accurate report.
 ### Exit criteria
 
 All nonterminal work reaches a legal state: attached/resumed, preserved/paused,
-reverification queued, fresh attempt authorized by proof, or explicit attention.
+reverification queued, proof-gated fresh-attempt authorization when an
+authoritative issuer exists, or explicit attention.
 
 ## OCP-010 — Typed intervention executor
 

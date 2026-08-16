@@ -24,10 +24,9 @@ This status is intentionally a capability boundary, not release evidence.
   immutable receipt. It cannot retry, resume, release, or change an attempt;
   all other typed interventions remain inactive;
 - reconciliation episode, immutable inventory finding/action-receipt, and
-  exclusive-ownership proof custody, including one-use transactional
-  proof-to-replacement authorization for authenticated retry. It requires a
-  terminal attempt, explicitly preserved clean worktree, matching live HEAD,
-  no active path lease/agent or prior command effect, and a durable operator action; it neither
+  exclusive-ownership proof custody. The one-use transactional proof consumer
+  exists, but fresh retry is disabled because no authoritative runtime issuer
+  can yet prove process/session/command/external-effect closure; it neither
   releases custody nor retries unknown effects implicitly;
 - bounded run topology table over durable run/task/attempt/agent/worktree and
   dependency facts; no graph layout or inferred links;

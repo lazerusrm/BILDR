@@ -220,8 +220,9 @@ and external effects. It emits typed findings and a bounded set of safe actions.
 
 Safe actions include preserve-and-pause, attach to a proven live owner, resume a
 compatible session, resume from durable context, invalidate stale approval,
-requeue verification, release a proven-dead lease, and authorize a fresh attempt
-only after exclusive ownership proof.
+requeue verification, and release a proven-dead lease. Fresh-attempt
+authorization remains unavailable until an authoritative runtime issuer records
+exclusive ownership proof.
 
 It never deletes or resets a worktree as part of automatic reconciliation.
 

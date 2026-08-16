@@ -1,0 +1,36 @@
+{
+  "schema": "harness.investigation-artifact.v1",
+  "artifact_id": "investigation-artifact-1",
+  "run_id": "run-1",
+  "task_id": "task-1",
+  "attempt_id": "attempt-1",
+  "question": "Why does the controller reject this contract?",
+  "scope": {
+    "owned_read_paths": ["crates/harness-domain/src/operator_control.rs"],
+    "forbidden_paths": [".git/objects"],
+    "time_budget_ms": 60000,
+    "token_budget": 8000
+  },
+  "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "repository_state_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "methods": ["bounded immutable-context review"],
+  "sources": ["context:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+  "findings": [{
+    "finding_id": "finding-1",
+    "classification": "confirmed",
+    "summary": "The controller and published contract need the same evidence rule.",
+    "confidence_milli": 930,
+    "evidence_refs": ["context:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+    "affected_refs": ["task:task-1"],
+    "risk": "high",
+    "limitations": []
+  }],
+  "recommendations": [],
+  "decision_inventory": [],
+  "limitations": [],
+  "rejected_hypotheses": [],
+  "sensitivity": "internal",
+  "artifact_refs": [],
+  "created_at_ms": 1,
+  "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+}

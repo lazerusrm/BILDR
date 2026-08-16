@@ -98,8 +98,8 @@ contracts/records, external-condition records, and authenticated run-owned
 absolute-time or controller-owned repository-capacity gate registration, immutable
 snapshots/return views, deterministic material progress, observe-only liveness episodes, exact-revision intervention receipts,
 reconciliation/ownership evidence with immutable inventory findings and action
-receipts, bounded run topology, a proof-consuming authenticated fresh-retry
-path, and retry-safe pending in-product notification claims plus presentation
+receipts, bounded run topology, a proof-consumption store boundary with no
+currently active fresh-retry issuer, and retry-safe pending in-product notification claims plus presentation
 receipts. Each source-attention lifecycle transaction
 atomically records its opening source, acknowledgement, or terminal authority
 causal link; each pending claim atomically records its source-attention causal
@@ -110,8 +110,9 @@ records its attempt-scoped causal link; each governed knowledge candidate
 atomically records its evidence causal links; each liveness observation
 atomically records its episode-scoped causal link; each reconciliation episode
 opening and ownership proof atomically records its source-event causal link;
-each reconciliation finding and action receipt, including proof-consuming
-fresh-attempt authorization, atomically records its episode-scoped causal link;
+each reconciliation finding and action receipt atomically records its
+episode-scoped causal link; fresh attempts remain unavailable until an
+authoritative runtime issuer can record process/session/command/external-effect closure evidence;
 and the API/CLI expose bounded immutable trace
 lookup. This is not yet full trace propagation through every producer.
 Supervisor snapshots receive bounded control-plane custody facts and restrict
