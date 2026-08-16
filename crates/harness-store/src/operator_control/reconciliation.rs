@@ -8,7 +8,8 @@
 use harness_domain::{
     CorrelationLink, CorrelationLinkId, OwnershipProof, OwnershipProofId, ReconciliationActionKind,
     ReconciliationActionReceipt, ReconciliationEpisode, ReconciliationEpisodeId,
-    ReconciliationFinding, ReconciliationState, TaskId, TaskState, TraceContext, now_ms,
+    ReconciliationFinding, ReconciliationState, ReconciliationTrigger, TaskId, TaskState,
+    TraceContext, now_ms,
 };
 use rusqlite::{OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
@@ -713,6 +714,24 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Finds an unresolved episode by its complete controller identity. This
+    /// is intentionally not a presentation-page query: recovery must keep
+    /// finding an active episode even after arbitrary newer history exists.
+    pub fn active_reconciliation_episode_for_run_trigger(
+        &self,
+        run_id: &str,
+        trigger: ReconciliationTrigger,
+    ) -> Result<Option<ReconciliationEpisode>, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT current_payload_json,current_payload_sha256 FROM reconciliation_episodes WHERE run_id=?1 AND trigger_kind=?2 AND state IN ('open','claimed','awaiting_evidence') ORDER BY updated_at DESC,id DESC LIMIT 1",
+                params![run_id, trigger_name(trigger)],
+                |row| checked_reconciliation_row(row.get(0)?, row.get(1)?),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn list_reconciliation_episodes(
         &self,
         run_id: Option<&str>,
@@ -1258,6 +1277,74 @@ mod tests {
             store.open_reconciliation_episode(&second),
             Err(StoreError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn active_reconciliation_lookup_is_not_lost_behind_a_history_page() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let run_id = "run-reconciliation-page-fixture";
+        let mut active = episode();
+        active.run_id = Some(run_id.to_owned());
+        active.trigger_kind = ReconciliationTrigger::DaemonRestart;
+        active.source_event_id = "event-active-daemon-restart".to_owned();
+        active.sha256 = active.digest().expect("active digest");
+        let active = store
+            .open_reconciliation_episode(&active)
+            .expect("active episode opens");
+
+        // These immutable terminal rows model arbitrary newer history. The
+        // old presentation-page query returned only 200 of them and would
+        // never see the still-open episode above.
+        for index in 0..201_i64 {
+            let mut historical = episode();
+            historical.run_id = Some(run_id.to_owned());
+            historical.trigger_kind = ReconciliationTrigger::DaemonRestart;
+            historical.state = ReconciliationState::Resolved;
+            historical.opened_at_ms = 10_000 + index;
+            historical.updated_at_ms = historical.opened_at_ms;
+            historical.source_event_id = format!("event-resolved-daemon-restart-{index}");
+            historical.sha256 = historical.digest().expect("historical digest");
+            let raw = serde_json::to_string(&historical).expect("historical serializes");
+            let raw_digest = digest(&raw);
+            store
+                .connection()
+                .expect("connection")
+                .execute(
+                    "INSERT INTO reconciliation_episodes(id,run_id,trigger_kind,state,version,opened_at,updated_at,current_payload_json,current_payload_sha256) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    rusqlite::params![
+                        historical.episode_id.as_str(),
+                        run_id,
+                        trigger_name(historical.trigger_kind),
+                        state_name(historical.state),
+                        historical.version as i64,
+                        historical.opened_at_ms,
+                        historical.updated_at_ms,
+                        raw,
+                        raw_digest,
+                    ],
+                )
+                .expect("historical terminal episode persists");
+        }
+
+        assert!(
+            !store
+                .list_reconciliation_episodes(Some(run_id), 200)
+                .expect("history page")
+                .into_iter()
+                .any(|episode| episode.episode_id == active.episode_id),
+            "the regression setup places the active episode outside the newest page"
+        );
+        assert_eq!(
+            store
+                .active_reconciliation_episode_for_run_trigger(
+                    run_id,
+                    ReconciliationTrigger::DaemonRestart,
+                )
+                .expect("active lookup"),
+            Some(active),
+            "recovery must query the exact active controller identity"
+        );
     }
 
     fn finding(episode_id: ReconciliationEpisodeId) -> ReconciliationFinding {

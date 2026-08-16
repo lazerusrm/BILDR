@@ -16,7 +16,6 @@ use sha2::{Digest, Sha256};
 use super::{Orchestrator, OrchestratorError};
 
 const MAX_INVENTORY_BYTES: usize = 240 * 1024;
-const RECONCILIATION_PAGE_LIMIT: u32 = 200;
 
 impl Orchestrator {
     /// Records a bounded exact-identity inventory before the existing recovery
@@ -38,16 +37,9 @@ impl Orchestrator {
             )));
         }
         let inventory_sha256 = digest_bytes(&inventory_raw);
-        let mut episodes = self
+        let existing = self
             .store
-            .list_reconciliation_episodes(Some(run.id.as_str()), RECONCILIATION_PAGE_LIMIT)?;
-        let existing = episodes.drain(..).find(|episode| {
-            episode.trigger_kind == trigger
-                && !matches!(
-                    episode.state,
-                    ReconciliationState::Resolved | ReconciliationState::Refused
-                )
-        });
+            .active_reconciliation_episode_for_run_trigger(run.id.as_str(), trigger)?;
         let now = now_ms();
         let episode = match existing {
             Some(episode) => episode,

@@ -7893,9 +7893,10 @@ impl Orchestrator {
                 &packet.objective,
                 Some(token_budget),
                 investigation_prompt(packet, &context, &run.id, attempt_id)?,
-                Some(model_output_schema(serde_json::from_str(
-                    INVESTIGATION_RESPONSE_SCHEMA,
-                )?)),
+                // Investigation activation is fail-closed until the runtime
+                // accepts this exact controller contract. Do not weaken the
+                // response schema into the App Server compatibility subset.
+                Some(investigation_output_schema()?),
             )
             .await?;
             Ok::<(), OrchestratorError>(())
@@ -7995,8 +7996,7 @@ impl Orchestrator {
                         Err(error) => {
                             self.fail_investigation_without_task_custody(
                                 run,
-                                &agent.id,
-                                attempt_id.as_ref(),
+                                &agent,
                                 &error.to_string(),
                             )?;
                             match (agent.thread_id, agent.active_turn_id) {
@@ -9046,11 +9046,12 @@ impl Orchestrator {
             return Ok(());
         }
         let interrupt = investigation_interrupt_target(&agent);
-        let Some(attempt_id) = self.store.task_attempt_for_agent(agent_id)? else {
+        let (agent_run_id, agent_attempt_id) = self.store.agent_context(agent_id)?;
+        let Some(attempt_id) = agent_attempt_id else {
             let error =
                 OrchestratorError::Protocol("investigation agent has no task attempt".to_owned());
-            let run = self.store.run(&agent.run_id)?;
-            self.fail_investigation_without_task_custody(&run, agent_id, None, &error.to_string())?;
+            let run = self.store.run(&agent_run_id)?;
+            self.fail_investigation_without_task_custody(&run, &agent, &error.to_string())?;
             drop(guard);
             self.best_effort_interrupt_investigation(agent_id, interrupt)
                 .await;
@@ -9059,13 +9060,8 @@ impl Orchestrator {
         let task_id = match self.store.task_for_attempt(&attempt_id) {
             Ok(task_id) => task_id,
             Err(error) => {
-                let run = self.store.run(&agent.run_id)?;
-                self.fail_investigation_without_task_custody(
-                    &run,
-                    agent_id,
-                    Some(&attempt_id),
-                    &error.to_string(),
-                )?;
+                let run = self.store.run(&agent_run_id)?;
+                self.fail_investigation_without_task_custody(&run, &agent, &error.to_string())?;
                 drop(guard);
                 self.best_effort_interrupt_investigation(agent_id, interrupt)
                     .await;
@@ -9075,19 +9071,25 @@ impl Orchestrator {
         let task = match self.store.task(&task_id) {
             Ok(task) => task,
             Err(error) => {
-                let run = self.store.run(&agent.run_id)?;
-                self.fail_investigation_without_task_custody(
-                    &run,
-                    agent_id,
-                    Some(&attempt_id),
-                    &error.to_string(),
-                )?;
+                let run = self.store.run(&agent_run_id)?;
+                self.fail_investigation_without_task_custody(&run, &agent, &error.to_string())?;
                 drop(guard);
                 self.best_effort_interrupt_investigation(agent_id, interrupt)
                     .await;
                 return Err(error.into());
             }
         };
+        if task.run_id != agent_run_id {
+            let error = OrchestratorError::Protocol(
+                "investigation task attempt is bound to a different run".to_owned(),
+            );
+            let run = self.store.run(&agent_run_id)?;
+            self.fail_investigation_without_task_custody(&run, &agent, &error.to_string())?;
+            drop(guard);
+            self.best_effort_interrupt_investigation(agent_id, interrupt)
+                .await;
+            return Err(error);
+        }
         let run = self.store.run(&task.run_id)?;
         let deadline_key = investigation_deadline_metadata_key(agent_id);
         let deadline_ms = match investigation_deadline_ms(&self.store, &deadline_key, &attempt_id) {
@@ -9319,6 +9321,7 @@ impl Orchestrator {
         if stored_base_sha != expected_base_sha
             || summary.head_sha != expected_base_sha
             || summary.dirty
+            || !summary.changed_paths.is_empty()
         {
             self.store.update_worktree(
                 &worktree_id,
@@ -9339,13 +9342,12 @@ impl Orchestrator {
     fn fail_investigation_without_task_custody(
         &self,
         run: &RunSummary,
-        agent_id: &AgentSessionId,
-        attempt_id: Option<&AttemptId>,
+        agent: &AgentSummary,
         reason: &str,
     ) -> Result<(), OrchestratorError> {
-        self.store.clear_agent_active_turn(agent_id)?;
+        self.store.clear_agent_active_turn(&agent.id)?;
         self.store.update_agent_state(
-            agent_id,
+            &agent.id,
             "FAILED",
             Some("Investigation task-attempt custody is unavailable"),
             None,
@@ -9353,16 +9355,22 @@ impl Orchestrator {
             Some(("protocol_error", reason)),
         )?;
         self.store
-            .delete_runtime_metadata(&investigation_deadline_metadata_key(agent_id))?;
-        if let Some(attempt_id) = attempt_id {
-            if let Ok((worktree_id, _, _, head_sha)) = self.store.worktree_for_attempt(attempt_id) {
-                self.store.update_worktree(
-                    &worktree_id,
-                    "PRESERVED",
-                    head_sha.as_deref(),
-                    Some("investigation task-attempt custody failed; worktree preserved"),
-                )?;
-            }
+            .delete_runtime_metadata(&investigation_deadline_metadata_key(&agent.id))?;
+        let recovered = self
+            .store
+            .investigation_worktree_for_agent_cwd(&run.id, &agent.cwd)?;
+        let recovered_attempt_id = recovered
+            .as_ref()
+            .and_then(|(_, attempt_id, _)| attempt_id.clone());
+        if let Some((worktree_id, _, head_sha)) = recovered {
+            self.store.update_worktree(
+                &worktree_id,
+                "PRESERVED",
+                head_sha.as_deref(),
+                Some("investigation task-attempt custody failed; worktree preserved"),
+            )?;
+        }
+        if let Some(attempt_id) = recovered_attempt_id.as_ref() {
             self.store.set_attempt_result(
                 attempt_id,
                 "FAILED",
@@ -9370,13 +9378,20 @@ impl Orchestrator {
                 Some("protocol_error"),
                 Some(reason),
             )?;
+            if let Ok(task_id) = self.store.task_for_attempt(attempt_id) {
+                let task = self.store.task(&task_id)?;
+                if !task.state.is_terminal() {
+                    self.store
+                        .transition_task(&task.id, TaskState::NeedsHelp, None)?;
+                }
+            }
         }
         self.emit_agent_event(
             &run.id,
-            agent_id,
+            &agent.id,
             "agent.investigation.response_rejected",
             json!({
-                "attempt_id": attempt_id,
+                "attempt_id": recovered_attempt_id,
                 "reason": reason,
                 "automatic_implementation": false,
             }),
@@ -10098,21 +10113,15 @@ impl Orchestrator {
             } else {
                 format!("investigation turn ended with status {status}")
             };
-            if let Some(attempt_id) = self.store.task_attempt_for_agent(agent_id)? {
+            let (run_id, attempt_id) = self.store.agent_context(agent_id)?;
+            if let Some(attempt_id) = attempt_id {
                 let task_id = self.store.task_for_attempt(&attempt_id)?;
                 let task = self.store.task(&task_id)?;
                 let run = self.store.run(&task.run_id)?;
                 self.fail_investigation_response(&run, &task, &attempt_id, agent_id, &reason)?;
             } else {
-                self.store.clear_agent_active_turn(agent_id)?;
-                self.store.update_agent_state(
-                    agent_id,
-                    "FAILED",
-                    Some("Investigation is missing task-attempt custody"),
-                    None,
-                    None,
-                    Some(("protocol_error", &reason)),
-                )?;
+                let run = self.store.run(&run_id)?;
+                self.fail_investigation_without_task_custody(&run, &agent, &reason)?;
             }
             return Ok(());
         }
@@ -17160,6 +17169,10 @@ fn model_output_schema(mut schema: Value) -> Value {
     schema
 }
 
+fn investigation_output_schema() -> Result<Value, OrchestratorError> {
+    serde_json::from_str(INVESTIGATION_RESPONSE_SCHEMA).map_err(Into::into)
+}
+
 fn normalize_structured_output_schema(value: &mut Value) {
     match value {
         Value::Object(object) => {
@@ -18757,6 +18770,13 @@ mod tests {
                 .and_then(Value::as_str),
             Some("urn:bildr:harness.investigation-response.v1")
         );
+        let exact_controller_schema =
+            investigation_output_schema().expect("controller contract parses");
+        assert_eq!(
+            started_turns[0].output_schema.as_ref(),
+            Some(&exact_controller_schema),
+            "investigator receives the exact controller contract, not a normalized subset"
+        );
         drop(started_turns);
 
         let context_digest = orchestrator
@@ -19195,6 +19215,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn investigation_missing_agent_attempt_recovers_exact_worktree_custody() {
+        let (orchestrator, _temp, _runtime, run_id, task_id) = investigation_fixture().await;
+        orchestrator
+            .tick(&run_id)
+            .await
+            .expect("investigation starts");
+        let investigator = orchestrator
+            .store()
+            .list_agents(&run_id)
+            .expect("agents read")
+            .into_iter()
+            .find(|agent| agent.role == AgentRole::Investigator)
+            .expect("investigator exists");
+        let attempt_id = orchestrator
+            .store()
+            .task_attempt_for_agent(&investigator.id)
+            .expect("attempt reads")
+            .expect("attempt exists");
+        let (worktree_id, _, _, _) = orchestrator
+            .store()
+            .worktree_for_attempt(&attempt_id)
+            .expect("worktree persists");
+
+        orchestrator
+            .store()
+            .connection()
+            .expect("connection")
+            .execute(
+                "UPDATE agent_sessions SET task_attempt_id=NULL WHERE id=?1",
+                [investigator.id.as_str()],
+            )
+            .expect("fixture removes only the direct agent custody link");
+        assert!(
+            orchestrator
+                .store()
+                .task_attempt_for_agent(&investigator.id)
+                .expect("corrupted custody reads")
+                .is_none()
+        );
+
+        orchestrator
+            .maintenance_tick()
+            .await
+            .expect("maintenance reconciles the exact durable worktree binding");
+
+        assert_eq!(
+            orchestrator
+                .store()
+                .agent(&investigator.id)
+                .expect("agent reads")
+                .state,
+            "FAILED"
+        );
+        assert_eq!(
+            orchestrator
+                .store()
+                .task(&task_id)
+                .expect("task reads")
+                .state,
+            TaskState::NeedsHelp
+        );
+        let attempt_state: String = orchestrator
+            .store()
+            .connection()
+            .expect("connection")
+            .query_row(
+                "SELECT state FROM task_attempts WHERE id=?1",
+                [attempt_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("attempt remains addressable through the worktree binding");
+        assert_eq!(attempt_state, "FAILED");
+        let worktree = orchestrator
+            .store()
+            .list_worktrees(Some(&run_id))
+            .expect("worktrees read")
+            .into_iter()
+            .find(|worktree| worktree.id == worktree_id)
+            .expect("exact investigation worktree remains durable");
+        assert_eq!(worktree.state, "PRESERVED");
+        assert_eq!(
+            worktree.preserved_reason.as_deref(),
+            Some("investigation task-attempt custody failed; worktree preserved")
+        );
+    }
+
+    #[tokio::test]
+    async fn investigation_terminal_callback_recovers_missing_agent_attempt_custody() {
+        let (orchestrator, _temp, _runtime, run_id, task_id) = investigation_fixture().await;
+        orchestrator
+            .tick(&run_id)
+            .await
+            .expect("investigation starts");
+        let investigator = orchestrator
+            .store()
+            .list_agents(&run_id)
+            .expect("agents read")
+            .into_iter()
+            .find(|agent| agent.role == AgentRole::Investigator)
+            .expect("investigator exists");
+        let attempt_id = orchestrator
+            .store()
+            .task_attempt_for_agent(&investigator.id)
+            .expect("attempt reads")
+            .expect("attempt exists");
+        let (worktree_id, _, _, _) = orchestrator
+            .store()
+            .worktree_for_attempt(&attempt_id)
+            .expect("worktree persists");
+        orchestrator
+            .store()
+            .connection()
+            .expect("connection")
+            .execute(
+                "UPDATE agent_sessions SET task_attempt_id=NULL WHERE id=?1",
+                [investigator.id.as_str()],
+            )
+            .expect("fixture removes only the direct agent custody link");
+
+        orchestrator
+            .handle_turn_completed(&investigator.id, &json!({"turn": {"status": "completed"}}))
+            .await
+            .expect("terminal callback reconciles the exact durable worktree binding");
+
+        assert_eq!(
+            orchestrator
+                .store()
+                .agent(&investigator.id)
+                .expect("agent reads")
+                .state,
+            "FAILED"
+        );
+        assert_eq!(
+            orchestrator
+                .store()
+                .task(&task_id)
+                .expect("task reads")
+                .state,
+            TaskState::NeedsHelp
+        );
+        let attempt_state: String = orchestrator
+            .store()
+            .connection()
+            .expect("connection")
+            .query_row(
+                "SELECT state FROM task_attempts WHERE id=?1",
+                [attempt_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("attempt remains addressable through the worktree binding");
+        assert_eq!(attempt_state, "FAILED");
+        assert_eq!(
+            orchestrator
+                .store()
+                .list_worktrees(Some(&run_id))
+                .expect("worktrees read")
+                .into_iter()
+                .find(|worktree| worktree.id == worktree_id)
+                .expect("exact investigation worktree remains durable")
+                .state,
+            "PRESERVED"
+        );
+    }
+
+    #[tokio::test]
     async fn investigation_response_with_malformed_attempt_binding_fails_closed() {
         let (orchestrator, _temp, _runtime, run_id, task_id) = investigation_fixture().await;
         orchestrator
@@ -19306,20 +19491,11 @@ mod tests {
             .store()
             .worktree_for_attempt(&attempt_id)
             .expect("worktree reads");
-        std::fs::write(
-            worktree.join("README.md"),
-            "# investigation fixture\nunauthorized mutable investigation write\n",
-        )
-        .expect("fixture corrupts the read-only worktree");
-        git_output(&worktree, &["add", "README.md"]);
-        git_output(
-            &worktree,
-            &[
-                "commit",
-                "-qm",
-                "fixture: unauthorized investigation candidate",
-            ],
-        );
+        // Porcelain normally reports untracked files, but controller custody
+        // must not depend on a repository-local display preference. This
+        // simulates the setting that previously hid an untracked candidate
+        // from `dirty` while `ls-files` still observed it.
+        git_output(&worktree, &["config", "status.showUntrackedFiles", "no"]);
         std::fs::write(
             worktree.join("candidate-request.txt"),
             "candidate request\n",
@@ -19388,10 +19564,10 @@ mod tests {
             .worktree_for_attempt(&attempt_id)
             .expect("preserved worktree reads");
         assert_eq!(stored_base_sha, base_sha);
-        assert_ne!(
+        assert_eq!(
             stored_head_sha.as_deref(),
             Some(base_sha.as_str()),
-            "the controller preserves the actually observed candidate HEAD"
+            "the untracked candidate cannot rely on a changed HEAD for rejection"
         );
     }
 
@@ -21802,13 +21978,19 @@ mod tests {
                 "expert",
                 model_output_schema(serde_json::from_str(EXPERT_RESPONSE_SCHEMA).unwrap()),
             ),
-            (
-                "investigation",
-                model_output_schema(serde_json::from_str(INVESTIGATION_RESPONSE_SCHEMA).unwrap()),
-            ),
         ] {
             assert_compatible(&schema, name);
         }
+    }
+
+    #[test]
+    fn investigation_output_schema_is_the_exact_controller_contract() {
+        let contract: Value = serde_json::from_str(INVESTIGATION_RESPONSE_SCHEMA).unwrap();
+        let supplied = investigation_output_schema().unwrap();
+        assert_eq!(
+            supplied, contract,
+            "investigation output must not be normalized into a compatibility subset"
+        );
     }
 
     #[test]

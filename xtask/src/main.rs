@@ -719,7 +719,7 @@ fn fault_test_command(case: OperatorControlFaultCase) -> (&'static str, &'static
         ),
         "investigation_cannot_mutate_or_create_candidate" => (
             "harness-orchestrator",
-            "tests::investigation_launch_and_artifact_completion_are_read_only_and_bound",
+            "tests::investigation_write_or_candidate_is_rejected_before_artifact_admission",
             true,
         ),
         "unknown_external_effect_never_auto_retried" => (
@@ -1261,6 +1261,9 @@ fn investigation_artifact_invalid_cases(
     let mut external_artifact = fixture.clone();
     external_artifact["artifact_refs"] = json!(["artifact:external"]);
 
+    let mut whitespace_method = fixture.clone();
+    whitespace_method["methods"] = json!(["   "]);
+
     let mut no_context_source = fixture.clone();
     no_context_source["sources"] = json!([]);
 
@@ -1277,6 +1280,7 @@ fn investigation_artifact_invalid_cases(
         ("empty conclusions", empty_conclusions, true),
         ("external conclusion evidence", external_evidence, true),
         ("external artifact reference", external_artifact, true),
+        ("whitespace-only method", whitespace_method, true),
         ("zero context sources", no_context_source, true),
         ("multiple context sources", multiple_context_sources, true),
         (

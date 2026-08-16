@@ -66,9 +66,10 @@ This status is intentionally a capability boundary, not release evidence.
 ## Explicitly not activated or complete
 
 - automatic reconciliation replacement, lease release, approval invalidation,
-  and session resumption; restart loss records preservation receipts and retains
-  uncertain custody, while only the authenticated proof-consuming retry path
-  may authorize a clean replacement;
+  session resumption, and every retry-created replacement; restart loss records
+  preservation receipts and retains uncertain custody. No route may create a
+  clean replacement until a controller-owned transaction can consume an
+  independently recorded ownership proof while creating that exact attempt;
 - all typed intervention execution other than `wait` and the exact
   confirmed-stall/recovery-required `pause_for_operator` scheduler pause;
 - external-condition polling/wake adapters beyond the controller-clock and
@@ -87,7 +88,7 @@ This status is intentionally a capability boundary, not release evidence.
 These are not implied by the existing tables or projections. Empty, current
 sections are not evidence that a run is healthy, reconciled, or safe to resume.
 
-## Verification recorded at this head family
+## Historical validation commands (not current-head proof)
 
 - `cargo test -p harness-store -p harness-api -p harnessctl --lib --bins -- --test-threads=1`
 - `cargo test --workspace --all-targets -- --test-threads=1`
@@ -96,9 +97,9 @@ sections are not evidence that a run is healthy, reconciled, or safe to resume.
 - `cargo run -p xtask -- schema-check`
 - `cargo run -p xtask -- openapi-check`
 
-Build output must use an isolated `CARGO_TARGET_DIR`. Verify available capacity
-at the time of a workspace build; unrelated workload alone is not a reason to
-withhold local validation.
+These are prior validation commands, not release evidence for the current
+source. Build output must use an isolated `CARGO_TARGET_DIR`; the exact final
+head needs fresh successful results before it can be signed or deployed.
 
 ## Promotion boundary
 

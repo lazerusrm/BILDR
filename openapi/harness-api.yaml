@@ -2427,36 +2427,36 @@ components:
       properties:
         finding_id: {$ref: '#/components/schemas/OpaqueId'}
         classification: {enum: [confirmed, supported, hypothesis, disproven, inconclusive]}
-        summary: {type: string, minLength: 1, maxLength: 4000}
+        summary: {type: string, minLength: 1, maxLength: 4000, pattern: '\S'}
         confidence_milli: {type: integer, minimum: 0, maximum: 1000}
         evidence_refs: {type: array, minItems: 1, maxItems: 1000, items: {$ref: '#/components/schemas/InvestigationContextEvidenceRef'}}
         affected_refs: {type: array, maxItems: 1000, items: {type: string, maxLength: 160}}
         risk: {enum: [info, normal, high, critical]}
-        limitations: {type: array, maxItems: 1000, items: {type: string, maxLength: 4000}}
+        limitations: {type: array, maxItems: 1000, items: {type: string, minLength: 1, maxLength: 4000, pattern: '\S'}}
     InvestigationRecommendation:
       type: object
       additionalProperties: false
       required: [recommendation_id, summary, required_authority, evidence_refs, alternatives, risk, next_verification]
       properties:
         recommendation_id: {$ref: '#/components/schemas/OpaqueId'}
-        summary: {type: string, minLength: 1, maxLength: 4000}
+        summary: {type: string, minLength: 1, maxLength: 4000, pattern: '\S'}
         required_authority: {$ref: '#/components/schemas/OpaqueId'}
         evidence_refs: {type: array, minItems: 1, maxItems: 1000, items: {$ref: '#/components/schemas/InvestigationContextEvidenceRef'}}
-        alternatives: {type: array, maxItems: 1000, items: {type: string, maxLength: 4000}}
+        alternatives: {type: array, maxItems: 1000, items: {type: string, minLength: 1, maxLength: 4000, pattern: '\S'}}
         risk: {enum: [info, normal, high, critical]}
-        next_verification: {type: string, minLength: 1, maxLength: 4000}
+        next_verification: {type: string, minLength: 1, maxLength: 4000, pattern: '\S'}
     DecisionInventoryItem:
       type: object
       additionalProperties: false
       required: [decision_id, question, state, options, evidence_refs, impact, recommended_option, required_actor, blocking_refs, independent_work_can_continue]
       properties:
         decision_id: {$ref: '#/components/schemas/OpaqueId'}
-        question: {type: string, minLength: 1, maxLength: 4000}
+        question: {type: string, minLength: 1, maxLength: 4000, pattern: '\S'}
         state: {$ref: '#/components/schemas/OpaqueId'}
-        options: {type: array, maxItems: 1000, items: {type: string, maxLength: 4000}}
+        options: {type: array, maxItems: 1000, items: {type: string, minLength: 1, maxLength: 4000, pattern: '\S'}}
         evidence_refs: {type: array, minItems: 1, maxItems: 1000, items: {$ref: '#/components/schemas/InvestigationContextEvidenceRef'}}
-        impact: {type: string, minLength: 1, maxLength: 4000}
-        recommended_option: {type: [string, 'null'], maxLength: 4000}
+        impact: {type: string, minLength: 1, maxLength: 4000, pattern: '\S'}
+        recommended_option: {type: [string, 'null'], maxLength: 4000, pattern: '\S'}
         required_actor: {$ref: '#/components/schemas/OpaqueId'}
         blocking_refs: {type: array, maxItems: 1000, items: {type: string, maxLength: 160}}
         independent_work_can_continue: {type: boolean}
@@ -2474,17 +2474,17 @@ components:
         run_id: {$ref: '#/components/schemas/OpaqueId'}
         task_id: {$ref: '#/components/schemas/OpaqueId'}
         attempt_id: {$ref: '#/components/schemas/OpaqueId'}
-        question: {type: string, minLength: 1, maxLength: 4000}
+        question: {type: string, minLength: 1, maxLength: 4000, pattern: '\S'}
         scope: {$ref: '#/components/schemas/InvestigationScope'}
         base_sha: {type: string, pattern: '^[0-9a-f]{40}$'}
         repository_state_digest: {$ref: '#/components/schemas/Digest'}
-        methods: {type: array, maxItems: 1000, items: {type: string, maxLength: 4000}}
+        methods: {type: array, maxItems: 1000, items: {type: string, minLength: 1, maxLength: 4000, pattern: '\S'}}
         sources: {type: array, minItems: 1, maxItems: 1, items: {$ref: '#/components/schemas/InvestigationContextEvidenceRef'}}
         findings: {type: array, maxItems: 200, items: {$ref: '#/components/schemas/InvestigationFinding'}}
         recommendations: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/InvestigationRecommendation'}}
         decision_inventory: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/DecisionInventoryItem'}}
-        limitations: {type: array, maxItems: 1000, items: {type: string, maxLength: 4000}}
-        rejected_hypotheses: {type: array, maxItems: 1000, items: {type: string, maxLength: 4000}}
+        limitations: {type: array, maxItems: 1000, items: {type: string, minLength: 1, maxLength: 4000, pattern: '\S'}}
+        rejected_hypotheses: {type: array, maxItems: 1000, items: {type: string, minLength: 1, maxLength: 4000, pattern: '\S'}}
         sensitivity: {enum: [public, internal, restricted]}
         artifact_refs: {type: array, maxItems: 0, items: {type: string, maxLength: 160}}
         created_at_ms: {type: integer, minimum: 0}
@@ -2797,7 +2797,7 @@ components:
                               kind: {const: human_review}
     KnowledgeToken:
       type: string
-      pattern: '^[A-Za-z0-9_.:-]{1,128}$'
+      pattern: '^[A-Za-z0-9_.:-]{1,160}$'
     KnowledgeScope:
       type: object
       additionalProperties: false
@@ -2954,7 +2954,7 @@ components:
         expected_snapshot_revision: {type: integer, minimum: 1}
     OpaqueId:
       type: string
-      pattern: '^[A-Za-z0-9_.:-]{1,128}$'
+      pattern: '^[A-Za-z0-9_.:-]{1,160}$'
     Digest:
       type: string
       pattern: '^[0-9a-f]{64}$'

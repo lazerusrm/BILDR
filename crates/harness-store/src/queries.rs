@@ -3731,6 +3731,38 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(format!("worktree for attempt {id}")))
     }
 
+    /// Recovers the durable worktree binding for an active investigator whose
+    /// direct agent-to-attempt link was lost. The worker cwd is controller
+    /// written at launch, so it is the only exact identity still available in
+    /// that corruption case; this lookup never guesses across worktrees.
+    pub fn investigation_worktree_for_agent_cwd(
+        &self,
+        run_id: &RunId,
+        cwd: &str,
+    ) -> Result<
+        Option<(
+            harness_domain::WorktreeId,
+            Option<AttemptId>,
+            Option<String>,
+        )>,
+        StoreError,
+    > {
+        self.connection()?
+            .query_row(
+                "SELECT id,task_attempt_id,head_sha FROM worktrees WHERE run_id=?1 AND kind='investigation' AND path=?2 AND removed_at IS NULL ORDER BY created_at DESC LIMIT 1",
+                params![run_id.as_str(), cwd],
+                |row| {
+                    Ok((
+                        harness_domain::WorktreeId::from(row.get::<_, String>(0)?),
+                        row.get::<_, Option<String>>(1)?.map(AttemptId::from),
+                        row.get(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn record_context_packet(&self, input: &NewContextPacket) -> Result<(), StoreError> {
         let connection = self.connection()?;
         let transaction = connection.unchecked_transaction()?;
