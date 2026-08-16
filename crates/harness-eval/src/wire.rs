@@ -1,4 +1,6 @@
-use crate::{DigestError, Split, canonical_digest_without_self, hash, sha40, token};
+use crate::{
+    DigestError, Split, canonical_digest_without_self, controller_identifier, hash, sha40, token,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -299,14 +301,14 @@ pub fn verify_case_v1(v: &EvalCaseV1) -> Result<(), DigestError> {
         && token(&v.case_id)
         && v.revision > 0
         && !v.title.is_empty()
-        && !v.task_family.is_empty()
+        && token(&v.task_family)
         && !v.objective.is_empty()
         && token(&v.grader_bundle_id)
         && v.grader_bundle_revision > 0
         && hash(&v.grader_bundle_digest)
         && !v.source.locator.is_empty()
         && hash(&v.source.digest)
-        && token(&v.runtime.repository_id)
+        && controller_identifier(&v.runtime.repository_id)
         && !v.runtime.repository_fixture.is_empty()
         && sha40(&v.runtime.base_sha)
         && hash(&v.runtime.setup_digest)

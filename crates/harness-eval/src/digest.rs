@@ -49,6 +49,12 @@ pub fn token(v: &str) -> bool {
         && v.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
 }
+pub fn controller_identifier(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= 160
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+}
 pub fn sha40(v: &str) -> bool {
     v.len() == 40
         && v.bytes()

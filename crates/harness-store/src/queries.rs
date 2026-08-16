@@ -6562,6 +6562,15 @@ fn validate_improvement_input(input: &NewImprovementRevision) -> Result<(), Stor
             "improvement payload schema discriminator mismatch".to_owned(),
         ));
     }
+    if matches!(
+        input.schema,
+        ImprovementSchema::TasksetV1
+            | ImprovementSchema::EvalCaseV1
+            | ImprovementSchema::GraderBundleV1
+    ) {
+        safe_eval_id(&input.id, 128)?;
+        safe_eval_id(&input.aggregate_id, 128)?;
+    }
     match input.schema {
         ImprovementSchema::PolicyBundleV1 => {
             let value: harness_learning::PolicyBundleV1 =
@@ -7834,6 +7843,37 @@ mod tests {
         input.grader_bundle_revision_id = "c".repeat(128);
         input.idempotency_key = "d".repeat(201);
         assert!(validate_new_evaluation_run(&input).is_err());
+    }
+
+    #[test]
+    fn evaluation_revision_identifiers_are_rejected_at_new_write_intake() {
+        let case: harness_eval::EvalCaseV1 = serde_json::from_str(include_str!(
+            "../../../examples/self-improvement/eval-case.example.json"
+        ))
+        .unwrap();
+        let payload = serde_json::to_value(case).unwrap();
+        let mut input = NewImprovementRevision {
+            id: "case-revision".to_owned(),
+            aggregate_kind: ImprovementRecordKind::EvalCase,
+            aggregate_id: "case".to_owned(),
+            schema: ImprovementSchema::EvalCaseV1,
+            state: ImprovementState::Proposed,
+            payload: payload.clone(),
+            payload_sha256: sha256(serde_json::to_string(&payload).unwrap().as_bytes()),
+            sensitivity: SensitivityClass::Internal,
+            retention_class: RetentionClass::Evaluation,
+            export_allowed: false,
+            idempotency_key: "case-revision-intake".to_owned(),
+            event_id: harness_domain::ImprovementEventId::from("case-revision-event"),
+            source_raw_event_id: None,
+            source_domain_event_id: None,
+        };
+        assert!(validate_improvement_input(&input).is_ok());
+        input.id = "a".repeat(129);
+        assert!(validate_improvement_input(&input).is_err());
+        input.id = "case-revision".to_owned();
+        input.aggregate_id = "a".repeat(129);
+        assert!(validate_improvement_input(&input).is_err());
     }
 
     #[test]

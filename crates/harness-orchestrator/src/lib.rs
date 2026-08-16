@@ -15572,7 +15572,9 @@ fn investigation_context_evidence_ref(context_digest: &str) -> String {
 }
 
 fn parse_investigation_response(text: &str) -> Result<InvestigationResponse, OrchestratorError> {
-    let value = parse_json_text::<Value>(text)?;
+    let value: Value = serde_json::from_str(text).map_err(|error| {
+        OrchestratorError::Protocol(format!("invalid investigation JSON: {error}"))
+    })?;
     validate_investigation_response_shape(&value)?;
     serde_json::from_value(value).map_err(Into::into)
 }
@@ -22055,6 +22057,11 @@ mod tests {
             )
             .is_err(),
             "a report cannot make an uncited conclusion"
+        );
+        let exact_response = serde_json::to_string(&admitted).expect("response serializes");
+        assert!(parse_investigation_response(&exact_response).is_ok());
+        assert!(
+            parse_investigation_response(&format!("```json\\n{exact_response}\\n```",)).is_err()
         );
 
         assert!(

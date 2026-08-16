@@ -211,7 +211,7 @@ impl Store {
             "INSERT INTO ownership_proofs(id,run_id,task_id,attempt_id,source_event_id,payload_json,payload_sha256,observed_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
                 proof.proof_id.as_str(), proof.run_id, proof.task_id, proof.prior_attempt_id,
-                proof.source_event_id, raw, payload_sha256, proof.expires_at_ms,
+                proof.source_event_id, raw, payload_sha256, proof.observed_at_ms,
             ],
         )?;
         record_correlation_link_in_transaction(&transaction, &correlation)?;
@@ -274,7 +274,7 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(format!("ownership proof {proof_id}")))?;
         let proof = checked_ownership_row(proof_raw, proof_digest)?;
         let now = now_ms();
-        if proof.expires_at_ms < now {
+        if ownership_proof_expired(&proof, now) {
             return Err(StoreError::Conflict(format!(
                 "ownership proof {proof_id} expired before replacement authorization"
             )));
@@ -886,8 +886,12 @@ fn ownership_proof_correlation_link(proof: &OwnershipProof) -> Result<Correlatio
         to_kind: "ownership_proof".to_owned(),
         to_id: proof.proof_id.to_string(),
         relation: "establishes_ownership_proof".to_owned(),
-        created_at_ms: proof.expires_at_ms,
+        created_at_ms: proof.observed_at_ms,
     })
+}
+
+fn ownership_proof_expired(proof: &OwnershipProof, now: i64) -> bool {
+    proof.expires_at_ms <= now
 }
 
 fn reconciliation_finding_correlation_link(
@@ -1572,6 +1576,7 @@ mod tests {
             external_effect_state: "none_or_reconciled".to_owned(),
             candidate_state: "preserved".to_owned(),
             approved_actions: vec!["authorize_fresh_attempt".to_owned()],
+            observed_at_ms: now_ms(),
             expires_at_ms: now_ms().saturating_add(60_000),
             sha256: String::new(),
         };
@@ -1631,6 +1636,26 @@ mod tests {
         };
         receipt.sha256 = receipt.digest().expect("receipt digest");
         receipt
+    }
+
+    #[test]
+    fn ownership_proof_uses_observation_time_and_expires_at_the_boundary() {
+        let temp = TempDir::new().expect("temp");
+        let (_store, _episode, proof, _task_id, _replacement, _human_action_id) =
+            fresh_attempt_fixture(&temp);
+        assert!(!ownership_proof_expired(&proof, proof.observed_at_ms));
+        assert!(ownership_proof_expired(&proof, proof.expires_at_ms));
+        assert_eq!(
+            ownership_proof_correlation_link(&proof)
+                .expect("proof correlation")
+                .created_at_ms,
+            proof.observed_at_ms
+        );
+
+        let mut invalid = proof;
+        invalid.observed_at_ms = invalid.expires_at_ms;
+        invalid.sha256 = invalid.digest().expect("invalid proof digest");
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

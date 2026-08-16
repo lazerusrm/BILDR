@@ -306,6 +306,22 @@ mod tests {
         case.runtime.seeds = Some(vec![1, 1]);
         assert!(verify_case_v1(&case).is_err());
 
+        let mut case: EvalCaseV1 = serde_json::from_str(include_str!(
+            "../../../examples/self-improvement/eval-case.example.json"
+        ))
+        .unwrap();
+        case.task_family = "a".repeat(128);
+        case.runtime.repository_id = "repository:".to_owned() + &"b".repeat(149);
+        case.sha256 = canonical_digest_without_self(&case).unwrap();
+        assert!(verify_case_v1(&case).is_ok());
+        case.task_family = "a".repeat(129);
+        case.sha256 = canonical_digest_without_self(&case).unwrap();
+        assert!(verify_case_v1(&case).is_err());
+        case.task_family = "a".repeat(128);
+        case.runtime.repository_id = "b".repeat(161);
+        case.sha256 = canonical_digest_without_self(&case).unwrap();
+        assert!(verify_case_v1(&case).is_err());
+
         let mut grader: GraderBundleV1 = serde_json::from_str(include_str!(
             "../../../examples/self-improvement/grader-bundle.example.json"
         ))

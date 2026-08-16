@@ -14,8 +14,8 @@ use axum::{
 };
 use harness_domain::{
     AgentRole, AgentSessionId, ApprovalId, ArtifactId, OutcomeClassification, OutcomeDimension,
-    OutcomeId, OutcomeSubject, RepositoryId, RunId, TaskId, WorktreeId, is_safe_outcome_identifier,
-    is_safe_outcome_reason_code,
+    OutcomeId, OutcomeSubject, RepositoryId, RunId, TaskId, WorktreeId,
+    is_safe_operator_control_identifier, is_safe_outcome_identifier, is_safe_outcome_reason_code,
 };
 use harness_orchestrator::{
     ApprovalDecisionRequest, ApproveSignoffRequest, AttestAcceptanceRequest, CreateRunRequest,
@@ -1346,7 +1346,7 @@ async fn list_outcomes(
     Query(query): Query<OutcomeVectorQuery>,
 ) -> Result<Json<harness_domain::OutcomeVector>, ApiError> {
     authenticate(&state, &headers, false)?;
-    validate_outcome_read_identifier(&query.run_id, "run_id")?;
+    validate_operator_control_read_identifier(&query.run_id, "run_id")?;
     let vector = state
         .orchestrator
         .store()
@@ -1361,7 +1361,7 @@ async fn list_failure_overview(
     Query(query): Query<FailureOverviewQuery>,
 ) -> Result<Json<FailureOverviewResponse>, ApiError> {
     authenticate(&state, &headers, false)?;
-    validate_failure_read_identifier(&query.repository_id, "repository_id")?;
+    validate_operator_control_read_identifier(&query.repository_id, "repository_id")?;
     let clusters = state
         .orchestrator
         .store()
@@ -1398,7 +1398,7 @@ async fn list_failure_overview(
                     .transpose()?,
                 representative_run_id: cluster
                     .representative_run_id
-                    .map(|id| checked_failure_identifier(id.to_string(), "run id"))
+                    .map(|id| checked_operator_control_identifier(id.to_string(), "run id"))
                     .transpose()?,
                 representative_trace_id: cluster
                     .representative_trace_id
@@ -1430,7 +1430,7 @@ async fn get_failure_trace(
     let rows = closed_trace_rows(&composition.trace_manifest)?;
     Ok(Json(FailureTraceResponse {
         trace_id: checked_failure_identifier(composition.trace_id, "trace id")?,
-        run_id: checked_failure_identifier(composition.run_id.to_string(), "run id")?,
+        run_id: checked_operator_control_identifier(composition.run_id.to_string(), "run id")?,
         rows,
         outcomes: composition.outcomes,
     }))
@@ -1830,7 +1830,7 @@ fn checked_failure_identifier(value: String, field: &str) -> Result<String, ApiE
 }
 
 fn checked_operator_control_identifier(value: String, field: &str) -> Result<String, ApiError> {
-    if is_safe_failure_identifier(&value, 160) {
+    if is_safe_operator_control_identifier(&value) {
         Ok(value)
     } else {
         Err(OrchestratorError::Validation(format!("invalid operator-control {field}")).into())
@@ -1880,8 +1880,8 @@ async fn record_operator_outcome(
 }
 
 fn validate_operator_outcome_request(body: &RecordOperatorOutcomeBody) -> Result<(), ApiError> {
-    if !is_safe_outcome_identifier(&body.run_id, 128)
-        || !is_safe_outcome_identifier(&body.subject.id, 128)
+    if !is_safe_operator_control_identifier(&body.run_id)
+        || !is_safe_operator_control_identifier(&body.subject.id)
         || body.code.trim().is_empty()
         || body.code.chars().count() > 80
         || body
@@ -1929,7 +1929,7 @@ fn validate_operator_outcome_request(body: &RecordOperatorOutcomeBody) -> Result
 fn validate_outcome_vector_response(
     vector: &harness_domain::OutcomeVector,
 ) -> Result<(), ApiError> {
-    if !is_safe_outcome_identifier(vector.run_id.as_str(), 128)
+    if !is_safe_operator_control_identifier(vector.run_id.as_str())
         || vector.items.iter().any(|item| {
             !is_safe_outcome_identifier(item.outcome_id.as_str(), 128)
                 || item.revisions.is_empty()
@@ -1957,6 +1957,14 @@ fn validate_outcome_read_identifier(value: &str, field: &str) -> Result<(), ApiE
         Ok(())
     } else {
         Err(OrchestratorError::Validation(format!("invalid outcome {field}")).into())
+    }
+}
+
+fn validate_operator_control_read_identifier(value: &str, field: &str) -> Result<(), ApiError> {
+    if is_safe_operator_control_identifier(value) {
+        Ok(())
+    } else {
+        Err(OrchestratorError::Validation(format!("invalid operator-control {field}")).into())
     }
 }
 
@@ -2399,6 +2407,8 @@ mod tests {
         assert!(validate_failure_read_identifier("trace/01J", "trace_id").is_err());
         assert!(checked_operator_control_identifier("a".repeat(160), "run id").is_ok());
         assert!(checked_operator_control_identifier("a".repeat(161), "run id").is_err());
+        assert!(validate_operator_control_read_identifier("run:01J", "run_id").is_ok());
+        assert!(validate_operator_control_read_identifier("run/01J", "run_id").is_err());
     }
 
     #[test]

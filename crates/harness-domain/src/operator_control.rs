@@ -14,7 +14,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use ulid::Ulid;
 
-const MAX_IDENTIFIER_LEN: usize = 160;
+use crate::{MAX_OPERATOR_CONTROL_IDENTIFIER_LEN, is_safe_operator_control_identifier};
+
+const MAX_IDENTIFIER_LEN: usize = MAX_OPERATOR_CONTROL_IDENTIFIER_LEN;
 const MAX_TITLE_LEN: usize = 240;
 const MAX_SUMMARY_LEN: usize = 4_000;
 const MAX_SECTION_ROWS: usize = 1_000;
@@ -50,20 +52,13 @@ pub enum OperatorControlError {
 }
 
 fn validate_identifier(value: &str, field: &'static str) -> Result<(), OperatorControlError> {
-    if value.is_empty() || value.len() > MAX_IDENTIFIER_LEN {
-        return Err(OperatorControlError::InvalidField {
-            field,
-            reason: "must be non-empty and bounded",
-        });
-    }
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
-    {
-        return Err(OperatorControlError::InvalidField {
-            field,
-            reason: "contains a path-unsafe character",
-        });
+    if !is_safe_operator_control_identifier(value) {
+        let reason = if value.is_empty() || value.len() > MAX_IDENTIFIER_LEN {
+            "must be non-empty and bounded"
+        } else {
+            "contains a path-unsafe character"
+        };
+        return Err(OperatorControlError::InvalidField { field, reason });
     }
     Ok(())
 }
@@ -1618,6 +1613,7 @@ pub struct OwnershipProof {
     pub external_effect_state: String,
     pub candidate_state: String,
     pub approved_actions: Vec<String>,
+    pub observed_at_ms: i64,
     pub expires_at_ms: i64,
     pub sha256: String,
 }
@@ -1664,10 +1660,10 @@ impl OwnershipProof {
                 reason: "must prove the closed exclusive-ownership state for a fresh attempt",
             });
         }
-        if self.expires_at_ms < 0 {
+        if self.observed_at_ms < 0 || self.expires_at_ms <= self.observed_at_ms {
             return Err(OperatorControlError::InvalidField {
-                field: "ownership proof expiry",
-                reason: "must not be negative",
+                field: "ownership proof timestamps",
+                reason: "must be nonnegative and expire after observation",
             });
         }
         validate_lower_hex(&self.sha256, "ownership proof sha256", SHA256_HEX_LEN)?;

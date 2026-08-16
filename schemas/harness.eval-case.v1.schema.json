@@ -10,7 +10,7 @@
     "case_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
     "revision": {"type": "integer", "minimum": 1},
     "title": {"type": "string", "minLength": 1},
-    "task_family": {"type": "string", "minLength": 1},
+    "task_family": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
     "objective": {"type": "string", "minLength": 1},
     "source": {
       "type": "object",
@@ -28,7 +28,7 @@
       "additionalProperties": false,
       "required": ["repository_id", "repository_fixture", "base_sha", "setup_digest", "resource_class", "timeout_seconds", "token_budget"],
       "properties": {
-        "repository_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"}, "repository_fixture": {"type": "string", "minLength": 1},
+        "repository_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,160}$"}, "repository_fixture": {"type": "string", "minLength": 1},
         "base_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "setup_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "resource_class": {"type": "string", "minLength": 1},

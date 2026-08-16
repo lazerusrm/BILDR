@@ -1296,6 +1296,15 @@ fn validate_openapi_identifier_contracts(openapi: &serde_yaml::Value) -> Result<
         "/components/schemas/EvaluationRunSummary/properties/controller_run_id/$ref",
         "/components/schemas/EvaluationOccurrenceSource/properties/repository_id/$ref",
         "/components/schemas/EvaluationOccurrenceSource/properties/run_id/$ref",
+        "/paths/~1improvement~1outcomes/get/parameters/0/schema/$ref",
+        "/paths/~1improvement~1failures/get/parameters/0/schema/$ref",
+        "/components/schemas/RecordOperatorOutcomeRequest/properties/run_id/$ref",
+        "/components/schemas/OutcomeSubject/properties/id/$ref",
+        "/components/schemas/OutcomeVector/properties/run_id/$ref",
+        "/components/schemas/FailureClusterSummary/properties/representative_run_id/anyOf/0/$ref",
+        "/components/schemas/FailureTrace/properties/run_id/$ref",
+        "/components/schemas/OutcomeHistory/properties/run_id/$ref",
+        "/components/schemas/OutcomeWireV1/properties/run_id/$ref",
     ] {
         require(pointer, "#/components/schemas/OpaqueId")?;
     }

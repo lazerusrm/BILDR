@@ -15,6 +15,17 @@ pub mod operator_control;
 
 pub use operator_control::*;
 
+pub const MAX_OPERATOR_CONTROL_IDENTIFIER_LEN: usize = 160;
+
+#[must_use]
+pub fn is_safe_operator_control_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_OPERATOR_CONTROL_IDENTIFIER_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+}
+
 macro_rules! id_type {
     ($name:ident) => {
         #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -1309,10 +1320,10 @@ impl OutcomeWireV1 {
         if !is_safe_outcome_identifier(self.outcome_id.as_str(), 128) {
             return Err(OutcomeWireValidationError::InvalidField("outcome_id"));
         }
-        if !is_safe_outcome_identifier(self.run_id.as_str(), 128) {
+        if !is_safe_operator_control_identifier(self.run_id.as_str()) {
             return Err(OutcomeWireValidationError::InvalidField("run_id"));
         }
-        if !is_safe_outcome_identifier(&self.subject.id, 128) {
+        if !is_safe_operator_control_identifier(&self.subject.id) {
             return Err(OutcomeWireValidationError::InvalidField("subject.id"));
         }
         validate_outcome_label(self.dimension, self.classification, &self.code)?;

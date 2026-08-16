@@ -1806,7 +1806,7 @@ paths:
         - name: run_id
           in: query
           required: true
-          schema: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+          schema: {$ref: '#/components/schemas/OpaqueId'}
       responses:
         '200':
           description: Redacted current outcome vector; conflicting heads remain visible.
@@ -1857,7 +1857,7 @@ paths:
         - name: repository_id
           in: query
           required: true
-          schema: {type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+          schema: {$ref: '#/components/schemas/OpaqueId'}
       responses:
         '200':
           description: Durable failure observations and bounded cluster summaries.
@@ -3024,7 +3024,7 @@ components:
       additionalProperties: false
       required: [run_id, subject, dimension, classification, code, supersedes, idempotency_key]
       properties:
-        run_id: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+        run_id: {$ref: '#/components/schemas/OpaqueId'}
         subject: {$ref: '#/components/schemas/OutcomeSubject'}
         dimension: {enum: [operator_acceptance, operator_correction, review_regression, pr_reopened, rollback, downstream_regression]}
         classification: {enum: [positive, negative, neutral, unknown]}
@@ -3053,13 +3053,13 @@ components:
       required: [kind, id]
       properties:
         kind: {enum: [run, task_attempt, publication]}
-        id: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+        id: {$ref: '#/components/schemas/OpaqueId'}
     OutcomeVector:
       type: object
       additionalProperties: false
       required: [run_id, items]
       properties:
-        run_id: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+        run_id: {$ref: '#/components/schemas/OpaqueId'}
         items: {type: array, items: {$ref: '#/components/schemas/OutcomeVectorItem'}}
     FailureOverview:
       type: object
@@ -3082,7 +3082,10 @@ components:
         cost_upper_microusd: {type: [integer, 'null'], minimum: 0}
         unknown_cost_occurrences: {type: integer, minimum: 0}
         representative_occurrence_id: {type: [string, 'null'], pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
-        representative_run_id: {type: [string, 'null'], pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        representative_run_id:
+          anyOf:
+            - {$ref: '#/components/schemas/OpaqueId'}
+            - {type: 'null'}
         representative_trace_id: {type: [string, 'null'], pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
     FailureTrace:
       type: object
@@ -3090,7 +3093,7 @@ components:
       required: [trace_id, run_id, rows, outcomes]
       properties:
         trace_id: {type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
-        run_id: {type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        run_id: {$ref: '#/components/schemas/OpaqueId'}
         rows: {type: array, items: {$ref: '#/components/schemas/FailureTraceRow'}}
         outcomes: {$ref: '#/components/schemas/OutcomeVector'}
     FailureTraceRow:
@@ -3128,7 +3131,7 @@ components:
       required: [outcome_id, run_id, revisions, conflicted]
       properties:
         outcome_id: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
-        run_id: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+        run_id: {$ref: '#/components/schemas/OpaqueId'}
         revisions: {type: array, items: {$ref: '#/components/schemas/OutcomeRevision'}}
         conflicted: {type: boolean}
     OutcomeRevisionReceipt:
@@ -3196,7 +3199,7 @@ components:
       properties:
         schema: {const: harness.outcome.v1}
         outcome_id: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
-        run_id: {type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$'}
+        run_id: {$ref: '#/components/schemas/OpaqueId'}
         subject: {$ref: '#/components/schemas/OutcomeSubject'}
         dimension: {$ref: '#/components/schemas/OutcomeDimension'}
         classification: {$ref: '#/components/schemas/OutcomeClassification'}

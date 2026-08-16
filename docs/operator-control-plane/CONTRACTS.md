@@ -481,6 +481,7 @@ the operator retry route rejects it.
   "task_id": "task-...",
   "prior_attempt_id": "attempt-...",
   "worktree_id": "worktree-...",
+  "source_event_id": "event-...",
   "head_sha": "40-hex",
   "worktree_fingerprint": "64-hex",
   "lease_generation": 9,
@@ -490,6 +491,7 @@ the operator retry route rejects it.
   "external_effect_state": "none_or_reconciled",
   "candidate_state": "preserved",
   "approved_actions": ["authorize_fresh_attempt"],
+  "observed_at_ms": 1786589040000,
   "expires_at_ms": 1786589100000,
   "sha256": "64-hex"
 }

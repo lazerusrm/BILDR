@@ -8,8 +8,8 @@
   "properties": {
     "schema": {"const": "harness.outcome.v1"},
     "outcome_id": {"type": "string", "pattern": "^[A-Za-z0-9_.-]{1,128}$"},
-    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9_.-]{1,128}$"},
-    "subject": {"type": "object", "additionalProperties": false, "required": ["kind", "id"], "properties": {"kind": {"enum": ["run", "task_attempt", "publication"]}, "id": {"type": "string", "pattern": "^[A-Za-z0-9_.-]{1,128}$"}}},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,160}$"},
+    "subject": {"type": "object", "additionalProperties": false, "required": ["kind", "id"], "properties": {"kind": {"enum": ["run", "task_attempt", "publication"]}, "id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,160}$"}}},
     "dimension": {"enum": ["operator_acceptance", "operator_correction", "validation", "evidence", "verifier_findings", "completion_state", "resource_use", "ci_required_checks", "review_regression", "pr_reopened", "rollback", "downstream_regression"]},
     "classification": {"enum": ["positive", "negative", "neutral", "unknown"]},
     "code": {"type": "string", "pattern": "^[a-z0-9_]{1,80}$"},
