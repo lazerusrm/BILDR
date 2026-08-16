@@ -95,7 +95,7 @@ pub const OPERATOR_CONTROL_FAULT_CASES: [OperatorControlFaultCase; 12] = [
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::CompletionCannotHideBlockingAttention,
         injection: FaultInjection::TerminalStateWithOpenAttention,
-        test_selector: "cargo test -p harness-store --lib operator_control::attention::tests::attention_lifecycle_records_deterministic_causal_receipts -- --exact --test-threads=1",
+        test_selector: "cargo test -p harness-orchestrator --lib tests::investigation_completion_preserves_open_blocking_attention -- --exact --test-threads=1",
     },
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::PresentationCannotResolve,
@@ -115,12 +115,12 @@ pub const OPERATOR_CONTROL_FAULT_CASES: [OperatorControlFaultCase; 12] = [
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::ProjectionNeverAuthorizes,
         injection: FaultInjection::ProjectionMutationRequest,
-        test_selector: "cargo test -p harness-store --lib operator_control::snapshots::tests::return_view_preserves_current_observe_only_sections_and_cursor_cannot_regress -- --exact --test-threads=1",
+        test_selector: "cargo test -p harness-store --lib operator_control::snapshots::tests::return_view_acknowledgement_cannot_authorize_or_mutate_open_attention -- --exact --test-threads=1",
     },
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::ReplayDeterministic,
         injection: FaultInjection::ReorderedReplay,
-        test_selector: "cargo test -p harness-store --lib operator_control::snapshots::tests::snapshot_is_reused_only_at_the_exact_source_cursors -- --exact --test-threads=1",
+        test_selector: "cargo test -p harness-store --lib operator_control::snapshots::tests::reordered_return_view_replay_cannot_regress_or_skip_current_events -- --exact --test-threads=1",
     },
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::StaleVersionOrDigestRejected,
@@ -135,7 +135,7 @@ pub const OPERATOR_CONTROL_FAULT_CASES: [OperatorControlFaultCase; 12] = [
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::RemoteRuntimeAbsent,
         injection: FaultInjection::RemoteDispatchRequest,
-        test_selector: "cargo test -p xtask tests::remote_dispatch_capability_is_absent -- --exact --test-threads=1",
+        test_selector: "cargo test -p harnessd tests::remote_bind_request_is_rejected_by_the_local_control_plane -- --exact --test-threads=1",
     },
 ];
 
@@ -155,6 +155,24 @@ pub struct OperatorControlFaultResultV1 {
     pub injection: FaultInjection,
     pub test_selector: String,
     pub outcome: FaultOutcome,
+    pub evidence_file: String,
+    pub evidence_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceTreeStateV1 {
+    pub head_sha: String,
+    pub clean: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorControlFaultSourceIdentityV1 {
+    pub expected_release_sha: String,
+    pub preflight: SourceTreeStateV1,
+    pub postflight: SourceTreeStateV1,
+    pub evidence_file: String,
     pub evidence_digest: String,
 }
 
@@ -163,6 +181,7 @@ pub struct OperatorControlFaultResultV1 {
 pub struct OperatorControlFaultMatrixRunV1 {
     pub schema: String,
     pub implementation_sha: String,
+    pub source_identity: OperatorControlFaultSourceIdentityV1,
     pub results: Vec<OperatorControlFaultResultV1>,
     pub sha256: String,
 }
@@ -194,6 +213,16 @@ impl OperatorControlFaultMatrixRunV1 {
                 "schema, implementation SHA, or digest",
             ));
         }
+        let source_identity = &self.source_identity;
+        if !sha40(&source_identity.expected_release_sha)
+            || source_identity.expected_release_sha != self.implementation_sha
+            || !sha40(&source_identity.preflight.head_sha)
+            || !sha40(&source_identity.postflight.head_sha)
+            || source_identity.evidence_file != "source-identity.log"
+            || !hash(&source_identity.evidence_digest)
+        {
+            return Err(FaultMatrixError::Invalid("source identity"));
+        }
         if self.results.len() != OPERATOR_CONTROL_FAULT_CASES.len() {
             return Err(FaultMatrixError::Invalid("result count"));
         }
@@ -203,6 +232,7 @@ impl OperatorControlFaultMatrixRunV1 {
             if !token(&result.case_id)
                 || result.test_selector.is_empty()
                 || result.test_selector.len() > 512
+                || result.evidence_file != format!("{}.log", result.case_id)
                 || !hash(&result.evidence_digest)
             {
                 return Err(FaultMatrixError::Invalid("result shape"));
@@ -240,8 +270,22 @@ impl OperatorControlFaultMatrixRunV1 {
     /// A release gate is intentionally stricter than shape validation: an
     /// unavailable test is preserved in the record but is never a passing
     /// invariant result.
-    pub fn promotion_gate(&self) -> Result<(), FaultMatrixError> {
+    pub fn promotion_gate(&self, expected_release_sha: &str) -> Result<(), FaultMatrixError> {
         self.validate()?;
+        if !sha40(expected_release_sha) || expected_release_sha != self.implementation_sha {
+            return Err(FaultMatrixError::Gate(
+                "receipt does not name the exact requested release SHA".to_owned(),
+            ));
+        }
+        if self.source_identity.preflight.head_sha != expected_release_sha
+            || self.source_identity.postflight.head_sha != expected_release_sha
+            || !self.source_identity.preflight.clean
+            || !self.source_identity.postflight.clean
+        {
+            return Err(FaultMatrixError::Gate(
+                "source identity changed or was not clean during the fault run".to_owned(),
+            ));
+        }
         for result in &self.results {
             match result.outcome {
                 FaultOutcome::Held => {}
@@ -276,6 +320,7 @@ mod tests {
                 injection: case.injection,
                 test_selector: case.test_selector.to_owned(),
                 outcome,
+                evidence_file: format!("{}.log", case.invariant.case_id()),
                 evidence_digest: "a".repeat(64),
             })
             .collect::<Vec<_>>();
@@ -283,6 +328,19 @@ mod tests {
         let mut value = OperatorControlFaultMatrixRunV1 {
             schema: "harness.operator-control-fault-matrix.v1".to_owned(),
             implementation_sha: "b".repeat(40),
+            source_identity: OperatorControlFaultSourceIdentityV1 {
+                expected_release_sha: "b".repeat(40),
+                preflight: SourceTreeStateV1 {
+                    head_sha: "b".repeat(40),
+                    clean: true,
+                },
+                postflight: SourceTreeStateV1 {
+                    head_sha: "b".repeat(40),
+                    clean: true,
+                },
+                evidence_file: "source-identity.log".to_owned(),
+                evidence_digest: "c".repeat(64),
+            },
             results,
             sha256: String::new(),
         };
@@ -294,7 +352,7 @@ mod tests {
     fn complete_held_matrix_is_closed_canonical_and_promotion_eligible() {
         let value = run(FaultOutcome::Held);
         assert!(value.validate().is_ok());
-        assert!(value.promotion_gate().is_ok());
+        assert!(value.promotion_gate(&"b".repeat(40)).is_ok());
     }
 
     #[test]
@@ -321,10 +379,22 @@ mod tests {
         violated.results[0].outcome = FaultOutcome::Violated;
         violated.sha256 = violated.digest().expect("digest");
         assert!(violated.validate().is_ok());
-        assert!(violated.promotion_gate().is_err());
+        assert!(violated.promotion_gate(&"b".repeat(40)).is_err());
 
         let unavailable = run(FaultOutcome::InfrastructureUnavailable);
         assert!(unavailable.validate().is_ok());
-        assert!(unavailable.promotion_gate().is_err());
+        assert!(unavailable.promotion_gate(&"b".repeat(40)).is_err());
+    }
+
+    #[test]
+    fn promotion_requires_a_clean_preflight_and_postflight_at_the_requested_sha() {
+        let mut changed = run(FaultOutcome::Held);
+        changed.source_identity.postflight.clean = false;
+        changed.sha256 = changed.digest().expect("digest");
+        assert!(changed.validate().is_ok());
+        assert!(changed.promotion_gate(&"b".repeat(40)).is_err());
+
+        let expected = "c".repeat(40);
+        assert!(run(FaultOutcome::Held).promotion_gate(&expected).is_err());
     }
 }

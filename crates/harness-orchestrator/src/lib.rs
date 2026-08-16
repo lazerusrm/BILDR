@@ -1846,7 +1846,11 @@ impl Orchestrator {
             #[cfg(test)]
             emit_material_event_before_expert_launch: Arc::new(AtomicBool::new(false)),
         };
-        orchestrator.reconcile_native_subagents()?;
+        // Native subagent activity is durable source evidence. Never
+        // reconstruct or rewrite child sessions from it before restart
+        // reconciliation has recorded its immutable inventory and receipts.
+        // Persisted child sessions are reconciled below; unbound activity
+        // remains visible for an explicit future reconciliation action.
         orchestrator
             .projection
             .rebuild_usage_projection_if_needed()?;
@@ -7950,52 +7954,64 @@ impl Orchestrator {
         &self,
         run: &RunSummary,
     ) -> Result<(), OrchestratorError> {
-        for agent in self
+        let investigator_ids = self
             .store
             .list_agents(&run.id)?
             .into_iter()
             .filter(|agent| {
                 agent.role == AgentRole::Investigator && agent_state_consumes_capacity(&agent.state)
             })
-        {
-            let key = investigation_deadline_metadata_key(&agent.id);
-            let deadline_ms = self
-                .store
-                .runtime_metadata(&key)?
-                .and_then(|value| value.get("deadline_ms").and_then(Value::as_i64));
-            let Some(deadline_ms) = deadline_ms else {
-                continue;
-            };
-            if now_ms() < deadline_ms {
-                continue;
-            }
-            if let (Some(thread_id), Some(turn_id)) =
-                (agent.thread_id.as_deref(), agent.active_turn_id.as_deref())
-            {
-                if let Ok(runtime) = self.runtime().await
-                    && let Err(error) = runtime.interrupt_turn(thread_id, turn_id).await
+            .map(|agent| agent.id)
+            .collect::<Vec<_>>();
+        for agent_id in investigator_ids {
+            let interrupt = {
+                // Finalize the durable failure under the same lock used by
+                // artifact intake. Runtime interruption is cleanup only: an
+                // unavailable App Server must not delay or decide custody.
+                let _guard = self.operation_lock.lock().await;
+                let agent = self.store.agent(&agent_id)?;
+                if agent.role != AgentRole::Investigator
+                    || !agent_state_consumes_capacity(&agent.state)
                 {
-                    warn!(agent_id = %agent.id, %error, "investigation deadline interruption could not reach App Server");
+                    None
+                } else {
+                    let key = investigation_deadline_metadata_key(&agent.id);
+                    let deadline_ms = investigation_deadline_ms(&self.store, &key)?;
+                    if now_ms() < deadline_ms {
+                        None
+                    } else {
+                        let attempt_id =
+                            self.store
+                                .task_attempt_for_agent(&agent.id)?
+                                .ok_or_else(|| {
+                                    OrchestratorError::Protocol(
+                                        "active investigator is missing task-attempt custody"
+                                            .to_owned(),
+                                    )
+                                })?;
+                        let task_id = self.store.task_for_attempt(&attempt_id)?;
+                        let task = self.store.task(&task_id)?;
+                        self.fail_investigation_response(
+                            run,
+                            &task,
+                            &attempt_id,
+                            &agent.id,
+                            "investigation time budget elapsed before a controller-valid immutable artifact was recorded",
+                        )?;
+                        self.store.delete_runtime_metadata(&key)?;
+                        match (agent.thread_id, agent.active_turn_id) {
+                            (Some(thread_id), Some(turn_id)) => Some((thread_id, turn_id)),
+                            _ => None,
+                        }
+                    }
                 }
+            };
+            if let Some((thread_id, turn_id)) = interrupt
+                && let Ok(runtime) = self.runtime().await
+                && let Err(error) = runtime.interrupt_turn(&thread_id, &turn_id).await
+            {
+                warn!(agent_id = %agent_id, %error, "investigation deadline interruption could not reach App Server");
             }
-            let attempt_id = self
-                .store
-                .task_attempt_for_agent(&agent.id)?
-                .ok_or_else(|| {
-                    OrchestratorError::Protocol(
-                        "active investigator is missing task-attempt custody".to_owned(),
-                    )
-                })?;
-            let task_id = self.store.task_for_attempt(&attempt_id)?;
-            let task = self.store.task(&task_id)?;
-            self.fail_investigation_response(
-                run,
-                &task,
-                &attempt_id,
-                &agent.id,
-                "investigation time budget elapsed before a controller-valid immutable artifact was recorded",
-            )?;
-            self.store.delete_runtime_metadata(&key)?;
         }
         Ok(())
     }
@@ -9000,6 +9016,20 @@ impl Orchestrator {
         let task_id = self.store.task_for_attempt(&attempt_id)?;
         let task = self.store.task(&task_id)?;
         let run = self.store.run(&task.run_id)?;
+        let deadline_key = investigation_deadline_metadata_key(agent_id);
+        if now_ms() >= investigation_deadline_ms(&self.store, &deadline_key)? {
+            self.fail_investigation_response(
+                &run,
+                &task,
+                &attempt_id,
+                agent_id,
+                "investigation response arrived after its durable time budget elapsed",
+            )?;
+            self.store.delete_runtime_metadata(&deadline_key)?;
+            return Err(OrchestratorError::Blocked(
+                "investigation response arrived after its durable time budget elapsed".to_owned(),
+            ));
+        }
         let outcome = (|| -> Result<InvestigationArtifact, OrchestratorError> {
             if agent.sandbox_mode != SandboxMode::ReadOnly
                 || self.store.agent_approval_policy(agent_id)? != "never"
@@ -9126,8 +9156,7 @@ impl Orchestrator {
             None,
             None,
         )?;
-        self.store
-            .delete_runtime_metadata(&investigation_deadline_metadata_key(agent_id))?;
+        self.store.delete_runtime_metadata(&deadline_key)?;
         self.emit_agent_event(
             &run.id,
             agent_id,
@@ -10456,64 +10485,6 @@ impl Orchestrator {
                     json!({"affected_agents": affected, "reason": reason}),
                 )?;
             }
-        }
-        Ok(())
-    }
-
-    fn reconcile_native_subagents(&self) -> Result<(), OrchestratorError> {
-        for activity in self.store.native_subagent_activities()? {
-            let envelope = json!({
-                "item": activity.payload
-            });
-            let Some((thread_id, agent_path, _)) = native_subagent_activity(&envelope) else {
-                continue;
-            };
-            let nickname = agent_path.rsplit('/').next().unwrap_or(agent_path);
-            let child_id = self.ensure_native_subagent(
-                &activity.parent_agent_session_id,
-                thread_id,
-                &activity.parent_thread_id,
-                Some(nickname),
-                Some(agent_path),
-                None,
-                None,
-                None,
-            )?;
-            match self.store.latest_thread_turn_status(thread_id)?.as_deref() {
-                Some("completed") => self.store.update_agent_state(
-                    &child_id,
-                    "TURN_COMPLETE",
-                    Some("Turn completed"),
-                    None,
-                    None,
-                    None,
-                )?,
-                Some("interrupted") => self.store.update_agent_state(
-                    &child_id,
-                    "INTERRUPTED",
-                    Some("Turn interrupted"),
-                    None,
-                    None,
-                    None,
-                )?,
-                Some(status) => self.store.update_agent_state(
-                    &child_id,
-                    "FAILED",
-                    Some("Turn failed"),
-                    None,
-                    None,
-                    Some(("runtime_failure", status)),
-                )?,
-                None => self.store.update_agent_state(
-                    &child_id,
-                    "STALLED",
-                    Some("Daemon restarted before child turn completed"),
-                    None,
-                    None,
-                    Some(("infrastructure_unavailable", "daemon restarted")),
-                )?,
-            }
-            self.store.clear_agent_active_turn(&child_id)?;
         }
         Ok(())
     }
@@ -14798,6 +14769,21 @@ fn investigation_deadline_metadata_key(agent_id: &AgentSessionId) -> String {
     format!("investigation-deadline:{agent_id}")
 }
 
+/// Active investigators have exactly one controller-written deadline. Missing
+/// or malformed metadata is a custody failure, not permission to continue an
+/// unbounded read-only session.
+fn investigation_deadline_ms(store: &Store, key: &str) -> Result<i64, OrchestratorError> {
+    store
+        .runtime_metadata(key)?
+        .and_then(|value| value.get("deadline_ms").and_then(Value::as_i64))
+        .filter(|deadline_ms| *deadline_ms >= 0)
+        .ok_or_else(|| {
+            OrchestratorError::Protocol(
+                "active investigation is missing a valid durable deadline".to_owned(),
+            )
+        })
+}
+
 /// The pinned App Server v2 contract exposes only a global `readOnly`
 /// sandbox. It has neither readable-root allowlists nor a controller-visible
 /// read-event stream, so a prompt cannot enforce `InvestigationScope`.
@@ -17796,7 +17782,10 @@ pub enum OrchestratorError {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use harness_domain::TaskMilestone;
+    use harness_domain::{
+        AttentionCategory, AttentionItem, AttentionItemId, AttentionResurfacingPolicy,
+        AttentionSeverity, AttentionSourceRef, AttentionSourceType, AttentionState, TaskMilestone,
+    };
     use tempfile::TempDir;
 
     #[derive(Default)]
@@ -18838,6 +18827,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn investigation_completion_preserves_open_blocking_attention() {
+        let (orchestrator, _temp, _runtime, run_id, task_id) = investigation_fixture().await;
+        orchestrator
+            .tick(&run_id)
+            .await
+            .expect("investigation starts");
+        let investigator = orchestrator
+            .store()
+            .list_agents(&run_id)
+            .expect("agents read")
+            .into_iter()
+            .find(|agent| agent.role == AgentRole::Investigator)
+            .expect("investigator exists");
+        let attempt_id = orchestrator
+            .store()
+            .task_attempt_for_agent(&investigator.id)
+            .expect("attempt reads")
+            .expect("attempt exists");
+        let context_digest = orchestrator
+            .store()
+            .context_packet_digest_for_attempt(&attempt_id, "investigator")
+            .expect("context reads")
+            .expect("context exists");
+        let attention = AttentionItem {
+            schema: "harness.attention-item.v1".to_owned(),
+            attention_id: AttentionItemId::new(),
+            repository_id: Some("investigation-fixture-repository".to_owned()),
+            run_id: Some(run_id.to_string()),
+            task_id: Some(task_id.to_string()),
+            source: AttentionSourceRef {
+                source_type: AttentionSourceType::Approval,
+                source_id: "investigation-completion-approval".to_owned(),
+                source_revision: 1,
+            },
+            category: AttentionCategory::Approval,
+            severity: AttentionSeverity::High,
+            state: AttentionState::Open,
+            title: "Blocking approval remains open".to_owned(),
+            summary: "A terminal investigation must not resolve this source record.".to_owned(),
+            option_refs: vec![],
+            evidence_refs: vec![],
+            blocked_refs: vec![task_id.to_string()],
+            dedupe_key: "investigation-completion-open-attention".to_owned(),
+            opened_event_id: "investigation-completion-attention-event".to_owned(),
+            opened_at_ms: 1,
+            acknowledged_at_ms: None,
+            due_at_ms: None,
+            resurfacing: AttentionResurfacingPolicy {
+                policy: "until_authority_receipt".to_owned(),
+                maximum_defer_ms: 60_000,
+            },
+            resolution: None,
+            version: 1,
+        };
+        orchestrator
+            .store()
+            .upsert_source_attention(&attention)
+            .expect("source opens blocking attention");
+        let response = json!({
+            "schema": "harness.investigation-response.v1",
+            "methods": ["bounded immutable context review"],
+            "findings": [{
+                "finding_id": "finding-1",
+                "classification": "supported",
+                "summary": "The scoped README is available in the immutable context.",
+                "confidence_milli": 900,
+                "evidence_refs": [investigation_context_evidence_ref(&context_digest)],
+                "affected_refs": [],
+                "risk": "normal",
+                "limitations": []
+            }],
+            "recommendations": [],
+            "decision_inventory": [],
+            "limitations": [],
+            "rejected_hypotheses": [],
+            "sensitivity": "internal",
+            "artifact_refs": []
+        });
+        orchestrator
+            .accept_investigation_response(
+                &investigator.id,
+                &serde_json::to_string(&response).expect("response serializes"),
+            )
+            .await
+            .expect("investigation completion");
+        assert_eq!(
+            orchestrator
+                .store()
+                .task(&task_id)
+                .expect("task reads")
+                .state,
+            TaskState::Closed
+        );
+        let persisted = orchestrator
+            .store()
+            .attention_item(&attention.attention_id)
+            .expect("attention reads")
+            .expect("attention remains");
+        assert_eq!(persisted.state, AttentionState::Open);
+        assert_eq!(persisted.version, attention.version);
+        assert!(persisted.resolution.is_none());
+    }
+
+    #[tokio::test]
     async fn investigation_deadline_fails_closed_without_a_model_artifact() {
         let (orchestrator, _temp, _runtime, run_id, task_id) = investigation_fixture().await;
         orchestrator
@@ -18884,6 +18977,91 @@ mod tests {
                 .store()
                 .list_investigation_artifacts(Some(run_id.as_str()), Some("INVESTIGATION-001"), 10)
                 .expect("artifact list reads")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn investigation_response_after_deadline_is_rejected_before_maintenance_runs() {
+        let (orchestrator, _temp, _runtime, run_id, task_id) = investigation_fixture().await;
+        orchestrator
+            .tick(&run_id)
+            .await
+            .expect("investigation starts");
+        let investigator = orchestrator
+            .store()
+            .list_agents(&run_id)
+            .expect("agents read")
+            .into_iter()
+            .find(|agent| agent.role == AgentRole::Investigator)
+            .expect("investigator exists");
+        let attempt_id = orchestrator
+            .store()
+            .task_attempt_for_agent(&investigator.id)
+            .expect("attempt reads")
+            .expect("attempt exists");
+        let context_digest = orchestrator
+            .store()
+            .context_packet_digest_for_attempt(&attempt_id, "investigator")
+            .expect("context reads")
+            .expect("context exists");
+        orchestrator
+            .store()
+            .put_runtime_metadata(
+                &investigation_deadline_metadata_key(&investigator.id),
+                &json!({"deadline_ms": 0}),
+            )
+            .expect("expired deadline persists");
+        let response = json!({
+            "schema": "harness.investigation-response.v1",
+            "methods": ["late response"],
+            "findings": [{
+                "finding_id": "finding-1",
+                "classification": "supported",
+                "summary": "A valid response must still lose to the durable deadline.",
+                "confidence_milli": 900,
+                "evidence_refs": [investigation_context_evidence_ref(&context_digest)],
+                "affected_refs": [],
+                "risk": "normal",
+                "limitations": []
+            }],
+            "recommendations": [],
+            "decision_inventory": [],
+            "limitations": [],
+            "rejected_hypotheses": [],
+            "sensitivity": "internal",
+            "artifact_refs": []
+        });
+        assert!(
+            orchestrator
+                .accept_investigation_response(
+                    &investigator.id,
+                    &serde_json::to_string(&response).expect("response serializes"),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            orchestrator
+                .store()
+                .task(&task_id)
+                .expect("task reads")
+                .state,
+            TaskState::NeedsHelp
+        );
+        assert_eq!(
+            orchestrator
+                .store()
+                .agent(&investigator.id)
+                .expect("agent reads")
+                .state,
+            "FAILED"
+        );
+        assert!(
+            orchestrator
+                .store()
+                .list_investigation_artifacts(Some(run_id.as_str()), Some("INVESTIGATION-001"), 10)
+                .expect("artifacts read")
                 .is_empty()
         );
     }

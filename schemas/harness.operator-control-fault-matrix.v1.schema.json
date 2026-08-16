@@ -4,10 +4,11 @@
   "title": "BILDR operator-control invariant fault-matrix result v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "implementation_sha", "results", "sha256"],
+  "required": ["schema", "implementation_sha", "source_identity", "results", "sha256"],
   "properties": {
     "schema": {"const": "harness.operator-control-fault-matrix.v1"},
     "implementation_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "source_identity": {"$ref": "#/$defs/source_identity"},
     "results": {
       "type": "array",
       "minItems": 12,
@@ -18,16 +19,38 @@
   },
   "$defs": {
     "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source_tree_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["head_sha", "clean"],
+      "properties": {
+        "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "clean": {"type": "boolean"}
+      }
+    },
+    "source_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expected_release_sha", "preflight", "postflight", "evidence_file", "evidence_digest"],
+      "properties": {
+        "expected_release_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "preflight": {"$ref": "#/$defs/source_tree_state"},
+        "postflight": {"$ref": "#/$defs/source_tree_state"},
+        "evidence_file": {"const": "source-identity.log"},
+        "evidence_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
     "result": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["case_id", "invariant", "injection", "test_selector", "outcome", "evidence_digest"],
+      "required": ["case_id", "invariant", "injection", "test_selector", "outcome", "evidence_file", "evidence_digest"],
       "properties": {
         "case_id": {"enum": ["one_mutable_owner", "unknown_cannot_authorize_replacement", "source_only_attention_closure", "completion_cannot_hide_blocking_attention", "presentation_cannot_resolve", "investigation_cannot_mutate_or_create_candidate", "unknown_external_effect_never_auto_retried", "projection_never_authorizes", "replay_deterministic", "stale_version_or_digest_rejected", "critical_notification_not_omitted", "remote_runtime_absent"]},
         "invariant": {"enum": ["one_mutable_owner", "unknown_cannot_authorize_replacement", "source_only_attention_closure", "completion_cannot_hide_blocking_attention", "presentation_cannot_resolve", "investigation_cannot_mutate_or_create_candidate", "unknown_external_effect_never_auto_retried", "projection_never_authorizes", "replay_deterministic", "stale_version_or_digest_rejected", "critical_notification_not_omitted", "remote_runtime_absent"]},
         "injection": {"enum": ["concurrent_claim", "ownership_unknown", "forged_closure", "terminal_state_with_open_attention", "forged_presentation_receipt", "investigation_write_or_candidate_request", "unknown_external_effect", "projection_mutation_request", "reordered_replay", "stale_version_or_digest", "critical_delivery_policy", "remote_dispatch_request"]},
         "test_selector": {"type": "string", "minLength": 1, "maxLength": 512},
         "outcome": {"enum": ["held", "violated", "infrastructure_unavailable"]},
+        "evidence_file": {"type": "string", "pattern": "^[a-z_]+\\.log$"},
         "evidence_digest": {"$ref": "#/$defs/digest"}
       }
     }

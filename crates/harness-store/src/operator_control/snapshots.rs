@@ -981,10 +981,48 @@ fn digest(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use harness_domain::OperatorPresenceMode;
+    use harness_domain::{
+        AttentionCategory, AttentionItem, AttentionItemId, AttentionResurfacingPolicy,
+        AttentionSeverity, AttentionSourceRef, AttentionSourceType, AttentionState,
+        OperatorPresenceMode,
+    };
     use tempfile::TempDir;
 
     use super::*;
+
+    fn open_blocking_attention() -> AttentionItem {
+        AttentionItem {
+            schema: "harness.attention-item.v1".to_owned(),
+            attention_id: AttentionItemId::new(),
+            repository_id: Some("repo_a".to_owned()),
+            run_id: Some("run_a".to_owned()),
+            task_id: Some("task_a".to_owned()),
+            source: AttentionSourceRef {
+                source_type: AttentionSourceType::Approval,
+                source_id: "approval_a".to_owned(),
+                source_revision: 1,
+            },
+            category: AttentionCategory::Approval,
+            severity: AttentionSeverity::High,
+            state: AttentionState::Open,
+            title: "Approval required".to_owned(),
+            summary: "The source authority remains open.".to_owned(),
+            option_refs: vec![],
+            evidence_refs: vec![],
+            blocked_refs: vec!["task_a".to_owned()],
+            dedupe_key: "approval_task_a".to_owned(),
+            opened_event_id: "event_a".to_owned(),
+            opened_at_ms: 1,
+            acknowledged_at_ms: None,
+            due_at_ms: None,
+            resurfacing: AttentionResurfacingPolicy {
+                policy: "until_authority_receipt".to_owned(),
+                maximum_defer_ms: 60_000,
+            },
+            resolution: None,
+            version: 1,
+        }
+    }
 
     #[test]
     fn snapshot_is_reused_only_at_the_exact_source_cursors() {
@@ -1076,7 +1114,32 @@ mod tests {
     }
 
     #[test]
-    fn return_view_preserves_chronological_controller_events_since_cursor() {
+    fn return_view_acknowledgement_cannot_authorize_or_mutate_open_attention() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let attention = open_blocking_attention();
+        store
+            .upsert_source_attention(&attention)
+            .expect("source opens attention");
+        let snapshot = store.control_plane_snapshot().expect("snapshot");
+
+        // This is the only presentation-side mutation: acknowledging a
+        // return view. It must not become an authority action over the source.
+        store
+            .advance_return_view_cursor("operator_a", snapshot.revision, snapshot.event_cursor)
+            .expect("presentation acknowledgement");
+
+        let persisted = store
+            .attention_item(&attention.attention_id)
+            .expect("attention reads")
+            .expect("attention remains");
+        assert_eq!(persisted.state, AttentionState::Open);
+        assert_eq!(persisted.version, attention.version);
+        assert!(persisted.resolution.is_none());
+    }
+
+    #[test]
+    fn reordered_return_view_replay_cannot_regress_or_skip_current_events() {
         let temp = TempDir::new().expect("temp");
         let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
         for event in 0..2 {
@@ -1112,6 +1175,17 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0]["event_id"], Value::from(2));
         assert_eq!(events[1]["event_id"], Value::from(3));
+        store
+            .advance_return_view_cursor("operator_a", view.snapshot_revision, view.event_cursor)
+            .expect("current replay acknowledgement");
+        assert!(matches!(
+            store.advance_return_view_cursor(
+                "operator_a",
+                view.snapshot_revision,
+                view.event_cursor - 1,
+            ),
+            Err(StoreError::Conflict(_))
+        ));
     }
 
     #[test]

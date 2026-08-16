@@ -1,7 +1,7 @@
 //! Controller-owned restart and runtime-loss inventory custody.
 //!
-//! The legacy recovery path can preserve sessions and worktrees. This module
-//! makes its inventory durable before that path changes any record. It does
+//! The runtime-loss recovery path can preserve sessions and worktrees. This
+//! module makes its inventory durable before that path changes any record. It does
 //! not consume ownership proof, authorize a fresh attempt, or expose an
 //! independent recovery action.
 
@@ -111,8 +111,8 @@ impl Orchestrator {
             .map_err(Into::into)
     }
 
-    /// Records a durable, idempotent authorization receipt before the legacy
-    /// restart path may make an authority-neutral preservation change. The
+    /// Records a durable, idempotent authorization receipt before the restart
+    /// path may make an authority-neutral preservation change. The
     /// receipt intentionally says only that preservation was authorized from
     /// the recorded inventory; the resulting state remains independently
     /// observable in the task/agent/worktree records. Unknown custody never
@@ -221,6 +221,25 @@ impl Orchestrator {
                 })
             })
             .collect::<Vec<_>>();
+        let native_subagent_activity_inventory = self
+            .store
+            .native_subagent_activities()?
+            .into_iter()
+            .filter_map(|activity| {
+                self.store
+                    .agent_context(&activity.parent_agent_session_id)
+                    .ok()
+                    .filter(|(activity_run_id, _)| activity_run_id == &run.id)
+                    .map(|_| {
+                        json!({
+                            "parent_agent_session_id": activity.parent_agent_session_id,
+                            "parent_thread_id": activity.parent_thread_id,
+                            "payload": activity.payload,
+                            "reconstruction": "not_attempted_without_a_receipted_action",
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
         Ok(json!({
             "schema": "harness.reconciliation-inventory.v1",
             "run": {
@@ -235,6 +254,7 @@ impl Orchestrator {
             "agents": agent_inventory,
             "worktrees": worktree_inventory,
             "approvals": approval_inventory,
+            "native_subagent_activities": native_subagent_activity_inventory,
         }))
     }
 }

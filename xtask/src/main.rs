@@ -1,16 +1,22 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use harness_eval::{
     FaultOutcome, OPERATOR_CONTROL_FAULT_CASES, OperatorControlFaultCase,
     OperatorControlFaultMatrixRunV1, OperatorControlFaultResultV1,
+    OperatorControlFaultSourceIdentityV1, SourceTreeStateV1,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -28,6 +34,7 @@ const IMPROVEMENT_CRATES: &[&str] = &[
 // and App are reviewed exceptions, rather than files subject to a growth cap.
 const IMPROVEMENT_RUST_FILE_LINE_BUDGET: usize = 1_200;
 const IMPROVEMENT_UI_FILE_LINE_BUDGET: usize = 1_200;
+const OPERATOR_CONTROL_FAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug)]
 struct SchemaDocument {
@@ -58,6 +65,16 @@ enum Task {
         output: PathBuf,
         #[arg(long)]
         evidence_dir: PathBuf,
+        #[arg(long)]
+        expected_sha: String,
+    },
+    OperatorControlFaultMatrixVerify {
+        #[arg(long)]
+        receipt: PathBuf,
+        #[arg(long)]
+        evidence_dir: PathBuf,
+        #[arg(long)]
+        expected_sha: String,
     },
     AppServerBindingsCheck,
     CodexSchema {
@@ -85,16 +102,28 @@ fn main() -> Result<()> {
         Task::OperatorControlFaultMatrix {
             output,
             evidence_dir,
-        } => operator_control_fault_matrix(&root, &output, &evidence_dir),
+            expected_sha,
+        } => operator_control_fault_matrix(&root, &output, &evidence_dir, &expected_sha),
+        Task::OperatorControlFaultMatrixVerify {
+            receipt,
+            evidence_dir,
+            expected_sha,
+        } => verify_operator_control_fault_matrix(&receipt, &evidence_dir, &expected_sha),
         Task::AppServerBindingsCheck => app_server_bindings_check(&root),
         Task::CodexSchema { codex } => codex_schema(&root, &codex),
         Task::Dist { check } => dist(&root, check),
     }
 }
 
-fn operator_control_fault_matrix(root: &Path, output: &Path, evidence_dir: &Path) -> Result<()> {
-    let implementation_sha = clean_head_sha(root)?;
+fn operator_control_fault_matrix(
+    root: &Path,
+    output: &Path,
+    evidence_dir: &Path,
+    expected_sha: &str,
+) -> Result<()> {
     let root = fs::canonicalize(root).context("canonicalize workspace root")?;
+    let preflight = source_tree_state(&root)?;
+    require_exact_clean_source(&preflight, expected_sha, "preflight")?;
     let output = external_output_path(&root, output, "fault-matrix output")?;
     let evidence_dir =
         external_output_path(&root, evidence_dir, "fault-matrix evidence directory")?;
@@ -122,35 +151,38 @@ fn operator_control_fault_matrix(root: &Path, output: &Path, evidence_dir: &Path
         if library_test {
             command.arg("--lib");
         }
-        let output = command
-            .args([test_name, "--", "--exact", "--test-threads=1"])
-            .current_dir(&root)
-            .output()
-            .with_context(|| format!("run fault case {}", case.invariant.case_id()))?;
-        let transcript = format!(
-            "$ {}\nexit_status: {}\n--- stdout ---\n{}\n--- stderr ---\n{}\n",
-            case.test_selector,
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
+        let execution = run_fault_command(
+            command
+                .args([test_name, "--", "--exact", "--test-threads=1"])
+                .current_dir(&root),
         );
-        write_new(
-            &evidence_dir.join(format!("{}.log", case.invariant.case_id())),
-            transcript.as_bytes(),
-        )?;
+        let transcript = fault_transcript(case.test_selector, &execution);
+        let evidence_file = format!("{}.log", case.invariant.case_id());
+        write_new(&evidence_dir.join(&evidence_file), transcript.as_bytes())?;
         results.push(OperatorControlFaultResultV1 {
             case_id: case.invariant.case_id().to_owned(),
             invariant: case.invariant,
             injection: case.injection,
             test_selector: case.test_selector.to_owned(),
-            outcome: fault_outcome(&output, &transcript),
+            outcome: fault_outcome(&execution, &transcript),
+            evidence_file,
             evidence_digest: sha256(transcript.as_bytes()),
         });
     }
+    let postflight = source_tree_state(&root)?;
+    let identity_bytes = source_identity_transcript(expected_sha, &preflight, &postflight)?;
+    write_new(&evidence_dir.join("source-identity.log"), &identity_bytes)?;
     results.sort_by(|left, right| left.case_id.cmp(&right.case_id));
     let mut matrix = OperatorControlFaultMatrixRunV1 {
         schema: "harness.operator-control-fault-matrix.v1".to_owned(),
-        implementation_sha,
+        implementation_sha: expected_sha.to_owned(),
+        source_identity: OperatorControlFaultSourceIdentityV1 {
+            expected_release_sha: expected_sha.to_owned(),
+            preflight,
+            postflight,
+            evidence_file: "source-identity.log".to_owned(),
+            evidence_digest: sha256(&identity_bytes),
+        },
         results,
         sha256: String::new(),
     };
@@ -160,7 +192,10 @@ fn operator_control_fault_matrix(root: &Path, output: &Path, evidence_dir: &Path
         &output,
         &serde_json::to_vec_pretty(&matrix).context("serialize fault matrix")?,
     )?;
-    matrix.promotion_gate().map_err(anyhow::Error::from)?;
+    verify_fault_matrix_evidence(&matrix, &evidence_dir)?;
+    matrix
+        .promotion_gate(expected_sha)
+        .map_err(anyhow::Error::from)?;
     println!(
         "operator-control-fault-matrix: 12 invariant cases held for {}\\nreceipt: {}\\nevidence: {}",
         matrix.implementation_sha,
@@ -170,7 +205,36 @@ fn operator_control_fault_matrix(root: &Path, output: &Path, evidence_dir: &Path
     Ok(())
 }
 
-fn clean_head_sha(root: &Path) -> Result<String> {
+fn verify_operator_control_fault_matrix(
+    receipt: &Path,
+    evidence_dir: &Path,
+    expected_sha: &str,
+) -> Result<()> {
+    let receipt = fs::canonicalize(receipt)
+        .with_context(|| format!("fault-matrix receipt does not exist: {}", receipt.display()))?;
+    let evidence_dir = fs::canonicalize(evidence_dir).with_context(|| {
+        format!(
+            "fault-matrix evidence directory does not exist: {}",
+            evidence_dir.display()
+        )
+    })?;
+    let matrix: OperatorControlFaultMatrixRunV1 =
+        serde_json::from_slice(&fs::read(&receipt).context("read fault-matrix receipt")?)
+            .context("parse fault-matrix receipt")?;
+    verify_fault_matrix_evidence(&matrix, &evidence_dir)?;
+    matrix
+        .promotion_gate(expected_sha)
+        .map_err(anyhow::Error::from)?;
+    println!(
+        "operator-control-fault-matrix verified for {}\\nreceipt: {}\\nevidence: {}",
+        expected_sha,
+        receipt.display(),
+        evidence_dir.display()
+    );
+    Ok(())
+}
+
+fn source_tree_state(root: &Path) -> Result<SourceTreeStateV1> {
     let status = Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(root)
@@ -178,9 +242,6 @@ fn clean_head_sha(root: &Path) -> Result<String> {
         .context("read Git worktree status")?;
     if !status.status.success() {
         bail!("could not read Git worktree status")
-    }
-    if !status.stdout.is_empty() {
-        bail!("fault-matrix execution requires an exact clean implementation commit")
     }
     let head = Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -190,14 +251,31 @@ fn clean_head_sha(root: &Path) -> Result<String> {
     if !head.status.success() {
         bail!("could not read implementation Git HEAD")
     }
-    let head = String::from_utf8(head.stdout)
+    let head_sha = String::from_utf8(head.stdout)
         .context("Git HEAD was not UTF-8")?
         .trim()
         .to_owned();
-    if head.len() != 40 || !head.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("implementation Git HEAD is not a full SHA-1")
+    if !sha40(&head_sha) {
+        bail!("implementation Git HEAD is not a full lowercase SHA-1")
     }
-    Ok(head)
+    Ok(SourceTreeStateV1 {
+        head_sha,
+        clean: status.stdout.is_empty(),
+    })
+}
+
+fn require_exact_clean_source(
+    state: &SourceTreeStateV1,
+    expected_sha: &str,
+    phase: &str,
+) -> Result<()> {
+    if !sha40(expected_sha) {
+        bail!("fault-matrix expected SHA is not a full lowercase SHA-1")
+    }
+    if !state.clean || state.head_sha != expected_sha {
+        bail!("fault-matrix {phase} requires clean exact source at {expected_sha}")
+    }
+    Ok(())
 }
 
 fn external_output_path(root: &Path, path: &Path, label: &str) -> Result<PathBuf> {
@@ -228,6 +306,244 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("write evidence artifact: {}", path.display()))
 }
 
+#[derive(Debug)]
+enum FaultExecution {
+    Completed {
+        status: ExitStatus,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+    TimedOut {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+    SpawnFailed(String),
+    WaitFailed {
+        error: String,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+}
+
+fn run_fault_command(command: &mut Command) -> FaultExecution {
+    // Each fault test owns a process group so a timeout can terminate Cargo and
+    // every test process it started, without ever signaling the controller.
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = match command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return FaultExecution::SpawnFailed(error.to_string()),
+    };
+    let stdout = child.stdout.take().map(read_child_pipe);
+    let stderr = child.stderr.take().map(read_child_pipe);
+    let started = Instant::now();
+    let mut terminal = None;
+    let mut wait_error = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                terminal = Some(status);
+                break;
+            }
+            Ok(None) if started.elapsed() < OPERATOR_CONTROL_FAULT_TIMEOUT => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                terminate_fault_command(&mut child);
+                let _ = child.wait();
+                break;
+            }
+            Err(error) => {
+                wait_error = Some(error.to_string());
+                terminate_fault_command(&mut child);
+                let _ = child.wait();
+                break;
+            }
+        }
+    }
+    let stdout = collect_child_pipe(stdout);
+    let stderr = collect_child_pipe(stderr);
+    if let Some(error) = wait_error {
+        FaultExecution::WaitFailed {
+            error,
+            stdout,
+            stderr,
+        }
+    } else if let Some(status) = terminal {
+        FaultExecution::Completed {
+            status,
+            stdout,
+            stderr,
+        }
+    } else {
+        FaultExecution::TimedOut { stdout, stderr }
+    }
+}
+
+fn terminate_fault_command(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        use rustix::{
+            io::Errno,
+            process::{Pid, Signal, getpgid, kill_process_group},
+        };
+
+        if let Some(pid) = child.id().try_into().ok().and_then(Pid::from_raw) {
+            match getpgid(Some(pid)) {
+                Ok(group) if group == pid => match kill_process_group(group, Signal::KILL) {
+                    Ok(()) | Err(Errno::SRCH) => return,
+                    Err(_) => {}
+                },
+                Err(Errno::SRCH) => return,
+                Ok(_) | Err(_) => {}
+            }
+        }
+    }
+    let _ = child.kill();
+}
+
+fn read_child_pipe<R>(mut pipe: R) -> thread::JoinHandle<Result<Vec<u8>, std::io::Error>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })
+}
+
+fn collect_child_pipe(
+    pipe: Option<thread::JoinHandle<Result<Vec<u8>, std::io::Error>>>,
+) -> Vec<u8> {
+    pipe.and_then(|reader| reader.join().ok())
+        .and_then(Result::ok)
+        .unwrap_or_default()
+}
+
+fn fault_transcript(selector: &str, execution: &FaultExecution) -> String {
+    let (state, status, stdout, stderr, detail) = match execution {
+        FaultExecution::Completed {
+            status,
+            stdout,
+            stderr,
+        } => (
+            "completed",
+            status.to_string(),
+            stdout.as_slice(),
+            stderr.as_slice(),
+            None,
+        ),
+        FaultExecution::TimedOut { stdout, stderr } => (
+            "timed_out",
+            "unavailable".to_owned(),
+            stdout.as_slice(),
+            stderr.as_slice(),
+            Some(format!(
+                "timeout_seconds: {}",
+                OPERATOR_CONTROL_FAULT_TIMEOUT.as_secs()
+            )),
+        ),
+        FaultExecution::SpawnFailed(error) => (
+            "spawn_failed",
+            "unavailable".to_owned(),
+            &[] as &[u8],
+            &[] as &[u8],
+            Some(format!("spawn_error: {error}")),
+        ),
+        FaultExecution::WaitFailed {
+            error,
+            stdout,
+            stderr,
+        } => (
+            "wait_failed",
+            "unavailable".to_owned(),
+            stdout.as_slice(),
+            stderr.as_slice(),
+            Some(format!("wait_error: {error}")),
+        ),
+    };
+    format!(
+        "$ {selector}\nexecution: {state}\nexit_status: {status}\n{}--- stdout ---\n{}\n--- stderr ---\n{}\n",
+        detail.map_or_else(String::new, |detail| format!("{detail}\n")),
+        String::from_utf8_lossy(stdout),
+        String::from_utf8_lossy(stderr),
+    )
+}
+
+fn source_identity_transcript(
+    expected_sha: &str,
+    preflight: &SourceTreeStateV1,
+    postflight: &SourceTreeStateV1,
+) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec_pretty(&json!({
+        "expected_release_sha": expected_sha,
+        "preflight": preflight,
+        "postflight": postflight,
+    }))?)
+}
+
+fn verify_fault_matrix_evidence(
+    matrix: &OperatorControlFaultMatrixRunV1,
+    evidence_dir: &Path,
+) -> Result<()> {
+    matrix.validate().map_err(anyhow::Error::from)?;
+    let identity = fs::read(evidence_dir.join(&matrix.source_identity.evidence_file))
+        .context("read source-identity evidence")?;
+    if sha256(&identity) != matrix.source_identity.evidence_digest
+        || identity
+            != source_identity_transcript(
+                &matrix.source_identity.expected_release_sha,
+                &matrix.source_identity.preflight,
+                &matrix.source_identity.postflight,
+            )?
+    {
+        bail!("source-identity evidence does not match the signed receipt")
+    }
+    for result in &matrix.results {
+        let transcript = fs::read(evidence_dir.join(&result.evidence_file))
+            .with_context(|| format!("read evidence for {}", result.case_id))?;
+        if sha256(&transcript) != result.evidence_digest {
+            bail!("evidence digest mismatch for {}", result.case_id)
+        }
+        let transcript = String::from_utf8(transcript)
+            .with_context(|| format!("evidence for {} is not UTF-8", result.case_id))?;
+        if !transcript.starts_with(&format!("$ {}\n", result.test_selector)) {
+            bail!("evidence command mismatch for {}", result.case_id)
+        }
+        let recorded_outcome = fault_outcome_from_transcript(&transcript);
+        if recorded_outcome != result.outcome {
+            bail!("evidence outcome mismatch for {}", result.case_id)
+        }
+    }
+    Ok(())
+}
+
+fn fault_outcome_from_transcript(transcript: &str) -> FaultOutcome {
+    if transcript.starts_with("$ ")
+        && transcript.contains("execution: completed\nexit_status: exit status: 0\n")
+        && transcript.contains("test result: ok. 1 passed;")
+    {
+        FaultOutcome::Held
+    } else if transcript.contains("test result: FAILED") {
+        FaultOutcome::Violated
+    } else {
+        FaultOutcome::InfrastructureUnavailable
+    }
+}
+
+fn sha40(value: &str) -> bool {
+    value.len() == 40
+        && value.bytes().all(|byte| {
+            byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())
+        })
+}
+
 fn fault_test_command(case: OperatorControlFaultCase) -> (&'static str, &'static str, bool) {
     match case.invariant.case_id() {
         "one_mutable_owner" => (
@@ -246,8 +562,8 @@ fn fault_test_command(case: OperatorControlFaultCase) -> (&'static str, &'static
             true,
         ),
         "completion_cannot_hide_blocking_attention" => (
-            "harness-store",
-            "operator_control::attention::tests::attention_lifecycle_records_deterministic_causal_receipts",
+            "harness-orchestrator",
+            "tests::investigation_completion_preserves_open_blocking_attention",
             true,
         ),
         "presentation_cannot_resolve" => (
@@ -267,12 +583,12 @@ fn fault_test_command(case: OperatorControlFaultCase) -> (&'static str, &'static
         ),
         "projection_never_authorizes" => (
             "harness-store",
-            "operator_control::snapshots::tests::return_view_preserves_current_observe_only_sections_and_cursor_cannot_regress",
+            "operator_control::snapshots::tests::return_view_acknowledgement_cannot_authorize_or_mutate_open_attention",
             true,
         ),
         "replay_deterministic" => (
             "harness-store",
-            "operator_control::snapshots::tests::snapshot_is_reused_only_at_the_exact_source_cursors",
+            "operator_control::snapshots::tests::reordered_return_view_replay_cannot_regress_or_skip_current_events",
             true,
         ),
         "stale_version_or_digest_rejected" => (
@@ -286,31 +602,24 @@ fn fault_test_command(case: OperatorControlFaultCase) -> (&'static str, &'static
             true,
         ),
         "remote_runtime_absent" => (
-            "xtask",
-            "tests::remote_dispatch_capability_is_absent",
+            "harnessd",
+            "tests::remote_bind_request_is_rejected_by_the_local_control_plane",
             false,
         ),
         _ => unreachable!("closed operator-control fault cases are exhaustive"),
     }
 }
 
-fn fault_outcome(output: &std::process::Output, transcript: &str) -> FaultOutcome {
-    if output.status.success() && transcript.contains("test result: ok. 1 passed;") {
+fn fault_outcome(execution: &FaultExecution, transcript: &str) -> FaultOutcome {
+    if matches!(execution, FaultExecution::Completed { status, .. } if status.success())
+        && transcript.contains("test result: ok. 1 passed;")
+    {
         FaultOutcome::Held
     } else if transcript.contains("test result: FAILED") {
         FaultOutcome::Violated
     } else {
         FaultOutcome::InfrastructureUnavailable
     }
-}
-
-#[cfg(test)]
-fn remote_dispatch_capability_absent(root: &Path) -> Result<()> {
-    let routes = api_router_paths(&root.join("crates/harness-api/src"))?;
-    if routes.iter().any(|route| route.contains("remote")) {
-        bail!("a remote API route is present in the local-only controller")
-    }
-    Ok(())
 }
 
 fn ui_install(root: &Path, locked: bool) -> Result<()> {
@@ -1205,15 +1514,7 @@ fn normalize_json(value: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn remote_dispatch_capability_is_absent() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("xtask has workspace parent")
-            .to_path_buf();
-        remote_dispatch_capability_absent(&root).expect("controller remains local only");
-    }
+    use serde_json::json;
 
     #[test]
     fn fault_matrix_runner_has_one_exact_command_per_closed_case() {
@@ -1227,7 +1528,69 @@ mod tests {
             assert_eq!(case.test_selector, selector);
         }
     }
-    use serde_json::json;
+    #[test]
+    fn fault_matrix_evidence_verifier_rejects_tampered_transcript() {
+        let evidence_dir = tempfile::tempdir().unwrap();
+        let sha = "a".repeat(40);
+        let source = SourceTreeStateV1 {
+            head_sha: sha.clone(),
+            clean: true,
+        };
+        let identity = source_identity_transcript(&sha, &source, &source).unwrap();
+        fs::write(evidence_dir.path().join("source-identity.log"), &identity).unwrap();
+        let mut results: Vec<_> = OPERATOR_CONTROL_FAULT_CASES
+            .iter()
+            .map(|case| {
+                let evidence_file = format!("{}.log", case.invariant.case_id());
+                let transcript = format!(
+                    "$ {}\nexecution: completed\nexit_status: exit status: 0\n--- stdout ---\ntest result: ok. 1 passed;\n--- stderr ---\n",
+                    case.test_selector
+                );
+                fs::write(evidence_dir.path().join(&evidence_file), &transcript).unwrap();
+                OperatorControlFaultResultV1 {
+                    case_id: case.invariant.case_id().to_owned(),
+                    invariant: case.invariant,
+                    injection: case.injection,
+                    test_selector: case.test_selector.to_owned(),
+                    outcome: FaultOutcome::Held,
+                    evidence_file,
+                    evidence_digest: sha256(transcript.as_bytes()),
+                }
+            })
+            .collect();
+        results.sort_by(|left, right| left.case_id.cmp(&right.case_id));
+        let mut matrix = OperatorControlFaultMatrixRunV1 {
+            schema: "harness.operator-control-fault-matrix.v1".to_owned(),
+            implementation_sha: sha.clone(),
+            source_identity: OperatorControlFaultSourceIdentityV1 {
+                expected_release_sha: sha,
+                preflight: source.clone(),
+                postflight: source,
+                evidence_file: "source-identity.log".to_owned(),
+                evidence_digest: sha256(&identity),
+            },
+            results,
+            sha256: String::new(),
+        };
+        matrix.sha256 = matrix.digest().unwrap();
+        verify_fault_matrix_evidence(&matrix, evidence_dir.path()).unwrap();
+
+        fs::write(
+            evidence_dir.path().join("one_mutable_owner.log"),
+            "tampered",
+        )
+        .unwrap();
+        assert!(verify_fault_matrix_evidence(&matrix, evidence_dir.path()).is_err());
+    }
+
+    #[test]
+    fn fault_runner_records_spawn_failure_instead_of_panicking() {
+        let mut command = Command::new("/definitely-not-a-bildr-command");
+        assert!(matches!(
+            run_fault_command(&mut command),
+            FaultExecution::SpawnFailed(_)
+        ));
+    }
 
     #[test]
     fn canonical_json_digest_ignores_object_order() {

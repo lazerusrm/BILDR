@@ -11,6 +11,7 @@ clap.workspace = true
 harness-eval = { path = "../crates/harness-eval" }
 hex.workspace = true
 jsonschema.workspace = true
+rustix.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 sha2.workspace = true

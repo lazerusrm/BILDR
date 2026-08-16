@@ -576,5 +576,24 @@ async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_bind_request_is_rejected_by_the_local_control_plane() {
+        for address in ["0.0.0.0", "192.0.2.44", "2001:db8::44"] {
+            let address = address.parse::<IpAddr>().expect("test IP parses");
+            assert!(
+                ensure_loopback(address).is_err(),
+                "non-loopback address {address} must not start a controller listener"
+            );
+        }
+        assert!(ensure_loopback("127.0.0.1".parse().expect("loopback parses")).is_ok());
+        assert!(ensure_loopback("::1".parse().expect("IPv6 loopback parses")).is_ok());
+    }
+}
+
 mod evaluation;
 mod observation;

@@ -837,11 +837,17 @@ Required property suites prove:
 
 `harness.operator-control-fault-matrix.v1` is the immutable result envelope
 for the twelve hard operator-control invariants. It pins the implementation
-SHA, requires exactly one sorted result for each closed invariant/fault pair,
-and binds every result to its executed test selector and evidence digest.
+SHA, records matching clean preflight and postflight source identity, requires
+exactly one sorted result for each closed invariant/fault pair, and binds every
+result to its exact evidence filename and digest.
 
 The Rust contract in `harness-eval` is stricter than the transport schema: it
 requires the canonical case-to-invariant-to-injection mapping and a self
 digest. A result marked `violated`, `infrastructure_unavailable`, missing, or
 reordered is retained as evidence but fails the promotion gate. A matrix shape
-alone is not a test run and cannot stand in for its command evidence.
+alone is not a test run and cannot stand in for its command evidence. The
+runner requires `--expected-sha`, writes a complete receipt even for an
+unavailable individual test, then re-reads every transcript and the source
+identity log before admitting the receipt. `cargo xtask
+operator-control-fault-matrix-verify` repeats that evidence check and rejects
+any release SHA other than the requested exact commit.

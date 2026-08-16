@@ -138,9 +138,12 @@ A hard-gate failure disables the affected capability regardless of aggregate
 quality metrics.
 
 The closed `harness.operator-control-fault-matrix.v1` receipt records the full
-OCP-018 run against one implementation SHA. Its promotion gate accepts only a
-complete, canonical set of `held` results; unavailable infrastructure and
-negative findings remain visible but are not counted as passes.
+OCP-018 run against one explicitly requested implementation SHA. It records
+clean matching source identity before and after the run, names every evidence
+file, and hashes each transcript. Its promotion gate accepts only a complete,
+canonical set of `held` results with verified evidence; unavailable
+infrastructure, source drift, and negative findings remain visible but are not
+counted as passes.
 
 ## Capability 1: durable attention
 
