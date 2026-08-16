@@ -232,60 +232,64 @@ fn fault_test_command(case: OperatorControlFaultCase) -> (&'static str, &'static
     match case.invariant.case_id() {
         "one_mutable_owner" => (
             "harness-store",
-            "proof_consumption_authorizes_exactly_one_replacement_and_scheduler_lease",
+            "operator_control::reconciliation::tests::proof_consumption_authorizes_exactly_one_replacement_and_scheduler_lease",
             true,
         ),
         "unknown_cannot_authorize_replacement" => (
             "harness-store",
-            "proof_consumption_refuses_any_unreconciled_command_history",
+            "operator_control::reconciliation::tests::proof_consumption_refuses_any_unreconciled_command_history",
             true,
         ),
         "source_only_attention_closure" => (
             "harness-domain",
-            "attention_transitions_are_source_owned_and_terminal_receipts_idempotent",
+            "operator_control::tests::attention_transitions_are_source_owned_and_terminal_receipts_idempotent",
             true,
         ),
         "completion_cannot_hide_blocking_attention" => (
             "harness-store",
-            "attention_lifecycle_records_deterministic_causal_receipts",
+            "operator_control::attention::tests::attention_lifecycle_records_deterministic_causal_receipts",
             true,
         ),
         "presentation_cannot_resolve" => (
             "harness-store",
-            "notification_presentation_is_exact_session_scoped_idempotent_and_authority_neutral",
+            "operator_control::notifications::tests::notification_presentation_is_exact_session_scoped_idempotent_and_authority_neutral",
             true,
         ),
         "investigation_cannot_mutate_or_create_candidate" => (
             "harness-orchestrator",
-            "investigation_launch_and_artifact_completion_are_read_only_and_bound",
+            "tests::investigation_launch_and_artifact_completion_are_read_only_and_bound",
             true,
         ),
         "unknown_external_effect_never_auto_retried" => (
             "harness-orchestrator",
-            "automatic_fresh_attempt_routes_remain_unavailable",
+            "tests::automatic_fresh_attempt_routes_remain_unavailable",
             true,
         ),
         "projection_never_authorizes" => (
             "harness-store",
-            "return_view_preserves_current_observe_only_sections_and_cursor_cannot_regress",
+            "operator_control::snapshots::tests::return_view_preserves_current_observe_only_sections_and_cursor_cannot_regress",
             true,
         ),
         "replay_deterministic" => (
             "harness-store",
-            "snapshot_is_reused_only_at_the_exact_source_cursors",
+            "operator_control::snapshots::tests::snapshot_is_reused_only_at_the_exact_source_cursors",
             true,
         ),
         "stale_version_or_digest_rejected" => (
             "harness-store",
-            "wait_intervention_is_idempotent_and_cannot_apply_to_a_stale_episode",
+            "operator_control::liveness::tests::wait_intervention_is_idempotent_and_cannot_apply_to_a_stale_episode",
             true,
         ),
         "critical_notification_not_omitted" => (
             "harness-store",
-            "shadow_batch_is_exact_idempotent_and_keeps_critical_attention_immediate",
+            "operator_control::notifications::tests::shadow_batch_is_exact_idempotent_and_keeps_critical_attention_immediate",
             true,
         ),
-        "remote_runtime_absent" => ("xtask", "remote_dispatch_capability_is_absent", false),
+        "remote_runtime_absent" => (
+            "xtask",
+            "tests::remote_dispatch_capability_is_absent",
+            false,
+        ),
         _ => unreachable!("closed operator-control fault cases are exhaustive"),
     }
 }
@@ -300,6 +304,7 @@ fn fault_outcome(output: &std::process::Output, transcript: &str) -> FaultOutcom
     }
 }
 
+#[cfg(test)]
 fn remote_dispatch_capability_absent(root: &Path) -> Result<()> {
     let routes = api_router_paths(&root.join("crates/harness-api/src"))?;
     if routes.iter().any(|route| route.contains("remote")) {
