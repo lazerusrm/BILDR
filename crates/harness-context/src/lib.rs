@@ -331,21 +331,23 @@ fn select_sources(
     let investigation_matcher = investigation_scope
         .map(|scope| compile_globs(&scope.owned_read_paths))
         .transpose()?;
+    let investigation_forbidden_matcher = investigation_scope
+        .map(|scope| compile_globs(&scope.forbidden_paths))
+        .transpose()?;
     // An investigation can only receive controller-admitted repository sources
     // that are inside its declared read scope. The packet validator also
     // rejects task authority refs outside that scope; filtering profile hints
     // here protects this boundary even if a malformed packet reaches the
     // compiler directly.
     let source_is_admitted = |path: &str| match investigation_scope {
-        Some(scope) => {
+        Some(_) => {
             !contains_glob(path)
                 && investigation_matcher
                     .as_ref()
                     .is_some_and(|matcher| matcher.is_match(path))
-                && !scope
-                    .forbidden_paths
-                    .iter()
-                    .any(|forbidden| forbidden == path)
+                && !investigation_forbidden_matcher
+                    .as_ref()
+                    .is_some_and(|matcher| matcher.is_match(path))
         }
         None => true,
     };
@@ -1068,11 +1070,37 @@ mod tests {
     }
 
     #[test]
-    fn investigation_forbidden_path_takes_precedence_over_matching_read_scope() {
+    fn investigation_forbidden_glob_takes_precedence_over_matching_read_scope() {
         let repository = tempfile::tempdir().expect("temporary repository");
         git(repository.path(), &["init", "-q"]);
-        fs::write(repository.path().join("scoped.txt"), "must not be admitted\n")
-            .expect("scoped source");
+        fs::write(
+            repository.path().join("scoped.txt"),
+            "must not be admitted\n",
+        )
+        .expect("scoped source");
+        fs::write(
+            repository.path().join("CONTRIBUTING.md"),
+            "must not be admitted\n",
+        )
+        .expect("instruction source");
+        fs::write(
+            repository
+                .path()
+                .join("ARCHITECTURE_AND_IMPLEMENTATION_PLAN.md"),
+            "must not be admitted\n",
+        )
+        .expect("receipt-only source");
+        fs::create_dir_all(repository.path().join("docs")).expect("documentation directory");
+        fs::write(
+            repository.path().join("docs/STYLE_GUIDE.md"),
+            "must not be admitted\n",
+        )
+        .expect("documentation source");
+        fs::write(
+            repository.path().join("SECURITY.md"),
+            "must not be admitted\n",
+        )
+        .expect("security source");
         git(repository.path(), &["add", "."]);
         git(
             repository.path(),
@@ -1087,15 +1115,15 @@ mod tests {
             ],
         );
         let base_sha = git_text(repository.path(), ["rev-parse", "HEAD"]).expect("base SHA");
-        let profile = harness_profile::load_profile("general", repository.path())
-            .expect("general profile")
+        let profile = harness_profile::load_profile("bildr", repository.path())
+            .expect("BILDR profile")
             .profile;
         let mut task = task_with_file("scoped.txt");
         task.execution_kind = harness_domain::TaskExecutionKind::Investigation;
         task.owned_paths.clear();
         task.investigation_scope = Some(harness_domain::InvestigationScope {
-            owned_read_paths: vec!["scoped.txt".to_owned()],
-            forbidden_paths: vec!["scoped.txt".to_owned()],
+            owned_read_paths: vec!["**".to_owned()],
+            forbidden_paths: vec!["**".to_owned()],
             time_budget_ms: 1_000,
             token_budget: 1_000,
         });
@@ -1109,9 +1137,6 @@ mod tests {
                 "profile-digest",
             )
             .expect("context compiles");
-        assert!(packet
-            .sources
-            .iter()
-            .all(|source| source.path != "scoped.txt"));
+        assert!(packet.sources.is_empty());
     }
 }
