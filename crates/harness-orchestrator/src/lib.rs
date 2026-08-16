@@ -16720,9 +16720,14 @@ fn canonicalize_architecture_task(
     task.insert("schema".to_owned(), json!("harness.orchestration.task.v1"));
     task.insert("program_id".to_owned(), json!(run.id.as_str()));
     task.insert("base_sha".to_owned(), json!(run.base_sha));
-    if profile.profile_id == "general" {
-        task.insert("execution_mode".to_owned(), json!("controller"));
-        task.insert("owner_profile".to_owned(), json!("governor"));
+    if profile.profile_id == "general"
+        && (task.get("execution_mode").and_then(Value::as_str) != Some("controller")
+            || task.get("owner_profile").and_then(Value::as_str) != Some("governor"))
+    {
+        return Err(OrchestratorError::Validation(
+            "general-profile architecture tasks must explicitly use controller execution and governor ownership"
+                .to_owned(),
+        ));
     }
     task.insert("reviewer_profile".to_owned(), json!("verifier"));
     task.insert("state".to_owned(), json!("proposed"));
@@ -18271,7 +18276,7 @@ mod tests {
                     time_budget_ms: 60_000,
                     token_budget: 2_000,
                 }),
-                owner_profile: "worker".to_owned(),
+                owner_profile: "governor".to_owned(),
                 reviewer_profile: "human".to_owned(),
                 checklist_rows: vec!["Return a controller-bound artifact".to_owned()],
                 authority_refs: Vec::new(),
@@ -20862,8 +20867,8 @@ mod tests {
                 "title": "Deliver the behavior",
                 "objective": "Implement and prove the requested behavior",
                 "priority": "P1",
-                "execution_mode": "agent",
-                "owner_profile": "worker",
+                "execution_mode": "controller",
+                "owner_profile": "governor",
                 "execution_kind": "implementation",
                 "investigation_scope": null,
                 "depends_on": [],
@@ -20900,6 +20905,19 @@ mod tests {
             parse_architecture_plan(&run, &profile, 80_000, &controller_owned.to_string()),
             Err(OrchestratorError::Validation(message))
                 if message.contains("controller-owned or unknown field authority_refs")
+        ));
+
+        let mut incompatible_general_ownership = serde_json::from_str::<Value>(&raw).unwrap();
+        incompatible_general_ownership["tasks"][0]["execution_mode"] = json!("agent");
+        assert!(matches!(
+            parse_architecture_plan(
+                &run,
+                &profile,
+                80_000,
+                &incompatible_general_ownership.to_string(),
+            ),
+            Err(OrchestratorError::Validation(message))
+                if message.contains("must explicitly use controller execution and governor ownership")
         ));
 
         let plan = parse_architecture_plan(&run, &profile, 80_000, &raw).unwrap();
