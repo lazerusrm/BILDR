@@ -9032,7 +9032,7 @@ impl Orchestrator {
         // and the investigator turn-complete path. Without this guard, a
         // deadline observing a stale RUNNING session could overwrite an
         // already-recorded immutable artifact with a failed attempt receipt.
-        let _guard = self.operation_lock.lock().await;
+        let guard = self.operation_lock.lock().await;
         let agent = self.store.agent(agent_id)?;
         if agent.role != AgentRole::Investigator {
             return Err(OrchestratorError::Protocol(
@@ -9051,6 +9051,7 @@ impl Orchestrator {
                 OrchestratorError::Protocol("investigation agent has no task attempt".to_owned());
             let run = self.store.run(&agent.run_id)?;
             self.fail_investigation_without_task_custody(&run, agent_id, None, &error.to_string())?;
+            drop(guard);
             self.best_effort_interrupt_investigation(agent_id, interrupt)
                 .await;
             return Err(error);
@@ -9065,6 +9066,7 @@ impl Orchestrator {
                     Some(&attempt_id),
                     &error.to_string(),
                 )?;
+                drop(guard);
                 self.best_effort_interrupt_investigation(agent_id, interrupt)
                     .await;
                 return Err(error.into());
@@ -9080,6 +9082,7 @@ impl Orchestrator {
                     Some(&attempt_id),
                     &error.to_string(),
                 )?;
+                drop(guard);
                 self.best_effort_interrupt_investigation(agent_id, interrupt)
                     .await;
                 return Err(error.into());
@@ -9097,6 +9100,7 @@ impl Orchestrator {
                     agent_id,
                     &error.to_string(),
                 )?;
+                drop(guard);
                 self.best_effort_interrupt_investigation(agent_id, interrupt)
                     .await;
                 return Err(error);
@@ -9111,13 +9115,17 @@ impl Orchestrator {
                 "investigation response arrived after its durable time budget elapsed",
             )?;
             self.store.delete_runtime_metadata(&deadline_key)?;
+            drop(guard);
             self.best_effort_interrupt_investigation(agent_id, interrupt)
                 .await;
             return Err(OrchestratorError::Blocked(
                 "investigation response arrived after its durable time budget elapsed".to_owned(),
             ));
         }
-        if let Err(error) = self.reconcile_investigation_worktree(&attempt_id).await {
+        if let Err(error) = self
+            .reconcile_investigation_worktree(&attempt_id, &run.base_sha)
+            .await
+        {
             self.fail_investigation_response(
                 &run,
                 &task,
@@ -9125,6 +9133,7 @@ impl Orchestrator {
                 agent_id,
                 &error.to_string(),
             )?;
+            drop(guard);
             self.best_effort_interrupt_investigation(agent_id, interrupt)
                 .await;
             return Err(error);
@@ -9302,10 +9311,15 @@ impl Orchestrator {
     async fn reconcile_investigation_worktree(
         &self,
         attempt_id: &AttemptId,
+        expected_base_sha: &str,
     ) -> Result<(), OrchestratorError> {
-        let (worktree_id, path, base_sha, _) = self.store.worktree_for_attempt(attempt_id)?;
-        let summary = self.git.diff_summary(&path, &base_sha).await?;
-        if summary.head_sha != base_sha || summary.dirty {
+        let (worktree_id, path, stored_base_sha, _) =
+            self.store.worktree_for_attempt(attempt_id)?;
+        let summary = self.git.diff_summary(&path, expected_base_sha).await?;
+        if stored_base_sha != expected_base_sha
+            || summary.head_sha != expected_base_sha
+            || summary.dirty
+        {
             self.store.update_worktree(
                 &worktree_id,
                 "PRESERVED",
