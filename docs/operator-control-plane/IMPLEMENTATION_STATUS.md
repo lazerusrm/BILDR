@@ -3,7 +3,7 @@
 **Current implementation branch:** `implement/pr4-operator-control-completion`.
 This status is intentionally a capability boundary, not release evidence.
 
-## Implemented, read-only/observe-only slices
+## Implemented, read-mostly slices
 
 - durable source-owned attention, canonical control-plane snapshots, and return
   cursor acknowledgement;
@@ -17,9 +17,12 @@ This status is intentionally a capability boundary, not release evidence.
 - deterministic allow-list material-progress classification;
 - liveness episodes with immutable observations; ordinary activity cannot clear
   degraded/stalled state, plus exact-revision immutable receipts for completed
-  controller-path interventions. The only active executor is the authenticated
-  `wait` receipt, which cannot alter custody or recovery; all other typed
-  interventions remain inactive;
+  controller-path interventions. The active executors are authenticated `wait`
+  and `pause_for_operator`: the latter is available only for an exact
+  confirmed-stall or recovery-required episode and atomically records its
+  local-session audit row, pauses that bound run's scheduler, and stores the
+  immutable receipt. It cannot retry, resume, release, or change an attempt;
+  all other typed interventions remain inactive;
 - reconciliation episode, immutable inventory finding/action-receipt, and
   exclusive-ownership proof custody, including one-use transactional
   proof-to-replacement authorization for authenticated retry. It requires a
@@ -54,8 +57,9 @@ This status is intentionally a capability boundary, not release evidence.
   independently preserved reconciliation episodes with the same trigger, using
   exact episode evidence plus controller-verified preservation findings and
   receipts; preservation does not imply recovery or retry authority;
-- authenticated exact-revision `wait` liveness intervention receipts, which
-  only record the bounded decision and increment the episode counter;
+- authenticated exact-revision liveness interventions: `wait` records only
+  the bounded decision, while `pause_for_operator` may atomically pause the
+  bound run scheduler from a confirmed-stall or recovery-required episode;
 - authenticated localhost API, CLI, and browser control-plane surfaces for the
   above read models.
 
@@ -65,7 +69,8 @@ This status is intentionally a capability boundary, not release evidence.
   and session resumption; restart loss records preservation receipts and retains
   uncertain custody, while only the authenticated proof-consuming retry path
   may authorize a clean replacement;
-- all non-`wait` typed intervention execution;
+- all typed intervention execution other than `wait` and the exact
+  confirmed-stall/recovery-required `pause_for_operator` scheduler pause;
 - external-condition polling/wake adapters beyond the controller-clock and
   controller-owned repository-capacity gates, whose terminal events remain
   non-authorizing;

@@ -21,6 +21,8 @@ use super::correlation::record_correlation_link_in_transaction;
 const MAX_LIVENESS_PAGE_SIZE: u32 = 200;
 const OBSERVE_REVIEW_DELAY_MS: i64 = 5 * 60 * 1_000;
 const WAIT_INTERVENTION_POLICY_VERSION: &str = "operator_control_wait_v1";
+const PAUSE_FOR_OPERATOR_INTERVENTION_POLICY_VERSION: &str =
+    "operator_control_pause_for_operator_v1";
 
 impl Store {
     /// Opens exactly one nonterminal liveness episode for an exact attempt.
@@ -341,6 +343,136 @@ impl Store {
         self.record_intervention_receipt(&receipt)
     }
 
+    /// Atomically pauses only the scheduler for the run already bound to a
+    /// confirmed-stall or recovery-required episode. The exact episode
+    /// revision, authenticated requester, durable human-action row, scheduler
+    /// update, and immutable intervention receipt commit together. It cannot
+    /// retry an attempt, release a lease, alter a worktree, or infer recovery.
+    pub fn execute_pause_for_operator_intervention(
+        &self,
+        episode_id: &LivenessEpisodeId,
+        expected_version: u64,
+        requested_by: &str,
+    ) -> Result<LivenessEpisode, StoreError> {
+        let identity = digest(&format!(
+            "harness.liveness-pause-for-operator.v1\0{episode_id}\0{expected_version}\0{requested_by}"
+        ));
+        let intervention_id = format!("intervention-pause-{}", &identity[..32]);
+        let source_event_id = format!("liveness-pause-{}", &identity[..32]);
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+
+        if let Some((raw, payload_sha256)) = transaction
+            .query_row(
+                "SELECT payload_json,payload_sha256 FROM intervention_receipts WHERE id=?1",
+                [&intervention_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            let receipt = checked_intervention_receipt(raw, payload_sha256)?;
+            if receipt.episode_id != *episode_id
+                || receipt.kind != InterventionKind::PauseForOperator
+                || receipt.source_event_id != source_event_id
+                || receipt.target_version != expected_version
+                || receipt.policy_version != PAUSE_FOR_OPERATOR_INTERVENTION_POLICY_VERSION
+                || receipt.requested_by != requested_by
+            {
+                return Err(StoreError::Conflict(
+                    "pause-for-operator intervention identity already has different content"
+                        .to_owned(),
+                ));
+            }
+            let episode = record_intervention_receipt_in_transaction(&transaction, &receipt)?;
+            transaction.commit()?;
+            return Ok(episode);
+        }
+
+        let (raw, stored_digest): (String, String) = transaction
+            .query_row(
+                "SELECT current_payload_json,current_payload_sha256 FROM liveness_episodes WHERE id=?1",
+                [episode_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("liveness episode {episode_id}")))?;
+        let episode = checked_episode_row(raw, stored_digest)?;
+        if episode.version != expected_version {
+            return Err(StoreError::Conflict(format!(
+                "liveness episode {episode_id} has version {}, pause requires {expected_version}",
+                episode.version
+            )));
+        }
+        if !matches!(
+            episode.state,
+            LivenessState::ConfirmedStall | LivenessState::RecoveryRequired
+        ) {
+            return Err(StoreError::Conflict(
+                "pause-for-operator requires a confirmed-stall or recovery-required liveness episode"
+                    .to_owned(),
+            ));
+        }
+        let run_id = episode.run_id.as_ref().ok_or_else(|| {
+            StoreError::Validation(
+                "pause-for-operator requires a liveness episode with an exact run identity"
+                    .to_owned(),
+            )
+        })?;
+        let scheduler_was_paused: bool = transaction
+            .query_row(
+                "SELECT scheduler_paused FROM runs WHERE id=?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("run {run_id}")))?;
+        let mut receipt = InterventionReceipt {
+            schema: "harness.intervention-receipt.v1".to_owned(),
+            intervention_id: InterventionId::parse(&intervention_id)
+                .map_err(|error| StoreError::Validation(error.to_string()))?,
+            episode_id: episode_id.clone(),
+            kind: InterventionKind::PauseForOperator,
+            source_event_id,
+            target_version: expected_version,
+            policy_version: PAUSE_FOR_OPERATOR_INTERVENTION_POLICY_VERSION.to_owned(),
+            requested_by: requested_by.to_owned(),
+            created_at_ms: now_ms().max(episode.updated_at_ms),
+            sha256: String::new(),
+        };
+        receipt.sha256 = receipt
+            .digest()
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        let action_payload = serde_json::json!({
+            "schema": "harness.liveness-pause-intervention.v1",
+            "episode_id": episode_id,
+            "episode_sha256": episode.sha256,
+            "target_version": expected_version,
+            "intervention_id": receipt.intervention_id,
+            "intervention_sha256": receipt.sha256,
+            "scheduler_was_paused": scheduler_was_paused,
+        });
+        let action_raw = serde_json::to_string(&action_payload)?;
+        let action_digest = digest(&action_raw);
+        transaction.execute(
+            "INSERT INTO human_actions(run_id,actor,action_type,target_type,target_id,occurred_at,payload_json,payload_sha256) VALUES(?1,?2,'pause_scheduler_from_liveness','liveness_episode',?3,?4,?5,?6)",
+            params![run_id, requested_by, episode_id.as_str(), receipt.created_at_ms, action_raw, action_digest],
+        )?;
+        if !scheduler_was_paused {
+            let changed = transaction.execute(
+                "UPDATE runs SET scheduler_paused=1,updated_at=?2,version=version+1 WHERE id=?1 AND scheduler_paused=0",
+                params![run_id, receipt.created_at_ms],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::Conflict(format!(
+                    "run {run_id} changed while recording a liveness pause intervention"
+                )));
+            }
+        }
+        let updated = record_intervention_receipt_in_transaction(&transaction, &receipt)?;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
     /// Records controller-owned evidence for one legal liveness intervention.
     ///
     /// This is intentionally not an intervention executor: the caller must
@@ -351,152 +483,9 @@ impl Store {
         &self,
         receipt: &InterventionReceipt,
     ) -> Result<LivenessEpisode, StoreError> {
-        receipt
-            .validate()
-            .map_err(|error| StoreError::Validation(error.to_string()))?;
-        let correlation = intervention_correlation_link(receipt)?;
-        let receipt_raw = serde_json::to_string(receipt)?;
-        let receipt_digest = digest(&receipt_raw);
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-
-        if let Some((existing_raw, existing_digest)) = transaction
-            .query_row(
-                "SELECT payload_json,payload_sha256 FROM intervention_receipts WHERE id=?1",
-                [receipt.intervention_id.as_str()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?
-        {
-            let existing = checked_intervention_receipt(existing_raw, existing_digest)?;
-            if existing != *receipt {
-                return Err(StoreError::Conflict(
-                    "intervention receipt id already has different content".to_owned(),
-                ));
-            }
-            let episode = transaction
-                .query_row(
-                    "SELECT current_payload_json,current_payload_sha256 FROM liveness_episodes WHERE id=?1",
-                    [receipt.episode_id.as_str()],
-                    |row| checked_episode_row(row.get(0)?, row.get(1)?),
-                )
-                .optional()?
-                .ok_or_else(|| StoreError::NotFound(format!("liveness episode {}", receipt.episode_id)))?;
-            record_correlation_link_in_transaction(&transaction, &correlation)?;
-            transaction.commit()?;
-            return Ok(episode);
-        }
-        if let Some((existing_raw, existing_digest)) = transaction
-            .query_row(
-                "SELECT payload_json,payload_sha256 FROM intervention_receipts WHERE episode_id=?1 AND kind=?2 AND source_event_id=?3",
-                params![
-                    receipt.episode_id.as_str(),
-                    intervention_kind_name(receipt.kind),
-                    receipt.source_event_id.as_str(),
-                ],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?
-        {
-            let existing = checked_intervention_receipt(existing_raw, existing_digest)?;
-            if existing != *receipt {
-                return Err(StoreError::Conflict(
-                    "intervention source event already has different content".to_owned(),
-                ));
-            }
-            let episode = transaction
-                .query_row(
-                    "SELECT current_payload_json,current_payload_sha256 FROM liveness_episodes WHERE id=?1",
-                    [receipt.episode_id.as_str()],
-                    |row| checked_episode_row(row.get(0)?, row.get(1)?),
-                )
-                .optional()?
-                .ok_or_else(|| StoreError::NotFound(format!("liveness episode {}", receipt.episode_id)))?;
-            record_correlation_link_in_transaction(&transaction, &correlation)?;
-            transaction.commit()?;
-            return Ok(episode);
-        }
-
-        let (raw, stored_digest): (String, String) = transaction
-            .query_row(
-                "SELECT current_payload_json,current_payload_sha256 FROM liveness_episodes WHERE id=?1",
-                [receipt.episode_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound(format!("liveness episode {}", receipt.episode_id)))?;
-        let mut episode = checked_episode_row(raw, stored_digest)?;
-        if episode.version != receipt.target_version {
-            return Err(StoreError::Conflict(format!(
-                "liveness episode {} has version {}, intervention requires {}",
-                receipt.episode_id, episode.version, receipt.target_version
-            )));
-        }
-        if episode.state == LivenessState::Terminal {
-            return Err(StoreError::Conflict(
-                "a terminal liveness episode cannot accept an intervention receipt".to_owned(),
-            ));
-        }
-        if receipt.created_at_ms < episode.opened_at_ms {
-            return Err(StoreError::Validation(
-                "intervention receipt predates the liveness episode".to_owned(),
-            ));
-        }
-        episode.intervention_count =
-            episode.intervention_count.checked_add(1).ok_or_else(|| {
-                StoreError::Validation("liveness intervention count overflow".to_owned())
-            })?;
-        episode.version = episode.version.checked_add(1).ok_or_else(|| {
-            StoreError::Validation("liveness episode version overflow".to_owned())
-        })?;
-        episode.updated_at_ms = episode.updated_at_ms.max(receipt.created_at_ms);
-        if episode
-            .next_review_at_ms
-            .is_some_and(|next_review_at_ms| next_review_at_ms < episode.updated_at_ms)
-        {
-            // The due review is now immediately eligible. This updates the
-            // factual projection without scheduling, waking, or executing
-            // anything on behalf of the receipt.
-            episode.next_review_at_ms = Some(episode.updated_at_ms);
-        }
-        episode.sha256 = episode
-            .digest()
-            .map_err(|error| StoreError::Validation(error.to_string()))?;
-        episode
-            .validate()
-            .map_err(|error| StoreError::Validation(error.to_string()))?;
-        let episode_raw = serde_json::to_string(&episode)?;
-        let episode_digest = digest(&episode_raw);
-        let changed = transaction.execute(
-            "UPDATE liveness_episodes SET version=?1,updated_at=?2,current_payload_json=?3,current_payload_sha256=?4 WHERE id=?5 AND version=?6",
-            params![
-                to_i64(episode.version, "liveness episode version")?,
-                episode.updated_at_ms,
-                episode_raw,
-                episode_digest,
-                receipt.episode_id.as_str(),
-                to_i64(receipt.target_version, "intervention target version")?,
-            ],
-        )?;
-        if changed != 1 {
-            return Err(StoreError::Conflict(format!(
-                "liveness episode {} changed during intervention recording",
-                receipt.episode_id
-            )));
-        }
-        transaction.execute(
-            "INSERT INTO intervention_receipts(id,episode_id,kind,source_event_id,created_at,payload_json,payload_sha256) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![
-                receipt.intervention_id.as_str(),
-                receipt.episode_id.as_str(),
-                intervention_kind_name(receipt.kind),
-                receipt.source_event_id.as_str(),
-                receipt.created_at_ms,
-                receipt_raw,
-                receipt_digest,
-            ],
-        )?;
-        record_correlation_link_in_transaction(&transaction, &correlation)?;
+        let episode = record_intervention_receipt_in_transaction(&transaction, receipt)?;
         transaction.commit()?;
         Ok(episode)
     }
@@ -534,6 +523,155 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?)
     }
+}
+
+fn record_intervention_receipt_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    receipt: &InterventionReceipt,
+) -> Result<LivenessEpisode, StoreError> {
+    receipt
+        .validate()
+        .map_err(|error| StoreError::Validation(error.to_string()))?;
+    let correlation = intervention_correlation_link(receipt)?;
+    let receipt_raw = serde_json::to_string(receipt)?;
+    let receipt_digest = digest(&receipt_raw);
+    if let Some((existing_raw, existing_digest)) = transaction
+        .query_row(
+            "SELECT payload_json,payload_sha256 FROM intervention_receipts WHERE id=?1",
+            [receipt.intervention_id.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+    {
+        let existing = checked_intervention_receipt(existing_raw, existing_digest)?;
+        if existing != *receipt {
+            return Err(StoreError::Conflict(
+                "intervention receipt id already has different content".to_owned(),
+            ));
+        }
+        let episode = transaction
+            .query_row(
+                "SELECT current_payload_json,current_payload_sha256 FROM liveness_episodes WHERE id=?1",
+                [receipt.episode_id.as_str()],
+                |row| checked_episode_row(row.get(0)?, row.get(1)?),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("liveness episode {}", receipt.episode_id)))?;
+        record_correlation_link_in_transaction(transaction, &correlation)?;
+        return Ok(episode);
+    }
+    if let Some((existing_raw, existing_digest)) = transaction
+        .query_row(
+            "SELECT payload_json,payload_sha256 FROM intervention_receipts WHERE episode_id=?1 AND kind=?2 AND source_event_id=?3",
+            params![
+                receipt.episode_id.as_str(),
+                intervention_kind_name(receipt.kind),
+                receipt.source_event_id.as_str(),
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+    {
+        let existing = checked_intervention_receipt(existing_raw, existing_digest)?;
+        if existing != *receipt {
+            return Err(StoreError::Conflict(
+                "intervention source event already has different content".to_owned(),
+            ));
+        }
+        let episode = transaction
+            .query_row(
+                "SELECT current_payload_json,current_payload_sha256 FROM liveness_episodes WHERE id=?1",
+                [receipt.episode_id.as_str()],
+                |row| checked_episode_row(row.get(0)?, row.get(1)?),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("liveness episode {}", receipt.episode_id)))?;
+        record_correlation_link_in_transaction(transaction, &correlation)?;
+        return Ok(episode);
+    }
+
+    let (raw, stored_digest): (String, String) = transaction
+        .query_row(
+            "SELECT current_payload_json,current_payload_sha256 FROM liveness_episodes WHERE id=?1",
+            [receipt.episode_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound(format!("liveness episode {}", receipt.episode_id)))?;
+    let mut episode = checked_episode_row(raw, stored_digest)?;
+    if episode.version != receipt.target_version {
+        return Err(StoreError::Conflict(format!(
+            "liveness episode {} has version {}, intervention requires {}",
+            receipt.episode_id, episode.version, receipt.target_version
+        )));
+    }
+    if episode.state == LivenessState::Terminal {
+        return Err(StoreError::Conflict(
+            "a terminal liveness episode cannot accept an intervention receipt".to_owned(),
+        ));
+    }
+    if receipt.created_at_ms < episode.opened_at_ms {
+        return Err(StoreError::Validation(
+            "intervention receipt predates the liveness episode".to_owned(),
+        ));
+    }
+    episode.intervention_count = episode
+        .intervention_count
+        .checked_add(1)
+        .ok_or_else(|| StoreError::Validation("liveness intervention count overflow".to_owned()))?;
+    episode.version = episode
+        .version
+        .checked_add(1)
+        .ok_or_else(|| StoreError::Validation("liveness episode version overflow".to_owned()))?;
+    episode.updated_at_ms = episode.updated_at_ms.max(receipt.created_at_ms);
+    if episode
+        .next_review_at_ms
+        .is_some_and(|next_review_at_ms| next_review_at_ms < episode.updated_at_ms)
+    {
+        // The due review is now immediately eligible. This updates the
+        // factual projection without scheduling, waking, or executing
+        // anything on behalf of the receipt.
+        episode.next_review_at_ms = Some(episode.updated_at_ms);
+    }
+    episode.sha256 = episode
+        .digest()
+        .map_err(|error| StoreError::Validation(error.to_string()))?;
+    episode
+        .validate()
+        .map_err(|error| StoreError::Validation(error.to_string()))?;
+    let episode_raw = serde_json::to_string(&episode)?;
+    let episode_digest = digest(&episode_raw);
+    let changed = transaction.execute(
+        "UPDATE liveness_episodes SET version=?1,updated_at=?2,current_payload_json=?3,current_payload_sha256=?4 WHERE id=?5 AND version=?6",
+        params![
+            to_i64(episode.version, "liveness episode version")?,
+            episode.updated_at_ms,
+            episode_raw,
+            episode_digest,
+            receipt.episode_id.as_str(),
+            to_i64(receipt.target_version, "intervention target version")?,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::Conflict(format!(
+            "liveness episode {} changed during intervention recording",
+            receipt.episode_id
+        )));
+    }
+    transaction.execute(
+        "INSERT INTO intervention_receipts(id,episode_id,kind,source_event_id,created_at,payload_json,payload_sha256) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            receipt.intervention_id.as_str(),
+            receipt.episode_id.as_str(),
+            intervention_kind_name(receipt.kind),
+            receipt.source_event_id.as_str(),
+            receipt.created_at_ms,
+            receipt_raw,
+            receipt_digest,
+        ],
+    )?;
+    record_correlation_link_in_transaction(transaction, &correlation)?;
+    Ok(episode)
 }
 
 /// Derives one episode-scoped causal receipt for each immutable observation.
@@ -796,6 +934,7 @@ fn observation_kind_name(kind: LivenessObservationKind) -> &'static str {
 fn intervention_kind_name(kind: InterventionKind) -> &'static str {
     match kind {
         InterventionKind::Wait => "wait",
+        InterventionKind::PauseForOperator => "pause_for_operator",
         InterventionKind::RequestOperatorDecision => "request_operator_decision",
         InterventionKind::RequestReconciliation => "request_reconciliation",
         InterventionKind::QueueReadOnlyReview => "queue_read_only_review",
@@ -813,11 +952,51 @@ fn digest(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use harness_domain::{InterventionId, LivenessObservationId};
+    use harness_domain::{InterventionId, LivenessObservationId, RepositoryId, RunId};
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::*;
+    use crate::{NewRepository, NewRun};
+
+    fn insert_run(store: &Store, root: &std::path::Path) -> RunId {
+        let repository_id = RepositoryId::from("repository-liveness-pause");
+        let run_id = RunId::from("run-liveness-pause");
+        store
+            .create_repository(&NewRepository {
+                id: repository_id.clone(),
+                profile_id: "fixture".to_owned(),
+                profile_version: 1,
+                display_name: "Liveness pause fixture".to_owned(),
+                root_path: root.join("checkout"),
+                origin_url: None,
+                default_branch: "main".to_owned(),
+                expected_coordination_branch: None,
+                state: "READY".to_owned(),
+            })
+            .expect("repository");
+        store
+            .create_run(&NewRun {
+                id: run_id.clone(),
+                repository_id,
+                title: "Liveness pause fixture".to_owned(),
+                objective: "Pause only a bound stalled run".to_owned(),
+                mode: "observe_only".to_owned(),
+                publication_mode: "none".to_owned(),
+                state: "CREATED".to_owned(),
+                phase: "created".to_owned(),
+                base_ref: "main".to_owned(),
+                base_sha: "a".repeat(40),
+                authority_digest: "c".repeat(64),
+                profile_digest: "d".repeat(64),
+                codex_version: None,
+                protocol_schema_sha256: None,
+                requested_by: "test".to_owned(),
+                token_budget: None,
+            })
+            .expect("run");
+        run_id
+    }
 
     fn episode() -> LivenessEpisode {
         let mut episode = LivenessEpisode {
@@ -1094,5 +1273,103 @@ mod tests {
             store.execute_wait_intervention(&opened.episode_id, opened.version, "other_session"),
             Err(StoreError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn pause_for_operator_is_atomic_exact_revisioned_and_never_recovers_work() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let run_id = insert_run(&store, temp.path());
+        let mut stalled = episode();
+        stalled.run_id = Some(run_id.to_string());
+        stalled.state = LivenessState::ConfirmedStall;
+        stalled.state_reason_codes = vec!["confirmed_stall".to_owned()];
+        stalled.sha256 = stalled.digest().expect("digest");
+        let opened = store.open_liveness_episode(&stalled).expect("open");
+
+        let paused = store
+            .execute_pause_for_operator_intervention(
+                &opened.episode_id,
+                opened.version,
+                "session-a",
+            )
+            .expect("pause");
+        assert_eq!(paused.version, opened.version + 1);
+        assert_eq!(paused.intervention_count, 1);
+        assert_eq!(paused.state, LivenessState::ConfirmedStall);
+        assert!(store.run(&run_id).expect("run rereads").scheduler_paused);
+        assert_eq!(
+            store
+                .list_intervention_receipts(&opened.episode_id, 10)
+                .expect("receipts")[0]
+                .kind,
+            InterventionKind::PauseForOperator
+        );
+        let action: serde_json::Value = store
+            .connection()
+            .expect("connection")
+            .query_row(
+                "SELECT payload_json FROM human_actions WHERE action_type='pause_scheduler_from_liveness'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|raw| serde_json::from_str(&raw).expect("action JSON"))
+            .expect("atomic human action");
+        assert_eq!(
+            action["episode_id"],
+            serde_json::Value::String(opened.episode_id.to_string())
+        );
+        assert_eq!(
+            action["target_version"],
+            serde_json::Value::from(opened.version)
+        );
+        assert_eq!(
+            action["scheduler_was_paused"],
+            serde_json::Value::Bool(false)
+        );
+
+        assert_eq!(
+            store
+                .execute_pause_for_operator_intervention(
+                    &opened.episode_id,
+                    opened.version,
+                    "session-a",
+                )
+                .expect("idempotent replay"),
+            paused
+        );
+        let count: i64 = store
+            .connection()
+            .expect("connection")
+            .query_row(
+                "SELECT COUNT(*) FROM human_actions WHERE action_type='pause_scheduler_from_liveness'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("action count");
+        assert_eq!(count, 1);
+
+        let mut healthy = episode();
+        healthy.episode_id = LivenessEpisodeId::new();
+        healthy.run_id = Some(run_id.to_string());
+        healthy.task_id = Some("task-healthy".to_owned());
+        healthy.attempt_id = Some("attempt-healthy".to_owned());
+        healthy.sha256 = healthy.digest().expect("healthy digest");
+        let healthy = store.open_liveness_episode(&healthy).expect("healthy open");
+        assert!(matches!(
+            store.execute_pause_for_operator_intervention(
+                &healthy.episode_id,
+                healthy.version,
+                "session-a",
+            ),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(
+            store
+                .list_intervention_receipts(&healthy.episode_id, 10)
+                .expect("healthy receipts"),
+            Vec::new(),
+            "a rejected precondition rolls back every pause side effect"
+        );
     }
 }

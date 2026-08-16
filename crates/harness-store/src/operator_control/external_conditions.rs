@@ -992,7 +992,7 @@ mod tests {
                 .expect("global page reads")
                 .iter()
                 .any(|condition| condition.condition_id == target.condition_id),
-            "the legacy global page demonstrates the starvation boundary"
+            "the former global page demonstrates the starvation boundary"
         );
         assert_eq!(
             store

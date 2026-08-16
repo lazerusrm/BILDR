@@ -472,11 +472,8 @@ pub struct AttentionItem {
     pub state: AttentionState,
     pub title: String,
     pub summary: String,
-    #[serde(default)]
     pub option_refs: Vec<String>,
-    #[serde(default)]
     pub evidence_refs: Vec<String>,
-    #[serde(default)]
     pub blocked_refs: Vec<String>,
     pub dedupe_key: String,
     pub opened_event_id: String,
@@ -1223,6 +1220,7 @@ impl LivenessEpisode {
 #[serde(rename_all = "snake_case")]
 pub enum InterventionKind {
     Wait,
+    PauseForOperator,
     RequestOperatorDecision,
     RequestReconciliation,
     QueueReadOnlyReview,
@@ -2388,7 +2386,6 @@ pub enum SnapshotSectionState {
 #[serde(deny_unknown_fields)]
 pub struct SnapshotSection {
     pub state: SnapshotSectionState,
-    #[serde(default)]
     pub rows: Vec<Value>,
     pub source_cursor: u64,
     pub truncated: bool,
@@ -2438,9 +2435,7 @@ pub struct ControlPlaneSnapshot {
     pub cost: SnapshotSection,
     pub notifications: SnapshotSection,
     pub limits: SnapshotSection,
-    #[serde(default)]
     pub truncation: Vec<SnapshotTruncation>,
-    #[serde(default)]
     pub source_cursors: BTreeMap<String, u64>,
     pub sha256: String,
 }
@@ -2485,7 +2480,6 @@ pub struct ReturnView {
     pub snapshot_revision: u64,
     pub event_cursor: u64,
     pub acknowledged_cursor: u64,
-    #[serde(default)]
     pub sections: BTreeMap<String, SnapshotSection>,
     pub sha256: String,
 }
@@ -2513,9 +2507,7 @@ pub struct TopologySnapshot {
     pub schema: String,
     pub snapshot_id: TopologySnapshotId,
     pub run_id: String,
-    #[serde(default)]
     pub nodes: Vec<TopologyNode>,
-    #[serde(default)]
     pub edges: Vec<TopologyEdge>,
     pub source_cursor: u64,
     pub sha256: String,
@@ -2728,6 +2720,20 @@ mod tests {
             AttentionState::Resolved
                 .validate_transition(AttentionState::Resolved, true)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn control_plane_projection_rows_are_explicit_not_defaulted() {
+        assert!(
+            serde_json::from_value::<SnapshotSection>(serde_json::json!({
+                "state": "current",
+                "source_cursor": 0,
+                "truncated": false,
+                "detail": null
+            }))
+            .is_err(),
+            "the current v1 section must carry an explicit rows array"
         );
     }
 

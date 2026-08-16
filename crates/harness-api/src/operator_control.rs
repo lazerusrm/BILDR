@@ -3,8 +3,8 @@
 //! Mutations stay deliberately narrow: version-checked presentation
 //! acknowledgement, authority-neutral local presence, and creation of an
 //! unreviewed knowledge candidates from exact investigation, liveness, and
-//! reconciliation evidence, one exact human knowledge review, and an
-//! exact-revision liveness wait receipt. They cannot resolve source attention,
+//! reconciliation evidence, one exact human knowledge review, and two
+//! exact-revision liveness interventions. They cannot resolve source attention,
 //! alter task custody, inject knowledge into task context, or force recovery.
 
 use axum::{
@@ -82,6 +82,10 @@ pub(super) fn routes() -> Router<ApiState> {
         .route(
             "/api/v1/liveness/{episode_id}/interventions",
             get(list_intervention_receipts).post(execute_wait_intervention),
+        )
+        .route(
+            "/api/v1/liveness/{episode_id}/interventions/pause-scheduler",
+            post(pause_scheduler_for_liveness_episode),
         )
         .route(
             "/api/v1/liveness/{episode_id}/knowledge-candidates",
@@ -700,24 +704,56 @@ struct ExecuteWaitInterventionRequest {
     expected_version: u64,
 }
 
-/// The only active intervention route is a bounded wait decision. It binds
-/// the current episode revision and records no work beyond its receipt; it
-/// cannot clear a stall or change any run/task/attempt custody.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PauseSchedulerForLivenessEpisodeRequest {
+    expected_version: u64,
+}
+
+/// Records a bounded wait decision. It binds the current episode revision and
+/// records no work beyond its receipt; it cannot clear a stall or change any
+/// run/task/attempt custody.
 async fn execute_wait_intervention(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(episode_id): Path<String>,
     Json(request): Json<ExecuteWaitInterventionRequest>,
 ) -> Result<Json<harness_domain::LivenessEpisode>, ApiError> {
-    authenticate(&state, &headers, true)?;
+    let session_id = authenticated_session_id(&state, &headers, true)?;
     let episode_id = LivenessEpisodeId::parse(episode_id).map_err(|error| {
         ApiError::from(harness_store::StoreError::Validation(error.to_string()))
     })?;
     Ok(Json(state.orchestrator.store().execute_wait_intervention(
         &episode_id,
         request.expected_version,
-        "local_session",
+        &session_id,
     )?))
+}
+
+/// Pauses only the scheduler for the run bound to an exact confirmed-stall or
+/// recovery-required liveness revision. The store commits the scheduler
+/// update, immutable intervention receipt, and local-session audit row in one
+/// transaction. It cannot retry, resume, release, or alter an attempt.
+async fn pause_scheduler_for_liveness_episode(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(episode_id): Path<String>,
+    Json(request): Json<PauseSchedulerForLivenessEpisodeRequest>,
+) -> Result<Json<harness_domain::LivenessEpisode>, ApiError> {
+    let session_id = authenticated_session_id(&state, &headers, true)?;
+    let episode_id = LivenessEpisodeId::parse(episode_id).map_err(|error| {
+        ApiError::from(harness_store::StoreError::Validation(error.to_string()))
+    })?;
+    Ok(Json(
+        state
+            .orchestrator
+            .pause_scheduler_for_liveness_episode(
+                &episode_id,
+                request.expected_version,
+                &session_id,
+            )
+            .await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1049,6 +1085,13 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<ExecuteWaitInterventionRequest>(json!({
+                "expected_version": 1,
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<PauseSchedulerForLivenessEpisodeRequest>(json!({
                 "expected_version": 1,
                 "unexpected": true,
             }))

@@ -1,6 +1,7 @@
 //! Deterministic orchestration service for controller-owned Codex work.
 
 mod external_conditions;
+mod interventions;
 mod reconciliation;
 mod supervision;
 
@@ -86,7 +87,6 @@ const SETTING_ADAPTIVE_GOVERNOR_BUDGETS: &str = "settings.adaptive_governor_budg
 const SETTING_AUTOMATIC_GOVERNOR_CONTINUATION: &str = "settings.automatic_governor_continuation";
 const SETTING_AUTOMATIC_PLAN_APPROVAL: &str = "settings.automatic_plan_approval";
 const SETTING_SUPERVISION_ENABLED: &str = "settings.supervision_enabled";
-const LEGACY_SETTING_SUPERVISION_OBSERVE_ONLY: &str = "settings.supervision_observe_only";
 const SETTING_GOVERNOR_GOAL_TOKEN_BUDGET: &str = "settings.governor_goal_token_budget";
 const SETTING_GOVERNOR_ATTEMPT_TOKEN_CEILING: &str = "settings.governor_attempt_token_ceiling";
 const DEFAULT_GOVERNOR_GOAL_TOKEN_BUDGET: u64 = 5_000_000;
@@ -2851,11 +2851,9 @@ impl Orchestrator {
 
     fn effective_supervision_config(&self) -> SupervisionConfig {
         let mut supervision = self.config.supervision.clone();
-        // The legacy observation switch never implied permission to start a
-        // model.  Keep it as observation-only until an operator explicitly
-        // writes the new advisory setting.  The new binary setting itself is
-        // still deliberately binary and cannot unlock shadow or either
-        // automatic action mode.
+        // Model supervision requires one explicit persisted advisory setting.
+        // That binary setting cannot unlock shadow or either automatic action
+        // mode.
         supervision.mode = match self
             .store
             .runtime_metadata(SETTING_SUPERVISION_ENABLED)
@@ -2865,13 +2863,6 @@ impl Orchestrator {
         {
             Some(enabled) => supervision_mode_for_operator_setting(enabled),
             None if supervision.mode == SupervisorMode::Advisory => SupervisorMode::Advisory,
-            None if self.stored_setting_bool(
-                LEGACY_SETTING_SUPERVISION_OBSERVE_ONLY,
-                supervision.mode == SupervisorMode::ObserveOnly,
-            ) =>
-            {
-                SupervisorMode::ObserveOnly
-            }
             None => SupervisorMode::Disabled,
         };
         supervision
@@ -7240,7 +7231,7 @@ impl Orchestrator {
         let retry_continuity = self.store.runtime_metadata(&retry_continuity_key)?;
         if retry_packet.is_some() || retry_continuity.is_some() {
             return Err(OrchestratorError::Blocked(
-                "fresh task attempt refused: legacy retry metadata is not an exclusive-ownership proof; use the reconciliation proof-consumption flow"
+                "fresh task attempt refused: unconsumed retry metadata is not an exclusive-ownership proof; use the reconciliation proof-consumption flow"
                     .to_owned(),
             ));
         }
@@ -7344,17 +7335,6 @@ impl Orchestrator {
         } else {
             self.store.latest_attempt_context(&task.id)?
         };
-        if governing
-            && self
-                .store
-                .runtime_metadata(&format!("governor-progress:{}", task.id))?
-                .is_none()
-            && let Some(prior_agent_id) = prior_context
-                .as_ref()
-                .and_then(|prior| prior.agent_id.as_ref())
-        {
-            self.synthesize_legacy_governor_checkpoint(prior_agent_id, &packet)?;
-        }
         let recent_handoffs = self.store.recent_task_handoffs(&task.id, 5)?;
         let durable_progress = self
             .store
@@ -9570,123 +9550,6 @@ impl Orchestrator {
         Ok(())
     }
 
-    fn synthesize_legacy_governor_checkpoint(
-        &self,
-        agent_id: &AgentSessionId,
-        packet: &TaskPacket,
-    ) -> Result<bool, OrchestratorError> {
-        // New plans already carry canonical milestones and governors must emit
-        // the structured schema. This bridge is only for pre-upgrade plans and
-        // interrupted turns that could not produce a final JSON item.
-        if !packet.milestones.is_empty()
-            || self
-                .store
-                .runtime_metadata(&format!("governor-progress-checkpoint:{agent_id}"))?
-                .is_some()
-        {
-            return Ok(false);
-        }
-        let Some(plan) = self.store.latest_agent_plan(agent_id)? else {
-            return Ok(false);
-        };
-        let Some(steps) = plan.get("plan").and_then(Value::as_array) else {
-            return Ok(false);
-        };
-        if !(3..=50).contains(&steps.len()) {
-            return Ok(false);
-        }
-        let mut milestones = steps
-            .iter()
-            .enumerate()
-            .filter_map(|(index, step)| {
-                let title = step.get("step")?.as_str()?.trim();
-                if title.is_empty() {
-                    return None;
-                }
-                let status = match step.get("status").and_then(Value::as_str) {
-                    Some("completed") => "completed",
-                    Some("inProgress" | "in_progress") => "in_progress",
-                    _ => "pending",
-                };
-                Some(GovernorMilestoneCheckpoint {
-                    id: format!("step-{:02}", index + 1),
-                    title: title.to_owned(),
-                    status: status.to_owned(),
-                    outcome: if status == "completed" {
-                        "Completed in the governor's live plan; controller verification remains authoritative."
-                            .to_owned()
-                    } else {
-                        title.to_owned()
-                    },
-                    acceptance: vec![
-                        "Controller custody and required proof confirm this outcome".to_owned(),
-                    ],
-                })
-            })
-            .collect::<Vec<_>>();
-        if milestones.len() != steps.len() {
-            return Ok(false);
-        }
-        if !milestones
-            .iter()
-            .any(|milestone| milestone.status == "in_progress")
-            && let Some(next) = milestones
-                .iter_mut()
-                .find(|milestone| milestone.status == "pending")
-        {
-            next.status = "in_progress".to_owned();
-        }
-        let complete = milestones
-            .iter()
-            .all(|milestone| milestone.status == "completed");
-        let current_milestone_id = milestones
-            .iter()
-            .find(|milestone| milestone.status == "in_progress")
-            .map(|milestone| milestone.id.clone());
-        let next_action = milestones
-            .iter()
-            .find(|milestone| milestone.status == "in_progress")
-            .map(|milestone| milestone.title.clone());
-        if !complete && current_milestone_id.is_none() {
-            return Ok(false);
-        }
-        let revision = self
-            .store
-            .runtime_metadata(&format!(
-                "governor-progress:{}",
-                self.store
-                    .agent(agent_id)?
-                    .task_id
-                    .as_ref()
-                    .ok_or_else(|| OrchestratorError::Protocol(
-                        "governor has no task".to_owned()
-                    ))?
-            ))?
-            .and_then(|value| serde_json::from_value::<GovernorCheckpoint>(value).ok())
-            .map_or(1, |checkpoint| checkpoint.revision.saturating_add(1));
-        let operator_update = self
-            .store
-            .latest_agent_message(agent_id)?
-            .map(|message| bounded_continuity_text(&message.text))
-            .unwrap_or_else(|| "Governor checkpointed its live implementation plan.".to_owned());
-        self.persist_governor_checkpoint(
-            agent_id,
-            GovernorCheckpoint {
-                schema: "harness.governor-checkpoint.v1".to_owned(),
-                revision,
-                status: if complete { "complete" } else { "progressing" }.to_owned(),
-                operator_update,
-                milestones,
-                current_milestone_id,
-                next_action,
-                blocked_on: None,
-                durable_artifacts: vec![],
-                workspace_state: "clean".to_owned(),
-            },
-        )?;
-        Ok(true)
-    }
-
     fn architecture_retry_state(&self, run_id: &RunId) -> Result<RunState, OrchestratorError> {
         Ok(
             if self
@@ -11286,7 +11149,6 @@ impl Orchestrator {
             &profile.profile.forbidden_generated_runtime_paths,
         );
         let latest_message = self.store.latest_agent_message(agent_id)?;
-        self.synthesize_legacy_governor_checkpoint(agent_id, packet)?;
         let structured_checkpoint = self
             .store
             .runtime_metadata(&format!("governor-progress-checkpoint:{agent_id}"))?;
@@ -12220,25 +12082,11 @@ impl Orchestrator {
         let settings = self.operator_settings();
         let run = self.store.run(run_id)?;
         let remediation_key = format!("governor-remediation-state:{task_id}");
-        let legacy_remediation_key = format!("governor-remediation-rounds:{task_id}");
         let signature = verifier_remediation_fingerprint(verdict)?;
-        let mut prior_state = self
+        let prior_state = self
             .store
             .runtime_metadata(&remediation_key)?
             .and_then(|value| serde_json::from_value::<GovernorRemediationState>(value).ok());
-        if prior_state.is_none() {
-            let legacy_rounds = self
-                .store
-                .runtime_metadata(&legacy_remediation_key)?
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0);
-            if legacy_rounds > 0 {
-                prior_state = Some(GovernorRemediationState {
-                    signature: signature.clone(),
-                    repetitions: legacy_rounds,
-                });
-            }
-        }
         let (next_remediation_state, remediation_round, strategy_correction) =
             advance_governor_remediation_state(
                 prior_state.as_ref(),
@@ -12322,8 +12170,6 @@ impl Orchestrator {
                 &remediation_key,
                 &serde_json::to_value(&next_remediation_state)?,
             )?;
-            self.store
-                .delete_runtime_metadata(&legacy_remediation_key)?;
             self.store.put_runtime_metadata(
                 &format!("governor-envelope-baseline:{task_id}"),
                 &json!(governor_usage),
@@ -15717,11 +15563,9 @@ fn parse_investigation_response(text: &str) -> Result<InvestigationResponse, Orc
     serde_json::from_value(value).map_err(Into::into)
 }
 
-/// The runtime schema is the first guard, but a persisted controller must
-/// remain fail-closed when a replay, fixture, or transport bug supplies JSON
-/// without the App Server Structured Outputs guarantee. Domain DTO defaults
-/// intentionally support legacy stored artifacts, so require the model-output
-/// shape explicitly before deserializing those DTOs.
+/// The runtime schema is the first guard, and the controller repeats that
+/// closed current-v1 shape check before deserializing model output so a replay,
+/// fixture, or transport bug cannot omit a required field.
 fn validate_investigation_response_shape(value: &Value) -> Result<(), OrchestratorError> {
     const RESPONSE_FIELDS: &[&str] = &[
         "schema",
@@ -20612,39 +20456,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn legacy_observation_toggle_never_enables_a_model_review() {
-        let (orchestrator, _temp) = operator_settings_test_orchestrator().await;
-        orchestrator
-            .store()
-            .put_runtime_metadata(LEGACY_SETTING_SUPERVISION_OBSERVE_ONLY, &json!(true))
-            .expect("legacy observation setting persists");
-
-        assert!(!orchestrator.operator_settings().supervision_enabled);
-        assert_eq!(
-            orchestrator.effective_supervision_config().mode,
-            SupervisorMode::ObserveOnly,
-            "a legacy observation opt-in must not authorize Terra"
-        );
-
-        orchestrator
-            .update_operator_settings(operator_settings_request(Some(true), None))
-            .await
-            .expect("fresh advisory opt-in persists");
-        assert_eq!(
-            orchestrator.effective_supervision_config().mode,
-            SupervisorMode::Advisory
-        );
-    }
-
     #[test]
-    fn legacy_observation_request_field_is_rejected_not_reinterpreted_as_advisory() {
+    fn unknown_observation_request_field_is_rejected() {
         assert!(
             serde_json::from_value::<UpdateOperatorSettingsRequest>(json!({
-                "supervision_observe_only": true
+                "unsupported_observation_mode": true
             }))
             .is_err(),
-            "a cached observe-only request must never authorize a Terra review"
+            "only the documented supervision opt-in is accepted"
         );
     }
 

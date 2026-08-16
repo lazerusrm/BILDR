@@ -238,6 +238,11 @@ class HarnessApi {
     this.get<InterventionReceipt[]>(
       `/liveness/${encodeURIComponent(episodeId)}/interventions?limit=50`,
     );
+  pauseSchedulerForLivenessEpisode = (episodeId: string, expectedVersion: number) =>
+    this.post<LivenessEpisode>(
+      `/liveness/${encodeURIComponent(episodeId)}/interventions/pause-scheduler`,
+      { expected_version: expectedVersion },
+    );
   operatorPresence = () =>
     this.get<OperatorPresence>("/operator-presence?operator_id=local_operator");
   setOperatorPresence = (mode: OperatorPresenceMode, expectedVersion: number) =>

@@ -414,7 +414,32 @@ paths:
             schema: {$ref: '#/components/schemas/ExecuteWaitInterventionRequest'}
       responses:
         '200':
-          description: The liveness episode after exactly one immutable wait receipt was recorded. Replaying the same caller and revision is idempotent.
+          description: The liveness episode after exactly one immutable wait receipt was recorded. Replaying the same authenticated session and revision is idempotent.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LivenessEpisode'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /liveness/{episodeId}/interventions/pause-scheduler:
+    post:
+      tags: [Liveness]
+      operationId: pauseSchedulerForLivenessEpisode
+      description: "Atomically pauses only the scheduler for the exact run bound to a confirmed-stall or recovery-required liveness episode. The exact revision, local-session audit row, scheduler update, and immutable receipt commit together; it cannot retry, resume, release, or alter an attempt."
+      parameters:
+        - name: episodeId
+          in: path
+          required: true
+          schema: {type: string, maxLength: 160}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PauseSchedulerForLivenessEpisodeRequest'}
+      responses:
+        '200':
+          description: The liveness episode after exactly one immutable pause-for-operator receipt was recorded. Replaying the same session and revision is idempotent.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/LivenessEpisode'}
@@ -2064,7 +2089,7 @@ components:
         schema: {const: harness.intervention-receipt.v1}
         intervention_id: {type: string, maxLength: 160}
         episode_id: {type: string, maxLength: 160}
-        kind: {enum: [wait, request_operator_decision, request_reconciliation, queue_read_only_review]}
+        kind: {enum: [wait, pause_for_operator, request_operator_decision, request_reconciliation, queue_read_only_review]}
         source_event_id: {type: string, maxLength: 160}
         target_version: {type: integer, minimum: 1}
         policy_version: {type: string, maxLength: 160}
@@ -2072,6 +2097,12 @@ components:
         created_at_ms: {type: integer, minimum: 0}
         sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
     ExecuteWaitInterventionRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_version]
+      properties:
+        expected_version: {type: integer, minimum: 1}
+    PauseSchedulerForLivenessEpisodeRequest:
       type: object
       additionalProperties: false
       required: [expected_version]
@@ -3365,7 +3396,7 @@ components:
         adaptive_governor_budgets: {type: boolean}
         automatic_governor_continuation: {type: boolean}
         automatic_plan_approval: {type: boolean}
-        supervision_enabled: {type: boolean, description: The only request field that can opt in to advisory Terra analysis. Legacy observe-only fields are rejected.}
+        supervision_enabled: {type: boolean, description: The only request field that can opt in to advisory Terra analysis.}
         governor_goal_token_budget: {type: integer, minimum: 500000, maximum: 1000000000}
         governor_attempt_token_ceiling: {type: integer, minimum: 400000, maximum: 100000000}
     Repository:

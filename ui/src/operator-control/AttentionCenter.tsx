@@ -302,6 +302,27 @@ export function AttentionCenter() {
     }
   };
 
+  const pauseSchedulerForLivenessEpisode = async (episode: LivenessEpisode) => {
+    if (!canPauseSchedulerForLivenessEpisode(episode)) return;
+    setBusy(`liveness-pause:${episode.episode_id}`);
+    try {
+      const updated = await api.pauseSchedulerForLivenessEpisode(
+        episode.episode_id,
+        episode.version,
+      );
+      setLiveness((current) =>
+        current.map((item) => item.episode_id === updated.episode_id ? updated : item),
+      );
+      setError("");
+      await selectLivenessEpisode(updated.episode_id);
+    } catch (cause) {
+      setError(displayError(cause, "The liveness episode changed before the scheduler pause was recorded. Refresh before trying again."));
+      await load();
+    } finally {
+      setBusy("");
+    }
+  };
+
   return (
     <div className="page control-plane-page">
       <header className="page-title">
@@ -370,7 +391,9 @@ export function AttentionCenter() {
           episodes={liveness}
           selectedEpisodeId={selectedLivenessEpisodeId}
           history={interventionHistory}
+          busy={busy}
           onSelect={(episodeId) => void selectLivenessEpisode(episodeId)}
+          onPauseScheduler={(episode) => void pauseSchedulerForLivenessEpisode(episode)}
         />
         <RunTopology
           runIds={snapshot?.runs.rows.map((row) => text(row.run_id)).filter((id) => id !== "unknown") ?? []}
@@ -527,13 +550,18 @@ function LivenessEpisodes({
   episodes,
   selectedEpisodeId,
   history,
+  busy,
   onSelect,
+  onPauseScheduler,
 }: {
   episodes: LivenessEpisode[];
   selectedEpisodeId?: string;
   history: InterventionHistory;
+  busy: string;
   onSelect: (episodeId: string) => void;
+  onPauseScheduler: (episode: LivenessEpisode) => void;
 }) {
+  const selectedEpisode = episodes.find((episode) => episode.episode_id === selectedEpisodeId);
   return (
     <section className="control-plane-support-card" aria-labelledby="liveness-heading">
       <span className="eyebrow">Observe only</span>
@@ -559,9 +587,23 @@ function LivenessEpisodes({
         </ul>
       )}
       <InterventionHistoryPanel episodeId={selectedEpisodeId} history={history} onLoad={onSelect} />
-      <p className="control-plane-note">This is a deterministic observation projection. It does not resume, retry, clear, or execute work.</p>
+      {selectedEpisode && canPauseSchedulerForLivenessEpisode(selectedEpisode) && (
+        <button
+          className="button danger"
+          type="button"
+          onClick={() => onPauseScheduler(selectedEpisode)}
+          disabled={busy === `liveness-pause:${selectedEpisode.episode_id}`}
+        >
+          {busy === `liveness-pause:${selectedEpisode.episode_id}` ? "Recording scheduler pause…" : "Pause this run's scheduler"}
+        </button>
+      )}
+      <p className="control-plane-note">Observation remains read-only except for an explicit exact-revision pause on a selected confirmed-stall or recovery-required episode. That pause cannot retry, resume, release, or change an attempt.</p>
     </section>
   );
+}
+
+function canPauseSchedulerForLivenessEpisode(episode: LivenessEpisode) {
+  return episode.state === "confirmed_stall" || episode.state === "recovery_required";
 }
 
 function InterventionHistoryPanel({

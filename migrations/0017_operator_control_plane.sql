@@ -115,7 +115,7 @@ CREATE TABLE IF NOT EXISTS liveness_observations (
 CREATE TABLE IF NOT EXISTS intervention_receipts (
     id TEXT PRIMARY KEY,
     episode_id TEXT NOT NULL REFERENCES liveness_episodes(id),
-    kind TEXT NOT NULL CHECK(kind IN ('wait','request_operator_decision','request_reconciliation','queue_read_only_review')),
+    kind TEXT NOT NULL CHECK(kind IN ('wait','pause_for_operator','request_operator_decision','request_reconciliation','queue_read_only_review')),
     source_event_id TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     payload_json TEXT NOT NULL,

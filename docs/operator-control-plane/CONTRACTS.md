@@ -431,14 +431,12 @@ A single timeout is insufficient.
   "schema": "harness.intervention-receipt.v1",
   "intervention_id": "intervention-...",
   "episode_id": "liveness-...",
-  "action": "request_targeted_inspection",
-  "target_revision": 12,
-  "precondition_digest": "64-hex",
-  "policy_version": "operator-control-v1",
-  "requested_by": "deterministic_policy",
-  "executed_at_ms": 1786588800000,
-  "result": "accepted",
-  "effect_refs": [],
+  "kind": "pause_for_operator",
+  "source_event_id": "liveness-pause-...",
+  "target_version": 12,
+  "policy_version": "operator_control_pause_for_operator_v1",
+  "requested_by": "local-session-...",
+  "created_at_ms": 1786588800000,
   "sha256": "64-hex"
 }
 ```
@@ -447,16 +445,15 @@ Closed actions:
 
 ```text
 wait
-request_targeted_inspection
-steer_active_turn
-start_followup_turn
-spawn_read_only_investigation
-request_verification
-request_reconciliation
 pause_for_operator
-stop_run
+request_operator_decision
+request_reconciliation
+queue_read_only_review
 ```
 
+Only `wait` and `pause_for_operator` are currently executable. The pause is
+limited to an exact confirmed-stall or recovery-required episode and commits
+the scheduler pause, immutable receipt, and local-session audit row together.
 `retry_fresh_attempt` is owned by reconciliation and requires exclusive
 ownership proof.
 
@@ -729,6 +726,8 @@ POST /api/v1/reconciliation/{id}/apply
 POST /api/v1/external-conditions/{id}/cancel
 POST /api/v1/runs/{run_id}/external-conditions/time-gates
 POST /api/v1/runs/{run_id}/external-conditions/local-capacity
+POST /api/v1/liveness/{episode_id}/interventions
+POST /api/v1/liveness/{episode_id}/interventions/pause-scheduler
 POST /api/v1/liveness/{episode_id}/knowledge-candidates
 POST /api/v1/improvement/knowledge/{knowledge_id}/review
 POST /api/v1/notification-shadow-batches
@@ -788,12 +787,12 @@ uses stable headings and explicit unknown/stale/truncated labels.
 ## Schema evolution
 
 - V1 enums are closed.
-- Additive optional presentation fields are allowed only with safe defaults.
 - New authoritative states or actions require a new reviewed build and contract
   tests.
-- Stored legacy task packets receive explicit compatibility fixtures.
-- Snapshot compilers support current and immediately prior schema during rolling
-  upgrade; incompatible active attempts are preserved and paused.
+- This greenfield control plane accepts only the current published schema;
+  persisted evidence rejects an old or incomplete shape.
+  Attention, snapshot, return-view, and topology payloads require every
+  published field, including explicitly empty collections.
 - Digest canonicalization is versioned.
 
 ## Retention and export

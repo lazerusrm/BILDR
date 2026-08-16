@@ -1,7 +1,7 @@
 //! Durable, source-owned operator-control repositories.
 //!
 //! Each submodule owns one bounded projection/repository.  This keeps control
-//! plane behavior out of the legacy query monolith and makes its event and
+//! plane behavior out of the existing query monolith and makes its event and
 //! snapshot custody independently testable.
 
 mod approval;

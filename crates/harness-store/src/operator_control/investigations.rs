@@ -460,7 +460,7 @@ mod tests {
                 decision_id: "decision_a".to_owned(),
                 question: "Which revision is authoritative?".to_owned(),
                 state: "open".to_owned(),
-                options: vec!["controller".to_owned(), "legacy".to_owned()],
+                options: vec!["controller".to_owned(), "operator".to_owned()],
                 evidence_refs: vec![format!("context:{}", "b".repeat(64))],
                 impact: "Blocks schema publication.".to_owned(),
                 recommended_option: Some("controller".to_owned()),

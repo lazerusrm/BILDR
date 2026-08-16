@@ -876,6 +876,7 @@ export interface InterventionReceipt {
   episode_id: string;
   kind:
     | "wait"
+    | "pause_for_operator"
     | "request_operator_decision"
     | "request_reconciliation"
     | "queue_read_only_review";
