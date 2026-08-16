@@ -48,6 +48,13 @@ import type {
 
 type JsonBody = Record<string, unknown>;
 
+export class ApiRequestError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+    this.name = "ApiRequestError";
+  }
+}
+
 class HarnessApi {
   private csrf = "";
   private session?: Promise<void>;
@@ -72,13 +79,13 @@ class HarnessApi {
     return this.session;
   }
 
-  private async error(response: Response): Promise<Error> {
+  private async error(response: Response): Promise<ApiRequestError> {
     const fallback = `${response.status} ${response.statusText}`;
     try {
       const body = (await response.json()) as { error?: { message?: string } };
-      return new Error(body.error?.message || fallback);
+      return new ApiRequestError(response.status, body.error?.message || fallback);
     } catch {
-      return new Error(fallback);
+      return new ApiRequestError(response.status, fallback);
     }
   }
 
@@ -244,20 +251,18 @@ class HarnessApi {
       { expected_version: expectedVersion },
     );
   operatorPresence = () =>
-    this.get<OperatorPresence>("/operator-presence?operator_id=local_operator");
+    this.get<OperatorPresence>("/operator-presence");
   setOperatorPresence = (mode: OperatorPresenceMode, expectedVersion: number) =>
     this.post<OperatorPresence>("/operator-presence", {
-      operator_id: "local_operator",
       mode,
       expected_version: expectedVersion,
     });
   notificationDeliveries = () =>
     this.get<NotificationDelivery[]>("/notification-deliveries?limit=50");
   notificationShadowBatches = () =>
-    this.get<NotificationShadowBatch[]>("/notification-shadow-batches?operator_id=local_operator&limit=20");
+    this.get<NotificationShadowBatch[]>("/notification-shadow-batches?limit=20");
   createNotificationShadowBatch = (expectedPresenceVersion: number) =>
     this.post<NotificationShadowBatch>("/notification-shadow-batches", {
-      operator_id: "local_operator",
       expected_presence_version: expectedPresenceVersion,
     });
   notificationDeliveryHealth = () =>
@@ -282,7 +287,6 @@ class HarnessApi {
     acknowledgedCursor: number,
   ) =>
     this.post("/control-plane/return-view/cursor", {
-      operator_id: "local_operator",
       expected_snapshot_revision: expectedSnapshotRevision,
       acknowledged_cursor: acknowledgedCursor,
     });

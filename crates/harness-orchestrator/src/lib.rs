@@ -5437,7 +5437,7 @@ impl Orchestrator {
                 .into_iter()
                 .rev()
             {
-                if message.phase.as_deref() == Some("commentary") {
+                if message.phase.as_deref() != Some("final_answer") {
                     continue;
                 }
                 let plan = match parse_architecture_plan(
@@ -6026,7 +6026,7 @@ impl Orchestrator {
                 .list_agent_messages(&reviewer.id, 16)?
                 .into_iter()
                 .rev()
-                .filter(|message| message.phase.as_deref() != Some("commentary"))
+                .filter(|message| message.phase.as_deref() == Some("final_answer"))
             {
                 let Ok(verdict) = parse_json_text::<PlanReviewVerdict>(&message.text) else {
                     continue;
@@ -16942,7 +16942,7 @@ fn value_text<'a>(value: &'a Value, paths: &[&[&str]]) -> Option<&'a str> {
 fn extract_agent_message(payload: &Value) -> Option<&str> {
     let item = payload.get("item")?;
     if item.get("type")?.as_str()? != "agentMessage"
-        || item.get("phase").and_then(Value::as_str) == Some("commentary")
+        || item.get("phase").and_then(Value::as_str) != Some("final_answer")
     {
         return None;
     }
@@ -20547,7 +20547,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_handlers_ignore_commentary_and_accept_final_or_legacy_messages() {
+    fn structured_handlers_accept_only_final_answers() {
         let message = |phase: Option<&str>| {
             let mut item = json!({"type": "agentMessage", "text": "{\"ok\":true}"});
             if let Some(phase) = phase {
@@ -20560,7 +20560,7 @@ mod tests {
             extract_agent_message(&message(Some("final_answer"))),
             Some("{\"ok\":true}")
         );
-        assert_eq!(extract_agent_message(&message(None)), Some("{\"ok\":true}"));
+        assert_eq!(extract_agent_message(&message(None)), None);
     }
 
     #[test]
@@ -21636,7 +21636,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_run_above_old_ceiling_accepts_a_fifty_million_token_addition() {
+    fn current_run_ceiling_admits_a_fifty_million_token_addition() {
         assert_eq!(
             continuation_run_budget(327_335_392, Some(100_000_000), 51_000_000, 500_000)
                 .expect("the 1b lifetime ceiling must admit the continuation"),

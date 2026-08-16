@@ -640,7 +640,7 @@ not activated without measured improvement.
 1. mirror classification with no suppression;
 2. shadow batching and compare delivery;
 3. opt-in focus/unattended batching;
-4. canary broader default only with evidence.
+4. canary broader opt-in only with evidence.
 
 ### Work
 
@@ -661,8 +661,8 @@ Routine interruptions decrease without delayed/missed important action.
 
 ### Snapshot additions
 
-Extend `harness.supervisor-snapshot` in a versioned backward-compatible way or
-introduce v2 after ADR-0011 implementation review. Include bounded refs/summaries
+Define the current `harness.supervisor-snapshot` contract after ADR-0011
+implementation review. Include bounded refs/summaries
 for open attention, liveness episodes, recovery conflicts, external waits,
 investigation artifacts, and return cursor—not full artifacts or notification
 preferences.

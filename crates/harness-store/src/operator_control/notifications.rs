@@ -2,7 +2,8 @@
 //!
 //! This first delivery slice records what the product has presented in its
 //! local control plane. It does not suppress an attention item, send desktop
-//! notifications, or update a source-owned lifecycle.
+//! notifications, or update a source-owned lifecycle. Presence is an explicit,
+//! session-owned operator choice; it is never inferred or synthesized.
 
 use harness_domain::{
     AttentionItem, AttentionSeverity, ControlPlaneSnapshot, CorrelationLink, CorrelationLinkId,
@@ -38,7 +39,9 @@ impl Store {
                 |row| checked_presence_row(row.get(0)?, row.get(1)?),
             )
             .optional()?;
-        Ok(existing.unwrap_or_else(|| default_presence(operator_id)))
+        existing.ok_or_else(|| {
+            StoreError::NotFound(format!("operator presence {operator_id} is not configured"))
+        })
     }
 
     /// Presence changes are optimistic-concurrency checked presentation
@@ -50,9 +53,9 @@ impl Store {
         expected_version: u64,
     ) -> Result<OperatorPresence, StoreError> {
         validate_operator(operator_id)?;
-        // Read and write under one immediate transaction. A missing row still
-        // has the canonical version-one default, so competing first writes
-        // serialize into a success and a normal optimistic-version conflict.
+        // Read and write under one immediate transaction. Version zero is the
+        // only explicit create precondition; an absent row never implies a
+        // presentation mode.
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = transaction
@@ -61,34 +64,45 @@ impl Store {
                 [operator_id],
                 |row| checked_presence_row(row.get(0)?, row.get(1)?),
             )
-            .optional()?
-            .unwrap_or_else(|| default_presence(operator_id));
-        if current.version != expected_version {
-            return Err(StoreError::Conflict(format!(
-                "operator presence has version {}, expected {expected_version}",
-                current.version
-            )));
-        }
-        let mut next = OperatorPresence {
-            mode,
-            version: current.version.checked_add(1).ok_or_else(|| {
-                StoreError::Validation("operator presence version overflow".to_owned())
-            })?,
-            updated_at_ms: now_ms(),
-            ..current
+            .optional()?;
+        let mut next = match current {
+            Some(current) => {
+                if current.version != expected_version {
+                    return Err(StoreError::Conflict(format!(
+                        "operator presence has version {}, expected {expected_version}",
+                        current.version
+                    )));
+                }
+                OperatorPresence {
+                    mode,
+                    version: current.version.checked_add(1).ok_or_else(|| {
+                        StoreError::Validation("operator presence version overflow".to_owned())
+                    })?,
+                    updated_at_ms: now_ms(),
+                    ..current
+                }
+            }
+            None => {
+                if expected_version != 0 {
+                    return Err(StoreError::Conflict(
+                        "operator presence is not configured; creation requires expected version 0"
+                            .to_owned(),
+                    ));
+                }
+                OperatorPresence {
+                    schema: "harness.operator-presence.v1".to_owned(),
+                    operator_id: operator_id.to_owned(),
+                    mode,
+                    version: 1,
+                    updated_at_ms: now_ms(),
+                    sha256: String::new(),
+                }
+            }
         };
         next.sha256 = next.digest().map_err(control_error)?;
         next.validate().map_err(control_error)?;
         let raw = serde_json::to_string(&next)?;
-        let exists = transaction
-            .query_row(
-                "SELECT 1 FROM operator_presence WHERE operator_id=?1",
-                [operator_id],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if !exists {
+        if expected_version == 0 {
             transaction.execute("INSERT INTO operator_presence(operator_id,mode,version,updated_at,payload_json,payload_sha256) VALUES(?1,?2,?3,?4,?5,?6)", params![operator_id, mode_name(mode), to_i64(next.version)?, next.updated_at_ms, raw, digest(&serde_json::to_string(&next)?)])?;
         } else {
             let changed = transaction.execute("UPDATE operator_presence SET mode=?1,version=?2,updated_at=?3,payload_json=?4,payload_sha256=?5 WHERE operator_id=?6 AND version=?7", params![mode_name(mode), to_i64(next.version)?, next.updated_at_ms, raw, digest(&serde_json::to_string(&next)?), operator_id, to_i64(expected_version)?])?;
@@ -251,7 +265,11 @@ impl Store {
                 |row| checked_presence_row(row.get(0)?, row.get(1)?),
             )
             .optional()?
-            .unwrap_or_else(|| default_presence(&batch.presence.operator_id));
+            .ok_or_else(|| {
+                StoreError::Conflict(
+                    "notification shadow batch presence is not configured".to_owned(),
+                )
+            })?;
         if stored_presence != batch.presence {
             return Err(StoreError::Conflict(
                 "notification shadow batch presence changed before recording".to_owned(),
@@ -351,7 +369,7 @@ impl Store {
 
     pub fn list_notification_shadow_batches(
         &self,
-        operator_id: Option<&str>,
+        operator_id: &str,
         limit: u32,
     ) -> Result<Vec<NotificationShadowBatch>, StoreError> {
         if limit == 0 || limit > MAX_NOTIFICATION_PAGE_SIZE {
@@ -359,12 +377,10 @@ impl Store {
                 "notification shadow batch page limit must be 1..={MAX_NOTIFICATION_PAGE_SIZE}"
             )));
         }
-        if let Some(operator_id) = operator_id {
-            validate_operator(operator_id)?;
-        }
+        validate_operator(operator_id)?;
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT payload_json,payload_sha256 FROM notification_shadow_batches WHERE (?1 IS NULL OR operator_id=?1) ORDER BY created_at DESC,id DESC LIMIT ?2",
+            "SELECT payload_json,payload_sha256 FROM notification_shadow_batches WHERE operator_id=?1 ORDER BY created_at DESC,id DESC LIMIT ?2",
         )?;
         Ok(statement
             .query_map(params![operator_id, i64::from(limit)], |row| {
@@ -545,18 +561,6 @@ impl Store {
     }
 }
 
-fn default_presence(operator_id: &str) -> OperatorPresence {
-    let mut presence = OperatorPresence {
-        schema: "harness.operator-presence.v1".to_owned(),
-        operator_id: operator_id.to_owned(),
-        mode: OperatorPresenceMode::Interactive,
-        version: 1,
-        updated_at_ms: 0,
-        sha256: String::new(),
-    };
-    presence.sha256 = presence.digest().expect("presence serialization");
-    presence
-}
 fn notification_from_attention(item: &AttentionItem) -> Result<NotificationDelivery, StoreError> {
     let source_event_id = format!("attention-{}-{}", item.attention_id, item.version);
     let class = match item.severity {
@@ -874,10 +878,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn presence_is_versioned_and_never_changes_notification_authority() {
+    fn presence_is_explicitly_created_versioned_and_never_changes_notification_authority() {
         let temp = TempDir::new().expect("temp");
         let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
-        let initial = store.operator_presence("operator-a").expect("presence");
+        assert!(matches!(
+            store.operator_presence("operator-a"),
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            store.set_operator_presence("operator-a", OperatorPresenceMode::Interactive, 1),
+            Err(StoreError::Conflict(_))
+        ));
+        let initial = store
+            .set_operator_presence("operator-a", OperatorPresenceMode::Interactive, 0)
+            .expect("explicit presence creation");
         assert_eq!(initial.mode, OperatorPresenceMode::Interactive);
         let updated = store
             .set_operator_presence("operator-a", OperatorPresenceMode::Focus, initial.version)
@@ -903,10 +917,10 @@ mod tests {
         let first_barrier = Arc::clone(&barrier);
         let first = std::thread::spawn(move || {
             first_barrier.wait();
-            first_store.set_operator_presence("operator-a", OperatorPresenceMode::Focus, 1)
+            first_store.set_operator_presence("operator-a", OperatorPresenceMode::Focus, 0)
         });
         barrier.wait();
-        let second = store.set_operator_presence("operator-a", OperatorPresenceMode::Unattended, 1);
+        let second = store.set_operator_presence("operator-a", OperatorPresenceMode::Unattended, 0);
         let first = first.join().expect("join");
         let outcomes = [first, second];
         assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
@@ -1068,9 +1082,8 @@ mod tests {
                 .upsert_source_attention(attention)
                 .expect("open attention");
         }
-        let initial = store.operator_presence("operator-a").expect("presence");
         let focus = store
-            .set_operator_presence("operator-a", OperatorPresenceMode::Focus, initial.version)
+            .set_operator_presence("operator-a", OperatorPresenceMode::Focus, 0)
             .expect("focus preference");
 
         let first = store
@@ -1116,7 +1129,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .list_notification_shadow_batches(Some("operator-a"), 10)
+                .list_notification_shadow_batches("operator-a", 10)
                 .expect("stored batch"),
             vec![first.clone()]
         );
@@ -1179,14 +1192,16 @@ mod tests {
                 .upsert_source_attention(&attention)
                 .expect("open attention");
         }
-        let presence = store.operator_presence("operator-a").expect("presence");
+        let presence = store
+            .set_operator_presence("operator-a", OperatorPresenceMode::Interactive, 0)
+            .expect("explicit presence");
         assert!(matches!(
             store.create_notification_shadow_batch("operator-a", presence.version),
             Err(StoreError::Conflict(_))
         ));
         assert!(
             store
-                .list_notification_shadow_batches(Some("operator-a"), 10)
+                .list_notification_shadow_batches("operator-a", 10)
                 .expect("no shadow batch")
                 .is_empty()
         );

@@ -1,7 +1,7 @@
 import { RefreshCw } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 
-import { api } from "../api";
+import { ApiRequestError, api } from "../api";
 import type {
   AttentionItem,
   AttentionPage,
@@ -78,7 +78,10 @@ export function AttentionCenter() {
         api.externalConditions(),
         api.materialProgress(),
         api.liveness(),
-        api.operatorPresence(),
+        api.operatorPresence().catch((cause: unknown) => {
+          if (cause instanceof ApiRequestError && cause.status === 404) return undefined;
+          throw cause;
+        }),
         api.notificationDeliveries(),
         api.notificationDeliveryHealth(),
         api.notificationShadowBatches(),
@@ -275,10 +278,10 @@ export function AttentionCenter() {
   }, []);
 
   const updatePresence = async (mode: OperatorPresenceMode) => {
-    if (!presence || presence.mode === mode) return;
+    if (presence?.mode === mode) return;
     setBusy("presence");
     try {
-      const updated = await api.setOperatorPresence(mode, presence.version);
+      const updated = await api.setOperatorPresence(mode, presence?.version ?? 0);
       setPresence(updated);
       setError("");
     } catch (cause) {
@@ -481,7 +484,16 @@ function PresenceAndNotifications({
     <section className="control-plane-support-card" aria-labelledby="notification-heading">
       <span className="eyebrow">Presentation only</span>
       <h2 id="notification-heading">Delivery mirror</h2>
-      {!presence ? <p className="empty-state">Loading local presence preference…</p> : (
+      {!presence ? (
+        <>
+          <p className="empty-state">No presence preference has been configured for this session.</p>
+          <div className="control-plane-run-picker" aria-label="Configure local presence preference">
+            {(["interactive", "focus", "unattended"] as const).map((mode) => (
+              <button key={mode} className="button secondary" type="button" disabled={busy} onClick={() => onPresence(mode)}>Use {mode}</button>
+            ))}
+          </div>
+        </>
+      ) : (
         <>
           <p className="control-plane-note">Local presence is currently <strong>{presence.mode}</strong>. It is version {presence.version} and does not change controller authority.</p>
           <div className="control-plane-run-picker" aria-label="Set local presence preference">

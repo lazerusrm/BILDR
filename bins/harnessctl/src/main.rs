@@ -54,11 +54,8 @@ enum Command {
         #[command(subcommand)]
         command: ImprovementCommand,
     },
-    /// Show the bounded operator return view from an immutable control-plane snapshot.
-    Return {
-        #[arg(long, default_value = "local_operator")]
-        operator_id: String,
-    },
+    /// Show this local session's bounded return view from an immutable control-plane snapshot.
+    Return,
     Attention {
         #[command(subcommand)]
         command: AttentionCommand,
@@ -132,13 +129,8 @@ enum RecoveryCommand {
 
 #[derive(Subcommand)]
 enum PresenceCommand {
-    Show {
-        #[arg(long, default_value = "local_operator")]
-        operator_id: String,
-    },
+    Show,
     Set {
-        #[arg(long, default_value = "local_operator")]
-        operator_id: String,
         #[arg(value_parser = ["interactive", "focus", "unattended"])]
         mode: String,
         #[arg(long)]
@@ -804,7 +796,7 @@ async fn execute(api: &ApiClient, command: Command) -> Result<Value> {
                 }
             },
         },
-        Command::Return { operator_id } => operator_control::return_view(api, operator_id).await,
+        Command::Return => operator_control::return_view(api).await,
         Command::Attention { command } => operator_control::attention(api, command).await,
         Command::Investigation { command } => operator_control::investigation(api, command).await,
         Command::Knowledge { command } => operator_control::knowledge(api, command).await,

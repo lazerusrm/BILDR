@@ -100,7 +100,7 @@ describe("AttentionCenter", () => {
     expect(markup).toContain("Material progress");
     expect(markup).toContain("Liveness episodes");
     expect(markup).toContain("Delivery mirror");
-    expect(markup).toContain("Loading local presence preference");
+    expect(markup).toContain("No presence preference has been configured for this session.");
     expect(markup).toContain("Loading current delivery health");
     expect(markup).toContain("Run topology");
   });

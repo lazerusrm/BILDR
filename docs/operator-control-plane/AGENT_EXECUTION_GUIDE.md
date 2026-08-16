@@ -122,7 +122,8 @@ Before code:
 4. confirm event vocabulary;
 5. confirm module boundaries;
 6. confirm schema versions;
-7. confirm compatibility strategy for stored `TaskPacket`;
+7. confirm the one current stored `TaskPacket` contract; no alternate shapes,
+   defaults, compatibility readers, or migration path are permitted;
 8. record unresolved contract questions as explicit decisions.
 
 Do not let implementation agents answer cross-cutting contract questions
@@ -495,9 +496,10 @@ Closed numbered list.
 
 Explicit exclusions.
 
-## Compatibility
+## Current contract
 
-Stored/API/schema behavior that must remain valid.
+The one stored/API/schema behavior that is valid. New code rejects omitted,
+legacy, and alternate shapes rather than translating them.
 
 ## Security and authority
 
@@ -589,7 +591,7 @@ No handoff may claim:
 - “recovered” when state was only preserved;
 - “safe” without naming the invariant/test;
 - “complete” with open blocking attention;
-- “backward compatible” without fixture evidence.
+- “compatible” when the requested payload is not the current contract.
 
 ## Review checklists
 
@@ -601,7 +603,7 @@ No handoff may claim:
 - legal transitions;
 - bounded values;
 - no generic setters;
-- legacy compatibility.
+- no legacy acceptance or compatibility reader.
 
 ### Store
 

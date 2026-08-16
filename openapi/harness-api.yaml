@@ -297,10 +297,6 @@ paths:
     get:
       tags: [ControlPlane]
       operationId: getControlPlaneReturnView
-      parameters:
-        - name: operator_id
-          in: query
-          schema: {type: string, maxLength: 160}
       responses:
         '200':
           description: Return-focused presentation from one immutable snapshot.
@@ -607,17 +603,13 @@ paths:
     get:
       tags: [Notifications]
       operationId: getOperatorPresence
-      parameters:
-        - name: operator_id
-          in: query
-          required: true
-          schema: {type: string, maxLength: 160}
       responses:
         '200':
-          description: Local presentation preference; it does not change controller authority or notification delivery.
+          description: The authenticated session's explicit presentation preference; it does not change controller authority or notification delivery.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/OperatorPresence'}
+        '404': {$ref: '#/components/responses/NotFound'}
     post:
       tags: [Notifications]
       operationId: setOperatorPresence
@@ -630,7 +622,7 @@ paths:
             schema: {$ref: '#/components/schemas/SetOperatorPresenceRequest'}
       responses:
         '200':
-          description: Version-checked presentation preference update; delivery remains mirror-only.
+          description: Explicit version-checked creation or update of the authenticated session's presentation preference; delivery remains mirror-only.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/OperatorPresence'}
@@ -656,10 +648,6 @@ paths:
       operationId: listNotificationShadowBatches
       description: Bounded immutable shadow-only notification plans. They compare a complete snapshot and exact local presence revision with the existing immediate mirror; they cannot defer, suppress, send, or resolve a source.
       parameters:
-        - name: operator_id
-          in: query
-          required: true
-          schema: {type: string, maxLength: 160}
         - name: limit
           in: query
           schema: {type: integer, minimum: 1, maximum: 200, default: 50}
@@ -2212,7 +2200,7 @@ components:
       required: [schema, operator_id, mode, version, updated_at_ms, sha256]
       properties:
         schema: {const: harness.operator-presence.v1}
-        operator_id: {type: string, maxLength: 160}
+        operator_id: {type: string, pattern: '^operator-[0-9a-f]{64}$'}
         mode: {enum: [interactive, focus, unattended]}
         version: {type: integer, minimum: 1}
         updated_at_ms: {type: integer, minimum: 0}
@@ -2220,17 +2208,15 @@ components:
     SetOperatorPresenceRequest:
       type: object
       additionalProperties: false
-      required: [operator_id, mode, expected_version]
+      required: [mode, expected_version]
       properties:
-        operator_id: {type: string, maxLength: 160}
         mode: {enum: [interactive, focus, unattended]}
-        expected_version: {type: integer, minimum: 1}
+        expected_version: {type: integer, minimum: 0}
     CreateNotificationShadowBatchRequest:
       type: object
       additionalProperties: false
-      required: [operator_id, expected_presence_version]
+      required: [expected_presence_version]
       properties:
-        operator_id: {type: string, maxLength: 160}
         expected_presence_version: {type: integer, minimum: 1}
     NotificationDelivery:
       type: object
@@ -2905,9 +2891,8 @@ components:
     AdvanceReturnViewCursorRequest:
       type: object
       additionalProperties: false
-      required: [operator_id, expected_snapshot_revision, acknowledged_cursor]
+      required: [expected_snapshot_revision, acknowledged_cursor]
       properties:
-        operator_id: {type: string, maxLength: 160}
         expected_snapshot_revision: {type: integer, minimum: 1}
         acknowledged_cursor: {type: integer, minimum: 0}
     ReturnViewCursor:
@@ -2915,7 +2900,7 @@ components:
       additionalProperties: false
       required: [operator_id, acknowledged_cursor, expected_snapshot_revision]
       properties:
-        operator_id: {type: string}
+        operator_id: {type: string, pattern: '^operator-[0-9a-f]{64}$'}
         acknowledged_cursor: {type: integer, minimum: 0}
         expected_snapshot_revision: {type: integer, minimum: 1}
     OpaqueId:

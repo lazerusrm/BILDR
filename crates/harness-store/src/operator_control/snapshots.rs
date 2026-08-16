@@ -1004,9 +1004,8 @@ mod tests {
         let temp = TempDir::new().expect("temp");
         let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
         let first = store.control_plane_snapshot().expect("first snapshot");
-        let initial = store.operator_presence("operator-a").expect("presence");
         let focus = store
-            .set_operator_presence("operator-a", OperatorPresenceMode::Focus, initial.version)
+            .set_operator_presence("operator-a", OperatorPresenceMode::Focus, 0)
             .expect("focus");
         let second = store.control_plane_snapshot().expect("presence snapshot");
         assert_ne!(second.snapshot_id, first.snapshot_id);

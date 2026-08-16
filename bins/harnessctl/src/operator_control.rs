@@ -13,13 +13,8 @@ use super::{
     PresenceCommand, RecoveryCommand,
 };
 
-pub(super) async fn return_view(api: &ApiClient, operator_id: String) -> Result<Value> {
-    let operator_id: String =
-        url::form_urlencoded::byte_serialize(operator_id.as_bytes()).collect();
-    api.get(&format!(
-        "/api/v1/control-plane/return-view?operator_id={operator_id}"
-    ))
-    .await
+pub(super) async fn return_view(api: &ApiClient) -> Result<Value> {
+    api.get("/api/v1/control-plane/return-view").await
 }
 
 pub(super) async fn attention(api: &ApiClient, command: AttentionCommand) -> Result<Value> {
@@ -243,28 +238,18 @@ pub(super) async fn trace(api: &ApiClient, trace_id: String) -> Result<Value> {
         .await
 }
 
-/// Presentation-only local preference. The expected version prevents the CLI
-/// from overwriting a more recent operator update and the API retains all
-/// session, CSRF, and same-origin protections.
+/// Session-owned presentation preference. Explicit creation uses expected
+/// version zero; every later update must name the currently recorded version.
 pub(super) async fn presence(api: &ApiClient, command: PresenceCommand) -> Result<Value> {
     match command {
-        PresenceCommand::Show { operator_id } => {
-            let operator_id: String =
-                url::form_urlencoded::byte_serialize(operator_id.as_bytes()).collect();
-            api.get(&format!(
-                "/api/v1/operator-presence?operator_id={operator_id}"
-            ))
-            .await
-        }
+        PresenceCommand::Show => api.get("/api/v1/operator-presence").await,
         PresenceCommand::Set {
-            operator_id,
             mode,
             expected_version,
         } => {
             api.post(
                 "/api/v1/operator-presence",
                 json!({
-                    "operator_id": operator_id,
                     "mode": mode,
                     "expected_version": expected_version,
                 }),

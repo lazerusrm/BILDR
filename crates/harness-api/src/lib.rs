@@ -2095,6 +2095,22 @@ pub(crate) fn authenticated_session_id(
     Ok(session.id)
 }
 
+/// Returns a stable, non-secret operator identity for one authenticated local
+/// session. Never place the HttpOnly session credential in a persisted or
+/// response payload.
+pub(crate) fn authenticated_operator_id(
+    state: &ApiState,
+    headers: &HeaderMap,
+    mutation: bool,
+) -> Result<String, ApiError> {
+    let session_id = authenticated_session_id(state, headers, mutation)?;
+    Ok(operator_id_for_session(&session_id))
+}
+
+fn operator_id_for_session(session_id: &str) -> String {
+    format!("operator-{}", sha256(session_id.as_bytes()))
+}
+
 fn authenticate(state: &ApiState, headers: &HeaderMap, mutation: bool) -> Result<(), ApiError> {
     authenticated_session_id(state, headers, mutation).map(|_| ())
 }
@@ -2253,6 +2269,16 @@ mod tests {
     fn csrf_digest_comparison_is_stable() {
         assert_eq!(sha256(b"token"), sha256(b"token"));
         assert_ne!(sha256(b"token"), sha256(b"other"));
+    }
+
+    #[test]
+    fn operator_identity_does_not_expose_the_session_credential() {
+        let session_id = "a2e5b02b2b9644d5a331eef97a87f0cc";
+        let operator_id = operator_id_for_session(session_id);
+        assert!(operator_id.starts_with("operator-"));
+        assert!(!operator_id.contains(session_id));
+        assert_eq!(operator_id, operator_id_for_session(session_id));
+        assert_ne!(operator_id, operator_id_for_session("different-session"));
     }
 
     #[test]

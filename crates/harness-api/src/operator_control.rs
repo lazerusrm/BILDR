@@ -19,7 +19,9 @@ use harness_domain::{
 };
 use serde::Deserialize;
 
-use super::{ApiError, ApiState, authenticate, authenticated_session_id};
+use super::{
+    ApiError, ApiState, authenticate, authenticated_operator_id, authenticated_session_id,
+};
 
 pub(super) fn routes() -> Router<ApiState> {
     Router::new()
@@ -137,22 +139,20 @@ async fn control_plane_snapshot(
 }
 
 #[derive(Debug, Deserialize)]
-struct ReturnViewQuery {
-    operator_id: Option<String>,
-}
+#[serde(deny_unknown_fields)]
+struct EmptyQuery {}
 
 async fn return_view(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(query): Query<ReturnViewQuery>,
+    Query(_): Query<EmptyQuery>,
 ) -> Result<Json<harness_domain::ReturnView>, ApiError> {
-    authenticate(&state, &headers, false)?;
-    let operator_id = query.operator_id.as_deref().unwrap_or("local_operator");
+    let operator_id = authenticated_operator_id(&state, &headers, false)?;
     Ok(Json(
         state
             .orchestrator
             .store()
-            .control_plane_return_view(operator_id)?,
+            .control_plane_return_view(&operator_id)?,
     ))
 }
 
@@ -221,7 +221,6 @@ async fn acknowledge_attention(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AdvanceReturnViewCursorRequest {
-    operator_id: String,
     expected_snapshot_revision: u64,
     acknowledged_cursor: u64,
 }
@@ -231,10 +230,10 @@ async fn advance_return_view_cursor(
     headers: HeaderMap,
     Json(request): Json<AdvanceReturnViewCursorRequest>,
 ) -> Result<Json<harness_store::ReturnViewCursor>, ApiError> {
-    authenticate(&state, &headers, true)?;
+    let operator_id = authenticated_operator_id(&state, &headers, true)?;
     Ok(Json(
         state.orchestrator.store().advance_return_view_cursor(
-            &request.operator_id,
+            &operator_id,
             request.expected_snapshot_revision,
             request.acknowledged_cursor,
         )?,
@@ -864,30 +863,20 @@ fn reconciliation_episode_id(episode_id: String) -> Result<ReconciliationEpisode
         .map_err(|error| ApiError::from(harness_store::StoreError::Validation(error.to_string())))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PresenceQuery {
-    operator_id: String,
-}
-
 async fn get_operator_presence(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(query): Query<PresenceQuery>,
+    Query(_): Query<EmptyQuery>,
 ) -> Result<Json<harness_domain::OperatorPresence>, ApiError> {
-    authenticate(&state, &headers, false)?;
+    let operator_id = authenticated_operator_id(&state, &headers, false)?;
     Ok(Json(
-        state
-            .orchestrator
-            .store()
-            .operator_presence(&query.operator_id)?,
+        state.orchestrator.store().operator_presence(&operator_id)?,
     ))
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetPresenceRequest {
-    operator_id: String,
     mode: OperatorPresenceMode,
     expected_version: u64,
 }
@@ -897,9 +886,9 @@ async fn set_operator_presence(
     headers: HeaderMap,
     Json(request): Json<SetPresenceRequest>,
 ) -> Result<Json<harness_domain::OperatorPresence>, ApiError> {
-    authenticate(&state, &headers, true)?;
+    let operator_id = authenticated_operator_id(&state, &headers, true)?;
     Ok(Json(state.orchestrator.store().set_operator_presence(
-        &request.operator_id,
+        &operator_id,
         request.mode,
         request.expected_version,
     )?))
@@ -913,7 +902,6 @@ struct NotificationQuery {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NotificationShadowBatchQuery {
-    operator_id: String,
     limit: Option<u32>,
 }
 
@@ -939,22 +927,18 @@ async fn list_notification_shadow_batches(
     headers: HeaderMap,
     Query(query): Query<NotificationShadowBatchQuery>,
 ) -> Result<Json<Vec<harness_domain::NotificationShadowBatch>>, ApiError> {
-    authenticate(&state, &headers, false)?;
+    let operator_id = authenticated_operator_id(&state, &headers, false)?;
     Ok(Json(
         state
             .orchestrator
             .store()
-            .list_notification_shadow_batches(
-                Some(&query.operator_id),
-                query.limit.unwrap_or(50),
-            )?,
+            .list_notification_shadow_batches(&operator_id, query.limit.unwrap_or(50))?,
     ))
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateNotificationShadowBatchRequest {
-    operator_id: String,
     expected_presence_version: u64,
 }
 
@@ -967,15 +951,12 @@ async fn create_notification_shadow_batch(
     headers: HeaderMap,
     Json(request): Json<CreateNotificationShadowBatchRequest>,
 ) -> Result<Json<harness_domain::NotificationShadowBatch>, ApiError> {
-    authenticate(&state, &headers, true)?;
+    let operator_id = authenticated_operator_id(&state, &headers, true)?;
     Ok(Json(
         state
             .orchestrator
             .store()
-            .create_notification_shadow_batch(
-                &request.operator_id,
-                request.expected_presence_version,
-            )?,
+            .create_notification_shadow_batch(&operator_id, request.expected_presence_version)?,
     ))
 }
 
@@ -1013,7 +994,6 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<AdvanceReturnViewCursorRequest>(json!({
-                "operator_id": "local_operator",
                 "expected_snapshot_revision": 1,
                 "acknowledged_cursor": 0,
                 "unexpected": true,
@@ -1022,7 +1002,6 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<SetPresenceRequest>(json!({
-                "operator_id": "local_operator",
                 "mode": "interactive",
                 "expected_version": 0,
                 "unexpected": true,
@@ -1062,7 +1041,6 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<CreateNotificationShadowBatchRequest>(json!({
-                "operator_id": "local_operator",
                 "expected_presence_version": 1,
                 "unexpected": true,
             }))
@@ -1157,32 +1135,40 @@ mod tests {
     }
 
     #[test]
-    fn notification_reads_require_an_exact_operator_scope() {
+    fn session_owned_notification_reads_reject_caller_supplied_scope() {
+        assert!(serde_json::from_value::<EmptyQuery>(json!({})).is_ok());
         assert!(
-            serde_json::from_value::<PresenceQuery>(json!({
-                "operator_id": "local_operator",
+            serde_json::from_value::<EmptyQuery>(json!({
+                "operator_id": "spoofed_operator",
+            }))
+            .is_err()
+        );
+
+        assert!(
+            serde_json::from_value::<SetPresenceRequest>(json!({
+                "mode": "interactive",
+                "expected_version": 0,
             }))
             .is_ok()
         );
-        assert!(serde_json::from_value::<PresenceQuery>(json!({})).is_err());
         assert!(
-            serde_json::from_value::<PresenceQuery>(json!({
-                "operator_id": "local_operator",
-                "unexpected": true,
+            serde_json::from_value::<SetPresenceRequest>(json!({
+                "operator_id": "other-session",
+                "mode": "interactive",
+                "expected_version": 0,
             }))
             .is_err()
         );
 
         assert!(
             serde_json::from_value::<NotificationShadowBatchQuery>(json!({
-                "operator_id": "local_operator",
                 "limit": 50,
             }))
             .is_ok()
         );
         assert!(
             serde_json::from_value::<NotificationShadowBatchQuery>(json!({
-                "limit": 50,
+                "operator_id": "spoofed_operator",
             }))
             .is_err()
         );

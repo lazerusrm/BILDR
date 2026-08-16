@@ -708,9 +708,9 @@ GET /api/v1/improvement/knowledge?repository_id={repository_id}&limit={1..200}
 GET /api/v1/improvement/knowledge/{knowledge_id}
 GET /api/v1/external-conditions
 GET /api/v1/traces/{trace_id}
-GET /api/v1/operator-presence?operator_id={exact_operator_id}
+GET /api/v1/operator-presence
 GET /api/v1/notification-deliveries
-GET /api/v1/notification-shadow-batches?operator_id={exact_operator_id}
+GET /api/v1/notification-shadow-batches
 GET /api/v1/notification-delivery-health
 ```
 
@@ -738,6 +738,14 @@ POST /api/v1/runs/{run_id}/investigations
 There is no generic attention-resolve or recovery-force route. Mutations require
 expected version/revision, local session, CSRF, same-origin, controller policy,
 and source-specific state checks.
+
+Operator return cursors, presence preferences, and notification shadow plans are
+owned by the authenticated session. Their routes accept no caller-supplied
+operator identifier. A missing presence row is a 404; creation is an explicit
+`POST /api/v1/operator-presence` with `expected_version: 0` and a selected
+mode. The persisted operator ID is derived one-way from the session and never
+exposes the HttpOnly session credential. No API, UI, or CLI default creates a
+preference.
 
 Knowledge review is a closed candidate transition: the request carries the
 current candidate SHA and `accept` or `reject`; the authenticated local session
