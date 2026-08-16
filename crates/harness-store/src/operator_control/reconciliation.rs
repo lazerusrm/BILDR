@@ -105,32 +105,6 @@ impl Store {
         Ok(())
     }
 
-    /// Returns whether the database has no remaining mutable execution
-    /// records for an attempt. The controller additionally rechecks the
-    /// preserved Git worktree immediately before it records the proof.
-    pub fn fresh_attempt_custody_is_closed(
-        &self,
-        attempt_id: &harness_domain::AttemptId,
-    ) -> Result<bool, StoreError> {
-        let connection = self.connection()?;
-        let active_path_lease: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM path_leases WHERE task_attempt_id=?1 AND released_at IS NULL)",
-            [attempt_id.as_str()],
-            |row| row.get(0),
-        )?;
-        let active_agent: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agent_sessions WHERE task_attempt_id=?1 AND state NOT IN ('COMPLETED','FAILED','CANCELED','CANCELLED','SHUTDOWN','TERMINATED','TURN_COMPLETE','STALLED','INTERRUPTED'))",
-            [attempt_id.as_str()],
-            |row| row.get(0),
-        )?;
-        let recorded_command: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM command_runs WHERE task_attempt_id=?1)",
-            [attempt_id.as_str()],
-            |row| row.get(0),
-        )?;
-        Ok(!active_path_lease && !active_agent && !recorded_command)
-    }
-
     pub fn open_reconciliation_episode(
         &self,
         episode: &ReconciliationEpisode,
@@ -1832,12 +1806,6 @@ mod tests {
                 ],
             )
             .expect("recorded command");
-        let prior_attempt_id = harness_domain::AttemptId::from(proof.prior_attempt_id.as_str());
-        assert!(
-            !store
-                .fresh_attempt_custody_is_closed(&prior_attempt_id)
-                .expect("command history blocks custody")
-        );
         let receipt = fresh_attempt_receipt(
             episode.episode_id.clone(),
             &proof,
