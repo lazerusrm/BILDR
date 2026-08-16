@@ -18697,6 +18697,8 @@ mod tests {
                 .map(|(field, value)| (field.clone(), value.clone()))
                 .collect(),
         );
+        raw["execution_mode"] = json!("controller");
+        raw["owner_profile"] = json!("governor");
 
         canonicalize_architecture_task(
             &run,
