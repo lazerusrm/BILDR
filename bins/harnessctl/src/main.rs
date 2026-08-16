@@ -1,8 +1,14 @@
-use std::{fs, net::IpAddr, path::PathBuf};
+use std::{
+    fs,
+    io::Write,
+    net::IpAddr,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use reqwest::{Client, Method, header};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
 
@@ -13,6 +19,10 @@ mod operator_control;
 struct Cli {
     #[arg(long, env = "HARNESS_URL", default_value = "http://127.0.0.1:7310")]
     url: String,
+    /// Exact private file that retains this CLI's authenticated local session.
+    /// If omitted, harnessctl uses one private state file per local origin.
+    #[arg(long, global = true, env = "HARNESS_SESSION_FILE")]
+    session_file: Option<PathBuf>,
     #[arg(long, global = true)]
     compact: bool,
     #[command(subcommand)]
@@ -428,14 +438,38 @@ struct ApiClient {
     csrf: String,
 }
 
+const CLI_SESSION_SCHEMA: &str = "harnessctl.local-session.v1";
+const MAX_SESSION_SECRET_LEN: usize = 512;
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedLocalSession {
+    schema: String,
+    origin: String,
+    cookie: String,
+    csrf: String,
+}
+
 impl ApiClient {
-    async fn connect(base: &str) -> Result<Self> {
+    async fn connect(base: &str, session_file: Option<&Path>) -> Result<Self> {
         let base = Url::parse(base).context("HARNESS_URL is not a valid URL")?;
         validate_local_url(&base)?;
         let origin = base.origin().ascii_serialization();
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .build()?;
+        let session_file = session_file
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| default_session_file(&base));
+        if let Some(session) = read_persisted_session(&session_file, &origin)? {
+            return Ok(Self {
+                http,
+                base,
+                origin,
+                cookie: session.cookie,
+                csrf: session.csrf,
+            });
+        }
         let endpoint = base.join("/api/v1/session")?;
         let response = http
             .post(endpoint)
@@ -460,6 +494,15 @@ impl ApiClient {
             .and_then(Value::as_str)
             .context("harnessd session response has no CSRF token")?
             .to_owned();
+        persist_session(
+            &session_file,
+            &PersistedLocalSession {
+                schema: CLI_SESSION_SCHEMA.to_owned(),
+                origin: origin.clone(),
+                cookie: cookie.clone(),
+                csrf: csrf.clone(),
+            },
+        )?;
         Ok(Self {
             http,
             base,
@@ -511,10 +554,167 @@ impl ApiClient {
     }
 }
 
+fn default_session_file(base: &Url) -> PathBuf {
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .map(|home| home.join(".local/state"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    let host = base
+        .host_str()
+        .unwrap_or("local")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let port = base.port_or_known_default().unwrap_or(0);
+    state_home
+        .join("harnessctl")
+        .join(format!("session-{host}-{port}.json"))
+}
+
+fn read_persisted_session(
+    session_file: &Path,
+    expected_origin: &str,
+) -> Result<Option<PersistedLocalSession>> {
+    let raw = match fs::read_to_string(session_file) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read private harnessctl session {}",
+                    session_file.display()
+                )
+            });
+        }
+    };
+    require_private_session_file(session_file)?;
+    let session: PersistedLocalSession = serde_json::from_str(&raw)
+        .context("private harnessctl session has an invalid current shape")?;
+    if session.schema != CLI_SESSION_SCHEMA {
+        bail!("private harnessctl session has an unknown schema");
+    }
+    if session.origin != expected_origin {
+        bail!("private harnessctl session belongs to a different local origin");
+    }
+    if !session.cookie.starts_with("harness_session=")
+        || !is_safe_session_secret(&session.cookie)
+        || !is_safe_session_secret(&session.csrf)
+    {
+        bail!("private harnessctl session contains an invalid credential shape");
+    }
+    Ok(Some(session))
+}
+
+fn persist_session(session_file: &Path, session: &PersistedLocalSession) -> Result<()> {
+    let parent = session_file
+        .parent()
+        .context("HARNESS_SESSION_FILE must name a file inside a directory")?;
+    let parent_existed = parent.exists();
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create private harnessctl state directory {}",
+            parent.display()
+        )
+    })?;
+    if parent_existed {
+        require_private_session_directory(parent)?;
+    } else {
+        set_private_directory_permissions(parent)?;
+    }
+    let payload = serde_json::to_vec(session)?;
+    let file_name = session_file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("HARNESS_SESSION_FILE must have a valid file name")?;
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary).with_context(|| {
+        format!(
+            "failed to create private harnessctl session {}",
+            temporary.display()
+        )
+    })?;
+    file.write_all(&payload)?;
+    file.sync_all()?;
+    fs::rename(&temporary, session_file).with_context(|| {
+        format!(
+            "failed to atomically install private harnessctl session {}",
+            session_file.display()
+        )
+    })?;
+    set_private_session_file_permissions(session_file)
+}
+
+fn is_safe_session_secret(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SESSION_SECRET_LEN
+        && !value.chars().any(char::is_control)
+}
+
+fn require_private_session_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
+            bail!("private harnessctl session must not be readable by group or other users");
+        }
+    }
+    Ok(())
+}
+
+fn set_private_session_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn require_private_session_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
+            bail!(
+                "private harnessctl session directory must not be readable by group or other users"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn set_private_directory_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let api = ApiClient::connect(&cli.url).await?;
+    let api = ApiClient::connect(&cli.url, cli.session_file.as_deref()).await?;
     let value = execute(&api, cli.command).await?;
     if cli.compact {
         println!("{}", serde_json::to_string(&value)?);
@@ -870,9 +1070,63 @@ fn validate_local_url(url: &Url) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use std::fs;
 
-    use super::{Cli, Command, ConditionCommand, KnowledgeCommand};
+    use clap::Parser;
+    use tempfile::TempDir;
+    use url::Url;
+
+    use super::{
+        CLI_SESSION_SCHEMA, Cli, Command, ConditionCommand, KnowledgeCommand,
+        PersistedLocalSession, default_session_file, persist_session, read_persisted_session,
+    };
+
+    #[test]
+    fn private_cli_session_is_exact_origin_scoped_and_persisted() {
+        let temp = TempDir::new().expect("temp directory");
+        let session_file = temp.path().join("private-state").join("session.json");
+        let session = PersistedLocalSession {
+            schema: CLI_SESSION_SCHEMA.to_owned(),
+            origin: "http://127.0.0.1:7310".to_owned(),
+            cookie: "harness_session=session-a".to_owned(),
+            csrf: "csrf-a".to_owned(),
+        };
+        persist_session(&session_file, &session).expect("session persists");
+        assert_eq!(
+            read_persisted_session(&session_file, "http://127.0.0.1:7310")
+                .expect("same-origin session reads")
+                .expect("session exists")
+                .cookie,
+            "harness_session=session-a"
+        );
+        assert!(read_persisted_session(&session_file, "http://127.0.0.1:7311").is_err());
+        let mut malformed = session;
+        malformed.schema = "harnessctl.local-session.v0".to_owned();
+        fs::write(
+            &session_file,
+            serde_json::to_vec(&malformed).expect("session serializes"),
+        )
+        .expect("malformed fixture writes");
+        set_private_file_mode_for_test(&session_file);
+        assert!(read_persisted_session(&session_file, "http://127.0.0.1:7310").is_err());
+    }
+
+    #[test]
+    fn default_cli_session_file_is_distinct_per_local_origin() {
+        let first = default_session_file(&Url::parse("http://127.0.0.1:7310").unwrap());
+        let second = default_session_file(&Url::parse("http://127.0.0.1:7311").unwrap());
+        assert_ne!(first, second);
+        assert!(first.ends_with("session-127_0_0_1-7310.json"));
+    }
+
+    fn set_private_file_mode_for_test(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .expect("fixture permissions are private");
+        }
+    }
 
     #[test]
     fn notification_health_is_a_read_only_cli_command() {

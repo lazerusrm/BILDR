@@ -600,7 +600,7 @@ in `unknown` and requires explicit re-registration.
 Presence:
 
 ```json
-{"mode":"interactive","changed_at_ms":1786588800000,"actor":"operator","version":4}
+{"schema":"harness.operator-presence.v1","operator_id":"operator-opaque","mode":"interactive","version":1,"updated_at_ms":1786588800000,"sha256":"64-hex"}
 ```
 
 The current v1 notification channel has exactly two immutable records:
@@ -785,7 +785,7 @@ harnessctl recovery list|show|findings|actions
 harnessctl investigation create|show|export
 harnessctl knowledge list {repository_id}|show {knowledge_id}|review {knowledge_id} --expected-knowledge-sha256 {sha256} {accept|reject}
 harnessctl condition list|show|observations|register-time-gate|register-local-capacity
-harnessctl presence get|set
+harnessctl presence show|set
 harnessctl notification-deliveries|notification-health
 harnessctl topology show [--format table|json|dot]
 harnessctl trace show
