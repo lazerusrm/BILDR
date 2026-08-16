@@ -837,7 +837,7 @@ paths:
         - name: knowledgeId
           in: path
           required: true
-          schema: {$ref: '#/components/schemas/OpaqueId'}
+          schema: {$ref: '#/components/schemas/KnowledgeToken'}
       responses:
         '200':
           description: Current immutable knowledge wire. Candidate, review, freshness, and scope remain explicit rather than inferred.
@@ -1890,7 +1890,7 @@ paths:
         - name: evaluationRunId
           in: path
           required: true
-          schema: {$ref: '#/components/schemas/OpaqueId'}
+          schema: {$ref: '#/components/schemas/EvaluationId'}
       responses:
         '200': {description: Closed evaluation run receipt., content: {application/json: {schema: {$ref: '#/components/schemas/EvaluationRunSummary'}}}}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -1903,7 +1903,7 @@ paths:
         - name: sampleId
           in: path
           required: true
-          schema: {$ref: '#/components/schemas/OpaqueId'}
+          schema: {$ref: '#/components/schemas/EvaluationId'}
       responses:
         '200': {description: Closed evaluation sample receipt., content: {application/json: {schema: {$ref: '#/components/schemas/EvaluationSampleSummary'}}}}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -1917,7 +1917,7 @@ paths:
         - name: caseRevisionId
           in: path
           required: true
-          schema: {$ref: '#/components/schemas/OpaqueId'}
+          schema: {$ref: '#/components/schemas/EvaluationId'}
       responses:
         '200': {description: Closed immutable evaluation case receipt., content: {application/json: {schema: {$ref: '#/components/schemas/EvaluationCaseSummary'}}}}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -1930,7 +1930,7 @@ paths:
         - name: occurrenceId
           in: path
           required: true
-          schema: {$ref: '#/components/schemas/OpaqueId'}
+          schema: {$ref: '#/components/schemas/EvaluationId'}
       responses:
         '200': {description: Closed occurrence source receipt., content: {application/json: {schema: {$ref: '#/components/schemas/EvaluationOccurrenceSource'}}}}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -2515,14 +2515,14 @@ components:
       properties:
         expected_artifact_sha256: {$ref: '#/components/schemas/Digest'}
         finding_id: {$ref: '#/components/schemas/OpaqueId'}
-        task_family: {$ref: '#/components/schemas/OpaqueId'}
+        task_family: {$ref: '#/components/schemas/KnowledgeToken'}
         model_family:
           anyOf:
-            - {$ref: '#/components/schemas/OpaqueId'}
+            - {$ref: '#/components/schemas/KnowledgeToken'}
             - {type: 'null'}
         runtime_class:
           anyOf:
-            - {$ref: '#/components/schemas/OpaqueId'}
+            - {$ref: '#/components/schemas/KnowledgeToken'}
             - {type: 'null'}
     ProposeKnowledgeFromLivenessRequest:
       type: object
@@ -2530,14 +2530,14 @@ components:
       required: [expected_episode_sha256, task_family, model_family, runtime_class]
       properties:
         expected_episode_sha256: {$ref: '#/components/schemas/Digest'}
-        task_family: {$ref: '#/components/schemas/OpaqueId'}
+        task_family: {$ref: '#/components/schemas/KnowledgeToken'}
         model_family:
           anyOf:
-            - {$ref: '#/components/schemas/OpaqueId'}
+            - {$ref: '#/components/schemas/KnowledgeToken'}
             - {type: 'null'}
         runtime_class:
           anyOf:
-            - {$ref: '#/components/schemas/OpaqueId'}
+            - {$ref: '#/components/schemas/KnowledgeToken'}
             - {type: 'null'}
     ProposeKnowledgeFromReconciliationRequest:
       type: object
@@ -2545,14 +2545,14 @@ components:
       required: [expected_episode_sha256, task_family, model_family, runtime_class]
       properties:
         expected_episode_sha256: {$ref: '#/components/schemas/Digest'}
-        task_family: {$ref: '#/components/schemas/OpaqueId'}
+        task_family: {$ref: '#/components/schemas/KnowledgeToken'}
         model_family:
           anyOf:
-            - {$ref: '#/components/schemas/OpaqueId'}
+            - {$ref: '#/components/schemas/KnowledgeToken'}
             - {type: 'null'}
         runtime_class:
           anyOf:
-            - {$ref: '#/components/schemas/OpaqueId'}
+            - {$ref: '#/components/schemas/KnowledgeToken'}
             - {type: 'null'}
     ReviewKnowledgeCandidateRequest:
       type: object
@@ -2576,15 +2576,15 @@ components:
       additionalProperties: false
       required: [repository_id, task_family, model_family, runtime_class]
       properties:
-        repository_id: {$ref: '#/components/schemas/OpaqueId'}
-        task_family: {$ref: '#/components/schemas/OpaqueId'}
+        repository_id: {$ref: '#/components/schemas/KnowledgeToken'}
+        task_family: {$ref: '#/components/schemas/KnowledgeToken'}
         model_family:
           anyOf:
-            - {$ref: '#/components/schemas/OpaqueId'}
+            - {$ref: '#/components/schemas/KnowledgeToken'}
             - {type: 'null'}
         runtime_class:
           anyOf:
-            - {$ref: '#/components/schemas/OpaqueId'}
+            - {$ref: '#/components/schemas/KnowledgeToken'}
             - {type: 'null'}
     InvestigationKnowledgeCandidate:
       type: object
@@ -2592,7 +2592,7 @@ components:
       required: [schema, knowledge_id, kind, statement, scope, evidence, confidence_milli, review, freshness, contradicts, supersedes, state, sha256]
       properties:
         schema: {const: harness.knowledge-item.v1}
-        knowledge_id: {$ref: '#/components/schemas/OpaqueId'}
+        knowledge_id: {$ref: '#/components/schemas/KnowledgeToken'}
         kind: {const: fact}
         statement: {type: string, minLength: 1, maxLength: 4096}
         scope: {$ref: '#/components/schemas/InvestigationKnowledgeScope'}
@@ -2639,7 +2639,7 @@ components:
       required: [schema, knowledge_id, kind, statement, scope, evidence, confidence_milli, review, freshness, contradicts, supersedes, state, sha256]
       properties:
         schema: {const: harness.knowledge-item.v1}
-        knowledge_id: {$ref: '#/components/schemas/OpaqueId'}
+        knowledge_id: {$ref: '#/components/schemas/KnowledgeToken'}
         kind: {const: heuristic}
         statement: {const: Repeated confirmed liveness stalls recovered only after material progress; heartbeats and command activity did not clear the stall.}
         scope: {$ref: '#/components/schemas/InvestigationKnowledgeScope'}
@@ -2686,7 +2686,7 @@ components:
       required: [schema, knowledge_id, kind, statement, scope, evidence, confidence_milli, review, freshness, contradicts, supersedes, state, sha256]
       properties:
         schema: {const: harness.knowledge-item.v1}
-        knowledge_id: {$ref: '#/components/schemas/OpaqueId'}
+        knowledge_id: {$ref: '#/components/schemas/KnowledgeToken'}
         kind: {const: warning}
         statement: {type: string, minLength: 1, maxLength: 4096}
         scope: {$ref: '#/components/schemas/InvestigationKnowledgeScope'}
@@ -2956,6 +2956,9 @@ components:
     OpaqueId:
       type: string
       pattern: '^[A-Za-z0-9_.:-]{1,160}$'
+    EvaluationId:
+      type: string
+      pattern: '^[A-Za-z0-9_.:-]{1,128}$'
     Digest:
       type: string
       pattern: '^[0-9a-f]{64}$'
@@ -2964,10 +2967,10 @@ components:
       additionalProperties: false
       required: [id, controller_run_id, taskset_revision_id, grader_bundle_revision_id, split, status, invalidated]
       properties:
-        id: {$ref: '#/components/schemas/OpaqueId'}
-        controller_run_id: {$ref: '#/components/schemas/OpaqueId'}
-        taskset_revision_id: {$ref: '#/components/schemas/OpaqueId'}
-        grader_bundle_revision_id: {$ref: '#/components/schemas/OpaqueId'}
+        id: {$ref: '#/components/schemas/EvaluationId'}
+        controller_run_id: {$ref: '#/components/schemas/EvaluationId'}
+        taskset_revision_id: {$ref: '#/components/schemas/EvaluationId'}
+        grader_bundle_revision_id: {$ref: '#/components/schemas/EvaluationId'}
         split: {enum: [training, development, holdout, canary, quarantine]}
         status: {enum: [recording, completed, infrastructure_unavailable, invalidated]}
         invalidated: {type: boolean}
@@ -2976,9 +2979,9 @@ components:
       additionalProperties: false
       required: [id, evaluation_run_id, eval_case_revision_id, arm, seed, classification, sample_digest, invalidated]
       properties:
-        id: {$ref: '#/components/schemas/OpaqueId'}
-        evaluation_run_id: {$ref: '#/components/schemas/OpaqueId'}
-        eval_case_revision_id: {$ref: '#/components/schemas/OpaqueId'}
+        id: {$ref: '#/components/schemas/EvaluationId'}
+        evaluation_run_id: {$ref: '#/components/schemas/EvaluationId'}
+        eval_case_revision_id: {$ref: '#/components/schemas/EvaluationId'}
         arm: {enum: [champion, challenger]}
         seed: {type: integer, minimum: 0}
         classification: {enum: [pass, fail, infrastructure_unavailable, invalidated]}
@@ -2989,16 +2992,16 @@ components:
       additionalProperties: false
       required: [revision_id, case_id, revision, payload_sha256, case_sha256, split, task_family, base_sha, setup_digest, grader_bundle_id, grader_bundle_revision, grader_bundle_digest]
       properties:
-        revision_id: {$ref: '#/components/schemas/OpaqueId'}
-        case_id: {$ref: '#/components/schemas/OpaqueId'}
+        revision_id: {$ref: '#/components/schemas/EvaluationId'}
+        case_id: {$ref: '#/components/schemas/EvaluationId'}
         revision: {type: integer, minimum: 1}
         payload_sha256: {$ref: '#/components/schemas/Digest'}
         case_sha256: {$ref: '#/components/schemas/Digest'}
         split: {enum: [training, development, holdout, canary, quarantine]}
-        task_family: {$ref: '#/components/schemas/OpaqueId'}
+        task_family: {$ref: '#/components/schemas/EvaluationId'}
         base_sha: {type: string, pattern: '^[0-9a-f]{40}$'}
         setup_digest: {$ref: '#/components/schemas/Digest'}
-        grader_bundle_id: {$ref: '#/components/schemas/OpaqueId'}
+        grader_bundle_id: {$ref: '#/components/schemas/EvaluationId'}
         grader_bundle_revision: {type: integer, minimum: 1}
         grader_bundle_digest: {$ref: '#/components/schemas/Digest'}
     EvaluationOccurrenceSource:
@@ -3006,9 +3009,9 @@ components:
       additionalProperties: false
       required: [occurrence_id, repository_id, run_id, base_sha, source_receipt_sha256, source_kind, trace_revision_id, trace_digest, outcome_revision_id, outcome_digest]
       properties:
-        occurrence_id: {$ref: '#/components/schemas/OpaqueId'}
-        repository_id: {$ref: '#/components/schemas/OpaqueId'}
-        run_id: {$ref: '#/components/schemas/OpaqueId'}
+        occurrence_id: {$ref: '#/components/schemas/EvaluationId'}
+        repository_id: {$ref: '#/components/schemas/EvaluationId'}
+        run_id: {$ref: '#/components/schemas/EvaluationId'}
         base_sha: {type: string, pattern: '^[0-9a-f]{40}$'}
         source_receipt_sha256: {$ref: '#/components/schemas/Digest'}
         source_kind: {enum: [attempt_terminal, run_terminal, typed_outcome]}

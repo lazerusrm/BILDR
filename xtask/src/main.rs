@@ -1137,6 +1137,7 @@ fn openapi_check(root: &Path) -> Result<()> {
             bail!("unresolved OpenAPI reference #{pointer}")
         }
     }
+    validate_openapi_identifier_contracts(&value)?;
     let runtime_status_schema = runtime_status_schema(&value)?;
     let runtime_status_fixture =
         read_json(&root.join("examples/openapi/runtime-status.example.json"))?;
@@ -1218,6 +1219,82 @@ fn openapi_check(root: &Path) -> Result<()> {
         pointers.len(),
         documented_routes.len()
     );
+    Ok(())
+}
+
+fn validate_openapi_identifier_contracts(openapi: &serde_yaml::Value) -> Result<()> {
+    let document = serde_json::to_value(openapi)
+        .context("OpenAPI identifier contracts cannot be represented as JSON")?;
+    let require = |pointer: &str, expected: &str| -> Result<()> {
+        let actual = document
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .with_context(|| format!("OpenAPI identifier contract has no string at {pointer}"))?;
+        if actual != expected {
+            bail!(
+                "OpenAPI identifier contract mismatch at {pointer}: expected {expected}, got {actual}"
+            );
+        }
+        Ok(())
+    };
+
+    require(
+        "/components/schemas/OpaqueId/pattern",
+        "^[A-Za-z0-9_.:-]{1,160}$",
+    )?;
+    require(
+        "/components/schemas/KnowledgeToken/pattern",
+        "^[A-Za-z0-9_.:-]{1,160}$",
+    )?;
+    require(
+        "/components/schemas/EvaluationId/pattern",
+        "^[A-Za-z0-9_.:-]{1,128}$",
+    )?;
+
+    for pointer in [
+        "/paths/~1improvement~1knowledge~1{knowledgeId}/get/parameters/0/schema/$ref",
+        "/components/schemas/ProposeKnowledgeFromInvestigationRequest/properties/task_family/$ref",
+        "/components/schemas/ProposeKnowledgeFromInvestigationRequest/properties/model_family/anyOf/0/$ref",
+        "/components/schemas/ProposeKnowledgeFromInvestigationRequest/properties/runtime_class/anyOf/0/$ref",
+        "/components/schemas/ProposeKnowledgeFromLivenessRequest/properties/task_family/$ref",
+        "/components/schemas/ProposeKnowledgeFromLivenessRequest/properties/model_family/anyOf/0/$ref",
+        "/components/schemas/ProposeKnowledgeFromLivenessRequest/properties/runtime_class/anyOf/0/$ref",
+        "/components/schemas/ProposeKnowledgeFromReconciliationRequest/properties/task_family/$ref",
+        "/components/schemas/ProposeKnowledgeFromReconciliationRequest/properties/model_family/anyOf/0/$ref",
+        "/components/schemas/ProposeKnowledgeFromReconciliationRequest/properties/runtime_class/anyOf/0/$ref",
+        "/components/schemas/InvestigationKnowledgeScope/properties/repository_id/$ref",
+        "/components/schemas/InvestigationKnowledgeScope/properties/task_family/$ref",
+        "/components/schemas/InvestigationKnowledgeScope/properties/model_family/anyOf/0/$ref",
+        "/components/schemas/InvestigationKnowledgeScope/properties/runtime_class/anyOf/0/$ref",
+        "/components/schemas/InvestigationKnowledgeCandidate/properties/knowledge_id/$ref",
+        "/components/schemas/LivenessKnowledgeCandidate/properties/knowledge_id/$ref",
+        "/components/schemas/ReconciliationKnowledgeCandidate/properties/knowledge_id/$ref",
+    ] {
+        require(pointer, "#/components/schemas/KnowledgeToken")?;
+    }
+
+    for pointer in [
+        "/paths/~1improvement~1evaluations~1runs~1{evaluationRunId}/get/parameters/0/schema/$ref",
+        "/paths/~1improvement~1evaluations~1samples~1{sampleId}/get/parameters/0/schema/$ref",
+        "/paths/~1improvement~1evaluations~1cases~1{caseRevisionId}/get/parameters/0/schema/$ref",
+        "/paths/~1improvement~1evaluations~1occurrences~1{occurrenceId}/get/parameters/0/schema/$ref",
+        "/components/schemas/EvaluationRunSummary/properties/id/$ref",
+        "/components/schemas/EvaluationRunSummary/properties/controller_run_id/$ref",
+        "/components/schemas/EvaluationRunSummary/properties/taskset_revision_id/$ref",
+        "/components/schemas/EvaluationRunSummary/properties/grader_bundle_revision_id/$ref",
+        "/components/schemas/EvaluationSampleSummary/properties/id/$ref",
+        "/components/schemas/EvaluationSampleSummary/properties/evaluation_run_id/$ref",
+        "/components/schemas/EvaluationSampleSummary/properties/eval_case_revision_id/$ref",
+        "/components/schemas/EvaluationCaseSummary/properties/revision_id/$ref",
+        "/components/schemas/EvaluationCaseSummary/properties/case_id/$ref",
+        "/components/schemas/EvaluationCaseSummary/properties/task_family/$ref",
+        "/components/schemas/EvaluationCaseSummary/properties/grader_bundle_id/$ref",
+        "/components/schemas/EvaluationOccurrenceSource/properties/occurrence_id/$ref",
+        "/components/schemas/EvaluationOccurrenceSource/properties/repository_id/$ref",
+        "/components/schemas/EvaluationOccurrenceSource/properties/run_id/$ref",
+    ] {
+        require(pointer, "#/components/schemas/EvaluationId")?;
+    }
     Ok(())
 }
 
@@ -2150,6 +2227,13 @@ mod tests {
         assert!(validator.is_valid(&at_contract_ceiling));
         at_contract_ceiling["knowledge_id"] = json!("a".repeat(161));
         assert!(!validator.is_valid(&at_contract_ceiling));
+    }
+
+    #[test]
+    fn openapi_identifier_contracts_keep_knowledge_and_evaluation_bounds_separate() {
+        let openapi: serde_yaml::Value =
+            serde_yaml::from_str(include_str!("../../openapi/harness-api.yaml")).unwrap();
+        validate_openapi_identifier_contracts(&openapi).unwrap();
     }
 
     #[test]
