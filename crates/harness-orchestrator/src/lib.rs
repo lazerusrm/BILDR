@@ -18276,7 +18276,7 @@ mod tests {
                     time_budget_ms: 60_000,
                     token_budget: 2_000,
                 }),
-                owner_profile: "governor".to_owned(),
+                owner_profile: "worker".to_owned(),
                 reviewer_profile: "human".to_owned(),
                 checklist_rows: vec!["Return a controller-bound artifact".to_owned()],
                 authority_refs: Vec::new(),
