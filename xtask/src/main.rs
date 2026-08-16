@@ -14,6 +14,7 @@ use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use harness_domain::InvestigationArtifact;
 use harness_eval::{
     FaultOutcome, OPERATOR_CONTROL_FAULT_CASES, OperatorControlFaultCase,
     OperatorControlFaultMatrixRunV1, OperatorControlFaultResultV1,
@@ -950,11 +951,12 @@ fn schema_check(root: &Path) -> Result<()> {
     )?;
     let investigation_fixture =
         read_json(&root.join("examples/investigation-artifact.example.json"))?;
-    for (label, invalid) in investigation_artifact_invalid_static_cases(&investigation_fixture) {
-        if investigation_validator.validate(&invalid).is_ok() {
-            bail!("Investigation artifact JSON Schema accepted {label}")
-        }
-    }
+    validate_runtime_investigation_artifact(&investigation_fixture, "Investigation artifact")?;
+    validate_investigation_artifact_cases(
+        &investigation_validator,
+        &investigation_fixture,
+        "Investigation artifact JSON Schema",
+    )?;
     let _: toml::Value = toml::from_str(&fs::read_to_string(
         root.join("config/harness.example.toml"),
     )?)?;
@@ -1175,13 +1177,15 @@ fn openapi_check(root: &Path) -> Result<()> {
     if let Err(error) = investigation_artifact_validator.validate(&investigation_artifact_fixture) {
         bail!("InvestigationArtifact fixture does not conform to OpenAPI: {error}")
     }
-    for (label, invalid) in
-        investigation_artifact_invalid_static_cases(&investigation_artifact_fixture)
-    {
-        if investigation_artifact_validator.validate(&invalid).is_ok() {
-            bail!("InvestigationArtifact OpenAPI contract accepted {label}")
-        }
-    }
+    validate_runtime_investigation_artifact(
+        &investigation_artifact_fixture,
+        "OpenAPI InvestigationArtifact",
+    )?;
+    validate_investigation_artifact_cases(
+        &investigation_artifact_validator,
+        &investigation_artifact_fixture,
+        "InvestigationArtifact OpenAPI contract",
+    )?;
     validate_run_detail_supervision_contract(&value)?;
     validate_operator_settings_supervision_contract(&value)?;
     let documented_routes = mapping
@@ -1217,7 +1221,35 @@ fn openapi_check(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn investigation_artifact_invalid_static_cases(fixture: &Value) -> Vec<(&'static str, Value)> {
+fn validate_runtime_investigation_artifact(value: &Value, label: &str) -> Result<()> {
+    let artifact: InvestigationArtifact = serde_json::from_value(value.clone())
+        .with_context(|| format!("{label} cannot deserialize into the runtime contract"))?;
+    artifact
+        .validate()
+        .with_context(|| format!("{label} does not satisfy the runtime contract"))
+}
+
+fn validate_investigation_artifact_cases(
+    validator: &jsonschema::Validator,
+    fixture: &Value,
+    contract: &str,
+) -> Result<()> {
+    for (label, invalid, static_rejection_required) in
+        investigation_artifact_invalid_cases(fixture)?
+    {
+        if static_rejection_required && validator.validate(&invalid).is_ok() {
+            bail!("{contract} accepted {label}")
+        }
+        if validate_runtime_investigation_artifact(&invalid, label).is_ok() {
+            bail!("runtime InvestigationArtifact contract accepted {label}")
+        }
+    }
+    Ok(())
+}
+
+fn investigation_artifact_invalid_cases(
+    fixture: &Value,
+) -> Result<Vec<(&'static str, Value, bool)>> {
     let mut empty_conclusions = fixture.clone();
     empty_conclusions["findings"] = json!([]);
     empty_conclusions["recommendations"] = json!([]);
@@ -1229,11 +1261,36 @@ fn investigation_artifact_invalid_static_cases(fixture: &Value) -> Vec<(&'static
     let mut external_artifact = fixture.clone();
     external_artifact["artifact_refs"] = json!(["artifact:external"]);
 
-    vec![
-        ("empty conclusions", empty_conclusions),
-        ("external conclusion evidence", external_evidence),
-        ("external artifact reference", external_artifact),
-    ]
+    let mut no_context_source = fixture.clone();
+    no_context_source["sources"] = json!([]);
+
+    let mut multiple_context_sources = fixture.clone();
+    multiple_context_sources["sources"] =
+        json!([fixture["sources"][0].clone(), fixture["sources"][0].clone()]);
+
+    let mut source_digest_mismatch = fixture.clone();
+    source_digest_mismatch["sources"] = json!([format!("context:{}", "e".repeat(64))]);
+    source_digest_mismatch["findings"][0]["evidence_refs"] =
+        json!([format!("context:{}", "e".repeat(64))]);
+
+    let mut cases = vec![
+        ("empty conclusions", empty_conclusions, true),
+        ("external conclusion evidence", external_evidence, true),
+        ("external artifact reference", external_artifact, true),
+        ("zero context sources", no_context_source, true),
+        ("multiple context sources", multiple_context_sources, true),
+        (
+            "context source does not match repository state digest",
+            source_digest_mismatch,
+            false,
+        ),
+    ];
+    for (_, invalid, _) in &mut cases {
+        let mut artifact: InvestigationArtifact = serde_json::from_value(invalid.clone())?;
+        artifact.sha256 = artifact.digest()?;
+        *invalid = serde_json::to_value(artifact)?;
+    }
+    Ok(cases)
 }
 
 fn validate_run_detail_supervision_contract(openapi: &serde_yaml::Value) -> Result<()> {

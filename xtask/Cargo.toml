@@ -9,6 +9,7 @@ license.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 harness-eval = { path = "../crates/harness-eval" }
+harness-domain = { path = "../crates/harness-domain" }
 hex.workspace = true
 jsonschema.workspace = true
 rustix.workspace = true

@@ -105,7 +105,7 @@ pub const OPERATOR_CONTROL_FAULT_CASES: [OperatorControlFaultCase; 12] = [
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::InvestigationCannotMutateOrCreateCandidate,
         injection: FaultInjection::InvestigationWriteOrCandidateRequest,
-        test_selector: "cargo test -p harness-orchestrator --lib tests::investigation_launch_and_artifact_completion_are_read_only_and_bound -- --exact --test-threads=1",
+        test_selector: "cargo test -p harness-orchestrator --lib tests::investigation_write_or_candidate_is_rejected_before_artifact_admission -- --exact --test-threads=1",
     },
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::UnknownExternalEffectNeverAutoRetried,
