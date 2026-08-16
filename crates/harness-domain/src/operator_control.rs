@@ -3,7 +3,10 @@
 //! These records describe authoritative controller facts and bounded read
 //! models. They never grant execution, Git, approval, or publication authority.
 
-use std::{collections::BTreeMap, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -145,6 +148,36 @@ fn validate_bounded_texts(
     }
     for value in values {
         validate_text(value, field, maximum_len)?;
+    }
+    Ok(())
+}
+
+fn validate_bounded_identifiers(
+    values: &[String],
+    field: &'static str,
+    maximum_items: usize,
+) -> Result<(), OperatorControlError> {
+    if values.len() > maximum_items {
+        return Err(OperatorControlError::InvalidField {
+            field,
+            reason: "exceeds the bounded item limit",
+        });
+    }
+    for value in values {
+        validate_identifier(value, field)?;
+    }
+    Ok(())
+}
+
+fn validate_unique_strings(
+    values: &[String],
+    field: &'static str,
+) -> Result<(), OperatorControlError> {
+    if values.iter().collect::<BTreeSet<_>>().len() != values.len() {
+        return Err(OperatorControlError::InvalidField {
+            field,
+            reason: "must not contain duplicate entries",
+        });
     }
     Ok(())
 }
@@ -526,6 +559,8 @@ impl AttentionItem {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InvestigationScope {
+    /// A path named by both lists remains forbidden; context admission always
+    /// applies `forbidden_paths` after matching this inclusive read allowlist.
     pub owned_read_paths: Vec<String>,
     pub forbidden_paths: Vec<String>,
     pub time_budget_ms: u64,
@@ -550,16 +585,8 @@ impl InvestigationScope {
         for path in self.owned_read_paths.iter().chain(&self.forbidden_paths) {
             validate_relative_repo_path(path, "investigation scope path")?;
         }
-        if self
-            .owned_read_paths
-            .iter()
-            .any(|path| self.forbidden_paths.contains(path))
-        {
-            return Err(OperatorControlError::InvalidField {
-                field: "investigation scope path",
-                reason: "a path cannot be both readable and forbidden",
-            });
-        }
+        validate_unique_strings(&self.owned_read_paths, "investigation owned read paths")?;
+        validate_unique_strings(&self.forbidden_paths, "investigation forbidden paths")?;
         Ok(())
     }
 }
@@ -615,11 +642,10 @@ impl InvestigationFinding {
             MAX_INVESTIGATION_REFS,
             MAX_IDENTIFIER_LEN,
         )?;
-        validate_bounded_texts(
+        validate_bounded_identifiers(
             &self.affected_refs,
             "investigation finding affected refs",
             MAX_INVESTIGATION_REFS,
-            MAX_IDENTIFIER_LEN,
         )?;
         validate_bounded_texts(
             &self.limitations,
@@ -726,11 +752,10 @@ impl DecisionInventoryItem {
             &self.required_actor,
             "investigation decision required actor",
         )?;
-        validate_bounded_texts(
+        validate_bounded_identifiers(
             &self.blocking_refs,
             "investigation decision blocking refs",
             MAX_INVESTIGATION_REFS,
-            MAX_IDENTIFIER_LEN,
         )
     }
 }
@@ -2977,6 +3002,47 @@ mod tests {
         unbound.findings[0].evidence_refs = vec![format!("context:{}", "c".repeat(SHA256_HEX_LEN))];
         unbound.sha256 = unbound.digest().unwrap();
         assert!(unbound.validate().is_err());
+
+        let mut malformed_affected_ref = artifact.clone();
+        malformed_affected_ref.findings[0].affected_refs = vec!["task with a space".to_owned()];
+        malformed_affected_ref.sha256 = malformed_affected_ref.digest().unwrap();
+        assert!(malformed_affected_ref.validate().is_err());
+
+        let mut malformed_blocking_ref = artifact.clone();
+        malformed_blocking_ref.decision_inventory = vec![DecisionInventoryItem {
+            decision_id: "decision-1".to_owned(),
+            question: "Which owner must decide?".to_owned(),
+            state: "pending".to_owned(),
+            options: vec![],
+            evidence_refs: vec![format!("context:{}", "b".repeat(SHA256_HEX_LEN))],
+            impact: "The controller cannot advance without the decision.".to_owned(),
+            recommended_option: None,
+            required_actor: "operator".to_owned(),
+            blocking_refs: vec!["task with a space".to_owned()],
+            independent_work_can_continue: false,
+        }];
+        malformed_blocking_ref.sha256 = malformed_blocking_ref.digest().unwrap();
+        assert!(malformed_blocking_ref.validate().is_err());
+
+        let mut duplicate_read_path = artifact.clone();
+        duplicate_read_path
+            .scope
+            .owned_read_paths
+            .push("crates/harness-domain/src/operator_control.rs".to_owned());
+        duplicate_read_path.sha256 = duplicate_read_path.digest().unwrap();
+        assert!(duplicate_read_path.validate().is_err());
+
+        let mut duplicate_forbidden_path = artifact.clone();
+        duplicate_forbidden_path.scope.forbidden_paths =
+            vec![".git/objects".to_owned(), ".git/objects".to_owned()];
+        duplicate_forbidden_path.sha256 = duplicate_forbidden_path.digest().unwrap();
+        assert!(duplicate_forbidden_path.validate().is_err());
+
+        let mut overlapping_scope = artifact.clone();
+        overlapping_scope.scope.forbidden_paths =
+            vec!["crates/harness-domain/src/operator_control.rs".to_owned()];
+        overlapping_scope.sha256 = overlapping_scope.digest().unwrap();
+        assert!(overlapping_scope.validate().is_ok());
 
         let mut external = artifact.clone();
         external.artifact_refs = vec!["artifact:external".to_owned()];

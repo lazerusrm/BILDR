@@ -1234,6 +1234,17 @@ fn validate_investigation_artifact_cases(
     fixture: &Value,
     contract: &str,
 ) -> Result<()> {
+    let mut overlapping_scope = fixture.clone();
+    overlapping_scope["scope"]["forbidden_paths"] =
+        json!([fixture["scope"]["owned_read_paths"][0].clone()]);
+    let mut artifact: InvestigationArtifact = serde_json::from_value(overlapping_scope.clone())?;
+    artifact.sha256 = artifact.digest()?;
+    overlapping_scope = serde_json::to_value(artifact)?;
+    if let Err(error) = validator.validate(&overlapping_scope) {
+        bail!("{contract} rejected a safe overlapping scope: {error}")
+    }
+    validate_runtime_investigation_artifact(&overlapping_scope, "safe overlapping scope")?;
+
     for (label, invalid, static_rejection_required) in
         investigation_artifact_invalid_cases(fixture)?
     {
@@ -1276,6 +1287,35 @@ fn investigation_artifact_invalid_cases(
     source_digest_mismatch["findings"][0]["evidence_refs"] =
         json!([format!("context:{}", "e".repeat(64))]);
 
+    let mut duplicate_owned_read_path = fixture.clone();
+    duplicate_owned_read_path["scope"]["owned_read_paths"] = json!([
+        fixture["scope"]["owned_read_paths"][0].clone(),
+        fixture["scope"]["owned_read_paths"][0].clone(),
+    ]);
+
+    let mut duplicate_forbidden_path = fixture.clone();
+    duplicate_forbidden_path["scope"]["forbidden_paths"] = json!([
+        fixture["scope"]["forbidden_paths"][0].clone(),
+        fixture["scope"]["forbidden_paths"][0].clone(),
+    ]);
+
+    let mut unsafe_affected_ref = fixture.clone();
+    unsafe_affected_ref["findings"][0]["affected_refs"] = json!(["task with a space"]);
+
+    let mut unsafe_blocking_ref = fixture.clone();
+    unsafe_blocking_ref["decision_inventory"] = json!([{
+        "decision_id": "decision-1",
+        "question": "Which owner must decide?",
+        "state": "pending",
+        "options": [],
+        "evidence_refs": [fixture["sources"][0].clone()],
+        "impact": "The controller cannot advance without the decision.",
+        "recommended_option": null,
+        "required_actor": "operator",
+        "blocking_refs": ["task with a space"],
+        "independent_work_can_continue": false,
+    }]);
+
     let mut cases = vec![
         ("empty conclusions", empty_conclusions, true),
         ("external conclusion evidence", external_evidence, true),
@@ -1288,6 +1328,10 @@ fn investigation_artifact_invalid_cases(
             source_digest_mismatch,
             false,
         ),
+        ("duplicate owned read path", duplicate_owned_read_path, true),
+        ("duplicate forbidden path", duplicate_forbidden_path, true),
+        ("unsafe affected ref", unsafe_affected_ref, true),
+        ("unsafe blocking ref", unsafe_blocking_ref, true),
     ];
     for (_, invalid, _) in &mut cases {
         let mut artifact: InvestigationArtifact = serde_json::from_value(invalid.clone())?;

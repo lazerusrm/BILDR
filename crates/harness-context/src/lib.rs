@@ -1066,4 +1066,52 @@ mod tests {
         assert_eq!(short_source.content.as_deref(), Some("short-body\n"));
         assert_eq!(short_packet.context_bytes, 11);
     }
+
+    #[test]
+    fn investigation_forbidden_path_takes_precedence_over_matching_read_scope() {
+        let repository = tempfile::tempdir().expect("temporary repository");
+        git(repository.path(), &["init", "-q"]);
+        fs::write(repository.path().join("scoped.txt"), "must not be admitted\n")
+            .expect("scoped source");
+        git(repository.path(), &["add", "."]);
+        git(
+            repository.path(),
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "context fixture",
+            ],
+        );
+        let base_sha = git_text(repository.path(), ["rev-parse", "HEAD"]).expect("base SHA");
+        let profile = harness_profile::load_profile("general", repository.path())
+            .expect("general profile")
+            .profile;
+        let mut task = task_with_file("scoped.txt");
+        task.execution_kind = harness_domain::TaskExecutionKind::Investigation;
+        task.owned_paths.clear();
+        task.investigation_scope = Some(harness_domain::InvestigationScope {
+            owned_read_paths: vec!["scoped.txt".to_owned()],
+            forbidden_paths: vec!["scoped.txt".to_owned()],
+            time_budget_ms: 1_000,
+            token_budget: 1_000,
+        });
+
+        let packet = ContextCompiler::default()
+            .compile(
+                repository.path(),
+                &base_sha,
+                &task,
+                &profile,
+                "profile-digest",
+            )
+            .expect("context compiles");
+        assert!(packet
+            .sources
+            .iter()
+            .all(|source| source.path != "scoped.txt"));
+    }
 }
