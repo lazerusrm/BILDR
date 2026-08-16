@@ -80,62 +80,62 @@ pub const OPERATOR_CONTROL_FAULT_CASES: [OperatorControlFaultCase; 12] = [
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::OneMutableOwner,
         injection: FaultInjection::ConcurrentClaim,
-        test_selector: "concurrent claim and fresh-attempt proof consumption",
+        test_selector: "cargo test -p harness-store --lib proof_consumption_authorizes_exactly_one_replacement_and_scheduler_lease -- --exact --test-threads=1",
     },
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::UnknownCannotAuthorizeReplacement,
         injection: FaultInjection::OwnershipUnknown,
-        test_selector: "unknown owner/reconciliation proof denial",
+        test_selector: "cargo test -p harness-store --lib proof_consumption_refuses_any_unreconciled_command_history -- --exact --test-threads=1",
     },
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::SourceOnlyAttentionClosure,
         injection: FaultInjection::ForgedClosure,
-        test_selector: "source-owned attention transition",
+        test_selector: "cargo test -p harness-domain --lib attention_transitions_are_source_owned_and_terminal_receipts_idempotent -- --exact --test-threads=1",
     },
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::CompletionCannotHideBlockingAttention,
         injection: FaultInjection::TerminalStateWithOpenAttention,
-        test_selector: "terminal task with unresolved attention",
+        test_selector: "cargo test -p harness-store --lib attention_lifecycle_records_deterministic_causal_receipts -- --exact --test-threads=1",
     },
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::PresentationCannotResolve,
         injection: FaultInjection::ForgedPresentationReceipt,
-        test_selector: "presentation receipt authority neutrality",
+        test_selector: "cargo test -p harness-store --lib notification_presentation_is_exact_session_scoped_idempotent_and_authority_neutral -- --exact --test-threads=1",
     },
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::InvestigationCannotMutateOrCreateCandidate,
         injection: FaultInjection::InvestigationWriteOrCandidateRequest,
-        test_selector: "investigation read-only custody and artifact binding",
+        test_selector: "cargo test -p harness-orchestrator --lib investigation_launch_and_artifact_completion_are_read_only_and_bound -- --exact --test-threads=1",
     },
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::UnknownExternalEffectNeverAutoRetried,
         injection: FaultInjection::UnknownExternalEffect,
-        test_selector: "automatic fresh-attempt routes remain unavailable",
+        test_selector: "cargo test -p harness-orchestrator --lib automatic_fresh_attempt_routes_remain_unavailable -- --exact --test-threads=1",
     },
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::ProjectionNeverAuthorizes,
         injection: FaultInjection::ProjectionMutationRequest,
-        test_selector: "projection authority denial",
+        test_selector: "cargo test -p harness-store --lib return_view_preserves_current_observe_only_sections_and_cursor_cannot_regress -- --exact --test-threads=1",
     },
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::ReplayDeterministic,
         injection: FaultInjection::ReorderedReplay,
-        test_selector: "replay ordering and snapshot digest",
+        test_selector: "cargo test -p harness-store --lib snapshot_is_reused_only_at_the_exact_source_cursors -- --exact --test-threads=1",
     },
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::StaleVersionOrDigestRejected,
         injection: FaultInjection::StaleVersionOrDigest,
-        test_selector: "stale version and digest rejection",
+        test_selector: "cargo test -p harness-store --lib wait_intervention_is_idempotent_and_cannot_apply_to_a_stale_episode -- --exact --test-threads=1",
     },
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::CriticalNotificationNotOmitted,
         injection: FaultInjection::CriticalDeliveryPolicy,
-        test_selector: "critical notification bypass and delivery policy",
+        test_selector: "cargo test -p harness-store --lib shadow_batch_is_exact_idempotent_and_keeps_critical_attention_immediate -- --exact --test-threads=1",
     },
     OperatorControlFaultCase {
         invariant: OperatorControlInvariant::RemoteRuntimeAbsent,
         injection: FaultInjection::RemoteDispatchRequest,
-        test_selector: "remote dispatch capability absence",
+        test_selector: "cargo test -p xtask remote_dispatch_capability_is_absent -- --exact --test-threads=1",
     },
 ];
 

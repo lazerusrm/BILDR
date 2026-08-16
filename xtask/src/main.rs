@@ -1,12 +1,17 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use harness_eval::{
+    FaultOutcome, OPERATOR_CONTROL_FAULT_CASES, OperatorControlFaultCase,
+    OperatorControlFaultMatrixRunV1, OperatorControlFaultResultV1,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
@@ -48,6 +53,12 @@ enum Task {
     ArchitecturePolicyCheck,
     OpenapiCheck,
     SchemaCheck,
+    OperatorControlFaultMatrix {
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        evidence_dir: PathBuf,
+    },
     AppServerBindingsCheck,
     CodexSchema {
         #[arg(long, default_value = "codex")]
@@ -71,10 +82,230 @@ fn main() -> Result<()> {
         Task::ArchitecturePolicyCheck => architecture_policy_check(&root),
         Task::OpenapiCheck => openapi_check(&root),
         Task::SchemaCheck => schema_check(&root),
+        Task::OperatorControlFaultMatrix {
+            output,
+            evidence_dir,
+        } => operator_control_fault_matrix(&root, &output, &evidence_dir),
         Task::AppServerBindingsCheck => app_server_bindings_check(&root),
         Task::CodexSchema { codex } => codex_schema(&root, &codex),
         Task::Dist { check } => dist(&root, check),
     }
+}
+
+fn operator_control_fault_matrix(root: &Path, output: &Path, evidence_dir: &Path) -> Result<()> {
+    let implementation_sha = clean_head_sha(root)?;
+    let root = fs::canonicalize(root).context("canonicalize workspace root")?;
+    let output = external_output_path(&root, output, "fault-matrix output")?;
+    let evidence_dir =
+        external_output_path(&root, evidence_dir, "fault-matrix evidence directory")?;
+    if output.exists() {
+        bail!("fault-matrix output already exists: {}", output.display())
+    }
+    if evidence_dir.exists() {
+        bail!(
+            "fault-matrix evidence directory already exists: {}",
+            evidence_dir.display()
+        )
+    }
+    fs::create_dir(&evidence_dir).with_context(|| {
+        format!(
+            "create explicit fault-matrix evidence directory: {}",
+            evidence_dir.display()
+        )
+    })?;
+
+    let mut results = Vec::with_capacity(OPERATOR_CONTROL_FAULT_CASES.len());
+    for case in OPERATOR_CONTROL_FAULT_CASES {
+        let (package, test_name, library_test) = fault_test_command(case);
+        let mut command = Command::new("cargo");
+        command.args(["test", "-q", "-p", package]);
+        if library_test {
+            command.arg("--lib");
+        }
+        let output = command
+            .args([test_name, "--", "--exact", "--test-threads=1"])
+            .current_dir(&root)
+            .output()
+            .with_context(|| format!("run fault case {}", case.invariant.case_id()))?;
+        let transcript = format!(
+            "$ {}\nexit_status: {}\n--- stdout ---\n{}\n--- stderr ---\n{}\n",
+            case.test_selector,
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        write_new(
+            &evidence_dir.join(format!("{}.log", case.invariant.case_id())),
+            transcript.as_bytes(),
+        )?;
+        results.push(OperatorControlFaultResultV1 {
+            case_id: case.invariant.case_id().to_owned(),
+            invariant: case.invariant,
+            injection: case.injection,
+            test_selector: case.test_selector.to_owned(),
+            outcome: fault_outcome(&output, &transcript),
+            evidence_digest: sha256(transcript.as_bytes()),
+        });
+    }
+    results.sort_by(|left, right| left.case_id.cmp(&right.case_id));
+    let mut matrix = OperatorControlFaultMatrixRunV1 {
+        schema: "harness.operator-control-fault-matrix.v1".to_owned(),
+        implementation_sha,
+        results,
+        sha256: String::new(),
+    };
+    matrix.sha256 = matrix.digest().context("digest fault matrix")?;
+    matrix.validate().context("validate fault matrix")?;
+    write_new(
+        &output,
+        &serde_json::to_vec_pretty(&matrix).context("serialize fault matrix")?,
+    )?;
+    matrix.promotion_gate().map_err(anyhow::Error::from)?;
+    println!(
+        "operator-control-fault-matrix: 12 invariant cases held for {}\\nreceipt: {}\\nevidence: {}",
+        matrix.implementation_sha,
+        output.display(),
+        evidence_dir.display()
+    );
+    Ok(())
+}
+
+fn clean_head_sha(root: &Path) -> Result<String> {
+    let status = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(root)
+        .output()
+        .context("read Git worktree status")?;
+    if !status.status.success() {
+        bail!("could not read Git worktree status")
+    }
+    if !status.stdout.is_empty() {
+        bail!("fault-matrix execution requires an exact clean implementation commit")
+    }
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+        .context("read implementation Git HEAD")?;
+    if !head.status.success() {
+        bail!("could not read implementation Git HEAD")
+    }
+    let head = String::from_utf8(head.stdout)
+        .context("Git HEAD was not UTF-8")?
+        .trim()
+        .to_owned();
+    if head.len() != 40 || !head.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("implementation Git HEAD is not a full SHA-1")
+    }
+    Ok(head)
+}
+
+fn external_output_path(root: &Path, path: &Path, label: &str) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("{label} must be an explicit absolute path outside the repository")
+    }
+    let parent = path
+        .parent()
+        .with_context(|| format!("{label} has no parent directory"))?;
+    let parent = fs::canonicalize(parent)
+        .with_context(|| format!("{label} parent does not exist: {}", parent.display()))?;
+    if parent.starts_with(root) {
+        bail!("{label} must be outside the repository")
+    }
+    Ok(parent.join(
+        path.file_name()
+            .with_context(|| format!("{label} has no filename"))?,
+    ))
+}
+
+fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("create evidence artifact: {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("write evidence artifact: {}", path.display()))
+}
+
+fn fault_test_command(case: OperatorControlFaultCase) -> (&'static str, &'static str, bool) {
+    match case.invariant.case_id() {
+        "one_mutable_owner" => (
+            "harness-store",
+            "proof_consumption_authorizes_exactly_one_replacement_and_scheduler_lease",
+            true,
+        ),
+        "unknown_cannot_authorize_replacement" => (
+            "harness-store",
+            "proof_consumption_refuses_any_unreconciled_command_history",
+            true,
+        ),
+        "source_only_attention_closure" => (
+            "harness-domain",
+            "attention_transitions_are_source_owned_and_terminal_receipts_idempotent",
+            true,
+        ),
+        "completion_cannot_hide_blocking_attention" => (
+            "harness-store",
+            "attention_lifecycle_records_deterministic_causal_receipts",
+            true,
+        ),
+        "presentation_cannot_resolve" => (
+            "harness-store",
+            "notification_presentation_is_exact_session_scoped_idempotent_and_authority_neutral",
+            true,
+        ),
+        "investigation_cannot_mutate_or_create_candidate" => (
+            "harness-orchestrator",
+            "investigation_launch_and_artifact_completion_are_read_only_and_bound",
+            true,
+        ),
+        "unknown_external_effect_never_auto_retried" => (
+            "harness-orchestrator",
+            "automatic_fresh_attempt_routes_remain_unavailable",
+            true,
+        ),
+        "projection_never_authorizes" => (
+            "harness-store",
+            "return_view_preserves_current_observe_only_sections_and_cursor_cannot_regress",
+            true,
+        ),
+        "replay_deterministic" => (
+            "harness-store",
+            "snapshot_is_reused_only_at_the_exact_source_cursors",
+            true,
+        ),
+        "stale_version_or_digest_rejected" => (
+            "harness-store",
+            "wait_intervention_is_idempotent_and_cannot_apply_to_a_stale_episode",
+            true,
+        ),
+        "critical_notification_not_omitted" => (
+            "harness-store",
+            "shadow_batch_is_exact_idempotent_and_keeps_critical_attention_immediate",
+            true,
+        ),
+        "remote_runtime_absent" => ("xtask", "remote_dispatch_capability_is_absent", false),
+        _ => unreachable!("closed operator-control fault cases are exhaustive"),
+    }
+}
+
+fn fault_outcome(output: &std::process::Output, transcript: &str) -> FaultOutcome {
+    if output.status.success() && transcript.contains("test result: ok. 1 passed;") {
+        FaultOutcome::Held
+    } else if transcript.contains("test result: FAILED") {
+        FaultOutcome::Violated
+    } else {
+        FaultOutcome::InfrastructureUnavailable
+    }
+}
+
+fn remote_dispatch_capability_absent(root: &Path) -> Result<()> {
+    let routes = api_router_paths(&root.join("crates/harness-api/src"))?;
+    if routes.iter().any(|route| route.contains("remote")) {
+        bail!("a remote API route is present in the local-only controller")
+    }
+    Ok(())
 }
 
 fn ui_install(root: &Path, locked: bool) -> Result<()> {
@@ -969,6 +1200,28 @@ fn normalize_json(value: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_dispatch_capability_is_absent() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask has workspace parent")
+            .to_path_buf();
+        remote_dispatch_capability_absent(&root).expect("controller remains local only");
+    }
+
+    #[test]
+    fn fault_matrix_runner_has_one_exact_command_per_closed_case() {
+        for case in OPERATOR_CONTROL_FAULT_CASES {
+            let (package, test_name, library_test) = fault_test_command(case);
+            let selector = if library_test {
+                format!("cargo test -p {package} --lib {test_name} -- --exact --test-threads=1")
+            } else {
+                format!("cargo test -p {package} {test_name} -- --exact --test-threads=1")
+            };
+            assert_eq!(case.test_selector, selector);
+        }
+    }
     use serde_json::json;
 
     #[test]
