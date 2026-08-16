@@ -603,20 +603,22 @@ Presence:
 {"mode":"interactive","changed_at_ms":1786588800000,"actor":"operator","version":4}
 ```
 
-Notification delivery includes item/source refs, classification, channel,
-created/eligible/defer-deadline times, state, attempt count, dedupe key,
-redacted payload digest, receipts, and last error.
+The current v1 notification channel has exactly two immutable records:
 
-Delivery states: pending, deferred, claimed, delivered, failed_retryable,
-failed_terminal, canceled, superseded.
+- a pending `NotificationDelivery` claim, bound to one attention revision; and
+- a session-derived `NotificationPresentationReceipt`, bound to the exact claim
+  digest after the authenticated product surface renders it.
 
-Critical categories have zero configurable defer window. Delivery never resolves
-the source item.
+Presentation is not acknowledgement, delivery-to-a-human, or source resolution.
+It cannot defer, suppress, batch, retry, close, or otherwise change the source
+item. The current v1 state is only `pending`; desktop channels and all deferred,
+claimed, failed, or suppression states are absent rather than tolerated as
+alternate shapes.
 
 `NotificationShadowBatch` is separate immutable phase-two evidence. It binds a
 complete control-plane snapshot, one exact local-presence revision, a hashed
-policy, every current attention revision, and each pre-existing immediate
-mirror receipt. It records a theoretical `immediate`, `batch`, `defer`, or
+policy, every current attention revision, and each pre-existing pending
+in-product claim. It records a theoretical `immediate`, `batch`, `defer`, or
 `digest` disposition only. Truncation is refused and critical entries are
 always `immediate`; a shadow batch never changes delivery timing or authority.
 

@@ -99,11 +99,12 @@ absolute-time or controller-owned repository-capacity gate registration, immutab
 snapshots/return views, deterministic material progress, observe-only liveness episodes, exact-revision intervention receipts,
 reconciliation/ownership evidence with immutable inventory findings and action
 receipts, bounded run topology, a proof-consuming authenticated fresh-retry
-path, and a retry-safe
-in-product notification mirror. Each source-attention lifecycle transaction
+path, and retry-safe pending in-product notification claims plus presentation
+receipts. Each source-attention lifecycle transaction
 atomically records its opening source, acknowledgement, or terminal authority
-causal link; each mirror receipt atomically records its source-attention causal
-link; each material-progress projection atomically
+causal link; each pending claim atomically records its source-attention causal
+link; each presentation receipt atomically records its claim causal link; each
+material-progress projection atomically
 records its source-event causal link; each investigation artifact atomically
 records its attempt-scoped causal link; each governed knowledge candidate
 atomically records its evidence causal links; each liveness observation
@@ -156,7 +157,7 @@ knowledge, change task context, or write global memory.
 
 An authenticated operator may record an immutable notification shadow plan from
 one complete control-plane snapshot and exact local-presence revision. It binds
-every current attention revision to its already-durable immediate mirror receipt
+every current attention revision to its already-durable pending in-product claim
 and records the theoretical focus/unattended cadence, with critical attention
 forced to immediate. A truncated snapshot is refused. The plan neither defers
 nor suppresses delivery, sends no desktop notification, and cannot close its

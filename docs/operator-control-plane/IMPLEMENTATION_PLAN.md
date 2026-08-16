@@ -644,9 +644,11 @@ not activated without measured improvement.
 
 ### Work
 
-Implement presence persistence, deterministic classes, durable delivery claim,
-critical bypass, maximum defer, chronological digest, receipts/retry,
-delivery-health UI/CLI, desktop notification opt-in, and return digest.
+Implement presence persistence, deterministic classes, a durable pending claim,
+an exact session-derived in-product presentation receipt, critical bypass,
+maximum defer, chronological digest, delivery-health UI/CLI, desktop
+notification opt-in, and return digest. Do not accept alternate deferred,
+claimed, failed, or compatibility shapes before those gated channels exist.
 
 ### Hard gates
 

@@ -378,6 +378,11 @@ fn apply_runtime_migrations(connection: &mut Connection) -> Result<(), StoreErro
     )?;
     if !has_attention_items {
         apply_operator_control_migration(connection, || Ok(()))?;
+    } else if !operator_control_schema_current(connection)? {
+        return Err(StoreError::Migration(
+            "operator-control storage is not the current greenfield schema; create a new database rather than applying a compatibility migration"
+                .to_owned(),
+        ));
     } else {
         set_runtime_schema_version(connection, "16")?;
     }
@@ -541,6 +546,41 @@ fn notification_shadow_batches_schema_current(connection: &Connection) -> Result
     let has_columns = required_columns
         .into_iter()
         .map(|column| table_has_column(connection, "notification_shadow_batches", column))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .all(|present| present);
+    let has_triggers = required_triggers
+        .into_iter()
+        .map(|trigger| {
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)",
+                [trigger],
+                |row| row.get::<_, bool>(0),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .all(|present| present);
+    Ok(has_columns && has_triggers)
+}
+
+fn operator_control_schema_current(connection: &Connection) -> Result<bool, StoreError> {
+    let required_columns = [
+        "id",
+        "delivery_id",
+        "operator_id",
+        "delivery_sha256",
+        "presented_at",
+        "payload_json",
+        "payload_sha256",
+    ];
+    let required_triggers = [
+        "notification_presentation_receipts_no_update",
+        "notification_presentation_receipts_no_delete",
+    ];
+    let has_columns = required_columns
+        .into_iter()
+        .map(|column| table_has_column(connection, "notification_presentation_receipts", column))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .all(|present| present);
@@ -756,6 +796,29 @@ mod tests {
             .unwrap();
         assert!(!attention_table_exists);
         assert_ne!(version, "16");
+    }
+
+    #[test]
+    fn operator_control_schema_requires_current_presentation_receipts_without_a_compatibility_upgrade()
+     {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(INITIAL_MIGRATION).unwrap();
+        connection.execute_batch(RUNTIME_MIGRATION).unwrap();
+        connection
+            .execute_batch(OPERATOR_CONTROL_MIGRATION)
+            .unwrap();
+        assert!(operator_control_schema_current(&connection).unwrap());
+        connection
+            .execute_batch(
+                "DROP TRIGGER notification_presentation_receipts_no_update;
+                 DROP TRIGGER notification_presentation_receipts_no_delete;
+                 DROP TABLE notification_presentation_receipts;",
+            )
+            .unwrap();
+        assert!(
+            !operator_control_schema_current(&connection).unwrap(),
+            "a partial historical shape must be refused, never altered in place"
+        );
     }
 
     #[test]

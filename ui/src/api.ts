@@ -26,6 +26,7 @@ import type {
   MaterialProgressEvent,
   NotificationDelivery,
   NotificationDeliveryHealth,
+  NotificationPresentationReceipt,
   NotificationShadowBatch,
   OutcomeVector,
   OperatorPresence,
@@ -259,6 +260,11 @@ class HarnessApi {
     });
   notificationDeliveries = () =>
     this.get<NotificationDelivery[]>("/notification-deliveries?limit=50");
+  recordNotificationPresentation = (deliveryId: string, expectedDeliverySha256: string) =>
+    this.post<NotificationPresentationReceipt>(
+      `/notification-deliveries/${encodeURIComponent(deliveryId)}/presentations`,
+      { expected_delivery_sha256: expectedDeliverySha256 },
+    );
   notificationShadowBatches = () =>
     this.get<NotificationShadowBatch[]>("/notification-shadow-batches?limit=20");
   createNotificationShadowBatch = (expectedPresenceVersion: number) =>

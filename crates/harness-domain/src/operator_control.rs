@@ -224,6 +224,7 @@ operator_control_id!(ConditionObservationId);
 operator_control_id!(ControlPlaneSnapshotId);
 operator_control_id!(ReturnViewId);
 operator_control_id!(NotificationDeliveryId);
+operator_control_id!(NotificationPresentationReceiptId);
 operator_control_id!(NotificationShadowBatchId);
 operator_control_id!(TopologySnapshotId);
 operator_control_id!(CorrelationLinkId);
@@ -1994,9 +1995,6 @@ pub enum NotificationClass {
 #[serde(rename_all = "snake_case")]
 pub enum NotificationState {
     Pending,
-    Deferred,
-    Delivered,
-    Failed,
 }
 
 /// A theoretical notification outcome recorded by the shadow policy. These
@@ -2074,10 +2072,14 @@ impl NotificationDelivery {
     }
 
     pub fn validate(&self) -> Result<(), OperatorControlError> {
-        if self.schema != "harness.notification-delivery.v1" || self.created_at_ms < 0 {
+        if self.schema != "harness.notification-delivery.v1"
+            || self.created_at_ms < 0
+            || self.state != NotificationState::Pending
+            || self.channel != "in_product_mirror"
+        {
             return Err(OperatorControlError::InvalidField {
                 field: "notification delivery",
-                reason: "must use the v1 schema with a non-negative timestamp",
+                reason: "must be a pending v1 in-product presentation claim with a non-negative timestamp",
             });
         }
         validate_identifier(self.delivery_id.as_str(), "notification delivery id")?;
@@ -2102,8 +2104,68 @@ impl NotificationDelivery {
     }
 }
 
+/// One immutable statement that the authenticated local product surface
+/// rendered an exact notification-delivery claim. It records presentation,
+/// not human acknowledgement or source resolution; it therefore carries no
+/// controller authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationPresentationReceipt {
+    pub schema: String,
+    pub receipt_id: NotificationPresentationReceiptId,
+    pub delivery_id: NotificationDeliveryId,
+    pub operator_id: String,
+    pub delivery_sha256: String,
+    pub presented_at_ms: i64,
+    pub sha256: String,
+}
+
+impl NotificationPresentationReceipt {
+    pub fn digest(&self) -> Result<String, OperatorControlError> {
+        let mut unsigned = self.clone();
+        unsigned.sha256.clear();
+        digest_json(&unsigned)
+    }
+
+    pub fn validate(&self) -> Result<(), OperatorControlError> {
+        if self.schema != "harness.notification-presentation-receipt.v1" || self.presented_at_ms < 0
+        {
+            return Err(OperatorControlError::InvalidField {
+                field: "notification presentation receipt",
+                reason: "must use the v1 schema with a non-negative presentation time",
+            });
+        }
+        validate_identifier(
+            self.receipt_id.as_str(),
+            "notification presentation receipt id",
+        )?;
+        validate_identifier(
+            self.delivery_id.as_str(),
+            "notification presentation delivery id",
+        )?;
+        validate_identifier(&self.operator_id, "notification presentation operator id")?;
+        validate_lower_hex(
+            &self.delivery_sha256,
+            "notification presentation delivery sha256",
+            SHA256_HEX_LEN,
+        )?;
+        validate_lower_hex(
+            &self.sha256,
+            "notification presentation receipt sha256",
+            SHA256_HEX_LEN,
+        )?;
+        if self.digest()? != self.sha256 {
+            return Err(OperatorControlError::InvalidField {
+                field: "notification presentation receipt sha256",
+                reason: "does not match the canonical payload",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Versioned, controller-owned parameters used only to compare a proposed
-/// notification cadence with the always-immediate in-product mirror.
+/// notification cadence with the always-created pending in-product claim.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotificationShadowPolicy {
@@ -2148,8 +2210,8 @@ impl NotificationShadowPolicy {
 }
 
 /// One exact current attention revision as evaluated by a shadow-only
-/// notification policy. `delivery_*` always refers to the already durable,
-/// immediate in-product mirror receipt used as the comparison baseline.
+/// notification policy. `delivery_*` always refers to the already durable
+/// pending in-product claim used as the comparison baseline.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotificationShadowEntry {
@@ -2201,8 +2263,8 @@ impl NotificationShadowEntry {
 }
 
 /// Immutable phase-two notification evidence. It binds the policy, exact
-/// local presence revision, control-plane snapshot, and immediate mirror
-/// receipts, but is deliberately incapable of changing notification delivery
+/// local presence revision, control-plane snapshot, and pending in-product
+/// claims, but is deliberately incapable of changing notification delivery
 /// or any source-owned attention lifecycle.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2308,12 +2370,13 @@ impl NotificationShadowBatch {
     }
 }
 
-/// Bounded, read-only health of the current in-product notification mirror.
+/// Bounded, read-only health of the current in-product notification channel.
 ///
 /// Counters describe only the integrity-checked current attention revisions
-/// examined by the controller. A truncated result intentionally makes no
-/// whole-system health claim. This projection cannot send, defer, suppress,
-/// batch, or resolve a notification source.
+/// examined by the controller. A presented revision has one exact immutable
+/// UI receipt; it has not thereby been acknowledged or resolved. A truncated
+/// result intentionally makes no whole-system health claim. This projection
+/// cannot send, defer, suppress, batch, or resolve a notification source.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotificationDeliveryHealth {
@@ -2321,14 +2384,13 @@ pub struct NotificationDeliveryHealth {
     pub channel: String,
     pub current_attention_revisions: u64,
     pub examined_current_revisions: u64,
-    pub delivered_examined_revisions: u64,
-    pub undelivered_examined_revisions: u64,
-    pub undelivered_critical_examined_revisions: u64,
-    pub undelivered_action_required_examined_revisions: u64,
-    pub failed_examined_revisions: u64,
-    pub unverified_delivery_examined_revisions: u64,
-    pub oldest_undelivered_opened_at_ms: Option<i64>,
-    pub latest_verified_mirror_receipt_at_ms: Option<i64>,
+    pub presented_examined_revisions: u64,
+    pub unpresented_examined_revisions: u64,
+    pub unpresented_critical_examined_revisions: u64,
+    pub unpresented_action_required_examined_revisions: u64,
+    pub unverified_claim_examined_revisions: u64,
+    pub oldest_unpresented_opened_at_ms: Option<i64>,
+    pub latest_presentation_receipt_at_ms: Option<i64>,
     pub truncated: bool,
     pub desktop_delivery_enabled: bool,
     pub batching_enabled: bool,
@@ -2340,18 +2402,17 @@ impl NotificationDeliveryHealth {
         if self.schema != "harness.notification-delivery-health.v1"
             || self.channel != "in_product_mirror"
             || self.examined_current_revisions > self.current_attention_revisions
-            || self.delivered_examined_revisions + self.undelivered_examined_revisions
+            || self.presented_examined_revisions + self.unpresented_examined_revisions
                 != self.examined_current_revisions
-            || self.undelivered_critical_examined_revisions
-                + self.undelivered_action_required_examined_revisions
-                > self.undelivered_examined_revisions
-            || self.failed_examined_revisions > self.undelivered_examined_revisions
-            || self.unverified_delivery_examined_revisions > self.undelivered_examined_revisions
+            || self.unpresented_critical_examined_revisions
+                + self.unpresented_action_required_examined_revisions
+                > self.unpresented_examined_revisions
+            || self.unverified_claim_examined_revisions > self.unpresented_examined_revisions
             || self
-                .oldest_undelivered_opened_at_ms
+                .oldest_unpresented_opened_at_ms
                 .is_some_and(|value| value < 0)
             || self
-                .latest_verified_mirror_receipt_at_ms
+                .latest_presentation_receipt_at_ms
                 .is_some_and(|value| value < 0)
             || self.desktop_delivery_enabled
             || self.batching_enabled
@@ -2359,7 +2420,7 @@ impl NotificationDeliveryHealth {
         {
             return Err(OperatorControlError::InvalidField {
                 field: "notification delivery health",
-                reason: "must be a bounded in-product mirror-only projection with internally consistent counters",
+                reason: "must be a bounded in-product presentation-only projection with internally consistent counters",
             });
         }
         if self.truncated != (self.examined_current_revisions < self.current_attention_revisions) {
@@ -2743,14 +2804,13 @@ mod tests {
             channel: "in_product_mirror".to_owned(),
             current_attention_revisions: 2,
             examined_current_revisions: 2,
-            delivered_examined_revisions: 1,
-            undelivered_examined_revisions: 1,
-            undelivered_critical_examined_revisions: 1,
-            undelivered_action_required_examined_revisions: 0,
-            failed_examined_revisions: 0,
-            unverified_delivery_examined_revisions: 0,
-            oldest_undelivered_opened_at_ms: Some(1),
-            latest_verified_mirror_receipt_at_ms: Some(2),
+            presented_examined_revisions: 1,
+            unpresented_examined_revisions: 1,
+            unpresented_critical_examined_revisions: 1,
+            unpresented_action_required_examined_revisions: 0,
+            unverified_claim_examined_revisions: 0,
+            oldest_unpresented_opened_at_ms: Some(1),
+            latest_presentation_receipt_at_ms: Some(2),
             truncated: false,
             desktop_delivery_enabled: false,
             batching_enabled: false,
@@ -2769,14 +2829,13 @@ mod tests {
                 "channel": "in_product_mirror",
                 "current_attention_revisions": 0,
                 "examined_current_revisions": 0,
-                "delivered_examined_revisions": 0,
-                "undelivered_examined_revisions": 0,
-                "undelivered_critical_examined_revisions": 0,
-                "undelivered_action_required_examined_revisions": 0,
-                "failed_examined_revisions": 0,
-                "unverified_delivery_examined_revisions": 0,
-                "oldest_undelivered_opened_at_ms": null,
-                "latest_verified_mirror_receipt_at_ms": null,
+                "presented_examined_revisions": 0,
+                "unpresented_examined_revisions": 0,
+                "unpresented_critical_examined_revisions": 0,
+                "unpresented_action_required_examined_revisions": 0,
+                "unverified_claim_examined_revisions": 0,
+                "oldest_unpresented_opened_at_ms": null,
+                "latest_presentation_receipt_at_ms": null,
                 "truncated": false,
                 "desktop_delivery_enabled": false,
                 "batching_enabled": false,

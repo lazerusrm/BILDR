@@ -409,8 +409,9 @@ Bounded batching reduces routine interruption without delaying important action.
 
 ### Replay and operator study
 
-First mirror classifications. Replay current event histories through proposed
-policy and measure theoretical delivery. Then run opt-in focus/unattended study.
+First mirror classifications and record exact in-product presentation receipts.
+Replay current event histories through proposed policy and measure theoretical
+delivery. Then run opt-in focus/unattended study.
 
 Primary:
 

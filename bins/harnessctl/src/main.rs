@@ -94,7 +94,7 @@ enum Command {
         #[command(subcommand)]
         command: PresenceCommand,
     },
-    /// Inspect bounded in-product notification-mirror receipts. This cannot deliver, retry, suppress, or resolve attention.
+    /// Inspect bounded pending in-product notification claims. This cannot deliver, retry, suppress, or resolve attention.
     NotificationDeliveries,
     /// Inspect bounded integrity-checked health for current in-product mirror revisions. This cannot refresh, deliver, batch, suppress, or resolve attention.
     NotificationHealth,

@@ -31,12 +31,13 @@ This status is intentionally a capability boundary, not release evidence.
   releases custody nor retries unknown effects implicitly;
 - bounded run topology table over durable run/task/attempt/agent/worktree and
   dependency facts; no graph layout or inferred links;
-- versioned local presence and deterministic, retry-safe in-product
-  notification-mirror receipts, plus bounded integrity-checked current-revision
-  delivery health; delivery cannot close attention or change controller authority;
+- versioned local presence, deterministic pending in-product notification
+  claims, exact session-derived presentation receipts, and bounded
+  integrity-checked current-revision presentation health; no receipt can close
+  attention or change controller authority;
 - authenticated, immutable notification shadow plans bound to one complete
   control-plane snapshot, exact local-presence revision, policy digest, and
-  already-durable mirror receipts. They prove critical bypass and theoretical
+  already-durable pending in-product claims. They prove critical bypass and theoretical
   bounded cadence only; they cannot defer, suppress, send, or resolve anything;
 - bounded supervisor snapshots carrying control-plane custody facts and
   restricting actions to wait/pause-for-human whenever ownership is uncertain;

@@ -904,11 +904,22 @@ export interface NotificationDelivery {
   delivery_id: string;
   attention_id: string | null;
   class: "critical" | "action_required" | "routine";
-  state: "pending" | "deferred" | "delivered" | "failed";
+  state: "pending";
   channel: "in_product_mirror";
   source_event_id: string;
   created_at_ms: number;
   payload_sha256: string;
+  sha256: string;
+}
+
+/** Immutable proof that one authenticated product session rendered a claim. */
+export interface NotificationPresentationReceipt {
+  schema: "harness.notification-presentation-receipt.v1";
+  receipt_id: string;
+  delivery_id: string;
+  operator_id: string;
+  delivery_sha256: string;
+  presented_at_ms: number;
   sha256: string;
 }
 
@@ -951,20 +962,19 @@ export interface NotificationShadowBatch {
   sha256: string;
 }
 
-/** Bounded, read-only integrity health for the in-product delivery mirror. */
+/** Bounded, read-only integrity health for in-product presentation receipts. */
 export interface NotificationDeliveryHealth {
   schema: "harness.notification-delivery-health.v1";
   channel: "in_product_mirror";
   current_attention_revisions: number;
   examined_current_revisions: number;
-  delivered_examined_revisions: number;
-  undelivered_examined_revisions: number;
-  undelivered_critical_examined_revisions: number;
-  undelivered_action_required_examined_revisions: number;
-  failed_examined_revisions: number;
-  unverified_delivery_examined_revisions: number;
-  oldest_undelivered_opened_at_ms: number | null;
-  latest_verified_mirror_receipt_at_ms: number | null;
+  presented_examined_revisions: number;
+  unpresented_examined_revisions: number;
+  unpresented_critical_examined_revisions: number;
+  unpresented_action_required_examined_revisions: number;
+  unverified_claim_examined_revisions: number;
+  oldest_unpresented_opened_at_ms: number | null;
+  latest_presentation_receipt_at_ms: number | null;
   truncated: boolean;
   desktop_delivery_enabled: false;
   batching_enabled: false;

@@ -8,9 +8,10 @@
 use harness_domain::{
     AttentionItem, AttentionSeverity, ControlPlaneSnapshot, CorrelationLink, CorrelationLinkId,
     NotificationClass, NotificationDelivery, NotificationDeliveryHealth, NotificationDeliveryId,
-    NotificationShadowBatch, NotificationShadowBatchId, NotificationShadowDisposition,
-    NotificationShadowEntry, NotificationShadowPolicy, NotificationState, OperatorPresence,
-    OperatorPresenceMode, SnapshotSectionState, TraceContext, now_ms,
+    NotificationPresentationReceipt, NotificationPresentationReceiptId, NotificationShadowBatch,
+    NotificationShadowBatchId, NotificationShadowDisposition, NotificationShadowEntry,
+    NotificationShadowPolicy, NotificationState, OperatorPresence, OperatorPresenceMode,
+    SnapshotSectionState, TraceContext, now_ms,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::json;
@@ -116,11 +117,11 @@ impl Store {
         Ok(next)
     }
 
-    /// Mirrors one bounded oldest-first batch of as-yet-undelivered
-    /// source-owned attention revisions into append-only product delivery
-    /// receipts. Selecting only pending revisions prevents a stable newest
-    /// page from starving an older item forever; the deterministic receipt ID
-    /// still makes retry and restart safe.
+    /// Mirrors one bounded oldest-first batch of source-owned attention
+    /// revisions into append-only pending product-presentation claims.
+    /// Selecting only unclaimed revisions prevents a stable newest page from
+    /// starving an older item forever; the deterministic claim ID still makes
+    /// retry and restart safe.
     pub fn refresh_notification_mirror(&self) -> Result<Vec<NotificationDelivery>, StoreError> {
         let attention = self.pending_notification_attention(MAX_NOTIFICATION_PAGE_SIZE)?;
         let mut written = Vec::new();
@@ -163,8 +164,9 @@ impl Store {
 
     /// Produces a phase-two shadow plan from one complete, immutable
     /// control-plane snapshot and one exact local-presence revision. The
-    /// existing immediate mirror remains the only delivery record: this method
-    /// only persists the theoretical batching comparison for later evaluation.
+    /// existing pending in-product claim remains the only delivery record: this
+    /// method only persists the theoretical batching comparison for later
+    /// evaluation.
     pub fn create_notification_shadow_batch(
         &self,
         operator_id: &str,
@@ -315,7 +317,7 @@ impl Store {
                 .optional()?
                 .ok_or_else(|| {
                     StoreError::Conflict(
-                        "notification shadow batch requires the exact immediate mirror receipt"
+                        "notification shadow batch requires the exact pending in-product claim"
                             .to_owned(),
                     )
                 })?;
@@ -441,6 +443,99 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Records one authenticated product-surface presentation of an immutable
+    /// notification claim. The receipt does not acknowledge, defer, retry,
+    /// suppress, or resolve its source attention item.
+    pub fn record_notification_presentation(
+        &self,
+        delivery_id: &NotificationDeliveryId,
+        operator_id: &str,
+        expected_delivery_sha256: &str,
+    ) -> Result<NotificationPresentationReceipt, StoreError> {
+        validate_operator(operator_id)?;
+        validate_sha256(
+            expected_delivery_sha256,
+            "expected notification delivery sha256",
+        )?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (delivery_raw, delivery_digest): (String, String) = transaction
+            .query_row(
+                "SELECT payload_json,payload_sha256 FROM notification_deliveries WHERE id=?1",
+                [delivery_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("notification delivery {delivery_id}")))?;
+        let delivery = checked_delivery_row(delivery_raw, delivery_digest)?;
+        if delivery.sha256 != expected_delivery_sha256 {
+            return Err(StoreError::Conflict(
+                "notification delivery digest changed before presentation".to_owned(),
+            ));
+        }
+        let receipt_identity = digest(&format!(
+            "harness.notification-presentation-receipt.v1:{}:{}",
+            delivery_id, operator_id
+        ));
+        if let Some((raw, payload_sha256)) = transaction
+            .query_row(
+                "SELECT payload_json,payload_sha256 FROM notification_presentation_receipts WHERE delivery_id=?1 AND operator_id=?2",
+                params![delivery_id.as_str(), operator_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            let receipt = checked_presentation_receipt_row(raw, payload_sha256)?;
+            if receipt.delivery_sha256 != delivery.sha256 {
+                return Err(StoreError::Conflict(
+                    "notification presentation receipt binds a different delivery".to_owned(),
+                ));
+            }
+            record_notification_presentation_correlation_in_transaction(
+                &transaction,
+                &delivery,
+                &receipt,
+            )?;
+            transaction.commit()?;
+            return Ok(receipt);
+        }
+        let mut receipt = NotificationPresentationReceipt {
+            schema: "harness.notification-presentation-receipt.v1".to_owned(),
+            receipt_id: NotificationPresentationReceiptId::parse(format!(
+                "notification-presentation-{}",
+                &receipt_identity[..32]
+            ))
+            .map_err(control_error)?,
+            delivery_id: delivery.delivery_id.clone(),
+            operator_id: operator_id.to_owned(),
+            delivery_sha256: delivery.sha256.clone(),
+            presented_at_ms: now_ms(),
+            sha256: String::new(),
+        };
+        receipt.sha256 = receipt.digest().map_err(control_error)?;
+        receipt.validate().map_err(control_error)?;
+        let raw = serde_json::to_string(&receipt)?;
+        transaction.execute(
+            "INSERT INTO notification_presentation_receipts(id,delivery_id,operator_id,delivery_sha256,presented_at,payload_json,payload_sha256) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                receipt.receipt_id.as_str(),
+                receipt.delivery_id.as_str(),
+                receipt.operator_id,
+                receipt.delivery_sha256,
+                receipt.presented_at_ms,
+                raw,
+                digest(&serde_json::to_string(&receipt)?),
+            ],
+        )?;
+        record_notification_presentation_correlation_in_transaction(
+            &transaction,
+            &delivery,
+            &receipt,
+        )?;
+        transaction.commit()?;
+        Ok(receipt)
+    }
+
     /// Computes a bounded health projection for the current source-owned
     /// attention revisions without refreshing the mirror or changing any
     /// delivery state. A caller must not interpret a truncated result as a
@@ -461,10 +556,19 @@ impl Store {
         )?;
         let rows = {
             let mut statement = transaction.prepare(
-                "SELECT attention.payload_json,attention.payload_sha256,delivery.payload_json,delivery.payload_sha256
+                "SELECT attention.payload_json,attention.payload_sha256,delivery.payload_json,delivery.payload_sha256,
+                        receipt.payload_json,receipt.payload_sha256
                  FROM attention_items AS attention
                  LEFT JOIN notification_deliveries AS delivery
                    ON delivery.source_event_id = ('attention-' || attention.id || '-' || attention.version)
+                 LEFT JOIN notification_presentation_receipts AS receipt
+                   ON receipt.id = (
+                     SELECT latest.id
+                     FROM notification_presentation_receipts AS latest
+                     WHERE latest.delivery_id = delivery.id
+                     ORDER BY latest.presented_at DESC,latest.id DESC
+                     LIMIT 1
+                   )
                  WHERE attention.state IN ('open','acknowledged','waiting_external')
                  ORDER BY
                    CASE attention.severity
@@ -495,7 +599,23 @@ impl Store {
                             ));
                         }
                     };
-                    Ok((attention, delivery))
+                    let presentation_raw: Option<String> = row.get(4)?;
+                    let presentation_digest: Option<String> = row.get(5)?;
+                    let presentation = match (presentation_raw, presentation_digest) {
+                        (None, None) => None,
+                        (Some(raw), Some(digest)) => {
+                            Some(checked_presentation_receipt_row(raw, digest)?)
+                        }
+                        _ => {
+                            return Err(rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Text,
+                                "notification presentation join has incomplete immutable payload"
+                                    .into(),
+                            ));
+                        }
+                    };
+                    Ok((attention, delivery, presentation))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
@@ -505,55 +625,60 @@ impl Store {
             channel: "in_product_mirror".to_owned(),
             current_attention_revisions,
             examined_current_revisions: rows.len() as u64,
-            delivered_examined_revisions: 0,
-            undelivered_examined_revisions: 0,
-            undelivered_critical_examined_revisions: 0,
-            undelivered_action_required_examined_revisions: 0,
-            failed_examined_revisions: 0,
-            unverified_delivery_examined_revisions: 0,
-            oldest_undelivered_opened_at_ms: None,
-            latest_verified_mirror_receipt_at_ms: None,
+            presented_examined_revisions: 0,
+            unpresented_examined_revisions: 0,
+            unpresented_critical_examined_revisions: 0,
+            unpresented_action_required_examined_revisions: 0,
+            unverified_claim_examined_revisions: 0,
+            oldest_unpresented_opened_at_ms: None,
+            latest_presentation_receipt_at_ms: None,
             truncated: (rows.len() as u64) < current_attention_revisions,
             desktop_delivery_enabled: false,
             batching_enabled: false,
             suppression_enabled: false,
         };
-        for (attention, delivery) in rows {
-            let verified = delivery.as_ref().is_some_and(|delivery| {
+        for (attention, delivery, presentation) in rows {
+            let verified_claim = delivery.as_ref().is_some_and(|delivery| {
                 notification_delivery_matches_attention(delivery, &attention)
             });
-            if verified {
-                health.delivered_examined_revisions += 1;
-                let delivery = delivery.expect("verified delivery is present");
-                health.latest_verified_mirror_receipt_at_ms = Some(
+            let verified_presentation = match (&delivery, presentation.as_ref()) {
+                (Some(delivery), Some(receipt)) if verified_claim => {
+                    receipt.delivery_id == delivery.delivery_id
+                        && receipt.delivery_sha256 == delivery.sha256
+                }
+                _ => false,
+            };
+            if verified_presentation {
+                health.presented_examined_revisions += 1;
+                let receipt = presentation
+                    .as_ref()
+                    .expect("verified presentation is present");
+                health.latest_presentation_receipt_at_ms = Some(
                     health
-                        .latest_verified_mirror_receipt_at_ms
-                        .map_or(delivery.created_at_ms, |current| {
-                            current.max(delivery.created_at_ms)
+                        .latest_presentation_receipt_at_ms
+                        .map_or(receipt.presented_at_ms, |current| {
+                            current.max(receipt.presented_at_ms)
                         }),
                 );
                 continue;
             }
-            health.undelivered_examined_revisions += 1;
-            health.oldest_undelivered_opened_at_ms = Some(
+            health.unpresented_examined_revisions += 1;
+            health.oldest_unpresented_opened_at_ms = Some(
                 health
-                    .oldest_undelivered_opened_at_ms
+                    .oldest_unpresented_opened_at_ms
                     .map_or(attention.opened_at_ms, |current| {
                         current.min(attention.opened_at_ms)
                     }),
             );
             match attention.severity {
-                AttentionSeverity::Critical => health.undelivered_critical_examined_revisions += 1,
+                AttentionSeverity::Critical => health.unpresented_critical_examined_revisions += 1,
                 AttentionSeverity::High => {
-                    health.undelivered_action_required_examined_revisions += 1
+                    health.unpresented_action_required_examined_revisions += 1
                 }
                 AttentionSeverity::Normal | AttentionSeverity::Info => {}
             }
-            if let Some(delivery) = delivery {
-                health.unverified_delivery_examined_revisions += 1;
-                if delivery.state == NotificationState::Failed {
-                    health.failed_examined_revisions += 1;
-                }
+            if !verified_claim {
+                health.unverified_claim_examined_revisions += 1;
             }
         }
         health.validate().map_err(control_error)?;
@@ -577,7 +702,7 @@ fn notification_from_attention(item: &AttentionItem) -> Result<NotificationDeliv
         .map_err(control_error)?,
         attention_id: Some(item.attention_id.clone()),
         class,
-        state: NotificationState::Delivered,
+        state: NotificationState::Pending,
         channel: "in_product_mirror".to_owned(),
         source_event_id,
         // A delivery is an immutable mirror of one exact attention revision.
@@ -715,8 +840,44 @@ fn notification_correlation_link(
     })
 }
 
-/// Each shadow entry is explicitly downstream of the durable immediate mirror
-/// receipt it compares. The trace is evidence only and cannot cause delivery,
+fn record_notification_presentation_correlation_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    delivery: &NotificationDelivery,
+    receipt: &NotificationPresentationReceipt,
+) -> Result<(), StoreError> {
+    let delivery_link = notification_correlation_link(delivery)?;
+    let link_id = CorrelationLinkId::parse(format!(
+        "correlation-{}",
+        &digest(&format!(
+            "harness.notification-presentation.link.v1:{}:{}",
+            delivery.delivery_id, receipt.receipt_id
+        ))[..48]
+    ))
+    .map_err(control_error)?;
+    let span_id = digest(&format!(
+        "harness.notification-presentation.span.v1:{}",
+        receipt.receipt_id
+    ));
+    let link = CorrelationLink {
+        schema: "harness.correlation-link.v1".to_owned(),
+        link_id,
+        trace: TraceContext {
+            trace_id: delivery_link.trace.trace_id,
+            span_id: span_id[..16].to_owned(),
+            parent_span_id: Some(delivery_link.trace.span_id),
+        },
+        from_kind: "notification_delivery".to_owned(),
+        from_id: delivery.delivery_id.to_string(),
+        to_kind: "notification_presentation_receipt".to_owned(),
+        to_id: receipt.receipt_id.to_string(),
+        relation: "presented_in_product".to_owned(),
+        created_at_ms: receipt.presented_at_ms,
+    };
+    record_correlation_link_in_transaction(transaction, &link).map(|_| ())
+}
+
+/// Each shadow entry is explicitly downstream of the durable pending in-product
+/// claim it compares. The trace is evidence only and cannot cause delivery,
 /// state transition, or acknowledgement.
 fn notification_shadow_correlations(
     batch: &NotificationShadowBatch,
@@ -798,6 +959,26 @@ pub(crate) fn checked_delivery_row(
     })?;
     Ok(delivery)
 }
+
+fn checked_presentation_receipt_row(
+    raw: String,
+    payload_sha256: String,
+) -> rusqlite::Result<NotificationPresentationReceipt> {
+    if digest(&raw) != payload_sha256 {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            "notification presentation receipt payload integrity check failed".into(),
+        ));
+    }
+    let receipt: NotificationPresentationReceipt = serde_json::from_str(&raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    receipt.validate().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(receipt)
+}
 fn checked_presence_row(raw: String, payload_sha256: String) -> rusqlite::Result<OperatorPresence> {
     if digest(&raw) != payload_sha256 {
         return Err(rusqlite::Error::FromSqlConversionFailure(
@@ -824,6 +1005,19 @@ fn validate_operator(value: &str) -> Result<(), StoreError> {
         return Err(StoreError::Validation(
             "operator id must be a bounded path-safe identifier".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_sha256(value: &str, field: &str) -> Result<(), StoreError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(StoreError::Validation(format!(
+            "{field} must be a 64-character lowercase SHA-256 digest"
+        )));
     }
     Ok(())
 }
@@ -856,9 +1050,6 @@ fn class_name(class: NotificationClass) -> &'static str {
 fn state_name(state: NotificationState) -> &'static str {
     match state {
         NotificationState::Pending => "pending",
-        NotificationState::Deferred => "deferred",
-        NotificationState::Delivered => "delivered",
-        NotificationState::Failed => "failed",
     }
 }
 fn digest(raw: &str) -> String {
@@ -1016,6 +1207,7 @@ mod tests {
         assert!(replay.is_empty());
         assert_eq!(store.list_notification_deliveries(10).unwrap(), first);
         assert_eq!(first[0].created_at_ms, attention.opened_at_ms);
+        assert_eq!(first[0].state, NotificationState::Pending);
         assert_eq!(
             store
                 .notification_delivery_health()
@@ -1025,14 +1217,13 @@ mod tests {
                 channel: "in_product_mirror".to_owned(),
                 current_attention_revisions: 1,
                 examined_current_revisions: 1,
-                delivered_examined_revisions: 1,
-                undelivered_examined_revisions: 0,
-                undelivered_critical_examined_revisions: 0,
-                undelivered_action_required_examined_revisions: 0,
-                failed_examined_revisions: 0,
-                unverified_delivery_examined_revisions: 0,
-                oldest_undelivered_opened_at_ms: None,
-                latest_verified_mirror_receipt_at_ms: Some(attention.opened_at_ms),
+                presented_examined_revisions: 0,
+                unpresented_examined_revisions: 1,
+                unpresented_critical_examined_revisions: 0,
+                unpresented_action_required_examined_revisions: 1,
+                unverified_claim_examined_revisions: 0,
+                oldest_unpresented_opened_at_ms: Some(attention.opened_at_ms),
+                latest_presentation_receipt_at_ms: None,
                 truncated: false,
                 desktop_delivery_enabled: false,
                 batching_enabled: false,
@@ -1048,6 +1239,70 @@ mod tests {
         );
         assert_eq!(
             store.list_attention(false, 10).unwrap().items,
+            vec![attention]
+        );
+    }
+
+    #[test]
+    fn notification_presentation_is_exact_session_scoped_idempotent_and_authority_neutral() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let attention = test_attention();
+        store
+            .upsert_source_attention(&attention)
+            .expect("open attention");
+        let delivery = store
+            .refresh_notification_mirror()
+            .expect("record pending claim")
+            .pop()
+            .expect("one claim");
+
+        assert!(matches!(
+            store.record_notification_presentation(
+                &delivery.delivery_id,
+                "operator-a",
+                &"0".repeat(64),
+            ),
+            Err(StoreError::Conflict(_))
+        ));
+        let receipt = store
+            .record_notification_presentation(&delivery.delivery_id, "operator-a", &delivery.sha256)
+            .expect("presentation receipt");
+        assert_eq!(receipt.delivery_id, delivery.delivery_id);
+        assert_eq!(receipt.operator_id, "operator-a");
+        assert_eq!(
+            store
+                .record_notification_presentation(
+                    &delivery.delivery_id,
+                    "operator-a",
+                    &delivery.sha256,
+                )
+                .expect("idempotent presentation"),
+            receipt
+        );
+        let health = store.notification_delivery_health().expect("health");
+        assert_eq!(health.presented_examined_revisions, 1);
+        assert_eq!(health.unpresented_examined_revisions, 0);
+        let trace = notification_correlation_link(&delivery)
+            .expect("delivery trace")
+            .trace
+            .trace_id;
+        assert!(
+            store
+                .correlation_links(&trace, 10)
+                .expect("correlations")
+                .iter()
+                .any(|link| {
+                    link.to_kind == "notification_presentation_receipt"
+                        && link.to_id == receipt.receipt_id.to_string()
+                        && link.relation == "presented_in_product"
+                })
+        );
+        assert_eq!(
+            store
+                .list_attention(false, 10)
+                .expect("attention remains read-only")
+                .items,
             vec![attention]
         );
     }
@@ -1260,41 +1515,35 @@ mod tests {
             .expect("delivery health");
         assert_eq!(health.current_attention_revisions, 201);
         assert_eq!(health.examined_current_revisions, 200);
-        assert_eq!(health.delivered_examined_revisions, 0);
-        assert_eq!(health.undelivered_examined_revisions, 200);
-        assert_eq!(health.undelivered_action_required_examined_revisions, 200);
+        assert_eq!(health.presented_examined_revisions, 0);
+        assert_eq!(health.unpresented_examined_revisions, 200);
+        assert_eq!(health.unpresented_action_required_examined_revisions, 200);
         assert!(health.truncated);
-        assert_eq!(health.oldest_undelivered_opened_at_ms, Some(0));
+        assert_eq!(health.oldest_unpresented_opened_at_ms, Some(0));
         assert!(store.list_notification_deliveries(200).unwrap().is_empty());
     }
 
     #[test]
-    fn notification_delivery_health_does_not_treat_a_failed_receipt_as_delivered() {
+    fn notification_delivery_health_refuses_non_product_delivery_claims() {
         let temp = TempDir::new().expect("temp");
         let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
         let attention = test_attention();
         store
             .upsert_source_attention(&attention)
             .expect("open attention");
-        let mut failed = notification_from_attention(&attention).expect("delivery");
-        failed.state = NotificationState::Failed;
-        failed.sha256 = failed.digest().expect("failed delivery digest");
-        store
-            .record_notification_delivery(&failed)
-            .expect("record failed receipt");
-
+        let mut invalid = notification_from_attention(&attention).expect("delivery");
+        invalid.channel = "desktop".to_owned();
+        invalid.sha256 = invalid.digest().expect("invalid delivery digest");
+        assert!(matches!(
+            store.record_notification_delivery(&invalid),
+            Err(StoreError::Validation(_))
+        ));
         let health = store
             .notification_delivery_health()
             .expect("delivery health");
-        assert_eq!(health.delivered_examined_revisions, 0);
-        assert_eq!(health.undelivered_examined_revisions, 1);
-        assert_eq!(health.undelivered_action_required_examined_revisions, 1);
-        assert_eq!(health.failed_examined_revisions, 1);
-        assert_eq!(health.unverified_delivery_examined_revisions, 1);
-        assert_eq!(
-            health.oldest_undelivered_opened_at_ms,
-            Some(attention.opened_at_ms)
-        );
+        assert_eq!(health.presented_examined_revisions, 0);
+        assert_eq!(health.unpresented_examined_revisions, 1);
+        assert_eq!(health.unverified_claim_examined_revisions, 1);
     }
 
     #[test]

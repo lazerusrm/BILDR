@@ -631,22 +631,47 @@ paths:
     get:
       tags: [Notifications]
       operationId: listNotificationDeliveries
-      description: Append-only in-product mirror receipts. These records never resolve or suppress their source attention item.
+      description: Immutable pending in-product presentation claims. A claim never resolves or suppresses its source attention item.
       parameters:
         - name: limit
           in: query
           schema: {type: integer, minimum: 1, maximum: 200, default: 50}
       responses:
         '200':
-          description: Bounded newest-first delivery mirror receipts.
+          description: Bounded newest-first pending presentation claims.
           content:
             application/json:
               schema: {type: array, items: {$ref: '#/components/schemas/NotificationDelivery'}}
+  /notification-deliveries/{delivery_id}/presentations:
+    post:
+      tags: [Notifications]
+      operationId: recordNotificationPresentation
+      description: Records one exact authenticated product-surface presentation of a pending claim. This cannot acknowledge, close, defer, suppress, retry, or otherwise alter source attention.
+      parameters:
+        - name: delivery_id
+          in: path
+          required: true
+          schema: {type: string, maxLength: 160}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RecordNotificationPresentationRequest'}
+      responses:
+        '200':
+          description: Idempotent immutable presentation receipt scoped to the authenticated session-derived operator identity.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NotificationPresentationReceipt'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
   /notification-shadow-batches:
     get:
       tags: [Notifications]
       operationId: listNotificationShadowBatches
-      description: Bounded immutable shadow-only notification plans. They compare a complete snapshot and exact local presence revision with the existing immediate mirror; they cannot defer, suppress, send, or resolve a source.
+      description: Bounded immutable shadow-only notification plans. They compare a complete snapshot and exact local presence revision with the existing pending in-product claims; they cannot defer, suppress, send, or resolve a source.
       parameters:
         - name: limit
           in: query
@@ -660,7 +685,7 @@ paths:
     post:
       tags: [Notifications]
       operationId: createNotificationShadowBatch
-      description: Records an exact snapshot-bound comparison plan after verifying every immediate mirror receipt. The plan is evidence only and fails closed on a truncated attention snapshot; it cannot alter delivery timing or source state.
+      description: Records an exact snapshot-bound comparison plan after verifying every pending in-product claim. The plan is evidence only and fails closed on a truncated attention snapshot; it cannot alter delivery timing or source state.
       parameters:
         - {$ref: '#/components/parameters/CsrfToken'}
       requestBody:
@@ -2227,29 +2252,46 @@ components:
         delivery_id: {type: string, maxLength: 160}
         attention_id: {type: [string, 'null'], maxLength: 160}
         class: {enum: [critical, action_required, routine]}
-        state: {enum: [pending, deferred, delivered, failed]}
+        state: {const: pending}
         channel: {const: in_product_mirror}
         source_event_id: {type: string, maxLength: 160}
         created_at_ms: {type: integer, minimum: 0}
         payload_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
         sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    NotificationPresentationReceipt:
+      type: object
+      additionalProperties: false
+      required: [schema, receipt_id, delivery_id, operator_id, delivery_sha256, presented_at_ms, sha256]
+      properties:
+        schema: {const: harness.notification-presentation-receipt.v1}
+        receipt_id: {type: string, maxLength: 160}
+        delivery_id: {type: string, maxLength: 160}
+        operator_id: {type: string, pattern: '^operator-[0-9a-f]{64}$'}
+        delivery_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        presented_at_ms: {type: integer, minimum: 0}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    RecordNotificationPresentationRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_delivery_sha256]
+      properties:
+        expected_delivery_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
     NotificationDeliveryHealth:
       type: object
       additionalProperties: false
-      required: [schema, channel, current_attention_revisions, examined_current_revisions, delivered_examined_revisions, undelivered_examined_revisions, undelivered_critical_examined_revisions, undelivered_action_required_examined_revisions, failed_examined_revisions, unverified_delivery_examined_revisions, oldest_undelivered_opened_at_ms, latest_verified_mirror_receipt_at_ms, truncated, desktop_delivery_enabled, batching_enabled, suppression_enabled]
+      required: [schema, channel, current_attention_revisions, examined_current_revisions, presented_examined_revisions, unpresented_examined_revisions, unpresented_critical_examined_revisions, unpresented_action_required_examined_revisions, unverified_claim_examined_revisions, oldest_unpresented_opened_at_ms, latest_presentation_receipt_at_ms, truncated, desktop_delivery_enabled, batching_enabled, suppression_enabled]
       properties:
         schema: {const: harness.notification-delivery-health.v1}
         channel: {const: in_product_mirror}
         current_attention_revisions: {type: integer, minimum: 0}
         examined_current_revisions: {type: integer, minimum: 0, maximum: 200}
-        delivered_examined_revisions: {type: integer, minimum: 0, maximum: 200}
-        undelivered_examined_revisions: {type: integer, minimum: 0, maximum: 200}
-        undelivered_critical_examined_revisions: {type: integer, minimum: 0, maximum: 200}
-        undelivered_action_required_examined_revisions: {type: integer, minimum: 0, maximum: 200}
-        failed_examined_revisions: {type: integer, minimum: 0, maximum: 200}
-        unverified_delivery_examined_revisions: {type: integer, minimum: 0, maximum: 200}
-        oldest_undelivered_opened_at_ms: {type: [integer, 'null'], minimum: 0}
-        latest_verified_mirror_receipt_at_ms: {type: [integer, 'null'], minimum: 0}
+        presented_examined_revisions: {type: integer, minimum: 0, maximum: 200}
+        unpresented_examined_revisions: {type: integer, minimum: 0, maximum: 200}
+        unpresented_critical_examined_revisions: {type: integer, minimum: 0, maximum: 200}
+        unpresented_action_required_examined_revisions: {type: integer, minimum: 0, maximum: 200}
+        unverified_claim_examined_revisions: {type: integer, minimum: 0, maximum: 200}
+        oldest_unpresented_opened_at_ms: {type: [integer, 'null'], minimum: 0}
+        latest_presentation_receipt_at_ms: {type: [integer, 'null'], minimum: 0}
         truncated: {type: boolean}
         desktop_delivery_enabled: {const: false}
         batching_enabled: {const: false}

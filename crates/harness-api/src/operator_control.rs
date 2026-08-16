@@ -15,7 +15,8 @@ use axum::{
 };
 use harness_domain::{
     AttentionItemId, ExternalConditionId, InvestigationArtifactId, KnowledgeReviewDecision,
-    LivenessEpisodeId, OperatorPresenceMode, ReconciliationEpisodeId, RunId,
+    LivenessEpisodeId, NotificationDeliveryId, OperatorPresenceMode, ReconciliationEpisodeId,
+    RunId,
 };
 use serde::Deserialize;
 
@@ -119,6 +120,10 @@ pub(super) fn routes() -> Router<ApiState> {
         .route(
             "/api/v1/notification-deliveries",
             get(list_notification_deliveries),
+        )
+        .route(
+            "/api/v1/notification-deliveries/{delivery_id}/presentations",
+            post(record_notification_presentation),
         )
         .route(
             "/api/v1/notification-shadow-batches",
@@ -895,8 +900,15 @@ async fn set_operator_presence(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NotificationQuery {
     limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordNotificationPresentationRequest {
+    expected_delivery_sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -919,8 +931,34 @@ async fn list_notification_deliveries(
     ))
 }
 
+/// Records that this authenticated product session rendered one exact pending
+/// mirror claim. This receipt is presentation evidence only: it cannot
+/// acknowledge, close, defer, suppress, retry, or otherwise mutate the
+/// source attention item.
+async fn record_notification_presentation(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(delivery_id): Path<String>,
+    Json(request): Json<RecordNotificationPresentationRequest>,
+) -> Result<Json<harness_domain::NotificationPresentationReceipt>, ApiError> {
+    let operator_id = authenticated_operator_id(&state, &headers, true)?;
+    let delivery_id = NotificationDeliveryId::parse(delivery_id).map_err(|error| {
+        ApiError::from(harness_store::StoreError::Validation(error.to_string()))
+    })?;
+    Ok(Json(
+        state
+            .orchestrator
+            .store()
+            .record_notification_presentation(
+                &delivery_id,
+                &operator_id,
+                &request.expected_delivery_sha256,
+            )?,
+    ))
+}
+
 /// Reads immutable shadow-only notification plans. They compare a presence
-/// policy against immediate mirror receipts but cannot change delivery timing,
+/// policy against pending in-product claims but cannot change delivery timing,
 /// suppress a source, or trigger an external notification channel.
 async fn list_notification_shadow_batches(
     State(state): State<ApiState>,
@@ -943,7 +981,7 @@ struct CreateNotificationShadowBatchRequest {
 }
 
 /// Records a complete snapshot-bound shadow plan only. The Store requires the
-/// existing immediate mirror receipt for every source and refuses truncated
+/// existing pending in-product claim for every source and refuses truncated
 /// attention snapshots, so this route never creates a hidden defer or
 /// suppression path.
 async fn create_notification_shadow_batch(
@@ -1042,6 +1080,13 @@ mod tests {
         assert!(
             serde_json::from_value::<CreateNotificationShadowBatchRequest>(json!({
                 "expected_presence_version": 1,
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<RecordNotificationPresentationRequest>(json!({
+                "expected_delivery_sha256": "a".repeat(64),
                 "unexpected": true,
             }))
             .is_err()

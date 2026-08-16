@@ -215,6 +215,23 @@ export function AttentionCenter() {
     void load();
   }, [load]);
 
+  useEffect(() => {
+    if (notificationDeliveries.length === 0) return;
+    let cancelled = false;
+    void Promise.all(
+      notificationDeliveries.map((delivery) =>
+        api.recordNotificationPresentation(delivery.delivery_id, delivery.sha256),
+      ),
+    ).catch((cause) => {
+      if (!cancelled) {
+        setError(displayError(cause, "The visible notification claims could not be recorded as presented."));
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [notificationDeliveries]);
+
   const acknowledge = async () => {
     if (!selected || selected.state !== "open") return;
     setBusy(`ack:${selected.attention_id}`);
@@ -511,9 +528,9 @@ function PresenceAndNotifications({
       )}
       {!health ? <p className="empty-state">Loading current delivery health…</p> : (
         <p className="control-plane-note">
-          Mirror health examined <strong>{health.examined_current_revisions}</strong> of <strong>{health.current_attention_revisions}</strong> current attention revisions: <strong>{health.delivered_examined_revisions}</strong> verified receipt{health.delivered_examined_revisions === 1 ? "" : "s"} and <strong>{health.undelivered_examined_revisions}</strong> not currently verified.
-          {health.undelivered_critical_examined_revisions > 0 ? ` ${health.undelivered_critical_examined_revisions} critical revision${health.undelivered_critical_examined_revisions === 1 ? " is" : "s are"} not verified.` : ""}
-          {health.failed_examined_revisions > 0 ? ` ${health.failed_examined_revisions} examined receipt${health.failed_examined_revisions === 1 ? " is" : "s are"} recorded failed.` : ""}
+          Mirror health examined <strong>{health.examined_current_revisions}</strong> of <strong>{health.current_attention_revisions}</strong> current attention revisions: <strong>{health.presented_examined_revisions}</strong> rendered in this product and <strong>{health.unpresented_examined_revisions}</strong> not yet recorded as rendered.
+          {health.unpresented_critical_examined_revisions > 0 ? ` ${health.unpresented_critical_examined_revisions} critical revision${health.unpresented_critical_examined_revisions === 1 ? " is" : "s are"} not yet recorded as rendered.` : ""}
+          {health.unverified_claim_examined_revisions > 0 ? ` ${health.unverified_claim_examined_revisions} examined revision${health.unverified_claim_examined_revisions === 1 ? " has" : "s have"} no exact presentation claim.` : ""}
           {health.truncated ? " Results are bounded; unexamined current revisions are unknown." : ""}
         </p>
       )}
@@ -522,7 +539,7 @@ function PresenceAndNotifications({
           Latest shadow plan <strong>{shadowBatches[0].batch_id}</strong> covers <strong>{shadowBatches[0].entries.length}</strong> current revisions at presence version {shadowBatches[0].presence.version}. Critical entries remain immediate; this is comparison evidence only.
         </p>
       ) : <p className="control-plane-note">No shadow plan has been recorded for this local presence preference.</p>}
-      <p className="control-plane-note">The immediate in-product mirror remains active. Shadow plans do not batch, suppress, send a desktop alert, or close the source attention item.</p>
+      <p className="control-plane-note">Pending in-product claims remain active. Shadow plans do not batch, suppress, send a desktop alert, or close the source attention item.</p>
     </section>
   );
 }

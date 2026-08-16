@@ -224,12 +224,24 @@ CREATE TABLE IF NOT EXISTS notification_deliveries (
     id TEXT PRIMARY KEY,
     attention_id TEXT REFERENCES attention_items(id),
     class TEXT NOT NULL CHECK(class IN ('critical','action_required','routine')),
-    state TEXT NOT NULL CHECK(state IN ('pending','deferred','delivered','failed')),
+    state TEXT NOT NULL CHECK(state = 'pending'),
     source_event_id TEXT NOT NULL UNIQUE,
     payload_json TEXT NOT NULL,
     payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),
     created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS notification_presentation_receipts (
+    id TEXT PRIMARY KEY,
+    delivery_id TEXT NOT NULL REFERENCES notification_deliveries(id),
+    operator_id TEXT NOT NULL,
+    delivery_sha256 TEXT NOT NULL CHECK(length(delivery_sha256) = 64 AND delivery_sha256 NOT GLOB '*[^0-9a-f]*'),
+    presented_at INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),
+    UNIQUE(delivery_id, operator_id)
+);
+CREATE INDEX IF NOT EXISTS idx_notification_presentation_receipts_delivery_presented
+    ON notification_presentation_receipts(delivery_id, presented_at DESC, id DESC);
 CREATE TABLE IF NOT EXISTS return_view_cursors (
     operator_id TEXT PRIMARY KEY,
     acknowledged_cursor INTEGER NOT NULL CHECK(acknowledged_cursor >= 0),
@@ -287,6 +299,8 @@ CREATE TRIGGER IF NOT EXISTS snapshot_sections_no_update BEFORE UPDATE ON snapsh
 CREATE TRIGGER IF NOT EXISTS snapshot_sections_no_delete BEFORE DELETE ON snapshot_sections BEGIN SELECT RAISE(ABORT, 'snapshot sections are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS notification_deliveries_no_update BEFORE UPDATE ON notification_deliveries BEGIN SELECT RAISE(ABORT, 'notification deliveries are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS notification_deliveries_no_delete BEFORE DELETE ON notification_deliveries BEGIN SELECT RAISE(ABORT, 'notification deliveries are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS notification_presentation_receipts_no_update BEFORE UPDATE ON notification_presentation_receipts BEGIN SELECT RAISE(ABORT, 'notification presentation receipts are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS notification_presentation_receipts_no_delete BEFORE DELETE ON notification_presentation_receipts BEGIN SELECT RAISE(ABORT, 'notification presentation receipts are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS topology_snapshots_no_update BEFORE UPDATE ON topology_snapshots BEGIN SELECT RAISE(ABORT, 'topology snapshots are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS topology_snapshots_no_delete BEFORE DELETE ON topology_snapshots BEGIN SELECT RAISE(ABORT, 'topology snapshots are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS correlation_links_no_update BEFORE UPDATE ON correlation_links BEGIN SELECT RAISE(ABORT, 'correlation links are immutable'); END;
