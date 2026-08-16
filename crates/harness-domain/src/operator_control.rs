@@ -257,6 +257,21 @@ impl crate::TaskPacket {
     /// Scheduling still owns sandbox and lease creation; this packet-level
     /// check rejects an investigation before it can request mutable custody.
     pub fn validate_execution_contract(&self) -> Result<(), OperatorControlError> {
+        if self.schema != "harness.orchestration.task.v1" {
+            return Err(OperatorControlError::InvalidField {
+                field: "task packet schema",
+                reason: "must be harness.orchestration.task.v1",
+            });
+        }
+        if !matches!(
+            self.execution_mode.as_str(),
+            "controller" | "agent" | "subagent_required" | "manual_operator"
+        ) {
+            return Err(OperatorControlError::InvalidField {
+                field: "task execution mode",
+                reason: "must be one current closed execution mode",
+            });
+        }
         match (self.execution_kind, self.investigation_scope.as_ref()) {
             (TaskExecutionKind::Investigation, Some(scope)) => {
                 scope.validate()?;
@@ -272,14 +287,10 @@ impl crate::TaskPacket {
                         reason: "investigations must bind directly to the pinned run base",
                     });
                 }
-                if self
-                    .authority_refs
-                    .iter()
-                    .any(|authority| !scope.owned_read_paths.contains(authority))
-                {
+                if !self.authority_refs.is_empty() {
                     return Err(OperatorControlError::InvalidField {
                         field: "investigation task authority refs",
-                        reason: "investigation authority files must be declared in the read scope",
+                        reason: "investigations use only their explicit read scope and cannot declare global authority refs",
                     });
                 }
             }
@@ -2893,6 +2904,7 @@ mod tests {
             "checklist_rows": [],
             "authority_refs": [],
             "base_sha": "",
+            "dependency_shas": {},
             "depends_on": [],
             "owned_paths": ["src"],
             "forbidden_paths": [],
@@ -2908,9 +2920,11 @@ mod tests {
             "proof_limits": [],
             "diff_budget": {"files": 1, "lines": 1},
             "token_budget": 1000,
+            "tool_budget": null,
             "lease_expires_at": "controller-managed",
             "stop_conditions": [],
-            "handoff_path": "controller://investigation"
+            "handoff_path": "controller://investigation",
+            "risk_flags": []
         }))
         .expect("packet deserializes");
         assert!(packet.validate_execution_contract().is_err());
@@ -2938,6 +2952,7 @@ mod tests {
             "checklist_rows": [],
             "authority_refs": [],
             "base_sha": "",
+            "dependency_shas": {},
             "depends_on": [],
             "owned_paths": [],
             "forbidden_paths": [],
@@ -2953,12 +2968,36 @@ mod tests {
             "proof_limits": [],
             "diff_budget": {"files": 1, "lines": 1},
             "token_budget": 1000,
+            "tool_budget": null,
             "lease_expires_at": "controller-managed",
             "stop_conditions": [],
-            "handoff_path": "controller://investigation"
+            "handoff_path": "controller://investigation",
+            "risk_flags": []
         }))
         .expect("packet deserializes");
         assert!(packet.validate_execution_contract().is_ok());
+        for field in ["dependency_shas", "milestones", "tool_budget", "risk_flags"] {
+            let mut raw = serde_json::to_value(&packet).expect("packet serializes");
+            raw.as_object_mut()
+                .expect("packet is an object")
+                .remove(field);
+            assert!(
+                serde_json::from_value::<crate::TaskPacket>(raw).is_err(),
+                "{field} must remain an explicit task-packet field"
+            );
+        }
+        let mut alternate_shape = serde_json::to_value(&packet).expect("packet serializes");
+        alternate_shape
+            .as_object_mut()
+            .expect("packet is an object")
+            .insert("legacy_task_mode".to_owned(), serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<crate::TaskPacket>(alternate_shape).is_err(),
+            "alternate task packet fields must not be silently accepted"
+        );
+        packet.execution_mode = "controller_governed".to_owned();
+        assert!(packet.validate_execution_contract().is_err());
+        packet.execution_mode = "controller".to_owned();
         packet
             .investigation_scope
             .as_mut()
@@ -2970,7 +3009,7 @@ mod tests {
             .as_mut()
             .expect("scope exists")
             .time_budget_ms = 1_000;
-        packet.authority_refs.push("README.md".to_owned());
+        packet.authority_refs.push("src/lib.rs".to_owned());
         assert!(packet.validate_execution_contract().is_err());
         packet.authority_refs.clear();
         packet.depends_on.push("other".to_owned());
@@ -2996,6 +3035,7 @@ mod tests {
                 "checklist_rows": [],
                 "authority_refs": [],
                 "base_sha": "",
+                "dependency_shas": {},
                 "depends_on": [],
                 "owned_paths": [],
                 "forbidden_paths": [],
@@ -3011,9 +3051,11 @@ mod tests {
                 "proof_limits": [],
                 "diff_budget": {"files": 1, "lines": 1},
                 "token_budget": 1000,
+                "tool_budget": null,
                 "lease_expires_at": "controller-managed",
                 "stop_conditions": [],
-                "handoff_path": "controller://task"
+                "handoff_path": "controller://task",
+                "risk_flags": []
             }))
             .is_err(),
             "missing execution kind and investigation scope must not default"

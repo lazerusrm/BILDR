@@ -5,7 +5,7 @@
 
 use std::{fmt, str::FromStr};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -708,12 +708,14 @@ pub fn budget_state(used: u64, budget: u64) -> BudgetState {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiffBudget {
     pub files: u32,
     pub lines: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskMilestone {
     pub id: String,
     pub title: String,
@@ -722,6 +724,7 @@ pub struct TaskMilestone {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskPacket {
     pub schema: String,
     pub program_id: String,
@@ -740,7 +743,6 @@ pub struct TaskPacket {
     pub checklist_rows: Vec<String>,
     pub authority_refs: Vec<String>,
     pub base_sha: String,
-    #[serde(default)]
     pub dependency_shas: std::collections::BTreeMap<String, String>,
     pub depends_on: Vec<String>,
     pub owned_paths: Vec<String>,
@@ -748,10 +750,8 @@ pub struct TaskPacket {
     pub reserved_serial_paths: Vec<String>,
     pub objective: String,
     /// Human-reviewable, bounded outcomes inside a governor-owned objective.
-    /// Kept on the task packet so the plan remains useful even when the
-    /// governor thread is not running. Older stored packets deserialize with
-    /// an empty list and are bootstrapped by the first structured checkpoint.
-    #[serde(default)]
+    /// This is an explicit wire field: stored packets never infer milestones
+    /// from an earlier contract.
     pub milestones: Vec<TaskMilestone>,
     pub non_goals: Vec<String>,
     pub success_criteria: Vec<String>,
@@ -762,12 +762,11 @@ pub struct TaskPacket {
     pub proof_limits: Vec<String>,
     pub diff_budget: DiffBudget,
     pub token_budget: u64,
-    #[serde(default)]
+    #[serde(deserialize_with = "required_optional_u64")]
     pub tool_budget: Option<u64>,
     pub lease_expires_at: String,
     pub stop_conditions: Vec<String>,
     pub handoff_path: String,
-    #[serde(default)]
     pub risk_flags: Vec<String>,
 }
 
@@ -795,10 +794,20 @@ impl TaskPacket {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunPlan {
     pub schema: String,
     pub summary: String,
     pub tasks: Vec<TaskPacket>,
+}
+
+/// `Option<T>` normally treats an omitted field as `None`. Task packets use a
+/// closed current wire shape, so `null` is allowed but omission is not.
+fn required_optional_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<u64>::deserialize(deserializer)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

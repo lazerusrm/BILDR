@@ -917,7 +917,7 @@ mod tests {
                 title: "Resolve integration contract".to_owned(),
                 state: "blocked".to_owned(),
                 priority: "P1".to_owned(),
-                execution_mode: "controller_governed".to_owned(),
+                execution_mode: "controller".to_owned(),
                 execution_kind: harness_domain::TaskExecutionKind::Implementation,
                 investigation_scope: None,
                 owner_profile: "general".to_owned(),

@@ -537,6 +537,8 @@ fn scripted_response(input: &str, objective: Option<&str>) -> String {
                 "state": "proposed",
                 "priority": "P1",
                 "execution_mode": "agent",
+                "execution_kind": "implementation",
+                "investigation_scope": null,
                 "owner_profile": "governor",
                 "reviewer_profile": "verifier",
                 "checklist_rows": ["Run deterministic adapter smoke"],

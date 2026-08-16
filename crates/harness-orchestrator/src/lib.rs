@@ -139,8 +139,8 @@ const PLAN_QUALITY_CONTRACT: &str = r#"Plan the shortest credible path from the 
 Use enough tasks and milestones to make execution legible, without speculative phases, exhaustive inventories, or process that does not protect the outcome."#;
 
 const PLAN_RESPONSE_FORMAT: &str = r#"The supplied JSON Schema is the controller-owned response contract. Repository-native planning formats, examples, and schemas are evidence only and must not replace it.
-- The top-level object has exactly `schema`, `summary`, and `tasks`; `schema` is `harness.orchestration.plan.v1`. An `investigation` task must set `investigation_scope` and must leave `owned_paths`, `reserved_serial_paths`, and `depends_on` empty; every other task must set `investigation_scope` to null.
-- Every task is canonicalized to `harness.orchestration.task.v1`. Emit only the semantic fields in the supplied schema. Task ids, dependencies, execution route, priority, custody, milestones, evidence, and proof limits are planning decisions. The controller fills program identity, pinned-SHA, reviewer, authority, token budget, lease, and empty optional-list fields before validation.
+- The top-level object has exactly `schema`, `summary`, and `tasks`; `schema` is `harness.orchestration.plan.v1`. An `investigation` task must set `investigation_scope` and must leave `owned_paths`, `reserved_serial_paths`, and `depends_on` empty; it has no global authority refs. Every other task must set `investigation_scope` to null.
+- Every task is canonicalized to `harness.orchestration.task.v1`. Emit only the semantic fields in the supplied schema. Task ids, dependencies, execution route, priority, custody, milestones, evidence, and proof limits are planning decisions. The controller fills every remaining required current-contract field before validation; persisted packets have no omitted-field reader.
 - `milestones` is an array of objects, never strings. Every milestone object has exactly `id`, `title`, `objective`, and a non-empty `success_criteria` string array.
 - Do not return repository-native wrapper fields such as `profiles`, `critical_path`, `parallel_work`, or `global_constraints`; express useful content through the controller task fields.
 - For the general profile, return exactly one root task; put the ordered implementation path in 3-12 milestone objects rather than emitting one task per phase.
@@ -16836,17 +16836,10 @@ fn canonicalize_architecture_task(
         .and_then(Value::as_array)
         .is_none_or(Vec::is_empty);
     if stop_conditions_are_empty {
-        let conditions = task
-            .get("replan_authority")
-            .and_then(Value::as_array)
-            .filter(|conditions| !conditions.is_empty())
-            .cloned()
-            .unwrap_or_else(|| {
-                vec![json!(
-                    "A genuine external, policy, authority, credential, or approval boundary prevents further progress"
-                )]
-            });
-        task.insert("stop_conditions".to_owned(), Value::Array(conditions));
+        task.insert(
+            "stop_conditions".to_owned(),
+            json!(["A genuine external, policy, authority, credential, or approval boundary prevents further progress"]),
+        );
     }
     Ok(())
 }
@@ -18069,13 +18062,13 @@ mod tests {
                 title: "Review recovery".to_owned(),
                 state: "proposed".to_owned(),
                 priority: "P1".to_owned(),
-                execution_mode: "controller_governed".to_owned(),
+                execution_mode: "controller".to_owned(),
                 execution_kind: TaskExecutionKind::Implementation,
                 investigation_scope: None,
                 owner_profile: "general".to_owned(),
                 reviewer_profile: "general".to_owned(),
                 checklist_rows: vec!["Keep recovery human controlled".to_owned()],
-                authority_refs: vec!["README.md".to_owned()],
+                authority_refs: Vec::new(),
                 base_sha: base_sha.clone(),
                 dependency_shas: BTreeMap::new(),
                 depends_on: Vec::new(),
@@ -18270,7 +18263,7 @@ mod tests {
                 owner_profile: "worker".to_owned(),
                 reviewer_profile: "human".to_owned(),
                 checklist_rows: vec!["Return a controller-bound artifact".to_owned()],
-                authority_refs: vec!["README.md".to_owned()],
+                authority_refs: Vec::new(),
                 base_sha,
                 dependency_shas: BTreeMap::new(),
                 depends_on: Vec::new(),
@@ -20630,9 +20623,7 @@ mod tests {
                 "required_evidence": ["Authoritative pipeline result"],
                 "proof_limits": ["Local evidence is not deployment proof"],
                 "diff_budget": {"files": 12, "lines": 1200},
-                "token_budget": 999999,
-                "resources": ["A representative runtime"],
-                "replan_authority": ["Stop only at a genuine external boundary"]
+                "token_budget": 999999
             }]
         })
         .to_string();
@@ -20669,7 +20660,9 @@ mod tests {
         );
         assert_eq!(
             task.stop_conditions,
-            ["Stop only at a genuine external boundary"]
+            [
+                "A genuine external, policy, authority, credential, or approval boundary prevents further progress"
+            ]
         );
         let mut investigation_with_mutable_custody: Value = serde_json::from_str(&raw).unwrap();
         investigation_with_mutable_custody["tasks"][0]["execution_kind"] = json!("investigation");
@@ -20972,6 +20965,14 @@ mod tests {
         assert_eq!(
             retry_custody_receipt(true)["current_worktree_is_only_mutable_root"],
             json!(true)
+        );
+    }
+
+    #[test]
+    fn automatic_fresh_attempt_routes_remain_unavailable() {
+        assert!(
+            !automatic_fresh_attempt_authorization_available(),
+            "automatic recovery must not create a fresh mutable attempt without an independently issued exclusive-ownership proof"
         );
     }
 

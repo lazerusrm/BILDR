@@ -7,11 +7,11 @@
   "required": [
     "schema", "program_id", "task_id", "title", "state", "priority",
     "execution_mode", "execution_kind", "investigation_scope", "owner_profile", "reviewer_profile", "checklist_rows",
-    "authority_refs", "base_sha", "depends_on", "owned_paths",
+    "authority_refs", "base_sha", "dependency_shas", "depends_on", "owned_paths",
     "forbidden_paths", "reserved_serial_paths", "objective", "milestones", "non_goals",
     "success_criteria", "required_positive_tests", "required_negative_tests",
     "required_metrics", "required_evidence", "proof_limits", "diff_budget",
-    "token_budget", "lease_expires_at", "stop_conditions", "handoff_path"
+    "token_budget", "tool_budget", "lease_expires_at", "stop_conditions", "handoff_path", "risk_flags"
   ],
   "properties": {
     "schema": { "const": "harness.orchestration.task.v1" },
@@ -50,9 +50,9 @@
       "additionalProperties": { "$ref": "#/$defs/sha" }
     },
     "depends_on": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
-    "owned_paths": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
-    "forbidden_paths": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
-    "reserved_serial_paths": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+    "owned_paths": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/repoPath" } },
+    "forbidden_paths": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/repoPath" } },
+    "reserved_serial_paths": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/repoPath" } },
     "objective": { "type": "string", "minLength": 1, "maxLength": 4000 },
     "milestones": {
       "type": "array",
@@ -77,8 +77,8 @@
       }
     },
     "token_budget": { "type": "integer", "minimum": 1000, "maximum": 100000000 },
-    "tool_budget": { "type": "integer", "minimum": 1, "maximum": 10000 },
-    "lease_expires_at": { "type": "string", "format": "date-time" },
+    "tool_budget": { "type": ["integer", "null"], "minimum": 1, "maximum": 10000 },
+    "lease_expires_at": { "oneOf": [{"const": "controller-managed"}, {"type": "string", "format": "date-time"}] },
     "stop_conditions": { "$ref": "#/$defs/nonEmptyStrings" },
     "handoff_path": { "type": "string", "minLength": 1 },
     "risk_flags": {
@@ -103,7 +103,7 @@
         "required": ["investigation_scope"],
         "properties": {
           "investigation_scope": {"type": "object"},
-          "authority_refs": {"$ref": "#/$defs/strings"},
+          "authority_refs": {"maxItems": 0},
           "owned_paths": {"maxItems": 0},
           "reserved_serial_paths": {"maxItems": 0},
           "depends_on": {"maxItems": 0},

@@ -19,7 +19,7 @@
     "limitations": {"type": "array", "maxItems": 1000, "items": {"type": "string", "minLength": 1, "maxLength": 4000}},
     "rejected_hypotheses": {"type": "array", "maxItems": 1000, "items": {"type": "string", "minLength": 1, "maxLength": 4000}},
     "sensitivity": {"type": "string", "enum": ["public", "internal", "restricted"]},
-    "artifact_refs": {"type": "array", "maxItems": 1000, "items": {"$ref": "#/$defs/id"}}
+    "artifact_refs": {"type": "array", "maxItems": 0}
   },
   "$defs": {
     "id": {"type": "string", "minLength": 1, "maxLength": 160, "pattern": "^[A-Za-z0-9._:-]+$"},

@@ -80,8 +80,10 @@ This status is intentionally a capability boundary, not release evidence.
 - adaptive supervisor policy or any independent control-plane mutation;
 - any knowledge context injection or execution activation beyond the existing
   governed display pipeline;
-- evaluation corpus, fault matrix, usability study, canary, rollback drill, and
-  production activation.
+- held-out evaluation corpus, fault-matrix execution evidence, usability study,
+  canary, rollback drill, and production activation. The closed OCP-018 fault
+  receipt contract is implemented, but no receipt is promotion evidence until
+  it pins this exact tested implementation SHA and all twelve results hold.
 
 These are not implied by the existing tables or projections. Empty, current
 sections are not evidence that a run is healthy, reconciled, or safe to resume.
@@ -101,8 +103,10 @@ withhold local validation.
 
 ## Promotion boundary
 
-No deployment or supervisory activation may use this status as release proof.
-The exact final artifact still needs complete integrated tests, an independent
-SOL-xhigh review/signoff, isolated local HTTP/database smoke evidence, binary
-provenance, and the activation evidence gates in
+No production deployment or supervisory activation may use this status as
+release proof. A controlled localhost test-harness cutover may exercise the
+current shapes, but it does not promote any capability. The exact final
+artifact still needs complete integrated tests, an independent SOL-xhigh
+review/signoff, isolated local HTTP/database smoke evidence, binary provenance,
+and the activation evidence gates in
 `EVALUATION_AND_ROLLOUT.md`.

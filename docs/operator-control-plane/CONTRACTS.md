@@ -832,3 +832,16 @@ Required property suites prove:
 - restart/replay preserves open attention, work, and cursors;
 - notification delivery cannot close attention;
 - investigation tasks cannot create candidates or mutable leases.
+
+## OCP-018 fault-matrix receipt
+
+`harness.operator-control-fault-matrix.v1` is the immutable result envelope
+for the twelve hard operator-control invariants. It pins the implementation
+SHA, requires exactly one sorted result for each closed invariant/fault pair,
+and binds every result to its executed test selector and evidence digest.
+
+The Rust contract in `harness-eval` is stricter than the transport schema: it
+requires the canonical case-to-invariant-to-injection mapping and a self
+digest. A result marked `violated`, `infrastructure_unavailable`, missing, or
+reordered is retained as evidence but fails the promotion gate. A matrix shape
+alone is not a test run and cannot stand in for its command evidence.

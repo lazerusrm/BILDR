@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:bildr:harness.operator-control-fault-matrix.v1",
+  "title": "BILDR operator-control invariant fault-matrix result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "implementation_sha", "results", "sha256"],
+  "properties": {
+    "schema": {"const": "harness.operator-control-fault-matrix.v1"},
+    "implementation_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "results": {
+      "type": "array",
+      "minItems": 12,
+      "maxItems": 12,
+      "items": {"$ref": "#/$defs/result"}
+    },
+    "sha256": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "invariant", "injection", "test_selector", "outcome", "evidence_digest"],
+      "properties": {
+        "case_id": {"enum": ["one_mutable_owner", "unknown_cannot_authorize_replacement", "source_only_attention_closure", "completion_cannot_hide_blocking_attention", "presentation_cannot_resolve", "investigation_cannot_mutate_or_create_candidate", "unknown_external_effect_never_auto_retried", "projection_never_authorizes", "replay_deterministic", "stale_version_or_digest_rejected", "critical_notification_not_omitted", "remote_runtime_absent"]},
+        "invariant": {"enum": ["one_mutable_owner", "unknown_cannot_authorize_replacement", "source_only_attention_closure", "completion_cannot_hide_blocking_attention", "presentation_cannot_resolve", "investigation_cannot_mutate_or_create_candidate", "unknown_external_effect_never_auto_retried", "projection_never_authorizes", "replay_deterministic", "stale_version_or_digest_rejected", "critical_notification_not_omitted", "remote_runtime_absent"]},
+        "injection": {"enum": ["concurrent_claim", "ownership_unknown", "forged_closure", "terminal_state_with_open_attention", "forged_presentation_receipt", "investigation_write_or_candidate_request", "unknown_external_effect", "projection_mutation_request", "reordered_replay", "stale_version_or_digest", "critical_delivery_policy", "remote_dispatch_request"]},
+        "test_selector": {"type": "string", "minLength": 1, "maxLength": 512},
+        "outcome": {"enum": ["held", "violated", "infrastructure_unavailable"]},
+        "evidence_digest": {"$ref": "#/$defs/digest"}
+      }
+    }
+  }
+}

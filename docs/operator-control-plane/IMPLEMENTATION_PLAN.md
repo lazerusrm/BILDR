@@ -171,8 +171,8 @@ Provide:
 
 ### Required tests
 
-- migrate fresh and realistic pre-0013 databases;
-- migration rollback strategy and integrity check;
+- fresh-database bootstrap to the exact current schema;
+- partial or alternate operator-control schema rejection rather than compatibility upgrade;
 - duplicate source/event/sequence/intervention idempotency;
 - concurrent attention/reconciliation/condition/delivery claims;
 - expected revision conflicts;
