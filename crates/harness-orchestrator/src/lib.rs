@@ -7079,6 +7079,12 @@ impl Orchestrator {
     }
 
     pub async fn tick(&self, run_id: &RunId) -> Result<u32, OrchestratorError> {
+        // This acquisition is intentionally separate from the scheduler-wide
+        // lock below. Deadline enforcement takes that same lock to serialize
+        // durable terminal custody with response intake; calling it while the
+        // scheduler owns the lock would self-deadlock.
+        let deadline_run = self.store.run(run_id)?;
+        self.enforce_investigation_deadlines(&deadline_run).await?;
         let _guard = self.operation_lock.lock().await;
         let mut run = self.store.run(run_id)?;
         if self.enforce_run_budget(&run)? {
@@ -7099,7 +7105,6 @@ impl Orchestrator {
         if run.state != RunState::Executing {
             return Ok(0);
         }
-        self.enforce_investigation_deadlines(&run).await?;
         self.reconcile_time_gate_conditions(&run)?;
         self.reconcile_local_capacity_conditions(&run)?;
         self.require_runtime_ready().await?;
@@ -16529,7 +16534,7 @@ fn validate_plan(
             .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
         let investigation = packet.execution_kind == TaskExecutionKind::Investigation;
         if (!investigation && packet.owned_paths.is_empty())
-            || (packet_uses_governor(packet) && !(3..=20).contains(&packet.milestones.len()))
+            || !(3..=20).contains(&packet.milestones.len())
             || packet.success_criteria.is_empty()
             || packet.required_evidence.is_empty()
             || packet.proof_limits.is_empty()
@@ -16538,7 +16543,7 @@ fn validate_plan(
             || packet.diff_budget.lines == 0
         {
             return Err(OrchestratorError::Validation(format!(
-                "task {} lacks required execution custody, 3-20 governor milestones, criteria, evidence, proof limits, or budgets",
+                "task {} lacks required execution custody, 3-20 milestones, criteria, evidence, proof limits, or budgets",
                 packet.task_id
             )));
         }
@@ -16658,6 +16663,11 @@ fn parse_architecture_plan(
     let plan = value.as_object_mut().ok_or_else(|| {
         OrchestratorError::Protocol("architecture response is not a JSON object".to_owned())
     })?;
+    reject_unexpected_architecture_fields(
+        plan,
+        &["schema", "summary", "tasks"],
+        "architecture plan",
+    )?;
     if plan.get("schema").and_then(Value::as_str) != Some("harness.orchestration.plan.v1") {
         return Err(OrchestratorError::Validation(
             "architecture response did not use harness.orchestration.plan.v1".to_owned(),
@@ -16702,6 +16712,7 @@ fn canonicalize_architecture_task(
     let task = task.as_object_mut().ok_or_else(|| {
         OrchestratorError::Protocol("architecture task is not a JSON object".to_owned())
     })?;
+    reject_unexpected_architecture_fields(task, ARCHITECT_TASK_OUTPUT_FIELDS, "architecture task")?;
 
     // These are controller facts, not architectural decisions. Canonicalizing
     // them here prevents an otherwise useful plan from consuming another
@@ -16713,34 +16724,19 @@ fn canonicalize_architecture_task(
         task.insert("execution_mode".to_owned(), json!("controller"));
         task.insert("owner_profile".to_owned(), json!("governor"));
     }
-    task.entry("reviewer_profile".to_owned())
-        .or_insert_with(|| json!("verifier"));
-    task.entry("state".to_owned())
-        .or_insert_with(|| json!("proposed"));
-    task.entry("priority".to_owned())
-        .or_insert_with(|| json!("P0"));
-    task.entry("dependency_shas".to_owned())
-        .or_insert_with(|| json!({}));
-    task.entry("depends_on".to_owned())
-        .or_insert_with(|| json!([]));
-    task.entry("reserved_serial_paths".to_owned())
-        .or_insert_with(|| json!([]));
-    task.entry("non_goals".to_owned())
-        .or_insert_with(|| json!([]));
-    task.entry("required_positive_tests".to_owned())
-        .or_insert_with(|| json!([]));
-    task.entry("required_negative_tests".to_owned())
-        .or_insert_with(|| json!([]));
-    task.entry("required_metrics".to_owned())
-        .or_insert_with(|| json!([]));
-    task.entry("tool_budget".to_owned()).or_insert(Value::Null);
-    task.entry("risk_flags".to_owned())
-        .or_insert_with(|| json!([]));
+    task.insert("reviewer_profile".to_owned(), json!("verifier"));
+    task.insert("state".to_owned(), json!("proposed"));
+    task.insert("dependency_shas".to_owned(), json!({}));
+    task.insert("required_positive_tests".to_owned(), json!([]));
+    task.insert("required_negative_tests".to_owned(), json!([]));
+    task.insert("required_metrics".to_owned(), json!([]));
+    task.insert("tool_budget".to_owned(), Value::Null);
     task.insert("token_budget".to_owned(), json!(default_token_budget));
-    task.entry("lease_expires_at".to_owned())
-        .or_insert_with(|| json!("controller-managed"));
-    task.entry("handoff_path".to_owned())
-        .or_insert_with(|| json!("controller://governor-checkpoint"));
+    task.insert("lease_expires_at".to_owned(), json!("controller-managed"));
+    task.insert(
+        "handoff_path".to_owned(),
+        json!("controller://governor-checkpoint"),
+    );
 
     let execution_kind = task
         .get("execution_kind")
@@ -16756,31 +16752,25 @@ fn canonicalize_architecture_task(
         ));
     }
     let is_investigation = execution_kind == "investigation";
-    let authority_refs_are_empty = task
-        .get("authority_refs")
-        .and_then(Value::as_array)
-        .is_none_or(Vec::is_empty);
-    if authority_refs_are_empty {
-        if is_investigation {
-            // The architect output schema intentionally omits this
-            // controller-populated field. Investigations may have no global
-            // authority file; their complete admissible read authority is
-            // their explicit bounded scope.
-            task.insert("authority_refs".to_owned(), json!([]));
-        } else {
-            let mut authorities = profile
-                .instruction_sources
-                .iter()
-                .chain(&profile.required_global_authorities)
-                .cloned()
-                .collect::<Vec<_>>();
-            authorities.sort();
-            authorities.dedup();
-            if authorities.is_empty() {
-                authorities.push("controller://run-objective".to_owned());
-            }
-            task.insert("authority_refs".to_owned(), json!(authorities));
+    if is_investigation {
+        // The architect output schema intentionally omits this
+        // controller-populated field. Investigations may have no global
+        // authority file; their complete admissible read authority is their
+        // explicit bounded scope.
+        task.insert("authority_refs".to_owned(), json!([]));
+    } else {
+        let mut authorities = profile
+            .instruction_sources
+            .iter()
+            .chain(&profile.required_global_authorities)
+            .cloned()
+            .collect::<Vec<_>>();
+        authorities.sort();
+        authorities.dedup();
+        if authorities.is_empty() {
+            authorities.push("controller://run-objective".to_owned());
         }
+        task.insert("authority_refs".to_owned(), json!(authorities));
     }
 
     let mut forbidden_paths = task
@@ -16796,36 +16786,45 @@ fn canonicalize_architecture_task(
     forbidden_paths.dedup();
     task.insert("forbidden_paths".to_owned(), json!(forbidden_paths));
 
-    let checklist_is_empty = task
-        .get("checklist_rows")
+    let checklist = task
+        .get("milestones")
         .and_then(Value::as_array)
-        .is_none_or(Vec::is_empty);
-    if checklist_is_empty {
-        let checklist = task
-            .get("milestones")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|milestone| {
-                let id = milestone.get("id")?.as_str()?;
-                let title = milestone.get("title")?.as_str()?;
-                Some(format!("{id}: {title}"))
-            })
-            .collect::<Vec<_>>();
-        if !checklist.is_empty() {
-            task.insert("checklist_rows".to_owned(), json!(checklist));
-        }
+        .into_iter()
+        .flatten()
+        .filter_map(|milestone| {
+            let id = milestone.get("id")?.as_str()?;
+            let title = milestone.get("title")?.as_str()?;
+            Some(format!("{id}: {title}"))
+        })
+        .collect::<Vec<_>>();
+    if !checklist.is_empty() {
+        task.insert("checklist_rows".to_owned(), json!(checklist));
     }
 
-    let stop_conditions_are_empty = task
-        .get("stop_conditions")
-        .and_then(Value::as_array)
-        .is_none_or(Vec::is_empty);
-    if stop_conditions_are_empty {
-        task.insert(
-            "stop_conditions".to_owned(),
-            json!(["A genuine external, policy, authority, credential, or approval boundary prevents further progress"]),
-        );
+    task.insert(
+        "stop_conditions".to_owned(),
+        json!(["A genuine external, policy, authority, credential, or approval boundary prevents further progress"]),
+    );
+    Ok(())
+}
+
+fn reject_unexpected_architecture_fields(
+    object: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+    label: &str,
+) -> Result<(), OrchestratorError> {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(OrchestratorError::Validation(format!(
+            "{label} supplied controller-owned or unknown field {field}"
+        )));
+    }
+    if let Some(field) = allowed.iter().find(|field| !object.contains_key(**field)) {
+        return Err(OrchestratorError::Validation(format!(
+            "{label} is missing required architectural field {field}"
+        )));
     }
     Ok(())
 }
@@ -17788,6 +17787,29 @@ mod tests {
     };
     use tempfile::TempDir;
 
+    fn current_contract_fixture_milestones() -> Vec<TaskMilestone> {
+        vec![
+            TaskMilestone {
+                id: "scope".to_owned(),
+                title: "Establish bounded custody".to_owned(),
+                objective: "Bind the task to its current controller contract.".to_owned(),
+                success_criteria: vec!["The task packet is controller-valid".to_owned()],
+            },
+            TaskMilestone {
+                id: "execute".to_owned(),
+                title: "Exercise the bounded path".to_owned(),
+                objective: "Perform only the authorized fixture lifecycle.".to_owned(),
+                success_criteria: vec!["The required lifecycle action completes".to_owned()],
+            },
+            TaskMilestone {
+                id: "verify".to_owned(),
+                title: "Record the terminal proof".to_owned(),
+                objective: "Leave an exact controller-visible result.".to_owned(),
+                success_criteria: vec!["The test can verify the durable state".to_owned()],
+            },
+        ]
+    }
+
     #[derive(Default)]
     struct RolloutLostPlanReviewRuntime {
         started_threads: StdMutex<Vec<StartThread>>,
@@ -18260,7 +18282,7 @@ mod tests {
                 forbidden_paths: Vec::new(),
                 reserved_serial_paths: Vec::new(),
                 objective: "Produce an immutable, bounded investigation report.".to_owned(),
-                milestones: Vec::new(),
+                milestones: current_contract_fixture_milestones(),
                 non_goals: vec!["Do not modify the repository".to_owned()],
                 success_criteria: vec!["A bound artifact is recorded".to_owned()],
                 required_positive_tests: Vec::new(),
@@ -18406,7 +18428,7 @@ mod tests {
             forbidden_paths: Vec::new(),
             reserved_serial_paths: Vec::new(),
             objective: "Resume from the preserved commit only after proof.".to_owned(),
-            milestones: Vec::new(),
+            milestones: current_contract_fixture_milestones(),
             non_goals: vec!["Do not release an active lease".to_owned()],
             success_criteria: vec!["One exact fresh attempt is authorized".to_owned()],
             required_positive_tests: Vec::new(),
@@ -18661,10 +18683,15 @@ mod tests {
             .task_packet(&task_id)
             .expect("packet reads")
             .expect("packet exists");
-        let mut raw = serde_json::to_value(packet).expect("packet serializes");
-        raw.as_object_mut()
-            .expect("task packet is an object")
-            .remove("authority_refs");
+        let raw = serde_json::to_value(packet).expect("packet serializes");
+        let mut raw = Value::Object(
+            raw.as_object()
+                .expect("task packet is an object")
+                .iter()
+                .filter(|(field, _)| ARCHITECT_TASK_OUTPUT_FIELDS.contains(&field.as_str()))
+                .map(|(field, value)| (field.clone(), value.clone()))
+                .collect(),
+        );
 
         canonicalize_architecture_task(
             &run,
@@ -18978,6 +19005,53 @@ mod tests {
                 .list_investigation_artifacts(Some(run_id.as_str()), Some("INVESTIGATION-001"), 10)
                 .expect("artifact list reads")
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_tick_does_not_reenter_the_investigation_deadline_lock() {
+        let (orchestrator, _temp, _runtime, run_id, task_id) = investigation_fixture().await;
+        orchestrator
+            .tick(&run_id)
+            .await
+            .expect("investigation starts");
+        let investigator = orchestrator
+            .store()
+            .list_agents(&run_id)
+            .expect("agents read")
+            .into_iter()
+            .find(|agent| agent.role == AgentRole::Investigator)
+            .expect("investigator exists");
+        orchestrator
+            .store()
+            .put_runtime_metadata(
+                &investigation_deadline_metadata_key(&investigator.id),
+                &json!({"deadline_ms": 0}),
+            )
+            .expect("expired deadline persists");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            orchestrator.tick(&run_id),
+        )
+        .await
+        .expect("scheduler tick must not wait on its own deadline lock")
+        .expect("deadline is finalized before scheduling");
+        assert_eq!(
+            orchestrator
+                .store()
+                .task(&task_id)
+                .expect("task reads")
+                .state,
+            TaskState::NeedsHelp
+        );
+        assert_eq!(
+            orchestrator
+                .store()
+                .agent(&investigator.id)
+                .expect("agent reads")
+                .state,
+            "FAILED"
         );
     }
 
@@ -20788,8 +20862,11 @@ mod tests {
                 "title": "Deliver the behavior",
                 "objective": "Implement and prove the requested behavior",
                 "priority": "P1",
+                "execution_mode": "agent",
+                "owner_profile": "worker",
                 "execution_kind": "implementation",
                 "investigation_scope": null,
+                "depends_on": [],
                 "owned_paths": ["src/**", "Cargo.lock"],
                 "reserved_serial_paths": ["Cargo.lock"],
                 "milestones": [
@@ -20801,7 +20878,8 @@ mod tests {
                 "required_evidence": ["Authoritative pipeline result"],
                 "proof_limits": ["Local evidence is not deployment proof"],
                 "diff_budget": {"files": 12, "lines": 1200},
-                "token_budget": 999999
+                "non_goals": [],
+                "risk_flags": []
             }]
         })
         .to_string();
@@ -20811,9 +20889,17 @@ mod tests {
             .as_object_mut()
             .expect("task is an object")
             .remove("execution_kind");
+        assert!(
+            parse_architecture_plan(&run, &profile, 80_000, &missing_execution_kind.to_string(),)
+                .is_err()
+        );
+
+        let mut controller_owned = serde_json::from_str::<Value>(&raw).unwrap();
+        controller_owned["tasks"][0]["authority_refs"] = json!(["README.md"]);
         assert!(matches!(
-            parse_architecture_plan(&run, &profile, 80_000, &missing_execution_kind.to_string(),),
-            Err(OrchestratorError::Protocol(_))
+            parse_architecture_plan(&run, &profile, 80_000, &controller_owned.to_string()),
+            Err(OrchestratorError::Validation(message))
+                if message.contains("controller-owned or unknown field authority_refs")
         ));
 
         let plan = parse_architecture_plan(&run, &profile, 80_000, &raw).unwrap();

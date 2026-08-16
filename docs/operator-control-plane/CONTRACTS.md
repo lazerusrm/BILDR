@@ -850,4 +850,7 @@ runner requires `--expected-sha`, writes a complete receipt even for an
 unavailable individual test, then re-reads every transcript and the source
 identity log before admitting the receipt. `cargo xtask
 operator-control-fault-matrix-verify` repeats that evidence check and rejects
-any release SHA other than the requested exact commit.
+any release SHA other than the requested exact commit. Each fault command has
+an isolated process group, a bounded output capture, and a bounded post-exit
+pipe drain; a lingering descendant or incomplete capture is recorded as
+infrastructure-unavailable rather than accepted as a held invariant.

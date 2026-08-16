@@ -4,6 +4,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
+    sync::mpsc::{self, Receiver},
     thread,
     time::{Duration, Instant},
 };
@@ -35,6 +36,8 @@ const IMPROVEMENT_CRATES: &[&str] = &[
 const IMPROVEMENT_RUST_FILE_LINE_BUDGET: usize = 1_200;
 const IMPROVEMENT_UI_FILE_LINE_BUDGET: usize = 1_200;
 const OPERATOR_CONTROL_FAULT_TIMEOUT: Duration = Duration::from_secs(300);
+const OPERATOR_CONTROL_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_OPERATOR_CONTROL_PIPE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 struct SchemaDocument {
@@ -310,19 +313,26 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
 enum FaultExecution {
     Completed {
         status: ExitStatus,
-        stdout: Vec<u8>,
-        stderr: Vec<u8>,
+        stdout: FaultPipe,
+        stderr: FaultPipe,
+        completion_issue: Option<String>,
     },
     TimedOut {
-        stdout: Vec<u8>,
-        stderr: Vec<u8>,
+        stdout: FaultPipe,
+        stderr: FaultPipe,
     },
     SpawnFailed(String),
     WaitFailed {
         error: String,
-        stdout: Vec<u8>,
-        stderr: Vec<u8>,
+        stdout: FaultPipe,
+        stderr: FaultPipe,
     },
+}
+
+#[derive(Debug, Default)]
+struct FaultPipe {
+    bytes: Vec<u8>,
+    issue: Option<String>,
 }
 
 fn run_fault_command(command: &mut Command) -> FaultExecution {
@@ -366,6 +376,9 @@ fn run_fault_command(command: &mut Command) -> FaultExecution {
             }
         }
     }
+    let completion_issue = terminal
+        .as_ref()
+        .and_then(|_| terminate_fault_process_group(child.id()));
     let stdout = collect_child_pipe(stdout);
     let stderr = collect_child_pipe(stderr);
     if let Some(error) = wait_error {
@@ -379,6 +392,7 @@ fn run_fault_command(command: &mut Command) -> FaultExecution {
             status,
             stdout,
             stderr,
+            completion_issue,
         }
     } else {
         FaultExecution::TimedOut { stdout, stderr }
@@ -386,44 +400,88 @@ fn run_fault_command(command: &mut Command) -> FaultExecution {
 }
 
 fn terminate_fault_command(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        use rustix::{
-            io::Errno,
-            process::{Pid, Signal, getpgid, kill_process_group},
-        };
-
-        if let Some(pid) = child.id().try_into().ok().and_then(Pid::from_raw) {
-            match getpgid(Some(pid)) {
-                Ok(group) if group == pid => match kill_process_group(group, Signal::KILL) {
-                    Ok(()) | Err(Errno::SRCH) => return,
-                    Err(_) => {}
-                },
-                Err(Errno::SRCH) => return,
-                Ok(_) | Err(_) => {}
-            }
-        }
+    if terminate_fault_process_group(child.id()).is_some() {
+        return;
     }
     let _ = child.kill();
 }
 
-fn read_child_pipe<R>(mut pipe: R) -> thread::JoinHandle<Result<Vec<u8>, std::io::Error>>
+/// Returns a diagnostic when a process group required active containment. A
+/// normal completed test has no group members after Cargo exits, so any member
+/// left here turns the receipt into infrastructure-unavailable evidence.
+fn terminate_fault_process_group(pid: u32) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use rustix::{
+            io::Errno,
+            process::{Pid, Signal, kill_process_group},
+        };
+
+        if let Some(group) = pid.try_into().ok().and_then(Pid::from_raw) {
+            return match kill_process_group(group, Signal::KILL) {
+                Ok(()) => {
+                    Some("fault process group retained descendants after Cargo exited".to_owned())
+                }
+                Err(Errno::SRCH) => None,
+                Err(error) => Some(format!(
+                    "could not prove the fault process group was empty: {error}"
+                )),
+            };
+        }
+    }
+    None
+}
+
+fn read_child_pipe<R>(mut pipe: R) -> Receiver<Result<FaultPipe, std::io::Error>>
 where
     R: Read + Send + 'static,
 {
+    let (sender, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
-        let mut bytes = Vec::new();
-        pipe.read_to_end(&mut bytes)?;
-        Ok(bytes)
-    })
+        let mut capture = FaultPipe::default();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = pipe.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let remaining = MAX_OPERATOR_CONTROL_PIPE_BYTES.saturating_sub(capture.bytes.len());
+            let retained = remaining.min(read);
+            capture.bytes.extend_from_slice(&buffer[..retained]);
+            if retained < read && capture.issue.is_none() {
+                capture.issue = Some(format!(
+                    "pipe capture exceeded {MAX_OPERATOR_CONTROL_PIPE_BYTES} bytes"
+                ));
+            }
+        }
+        let _ = sender.send(Ok(capture));
+        Ok::<(), std::io::Error>(())
+    });
+    receiver
 }
 
-fn collect_child_pipe(
-    pipe: Option<thread::JoinHandle<Result<Vec<u8>, std::io::Error>>>,
-) -> Vec<u8> {
-    pipe.and_then(|reader| reader.join().ok())
-        .and_then(Result::ok)
-        .unwrap_or_default()
+fn collect_child_pipe(pipe: Option<Receiver<Result<FaultPipe, std::io::Error>>>) -> FaultPipe {
+    let Some(pipe) = pipe else {
+        return FaultPipe::default();
+    };
+    match pipe.recv_timeout(OPERATOR_CONTROL_PIPE_DRAIN_TIMEOUT) {
+        Ok(Ok(capture)) => capture,
+        Ok(Err(error)) => FaultPipe {
+            bytes: Vec::new(),
+            issue: Some(format!("pipe reader failed: {error}")),
+        },
+        Err(mpsc::RecvTimeoutError::Timeout) => FaultPipe {
+            bytes: Vec::new(),
+            issue: Some(format!(
+                "pipe reader did not close within {} seconds",
+                OPERATOR_CONTROL_PIPE_DRAIN_TIMEOUT.as_secs()
+            )),
+        },
+        Err(mpsc::RecvTimeoutError::Disconnected) => FaultPipe {
+            bytes: Vec::new(),
+            issue: Some("pipe reader disconnected before completing capture".to_owned()),
+        },
+    }
 }
 
 fn fault_transcript(selector: &str, execution: &FaultExecution) -> String {
@@ -432,18 +490,26 @@ fn fault_transcript(selector: &str, execution: &FaultExecution) -> String {
             status,
             stdout,
             stderr,
+            completion_issue,
         } => (
             "completed",
             status.to_string(),
-            stdout.as_slice(),
-            stderr.as_slice(),
-            None,
+            stdout.bytes.as_slice(),
+            stderr.bytes.as_slice(),
+            completion_issue
+                .clone()
+                .or_else(|| stdout.issue.clone())
+                .or_else(|| stderr.issue.clone())
+                .map_or_else(
+                    || Some("capture: complete".to_owned()),
+                    |issue| Some(format!("capture: incomplete\n{issue}")),
+                ),
         ),
         FaultExecution::TimedOut { stdout, stderr } => (
             "timed_out",
             "unavailable".to_owned(),
-            stdout.as_slice(),
-            stderr.as_slice(),
+            stdout.bytes.as_slice(),
+            stderr.bytes.as_slice(),
             Some(format!(
                 "timeout_seconds: {}",
                 OPERATOR_CONTROL_FAULT_TIMEOUT.as_secs()
@@ -463,8 +529,8 @@ fn fault_transcript(selector: &str, execution: &FaultExecution) -> String {
         } => (
             "wait_failed",
             "unavailable".to_owned(),
-            stdout.as_slice(),
-            stderr.as_slice(),
+            stdout.bytes.as_slice(),
+            stderr.bytes.as_slice(),
             Some(format!("wait_error: {error}")),
         ),
     };
@@ -527,6 +593,7 @@ fn verify_fault_matrix_evidence(
 fn fault_outcome_from_transcript(transcript: &str) -> FaultOutcome {
     if transcript.starts_with("$ ")
         && transcript.contains("execution: completed\nexit_status: exit status: 0\n")
+        && transcript.contains("capture: complete\n")
         && transcript.contains("test result: ok. 1 passed;")
     {
         FaultOutcome::Held
@@ -611,7 +678,7 @@ fn fault_test_command(case: OperatorControlFaultCase) -> (&'static str, &'static
 }
 
 fn fault_outcome(execution: &FaultExecution, transcript: &str) -> FaultOutcome {
-    if matches!(execution, FaultExecution::Completed { status, .. } if status.success())
+    if matches!(execution, FaultExecution::Completed { status, completion_issue: None, stdout, stderr } if status.success() && stdout.issue.is_none() && stderr.issue.is_none())
         && transcript.contains("test result: ok. 1 passed;")
     {
         FaultOutcome::Held
@@ -1543,7 +1610,7 @@ mod tests {
             .map(|case| {
                 let evidence_file = format!("{}.log", case.invariant.case_id());
                 let transcript = format!(
-                    "$ {}\nexecution: completed\nexit_status: exit status: 0\n--- stdout ---\ntest result: ok. 1 passed;\n--- stderr ---\n",
+                    "$ {}\nexecution: completed\nexit_status: exit status: 0\ncapture: complete\n--- stdout ---\ntest result: ok. 1 passed;\n--- stderr ---\n",
                     case.test_selector
                 );
                 fs::write(evidence_dir.path().join(&evidence_file), &transcript).unwrap();
@@ -1590,6 +1657,17 @@ mod tests {
             run_fault_command(&mut command),
             FaultExecution::SpawnFailed(_)
         ));
+    }
+
+    #[test]
+    fn fault_pipe_capture_is_bounded_and_marks_truncation() {
+        let capture = collect_child_pipe(Some(read_child_pipe(std::io::Cursor::new(vec![
+            b'x';
+            MAX_OPERATOR_CONTROL_PIPE_BYTES
+                + 1
+        ]))));
+        assert_eq!(capture.bytes.len(), MAX_OPERATOR_CONTROL_PIPE_BYTES);
+        assert!(capture.issue.is_some());
     }
 
     #[test]
