@@ -1279,7 +1279,6 @@ fn validate_openapi_identifier_contracts(openapi: &serde_yaml::Value) -> Result<
         "/paths/~1improvement~1evaluations~1cases~1{caseRevisionId}/get/parameters/0/schema/$ref",
         "/paths/~1improvement~1evaluations~1occurrences~1{occurrenceId}/get/parameters/0/schema/$ref",
         "/components/schemas/EvaluationRunSummary/properties/id/$ref",
-        "/components/schemas/EvaluationRunSummary/properties/controller_run_id/$ref",
         "/components/schemas/EvaluationRunSummary/properties/taskset_revision_id/$ref",
         "/components/schemas/EvaluationRunSummary/properties/grader_bundle_revision_id/$ref",
         "/components/schemas/EvaluationSampleSummary/properties/id/$ref",
@@ -1290,10 +1289,15 @@ fn validate_openapi_identifier_contracts(openapi: &serde_yaml::Value) -> Result<
         "/components/schemas/EvaluationCaseSummary/properties/task_family/$ref",
         "/components/schemas/EvaluationCaseSummary/properties/grader_bundle_id/$ref",
         "/components/schemas/EvaluationOccurrenceSource/properties/occurrence_id/$ref",
+    ] {
+        require(pointer, "#/components/schemas/EvaluationId")?;
+    }
+    for pointer in [
+        "/components/schemas/EvaluationRunSummary/properties/controller_run_id/$ref",
         "/components/schemas/EvaluationOccurrenceSource/properties/repository_id/$ref",
         "/components/schemas/EvaluationOccurrenceSource/properties/run_id/$ref",
     ] {
-        require(pointer, "#/components/schemas/EvaluationId")?;
+        require(pointer, "#/components/schemas/OpaqueId")?;
     }
     Ok(())
 }

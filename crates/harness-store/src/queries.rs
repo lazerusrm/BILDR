@@ -384,8 +384,10 @@ impl Store {
             ));
         }
         let split = pins.split;
+        let (initial_status_id, initial_status_idempotency_key) =
+            initial_evaluation_run_status_identifiers(input);
         tx.execute("INSERT INTO evaluation_runs(id,controller_run_id,taskset_revision_id,grader_bundle_revision_id,split,base_sha,fixture_digest,runtime_digest,seed_policy_digest,champion_policy_digest,challenger_policy_digest,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![input.id,input.controller_run_id.as_str(),input.taskset_revision_id,input.grader_bundle_revision_id,split_text(split),input.base_sha,input.fixture_digest,input.runtime_digest,input.seed_policy_digest,input.champion_policy_digest,input.challenger_policy_digest,input.idempotency_key,now_ms()])?;
-        tx.execute("INSERT INTO evaluation_run_status_revisions(id,evaluation_run_id,sequence,status,receipt_digest,idempotency_key,created_at) VALUES(?1,?2,1,'recording',?3,?4,?5)",params![format!("{}-recording",input.id),input.id,input.runtime_digest,format!("{}-recording",input.idempotency_key),now_ms()])?;
+        tx.execute("INSERT INTO evaluation_run_status_revisions(id,evaluation_run_id,sequence,status,receipt_digest,idempotency_key,created_at) VALUES(?1,?2,1,'recording',?3,?4,?5)",params![initial_status_id,input.id,input.runtime_digest,initial_status_idempotency_key,now_ms()])?;
         let receipt = read_evaluation_run(&tx, &input.id)?;
         tx.commit()?;
         Ok(receipt)
@@ -5475,14 +5477,15 @@ fn invalidation_reason_text(value: EvaluationInvalidationReason) -> &'static str
 }
 
 fn validate_new_evaluation_run(input: &NewEvaluationRun) -> Result<(), StoreError> {
+    safe_eval_id(input.controller_run_id.as_str(), 160)?;
     for value in [
         &input.id,
         &input.taskset_revision_id,
         &input.grader_bundle_revision_id,
-        &input.idempotency_key,
     ] {
-        safe_eval_id(value, 200)?;
+        safe_eval_id(value, 128)?;
     }
+    safe_eval_id(&input.idempotency_key, 200)?;
     for value in [
         &input.fixture_digest,
         &input.runtime_digest,
@@ -5503,6 +5506,30 @@ fn validate_new_evaluation_run(input: &NewEvaluationRun) -> Result<(), StoreErro
         return Err(StoreError::Validation("invalid evaluation base SHA".into()));
     }
     Ok(())
+}
+
+fn initial_evaluation_run_status_identifiers(input: &NewEvaluationRun) -> (String, String) {
+    let status_id = format!(
+        "evaluation-run-status-{}",
+        sha256(
+            format!(
+                "harness.evaluation-run-status.v1\\0{}\\0recording",
+                input.id
+            )
+            .as_bytes()
+        )
+    );
+    let idempotency_key = format!(
+        "evaluation-run-status-{}",
+        sha256(
+            format!(
+                "harness.evaluation-run-status-idempotency.v1\\0{}\\0recording",
+                input.idempotency_key
+            )
+            .as_bytes()
+        )
+    );
+    (status_id, idempotency_key)
 }
 
 fn require_eval_revision(
@@ -7761,6 +7788,52 @@ mod tests {
             })
             .unwrap();
         (store, run_id)
+    }
+
+    fn new_evaluation_run() -> NewEvaluationRun {
+        NewEvaluationRun {
+            id: "evaluation-run".to_owned(),
+            controller_run_id: RunId::from("controller-run"),
+            taskset_revision_id: "taskset-revision".to_owned(),
+            grader_bundle_revision_id: "grader-revision".to_owned(),
+            base_sha: "a".repeat(40),
+            fixture_digest: "b".repeat(64),
+            runtime_digest: "c".repeat(64),
+            seed_policy_digest: "d".repeat(64),
+            champion_policy_digest: "e".repeat(64),
+            challenger_policy_digest: None,
+            idempotency_key: "evaluation-launch".to_owned(),
+        }
+    }
+
+    #[test]
+    fn evaluation_run_identifiers_are_bounded_separately_from_idempotency() {
+        let mut input = new_evaluation_run();
+        input.id = "a".repeat(128);
+        input.taskset_revision_id = "b".repeat(128);
+        input.grader_bundle_revision_id = "c".repeat(128);
+        input.idempotency_key = "d".repeat(200);
+        assert!(validate_new_evaluation_run(&input).is_ok());
+        let (status_id, status_idempotency_key) = initial_evaluation_run_status_identifiers(&input);
+        assert!(safe_eval_id(&status_id, 128).is_ok());
+        assert!(safe_eval_id(&status_idempotency_key, 200).is_ok());
+
+        input.controller_run_id = RunId::from("e".repeat(161));
+        assert!(validate_new_evaluation_run(&input).is_err());
+        input.controller_run_id = RunId::from("e".repeat(160));
+        assert!(validate_new_evaluation_run(&input).is_ok());
+
+        input.id = "a".repeat(129);
+        assert!(validate_new_evaluation_run(&input).is_err());
+        input.id = "a".repeat(128);
+        input.taskset_revision_id = "b".repeat(129);
+        assert!(validate_new_evaluation_run(&input).is_err());
+        input.taskset_revision_id = "b".repeat(128);
+        input.grader_bundle_revision_id = "c".repeat(129);
+        assert!(validate_new_evaluation_run(&input).is_err());
+        input.grader_bundle_revision_id = "c".repeat(128);
+        input.idempotency_key = "d".repeat(201);
+        assert!(validate_new_evaluation_run(&input).is_err());
     }
 
     #[test]

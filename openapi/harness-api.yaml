@@ -2968,7 +2968,7 @@ components:
       required: [id, controller_run_id, taskset_revision_id, grader_bundle_revision_id, split, status, invalidated]
       properties:
         id: {$ref: '#/components/schemas/EvaluationId'}
-        controller_run_id: {$ref: '#/components/schemas/EvaluationId'}
+        controller_run_id: {$ref: '#/components/schemas/OpaqueId'}
         taskset_revision_id: {$ref: '#/components/schemas/EvaluationId'}
         grader_bundle_revision_id: {$ref: '#/components/schemas/EvaluationId'}
         split: {enum: [training, development, holdout, canary, quarantine]}
@@ -3010,8 +3010,8 @@ components:
       required: [occurrence_id, repository_id, run_id, base_sha, source_receipt_sha256, source_kind, trace_revision_id, trace_digest, outcome_revision_id, outcome_digest]
       properties:
         occurrence_id: {$ref: '#/components/schemas/EvaluationId'}
-        repository_id: {$ref: '#/components/schemas/EvaluationId'}
-        run_id: {$ref: '#/components/schemas/EvaluationId'}
+        repository_id: {$ref: '#/components/schemas/OpaqueId'}
+        run_id: {$ref: '#/components/schemas/OpaqueId'}
         base_sha: {type: string, pattern: '^[0-9a-f]{40}$'}
         source_receipt_sha256: {$ref: '#/components/schemas/Digest'}
         source_kind: {enum: [attempt_terminal, run_terminal, typed_outcome]}

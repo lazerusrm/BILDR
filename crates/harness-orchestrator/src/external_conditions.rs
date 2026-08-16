@@ -448,6 +448,13 @@ fn local_capacity_outcome(
 }
 
 fn local_capacity_poll_due(condition: &ExternalCondition, now: i64) -> bool {
+    if condition
+        .poll_policy
+        .deadline_ms
+        .is_some_and(|deadline| now >= deadline)
+    {
+        return true;
+    }
     let Some(last_observation) = &condition.last_observation else {
         return true;
     };
@@ -618,6 +625,31 @@ mod tests {
                 available_bytes: 99,
                 minimum_available_bytes: 100
             })
+        );
+    }
+
+    #[test]
+    fn local_capacity_deadline_overrides_poll_backoff() {
+        let mut condition = local_capacity_condition(Some(1_001));
+        condition.sequence = 7;
+        condition.last_observation = Some(ConditionObservation {
+            schema: "harness.condition-observation.v1".to_owned(),
+            observation_id: ConditionObservationId::new(),
+            condition_id: condition.condition_id.clone(),
+            source_event_id: "capacity-observation".to_owned(),
+            sequence: 7,
+            observed_at_ms: 1_000,
+            state: ExternalConditionState::Open,
+            payload: json!({"reason": "below_threshold"}),
+            sha256: "a".repeat(64),
+        });
+        assert!(
+            !local_capacity_poll_due(&condition, 1_000),
+            "the saturated poll interval is not due before the deadline"
+        );
+        assert!(
+            local_capacity_poll_due(&condition, 1_001),
+            "the deadline must override the prior poll backoff"
         );
     }
 }

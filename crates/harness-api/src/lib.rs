@@ -1504,7 +1504,7 @@ async fn get_evaluation_run(
         .evaluation_run(&evaluation_run_id)?;
     Ok(Json(EvaluationRunResponse {
         id: checked_failure_identifier(value.id, "evaluation run id")?,
-        controller_run_id: checked_failure_identifier(
+        controller_run_id: checked_operator_control_identifier(
             value.controller_run_id.to_string(),
             "controller run id",
         )?,
@@ -1589,11 +1589,11 @@ async fn get_evaluation_occurrence_source(
         .failure_development_case_source(&occurrence_id)?;
     Ok(Json(EvaluationOccurrenceSourceResponse {
         occurrence_id: checked_failure_identifier(value.occurrence_id, "occurrence id")?,
-        repository_id: checked_failure_identifier(
+        repository_id: checked_operator_control_identifier(
             value.repository_id.to_string(),
             "repository id",
         )?,
-        run_id: checked_failure_identifier(value.run_id.to_string(), "run id")?,
+        run_id: checked_operator_control_identifier(value.run_id.to_string(), "run id")?,
         base_sha: checked_base_sha(value.base_sha)?,
         source_receipt_sha256: checked_digest(
             value.source_receipt_sha256,
@@ -1827,6 +1827,14 @@ fn validate_failure_read_identifier(value: &str, field: &str) -> Result<(), ApiE
 fn checked_failure_identifier(value: String, field: &str) -> Result<String, ApiError> {
     validate_failure_read_identifier(&value, field)?;
     Ok(value)
+}
+
+fn checked_operator_control_identifier(value: String, field: &str) -> Result<String, ApiError> {
+    if is_safe_failure_identifier(&value, 160) {
+        Ok(value)
+    } else {
+        Err(OrchestratorError::Validation(format!("invalid operator-control {field}")).into())
+    }
 }
 
 async fn outcome_history(
@@ -2389,6 +2397,8 @@ mod tests {
         .is_err());
         assert!(validate_failure_read_identifier("trace:01J", "trace_id").is_ok());
         assert!(validate_failure_read_identifier("trace/01J", "trace_id").is_err());
+        assert!(checked_operator_control_identifier("a".repeat(160), "run id").is_ok());
+        assert!(checked_operator_control_identifier("a".repeat(161), "run id").is_err());
     }
 
     #[test]
