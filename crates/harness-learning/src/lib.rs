@@ -136,7 +136,9 @@ impl CostAttribution {
 
     fn valid(&self) -> bool {
         match (&self.scope_id, self.lower_microusd, self.upper_microusd) {
-            (Some(scope), Some(lower), Some(upper)) => safe_token(scope) && lower <= upper,
+            (Some(scope), Some(lower), Some(upper)) => {
+                safe_failure_cost_scope(scope) && lower <= upper
+            }
             (None, None, None) => true,
             _ => false,
         }
@@ -276,8 +278,8 @@ impl FailureOccurrence {
 
     pub fn from_typed(input: FailureInput) -> Result<Self, LearningError> {
         if !safe_token(&input.occurrence_id)
-            || !safe_token(&input.repository_id)
-            || !safe_token(&input.source_id)
+            || !safe_controller_identifier(&input.repository_id)
+            || !safe_controller_identifier(&input.source_id)
         {
             return Err(LearningError::InvalidOccurrence(input.occurrence_id));
         }
@@ -738,6 +740,21 @@ fn safe_token(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
 }
 
+fn safe_controller_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 160
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+}
+
+fn safe_failure_cost_scope(value: &str) -> bool {
+    safe_token(value)
+        || value
+            .strip_prefix("run:")
+            .is_some_and(safe_controller_identifier)
+}
+
 const fn scope_code(scope: FailureScope) -> &'static str {
     match scope {
         FailureScope::AttemptTerminal => "attempt_terminal",
@@ -1026,6 +1043,31 @@ mod tests {
         assert_eq!(
             FailureOccurrence::try_from(mutated),
             Err(LearningError::InvalidWire("terminal_code/class pairing"))
+        );
+    }
+
+    #[test]
+    fn failure_wire_preserves_160_character_controller_identities() {
+        let run_id = "r".repeat(160);
+        let occurrence = FailureOccurrence::from_typed(FailureInput {
+            occurrence_id: "failure-160".into(),
+            repository_id: run_id.clone(),
+            source_id: "a".repeat(160),
+            scope: FailureScope::AttemptTerminal,
+            terminal_code: TerminalCode::parse("budget_exhausted"),
+            severity: Severity::Unknown,
+            cost: CostAttribution::known(format!("run:{run_id}"), 10, 15),
+        })
+        .expect("controller identities are valid failure evidence");
+        let wire = FailureWireOccurrence::from(&occurrence);
+        assert_eq!(wire.repository_id.len(), 160);
+        assert_eq!(wire.source.id.len(), 160);
+        assert_eq!(
+            FailureOccurrence::try_from(wire)
+                .expect("failure wire round-trips controller identities")
+                .cost
+                .scope_id,
+            Some(format!("run:{run_id}"))
         );
     }
 

@@ -2204,6 +2204,63 @@ mod tests {
     }
 
     #[test]
+    fn controller_identity_schemas_preserve_160_character_run_and_attempt_ids() {
+        let trace: Value =
+            serde_json::from_str(include_str!("../../schemas/harness.trace.v2.schema.json"))
+                .unwrap();
+        assert_eq!(
+            trace
+                .pointer("/properties/run_id/pattern")
+                .and_then(Value::as_str),
+            Some("^[A-Za-z0-9_.:-]{1,160}$")
+        );
+        assert_eq!(
+            trace
+                .pointer("/properties/task_attempt_id/pattern")
+                .and_then(Value::as_str),
+            Some("^[A-Za-z0-9_.:-]{1,160}$")
+        );
+
+        let failure: Value =
+            serde_json::from_str(include_str!("../../schemas/harness.failure.v1.schema.json"))
+                .unwrap();
+        assert_eq!(
+            failure
+                .pointer("/properties/repository_id/pattern")
+                .and_then(Value::as_str),
+            Some("^[A-Za-z0-9_.:-]{1,160}$")
+        );
+        assert_eq!(
+            failure
+                .pointer("/properties/source/properties/id/pattern")
+                .and_then(Value::as_str),
+            Some("^[A-Za-z0-9_.:-]{1,160}$")
+        );
+
+        for (schema, pointer) in [
+            (
+                include_str!("../../schemas/harness.supervisor-snapshot.v1.schema.json"),
+                "/properties/run_id/maxLength",
+            ),
+            (
+                include_str!("../../schemas/harness.supervisor-decision.v1.schema.json"),
+                "/properties/run_id/maxLength",
+            ),
+            (
+                include_str!("../../schemas/harness.expert-request.v1.schema.json"),
+                "/properties/run_id/maxLength",
+            ),
+            (
+                include_str!("../../schemas/harness.expert-response.v1.schema.json"),
+                "/properties/run_id/maxLength",
+            ),
+        ] {
+            let schema: Value = serde_json::from_str(schema).unwrap();
+            assert_eq!(schema.pointer(pointer).and_then(Value::as_u64), Some(160));
+        }
+    }
+
+    #[test]
     fn knowledge_schema_requires_active_human_review_and_safe_optional_scope_ids() {
         let registry = jsonschema::Registry::new().prepare().unwrap();
         let schema: Value = serde_json::from_str(include_str!(

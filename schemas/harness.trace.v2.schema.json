@@ -8,8 +8,8 @@
   "properties": {
     "schema": {"const": "harness.trace.v2"},
     "trace_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
-    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
-    "task_attempt_id": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,160}$"},
+    "task_attempt_id": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9_.:-]{1,160}$"},
     "source_event_range": {"type": ["object", "null"], "additionalProperties": false, "required": ["first_id", "last_id"], "properties": {"first_id": {"type": "integer", "minimum": 1}, "last_id": {"type": "integer", "minimum": 1}}},
     "runtime_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "redaction_policy_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},

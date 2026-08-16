@@ -9039,12 +9039,12 @@ impl Orchestrator {
                 "investigation response came from a non-investigator agent".to_owned(),
             ));
         }
-        if matches!(agent.state.as_str(), "COMPLETED" | "FAILED") {
-            // App Server item/completed callbacks are replayable. The
-            // deterministic artifact id and the completed agent state make
-            // a previously committed receipt authoritative.
-            return Ok(());
-        }
+        // Every callback, including an App Server terminal replay, must be an
+        // exact closed investigation response.  A terminal state only makes a
+        // previously recorded artifact replayable; it never turns arbitrary
+        // callback text into a successful controller acknowledgement.
+        let response = parse_investigation_response(text)?;
+        let terminal_replay = matches!(agent.state.as_str(), "COMPLETED" | "FAILED");
         let interrupt = investigation_interrupt_target(&agent);
         let (agent_run_id, agent_attempt_id) = self.store.agent_context(agent_id)?;
         let Some(attempt_id) = agent_attempt_id else {
@@ -9092,9 +9092,45 @@ impl Orchestrator {
         }
         let run = self.store.run(&task.run_id)?;
         let deadline_key = investigation_deadline_metadata_key(agent_id);
-        let deadline_ms = match investigation_deadline_ms(&self.store, &deadline_key, &attempt_id) {
-            Ok(deadline_ms) => deadline_ms,
-            Err(error) => {
+        if !terminal_replay {
+            let deadline_ms =
+                match investigation_deadline_ms(&self.store, &deadline_key, &attempt_id) {
+                    Ok(deadline_ms) => deadline_ms,
+                    Err(error) => {
+                        self.fail_investigation_response(
+                            &run,
+                            &task,
+                            &attempt_id,
+                            agent_id,
+                            &error.to_string(),
+                        )?;
+                        drop(guard);
+                        self.best_effort_interrupt_investigation(agent_id, interrupt)
+                            .await;
+                        return Err(error);
+                    }
+                };
+            if now_ms() >= deadline_ms {
+                self.fail_investigation_response(
+                    &run,
+                    &task,
+                    &attempt_id,
+                    agent_id,
+                    "investigation response arrived after its durable time budget elapsed",
+                )?;
+                self.store.delete_runtime_metadata(&deadline_key)?;
+                drop(guard);
+                self.best_effort_interrupt_investigation(agent_id, interrupt)
+                    .await;
+                return Err(OrchestratorError::Blocked(
+                    "investigation response arrived after its durable time budget elapsed"
+                        .to_owned(),
+                ));
+            }
+            if let Err(error) = self
+                .reconcile_investigation_worktree(&attempt_id, &run.base_sha)
+                .await
+            {
                 self.fail_investigation_response(
                     &run,
                     &task,
@@ -9107,38 +9143,6 @@ impl Orchestrator {
                     .await;
                 return Err(error);
             }
-        };
-        if now_ms() >= deadline_ms {
-            self.fail_investigation_response(
-                &run,
-                &task,
-                &attempt_id,
-                agent_id,
-                "investigation response arrived after its durable time budget elapsed",
-            )?;
-            self.store.delete_runtime_metadata(&deadline_key)?;
-            drop(guard);
-            self.best_effort_interrupt_investigation(agent_id, interrupt)
-                .await;
-            return Err(OrchestratorError::Blocked(
-                "investigation response arrived after its durable time budget elapsed".to_owned(),
-            ));
-        }
-        if let Err(error) = self
-            .reconcile_investigation_worktree(&attempt_id, &run.base_sha)
-            .await
-        {
-            self.fail_investigation_response(
-                &run,
-                &task,
-                &attempt_id,
-                agent_id,
-                &error.to_string(),
-            )?;
-            drop(guard);
-            self.best_effort_interrupt_investigation(agent_id, interrupt)
-                .await;
-            return Err(error);
         }
         let outcome = (|| -> Result<InvestigationArtifact, OrchestratorError> {
             if agent.sandbox_mode != SandboxMode::ReadOnly
@@ -9174,6 +9178,8 @@ impl Orchestrator {
                 })?;
             let artifact_id = InvestigationArtifactId::parse(format!("investigation-{attempt_id}"))
                 .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
+            let source_ref = investigation_context_evidence_ref(&context_digest);
+            validate_investigation_response_evidence(&response, &source_ref)?;
             if let Some(existing) = self.store.investigation_artifact(&artifact_id)? {
                 existing
                     .validate()
@@ -9188,9 +9194,12 @@ impl Orchestrator {
                 )?;
                 return Ok(existing);
             }
-            let response = parse_investigation_response(text)?;
-            let source_ref = investigation_context_evidence_ref(&context_digest);
-            validate_investigation_response_evidence(&response, &source_ref)?;
+            if terminal_replay {
+                return Err(OrchestratorError::Protocol(
+                    "terminal investigation callback has no immutable artifact to replay"
+                        .to_owned(),
+                ));
+            }
             let scope = packet.investigation_scope.clone().ok_or_else(|| {
                 OrchestratorError::Protocol(
                     "investigation response packet is missing its scope".to_owned(),
@@ -9246,6 +9255,9 @@ impl Orchestrator {
                 return Err(error);
             }
         };
+        if terminal_replay {
+            return Ok(());
+        }
         let (worktree_id, _, _, head_sha) = self.store.worktree_for_attempt(&attempt_id)?;
         self.store.update_worktree(
             &worktree_id,
@@ -18806,11 +18818,9 @@ mod tests {
             "sensitivity": "internal",
             "artifact_refs": []
         });
+        let response_json = serde_json::to_string(&response).expect("response serializes");
         orchestrator
-            .accept_investigation_response(
-                &investigator.id,
-                &serde_json::to_string(&response).expect("response serializes"),
-            )
+            .accept_investigation_response(&investigator.id, &response_json)
             .await
             .expect("controller binds and records the artifact");
         assert_eq!(
@@ -18838,6 +18848,30 @@ mod tests {
             artifacts[0].sources,
             vec![investigation_context_evidence_ref(&context_digest)]
         );
+        assert!(
+            orchestrator
+                .accept_investigation_response(&investigator.id, "not investigation JSON")
+                .await
+                .is_err(),
+            "a terminal replay cannot acknowledge arbitrary callback text"
+        );
+        let mut wrong_evidence_replay = response.clone();
+        wrong_evidence_replay["findings"][0]["evidence_refs"] = json!(["context:invented"]);
+        assert!(
+            orchestrator
+                .accept_investigation_response(
+                    &investigator.id,
+                    &serde_json::to_string(&wrong_evidence_replay)
+                        .expect("wrong replay serializes"),
+                )
+                .await
+                .is_err(),
+            "an existing artifact cannot bypass current callback evidence binding"
+        );
+        orchestrator
+            .accept_investigation_response(&investigator.id, &response_json)
+            .await
+            .expect("an exact terminal replay preserves the recorded artifact");
         // App Server normally emits turn/completed after the structured item.
         // The terminal turn callback must preserve, rather than overwrite, the
         // controller-bound artifact outcome.

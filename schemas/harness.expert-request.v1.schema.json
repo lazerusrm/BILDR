@@ -8,7 +8,7 @@
   "properties": {
     "schema": {"const": "harness.expert-request.v1"},
     "request_id": {"type": "string", "minLength": 1, "maxLength": 128},
-    "run_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "run_id": {"type": "string", "minLength": 1, "maxLength": 160},
     "snapshot_id": {"type": "string", "minLength": 1, "maxLength": 128},
     "snapshot_revision": {"type": "integer", "minimum": 1},
     "decision_id": {"type": "string", "minLength": 1, "maxLength": 128},

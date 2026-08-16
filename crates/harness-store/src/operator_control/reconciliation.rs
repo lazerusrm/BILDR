@@ -273,25 +273,57 @@ impl Store {
             .optional()?
             .ok_or_else(|| StoreError::NotFound(format!("ownership proof {proof_id}")))?;
         let proof = checked_ownership_row(proof_raw, proof_digest)?;
-        let now = now_ms();
-        if ownership_proof_expired(&proof, now) {
-            return Err(StoreError::Conflict(format!(
-                "ownership proof {proof_id} expired before replacement authorization"
-            )));
-        }
-
-        let existing_consumption: Option<(String, String, String, String)> = transaction
+        let existing_consumption: Option<(
+            String,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            String,
+        )> = transaction
             .query_row(
-                "SELECT c.replacement_attempt_id,c.task_id,a.payload_json,a.payload_sha256 FROM reconciliation_proof_consumptions c JOIN reconciliation_actions a ON a.id=c.action_id WHERE c.proof_id=?1",
+                "SELECT c.replacement_attempt_id,c.task_id,a.payload_json,a.payload_sha256,ta.attempt_number,ta.state,ta.task_packet_json,ta.task_packet_sha256,ta.base_sha,ta.requested_model_route FROM reconciliation_proof_consumptions c JOIN reconciliation_actions a ON a.id=c.action_id JOIN task_attempts ta ON ta.id=c.replacement_attempt_id AND ta.task_id=c.task_id WHERE c.proof_id=?1",
                 [proof_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
             )
             .optional()?;
-        if let Some((existing_attempt_id, existing_task_id, existing_raw, existing_digest)) =
-            existing_consumption
+        if let Some((
+            existing_attempt_id,
+            existing_task_id,
+            existing_raw,
+            existing_digest,
+            existing_number,
+            _existing_state,
+            existing_packet_json,
+            existing_packet_sha256,
+            existing_base_sha,
+            existing_model_route,
+        )) = existing_consumption
         {
             if existing_attempt_id == replacement.id.as_str()
                 && existing_task_id == replacement.task_id.as_str()
+                && existing_number == i64::from(replacement.attempt_number)
+                && existing_packet_json == packet_json
+                && existing_packet_sha256 == replacement.packet_sha256
+                && existing_base_sha == replacement.base_sha
+                && existing_model_route == replacement.requested_model_route
                 && checked_action_receipt_row(existing_raw, existing_digest)? == *receipt
             {
                 record_correlation_link_in_transaction(&transaction, &correlation)?;
@@ -300,6 +332,12 @@ impl Store {
             }
             return Err(StoreError::Conflict(format!(
                 "ownership proof {proof_id} was already consumed by replacement attempt {existing_attempt_id}"
+            )));
+        }
+        let now = now_ms();
+        if ownership_proof_expired(&proof, now) {
+            return Err(StoreError::Conflict(format!(
+                "ownership proof {proof_id} expired before replacement authorization"
             )));
         }
 
@@ -1851,6 +1889,42 @@ mod tests {
             ),
             Err(StoreError::Conflict(_))
         ));
+
+        let mut conflicting_route = replacement.clone();
+        conflicting_route.requested_model_route = "different-route".to_owned();
+        assert!(matches!(
+            store.consume_ownership_proof_for_fresh_attempt(
+                &proof.proof_id,
+                &receipt,
+                episode.version,
+                &conflicting_route,
+                task_version,
+            ),
+            Err(StoreError::Conflict(_))
+        ));
+
+        let mut expired_proof = proof.clone();
+        expired_proof.expires_at_ms = now_ms().saturating_sub(1);
+        expired_proof.sha256 = expired_proof.digest().expect("expired proof digest");
+        let expired_raw = serde_json::to_string(&expired_proof).expect("expired proof serializes");
+        let expired_raw_digest = digest(&expired_raw);
+        store
+            .connection()
+            .expect("connection")
+            .execute(
+                "UPDATE ownership_proofs SET payload_json=?2,payload_sha256=?3 WHERE id=?1",
+                rusqlite::params![proof.proof_id.as_str(), expired_raw, expired_raw_digest,],
+            )
+            .expect("expired proof is installed for replay");
+        store
+            .consume_ownership_proof_for_fresh_attempt(
+                &proof.proof_id,
+                &receipt,
+                episode.version,
+                &replacement,
+                task_version,
+            )
+            .expect("exact committed replay survives later proof expiry");
 
         store
             .lease_authorized_fresh_attempt(&task_id, &replacement.id)

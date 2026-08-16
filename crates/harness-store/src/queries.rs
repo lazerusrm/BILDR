@@ -11,8 +11,8 @@ use harness_domain::{
     OutcomeSourceKind, OutcomeVector, OutcomeVectorItem, OutcomeWireV1, PlanRevisionId,
     RepositoryId, RepositorySummary, RetentionClass, RunId, RunPlan, RunState, RunSummary,
     SensitivityClass, TaskId, TaskState, TaskSummary, TokenUsage, UsageBreakdown, UsageGroup,
-    UsageSummary, WorktreeId, WorktreeSummary, format_timestamp, now_ms,
-    validate_operator_outcome_label,
+    UsageSummary, WorktreeId, WorktreeSummary, format_timestamp,
+    is_safe_operator_control_identifier, now_ms, validate_operator_outcome_label,
 };
 use harness_learning::{
     CostAttribution, EditReason, FailureClass, FailureOccurrence, FailureScope, FailureWireCost,
@@ -1012,7 +1012,7 @@ impl Store {
                            severity: Severity,
                            source_domain_event_id: Option<i64>|
          -> Result<(), StoreError> {
-            validate_failure_identifier(&source_id)?;
+            validate_failure_controller_identifier(&source_id)?;
             let automatic = terminal.map_or(FailureClass::Unknown, TerminalCode::class);
             // Cost accounting can finish after a terminal receipt arrives.
             // Keep the immutable occurrence independent of that live ledger;
@@ -2320,6 +2320,7 @@ impl Store {
             "SELECT coalesce(max(revision),0)+1 FROM improvement_revisions WHERE aggregate_kind=?1 AND aggregate_id=?2",
             params![enum_text(&input.aggregate_kind)?, input.aggregate_id], |row| row.get(0),
         )?;
+        validate_improvement_wire_revision(input, next)?;
         transaction.execute(
             "INSERT INTO improvement_revisions(id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![input.id, enum_text(&input.aggregate_kind)?, input.aggregate_id, next, input.schema.as_str(), enum_text(&input.state)?, payload_json, input.payload_sha256, enum_text(&input.sensitivity)?, enum_text(&input.retention_class)?, input.export_allowed, input.source_domain_event_id, now],
@@ -6625,17 +6626,45 @@ fn validate_improvement_input(input: &NewImprovementRevision) -> Result<(), Stor
             let value: harness_eval::TasksetV1 = serde_json::from_value(input.payload.clone())?;
             harness_eval::verify_taskset_v1(&value)
                 .map_err(|error| StoreError::Validation(error.to_string()))?;
+            if input.aggregate_id != value.taskset_id {
+                return Err(StoreError::Validation(
+                    "taskset aggregate identity must equal the canonical taskset_id".to_owned(),
+                ));
+            }
         }
         ImprovementSchema::EvalCaseV1 => {
             let value: harness_eval::EvalCaseV1 = serde_json::from_value(input.payload.clone())?;
             harness_eval::verify_case_v1(&value)
                 .map_err(|error| StoreError::Validation(error.to_string()))?;
+            if input.aggregate_id != value.case_id {
+                return Err(StoreError::Validation(
+                    "eval-case aggregate identity must equal the canonical case_id".to_owned(),
+                ));
+            }
         }
         ImprovementSchema::GraderBundleV1 => {
             let value: harness_eval::GraderBundleV1 =
                 serde_json::from_value(input.payload.clone())?;
             harness_eval::verify_grader_contract(&value)
                 .map_err(|error| StoreError::Validation(error.to_string()))?;
+            if input.aggregate_id != value.grader_bundle_id {
+                return Err(StoreError::Validation(
+                    "grader aggregate identity must equal the canonical grader_bundle_id"
+                        .to_owned(),
+                ));
+            }
+        }
+        ImprovementSchema::OutcomeV1 => {
+            let value: OutcomeWireV1 = serde_json::from_value(input.payload.clone())?;
+            value
+                .validate()
+                .map_err(|error| StoreError::Validation(error.to_string()))?;
+            safe_eval_id(&input.id, 128)?;
+            if input.aggregate_id != value.outcome_id.as_str() {
+                return Err(StoreError::Validation(
+                    "outcome aggregate identity must equal the canonical outcome_id".to_owned(),
+                ));
+            }
         }
         _ => {}
     }
@@ -6652,6 +6681,35 @@ fn validate_improvement_input(input: &NewImprovementRevision) -> Result<(), Stor
         ));
     }
     Ok(())
+}
+
+fn validate_improvement_wire_revision(
+    input: &NewImprovementRevision,
+    sequence: i64,
+) -> Result<(), StoreError> {
+    let sequence = u64::try_from(sequence).map_err(|_| {
+        StoreError::Validation("improvement revision sequence is invalid".to_owned())
+    })?;
+    let wire_revision = match input.schema {
+        ImprovementSchema::TasksetV1 => {
+            serde_json::from_value::<harness_eval::TasksetV1>(input.payload.clone())?.revision
+        }
+        ImprovementSchema::EvalCaseV1 => {
+            serde_json::from_value::<harness_eval::EvalCaseV1>(input.payload.clone())?.revision
+        }
+        ImprovementSchema::GraderBundleV1 => {
+            serde_json::from_value::<harness_eval::GraderBundleV1>(input.payload.clone())?.revision
+        }
+        _ => return Ok(()),
+    };
+    if wire_revision == sequence {
+        Ok(())
+    } else {
+        Err(StoreError::Conflict(
+            "canonical evaluation wire revision does not match the immutable aggregate sequence"
+                .to_owned(),
+        ))
+    }
 }
 
 fn sensitivity_rank(value: SensitivityClass) -> u8 {
@@ -7095,6 +7153,30 @@ fn validate_failure_identifier(value: &str) -> Result<(), StoreError> {
     }
 }
 
+fn validate_failure_controller_identifier(value: &str) -> Result<(), StoreError> {
+    if is_safe_operator_control_identifier(value) {
+        Ok(())
+    } else {
+        Err(StoreError::Validation(
+            "failure controller identity must be an opaque bounded token".to_owned(),
+        ))
+    }
+}
+
+fn validate_failure_scope_identifier(value: &str) -> Result<(), StoreError> {
+    if validate_failure_identifier(value).is_ok()
+        || value
+            .strip_prefix("run:")
+            .is_some_and(is_safe_operator_control_identifier)
+    {
+        Ok(())
+    } else {
+        Err(StoreError::Validation(
+            "failure cost scope must be a bounded token or controller run scope".to_owned(),
+        ))
+    }
+}
+
 fn validate_failure_actor(value: &str) -> Result<(), StoreError> {
     validate_failure_identifier(value)
 }
@@ -7224,7 +7306,7 @@ fn failure_cost_columns(cost: FailureWireCost) -> Result<FailureCostColumns, Sto
             lower_microusd,
             additional_microusd,
         } => {
-            validate_failure_identifier(&scope_id)?;
+            validate_failure_scope_identifier(&scope_id)?;
             let lower = i64::try_from(lower_microusd)
                 .map_err(|_| StoreError::Validation("cost exceeds SQLite range".to_owned()))?;
             let upper = lower_microusd
@@ -7505,8 +7587,8 @@ fn stable_authoritative_outcome_id(
 }
 
 fn validate_operator_outcome_input(input: &NewOperatorOutcome) -> Result<(), StoreError> {
-    if !safe_outcome_identifier(input.run_id.as_str(), 128)
-        || !safe_outcome_identifier(&input.subject.id, 128)
+    if !is_safe_operator_control_identifier(input.run_id.as_str())
+        || !is_safe_operator_control_identifier(&input.subject.id)
         || !safe_outcome_identifier(&input.code, 80)
         || !safe_outcome_identifier(&input.actor, 128)
         || !safe_outcome_identifier(&input.idempotency_key, 200)
@@ -7851,11 +7933,12 @@ mod tests {
             "../../../examples/self-improvement/eval-case.example.json"
         ))
         .unwrap();
+        let canonical_case_id = case.case_id.clone();
         let payload = serde_json::to_value(case).unwrap();
         let mut input = NewImprovementRevision {
             id: "case-revision".to_owned(),
             aggregate_kind: ImprovementRecordKind::EvalCase,
-            aggregate_id: "case".to_owned(),
+            aggregate_id: canonical_case_id.clone(),
             schema: ImprovementSchema::EvalCaseV1,
             state: ImprovementState::Proposed,
             payload: payload.clone(),
@@ -7869,6 +7952,11 @@ mod tests {
             source_domain_event_id: None,
         };
         assert!(validate_improvement_input(&input).is_ok());
+        assert!(validate_improvement_wire_revision(&input, 1).is_ok());
+        assert!(validate_improvement_wire_revision(&input, 2).is_err());
+        input.aggregate_id = "case".to_owned();
+        assert!(validate_improvement_input(&input).is_err());
+        input.aggregate_id = canonical_case_id;
         input.id = "a".repeat(129);
         assert!(validate_improvement_input(&input).is_err());
         input.id = "case-revision".to_owned();
@@ -8355,6 +8443,73 @@ mod tests {
             store.record_operator_outcome(&invalid_reason),
             Err(StoreError::Validation(_))
         ));
+    }
+
+    #[test]
+    fn controller_owned_outcome_and_failure_identities_allow_160_characters() {
+        let run_id = RunId::from("r".repeat(160));
+        let input = operator_outcome(&run_id, "outcome-160", "accepted_without_correction");
+        assert!(validate_operator_outcome_input(&input).is_ok());
+        assert!(validate_failure_controller_identifier(&"a".repeat(160)).is_ok());
+        assert!(validate_failure_controller_identifier(&"a".repeat(161)).is_err());
+        assert!(validate_failure_scope_identifier(&format!("run:{}", "a".repeat(160))).is_ok());
+    }
+
+    #[test]
+    fn immutable_outcome_intake_binds_its_aggregate_and_revision_identifier() {
+        let outcome = OutcomeWireV1 {
+            schema: "harness.outcome.v1".to_owned(),
+            outcome_id: OutcomeId::from("outcome-intake"),
+            run_id: RunId::from("run-intake"),
+            subject: harness_domain::OutcomeSubject {
+                kind: harness_domain::OutcomeSubjectKind::Run,
+                id: "run-intake".to_owned(),
+            },
+            dimension: harness_domain::OutcomeDimension::OperatorAcceptance,
+            classification: harness_domain::OutcomeClassification::Positive,
+            code: "accepted_without_correction".to_owned(),
+            observed_at: 1,
+            confidence: OutcomeConfidence::OperatorAsserted,
+            source: OutcomeSource {
+                kind: OutcomeSourceKind::HumanAction,
+                record_id: "1".to_owned(),
+                record_sha256: "a".repeat(64),
+                source_sha: None,
+                source_domain_event_id: None,
+            },
+            supersedes: Vec::new(),
+            reason_code: None,
+            correction_artifact_id: None,
+            redactor_version: "outcome-redactor.v1".to_owned(),
+            free_text_redacted: false,
+        };
+        let payload = serde_json::to_value(&outcome).expect("outcome payload serializes");
+        let mut input = NewImprovementRevision {
+            id: "outcome-revision-intake".to_owned(),
+            aggregate_kind: ImprovementRecordKind::Outcome,
+            aggregate_id: outcome.outcome_id.to_string(),
+            schema: ImprovementSchema::OutcomeV1,
+            state: ImprovementState::Observed,
+            payload: payload.clone(),
+            payload_sha256: sha256(
+                serde_json::to_string(&payload)
+                    .expect("payload serializes")
+                    .as_bytes(),
+            ),
+            sensitivity: SensitivityClass::Internal,
+            retention_class: RetentionClass::Governance,
+            export_allowed: false,
+            idempotency_key: "outcome-revision-intake".to_owned(),
+            event_id: harness_domain::ImprovementEventId::from("outcome-revision-intake-event"),
+            source_raw_event_id: None,
+            source_domain_event_id: None,
+        };
+        assert!(validate_improvement_input(&input).is_ok());
+        input.aggregate_id = "different-outcome".to_owned();
+        assert!(validate_improvement_input(&input).is_err());
+        input.aggregate_id = outcome.outcome_id.to_string();
+        input.id = "r".repeat(129);
+        assert!(validate_improvement_input(&input).is_err());
     }
 
     #[test]

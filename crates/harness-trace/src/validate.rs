@@ -18,18 +18,26 @@ pub fn validate_manifest(manifest: &TraceManifest) -> Result<(), ProjectionError
     if manifest.schema != "harness.trace.v2" {
         return invalid_manifest("schema");
     }
-    for (field, value) in [
-        ("trace_id", &manifest.trace_id),
-        ("run_id", &manifest.run_id),
+    for (field, value, valid) in [
+        (
+            "trace_id",
+            &manifest.trace_id,
+            safe_trace_id(&manifest.trace_id),
+        ),
+        (
+            "run_id",
+            &manifest.run_id,
+            safe_controller_id(&manifest.run_id),
+        ),
     ] {
-        if !safe_id(value) {
+        if !valid {
             return invalid_manifest(field);
         }
     }
     if manifest
         .task_attempt_id
         .as_deref()
-        .is_some_and(|value| !safe_id(value))
+        .is_some_and(|value| !safe_controller_id(value))
         || !is_digest(&manifest.runtime_digest)
         || !is_digest(&manifest.redaction_policy_digest)
         || !matches!(
@@ -334,9 +342,17 @@ fn is_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn safe_id(value: &str) -> bool {
+fn safe_trace_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+}
+
+fn safe_controller_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 160
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))

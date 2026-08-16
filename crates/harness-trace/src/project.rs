@@ -114,7 +114,12 @@ fn validate_receipts(input: &TraceInput) -> Result<(), ProjectionError> {
         ("redaction_policy_digest", &input.redaction_policy_digest),
     ] {
         if value.is_empty()
-            || (!field.ends_with("digest") && !safe_id(value))
+            || (!field.ends_with("digest")
+                && match field {
+                    "trace_id" => !safe_trace_id(value),
+                    "run_id" => !safe_controller_id(value),
+                    _ => true,
+                })
             || (field.ends_with("digest") && !is_digest(value))
         {
             return Err(ProjectionError::InvalidInput {
@@ -126,7 +131,7 @@ fn validate_receipts(input: &TraceInput) -> Result<(), ProjectionError> {
     if input
         .task_attempt_id
         .as_deref()
-        .is_some_and(|value| !safe_id(value))
+        .is_some_and(|value| !safe_controller_id(value))
     {
         return Err(ProjectionError::InvalidInput {
             field: "task_attempt_id".to_owned(),
@@ -158,7 +163,7 @@ fn validate_receipts(input: &TraceInput) -> Result<(), ProjectionError> {
             ("execution_scope_id", event.execution_scope_id.as_deref()),
             ("lifecycle_group_id", event.lifecycle_group_id.as_deref()),
         ] {
-            if value.is_some_and(|value| !safe_id(value)) {
+            if value.is_some_and(|value| !safe_trace_id(value)) {
                 return Err(ProjectionError::InvalidInput {
                     field: field.to_owned(),
                     value: "invalid".to_owned(),
@@ -197,7 +202,7 @@ fn validate_receipts(input: &TraceInput) -> Result<(), ProjectionError> {
         }
     }
     for receipt in &input.structural_receipts {
-        if !safe_id(&receipt.id) {
+        if !safe_trace_id(&receipt.id) {
             return Err(ProjectionError::InvalidInput {
                 field: "structural_receipt.id".to_owned(),
                 value: "invalid".to_owned(),
@@ -214,9 +219,17 @@ fn is_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-fn safe_id(value: &str) -> bool {
+fn safe_trace_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn safe_controller_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 160
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
@@ -758,6 +771,15 @@ mod scale_tests {
             relations: Vec::new(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn trace_manifest_keeps_160_character_controller_identities() {
+        let mut manifest = manifest_fixture();
+        manifest.run_id = "r".repeat(160);
+        manifest.task_attempt_id = Some("a".repeat(160));
+        resign(&mut manifest);
+        validate_manifest(&manifest).expect("controller identities remain traceable");
     }
 
     #[test]

@@ -7,14 +7,14 @@
   "properties": {
     "schema": {"const": "harness.failure.v1"},
     "id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
-    "repository_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
-    "source": {"type": "object", "additionalProperties": false, "required": ["kind", "id"], "properties": {"kind": {"enum": ["attempt_terminal", "run_terminal", "typed_outcome"]}, "id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"}}},
+    "repository_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,160}$"},
+    "source": {"type": "object", "additionalProperties": false, "required": ["kind", "id"], "properties": {"kind": {"enum": ["attempt_terminal", "run_terminal", "typed_outcome"]}, "id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,160}$"}}},
     "terminal_code": {"type": ["string", "null"], "enum": ["policy_blocked", "budget_exhausted", "infrastructure_unavailable", "protocol_error", "integration_conflict", "source_failure", "inconclusive", "cancelled_superseded", null]},
     "automatic_class": {"enum": ["unknown", "policy_blocked", "budget_exhausted", "infrastructure_unavailable", "protocol_error", "integration_conflict", "source_failure", "inconclusive", "cancelled_superseded"]},
     "severity": {"enum": ["unknown", "low", "medium", "high", "critical"]},
     "taxonomy_version": {"const": "harness.failure-taxonomy.v1"},
     "fingerprint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "cost": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"const": "unknown"}}}, {"type": "object", "additionalProperties": false, "required": ["kind", "scope_id", "lower_microusd", "additional_microusd"], "properties": {"kind": {"const": "known"}, "scope_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"}, "lower_microusd": {"type": "integer", "minimum": 0}, "additional_microusd": {"type": "integer", "minimum": 0}}}]}
+    "cost": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"const": "unknown"}}}, {"type": "object", "additionalProperties": false, "required": ["kind", "scope_id", "lower_microusd", "additional_microusd"], "properties": {"kind": {"const": "known"}, "scope_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,164}$"}, "lower_microusd": {"type": "integer", "minimum": 0}, "additional_microusd": {"type": "integer", "minimum": 0}}}]}
   },
   "allOf": [
     {"if": {"properties": {"terminal_code": {"type": "null"}}, "required": ["terminal_code"]}, "then": {"properties": {"automatic_class": {"const": "unknown"}}}},
