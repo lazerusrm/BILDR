@@ -4,10 +4,10 @@
 //! never a route to task creation, publication, or mutable worktree custody.
 
 use harness_domain::{
-    CorrelationLink, CorrelationLinkId, ImprovementEventId, ImprovementRecordKind,
-    ImprovementSchema, ImprovementState, InvestigationArtifact, InvestigationArtifactId,
-    InvestigationArtifactSummary, InvestigationFindingClassification, InvestigationSensitivity,
-    RetentionClass, SensitivityClass, TraceContext, now_ms,
+    AgentSessionId, AttemptId, CorrelationLink, CorrelationLinkId, ImprovementEventId,
+    ImprovementRecordKind, ImprovementSchema, ImprovementState, InvestigationArtifact,
+    InvestigationArtifactId, InvestigationArtifactSummary, InvestigationFindingClassification,
+    InvestigationSensitivity, RetentionClass, SensitivityClass, TaskId, TraceContext, now_ms,
 };
 use harness_learning::{
     CustodyState, KnowledgeFreshness, KnowledgeItemV1, KnowledgeKind, KnowledgeReview,
@@ -77,6 +77,173 @@ impl Store {
         record_correlation_link_in_transaction(&transaction, &correlation)?;
         transaction.commit()?;
         Ok(artifact.clone())
+    }
+
+    /// Atomically converges the execution lifecycle for an immutable
+    /// investigation artifact that is already committed. The artifact remains
+    /// the authority: this method re-reads the persisted bytes and binds them
+    /// to the exact task, attempt, agent, and live worktree before replacing a
+    /// transient deadline failure with the proven terminal outcome.
+    ///
+    /// It is safe to call after restart and returns `false` only when all
+    /// lifecycle rows were already in their exact completed state.
+    pub fn finalize_investigation_artifact_lifecycle(
+        &self,
+        artifact: &InvestigationArtifact,
+        task_id: &TaskId,
+        attempt_id: &AttemptId,
+        agent_id: &AgentSessionId,
+        deadline_metadata_key: &str,
+    ) -> Result<bool, StoreError> {
+        artifact
+            .validate()
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        if artifact.attempt_id != attempt_id.as_str() {
+            return Err(StoreError::Conflict(
+                "investigation artifact does not bind the requested task attempt".to_owned(),
+            ));
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let (persisted_raw, persisted_digest): (String, String) = transaction
+            .query_row(
+                "SELECT payload_json,payload_sha256 FROM investigation_artifacts WHERE id=?1",
+                [artifact.artifact_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(artifact.artifact_id.to_string()))?;
+        let persisted = checked_artifact_row(persisted_raw, persisted_digest)?;
+        if persisted != *artifact {
+            return Err(StoreError::Conflict(
+                "persisted investigation artifact differs from the controller-validated artifact"
+                    .to_owned(),
+            ));
+        }
+
+        let (run_id, external_task_id, task_state, attempt_base_sha, attempt_state, agent_run_id, agent_attempt_id, agent_role, agent_state, worktree_id, worktree_state): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            String,
+            String,
+        ) = transaction
+            .query_row(
+                "SELECT t.run_id,t.external_task_id,t.state,a.base_sha,a.state,ag.run_id,ag.task_attempt_id,ag.role,ag.state,w.id,w.state \
+                 FROM tasks t \
+                 JOIN task_attempts a ON a.id=?2 AND a.task_id=t.id \
+                 JOIN agent_sessions ag ON ag.id=?3 \
+                 JOIN worktrees w ON w.task_attempt_id=a.id AND w.removed_at IS NULL \
+                 WHERE t.id=?1 \
+                 ORDER BY w.created_at DESC LIMIT 1",
+                params![task_id.as_str(), attempt_id.as_str(), agent_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::Conflict(
+                    "investigation lifecycle no longer has the exact task, attempt, agent, and worktree binding"
+                        .to_owned(),
+                )
+            })?;
+        if persisted.run_id != run_id
+            || persisted.task_id != external_task_id
+            || persisted.base_sha != attempt_base_sha
+            || agent_run_id != run_id
+            || agent_attempt_id.as_deref() != Some(attempt_id.as_str())
+            || agent_role != "investigator"
+        {
+            return Err(StoreError::Conflict(
+                "investigation artifact lifecycle binding differs from persisted controller custody"
+                    .to_owned(),
+            ));
+        }
+        if !matches!(
+            task_state.as_str(),
+            "LEASED"
+                | "STARTING"
+                | "IMPLEMENTING"
+                | "NEEDS_HELP"
+                | "FAILED"
+                | "BLOCKED"
+                | "STALLED"
+                | "INTERRUPTED"
+                | "CLOSED"
+        ) || !matches!(
+            attempt_state.as_str(),
+            "LEASED" | "RUNNING" | "FAILED" | "COMPLETED"
+        ) || !matches!(
+            agent_state.as_str(),
+            "STARTING" | "RUNNING" | "FAILED" | "COMPLETED"
+        ) {
+            return Err(StoreError::Conflict(
+                "investigation artifact cannot recover an unrelated lifecycle state".to_owned(),
+            ));
+        }
+
+        let deadline_present: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runtime_metadata WHERE key=?1)",
+            [deadline_metadata_key],
+            |row| row.get(0),
+        )?;
+        let already_completed = task_state == "CLOSED"
+            && attempt_state == "COMPLETED"
+            && agent_state == "COMPLETED"
+            && worktree_state == "PRESERVED"
+            && !deadline_present;
+        if already_completed {
+            transaction.commit()?;
+            return Ok(false);
+        }
+
+        let timestamp = now_ms();
+        transaction.execute(
+            "UPDATE worktrees SET state='PRESERVED',preserved_reason='immutable investigation artifact recorded; no mutable candidate exists',reconciled_at=?2,version=version+1 WHERE id=?1",
+            params![worktree_id, timestamp],
+        )?;
+        transaction.execute(
+            "UPDATE task_attempts SET state='COMPLETED',head_sha=coalesce(head_sha,?2),terminal_class=NULL,failure_reason=NULL,started_at=coalesce(started_at,?3),completed_at=coalesce(completed_at,?3),updated_at=?3,version=version+1 WHERE id=?1",
+            params![attempt_id.as_str(), persisted.base_sha, timestamp],
+        )?;
+        transaction.execute(
+            "UPDATE tasks SET state='CLOSED',failure_reason=NULL,updated_at=?2,version=version+1 WHERE id=?1",
+            params![task_id.as_str(), timestamp],
+        )?;
+        transaction.execute(
+            "UPDATE agent_sessions SET state='COMPLETED',completed_at=coalesce(completed_at,?2),last_heartbeat_at=?2,failure_class=NULL,failure_reason=NULL,version=version+1 WHERE id=?1",
+            params![agent_id.as_str(), timestamp],
+        )?;
+        transaction.execute(
+            "UPDATE agent_runtime_details SET active_turn_id=NULL,current_action='Controller recorded the immutable investigation artifact',last_activity_kind='runtime',last_activity_at=?2,updated_at=?2 WHERE agent_session_id=?1",
+            params![agent_id.as_str(), timestamp],
+        )?;
+        transaction.execute(
+            "DELETE FROM runtime_metadata WHERE key=?1",
+            [deadline_metadata_key],
+        )?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     /// Creates one unreviewed, display-only knowledge candidate from a fresh

@@ -17,7 +17,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{Store, StoreError};
 
-use super::correlation::record_correlation_link_in_transaction;
+use super::correlation::{
+    record_correlation_link_in_transaction, require_correlation_link_in_transaction,
+};
 
 const MAX_EXTERNAL_CONDITION_PAGE_SIZE: u32 = 200;
 const MAX_CONDITION_OBSERVATION_PAGE_SIZE: u32 = 200;
@@ -253,7 +255,7 @@ impl Store {
                         ));
                     }
                 }
-                record_correlation_link_in_transaction(&transaction, &correlation)?;
+                require_correlation_link_in_transaction(&transaction, &correlation)?;
                 transaction.commit()?;
                 return Ok(current);
             }
@@ -424,26 +426,26 @@ impl Store {
         Ok(rows)
     }
 
-    /// Lists open conditions only after applying the durable owner and adapter
+    /// Lists nonterminal conditions only after applying the durable owner and adapter
     /// predicates. Applying a global page limit before those predicates can
     /// leave an older due condition unobserved forever.
-    pub fn list_open_external_conditions_for_owner_adapter(
+    pub fn list_nonterminal_external_conditions_for_owner_adapter(
         &self,
         owner_type: ExternalConditionOwnerType,
         owner_id: &str,
         adapter: ExternalConditionAdapter,
         limit: u32,
     ) -> Result<Vec<ExternalCondition>, StoreError> {
-        self.list_open_external_conditions_for_owner_adapter_before(
+        self.list_nonterminal_external_conditions_for_owner_adapter_before(
             owner_type, owner_id, adapter, None, limit,
         )
     }
 
-    /// Lists one stable newest-first page of an owner's open conditions. The
+    /// Lists one stable newest-first page of an owner's nonterminal conditions. The
     /// cursor is the final `(updated_at_ms, condition_id)` tuple from the
     /// preceding page. It makes reconciliation exhaustive even when an owner
     /// has more than the page-size ceiling.
-    pub fn list_open_external_conditions_for_owner_adapter_before(
+    pub fn list_nonterminal_external_conditions_for_owner_adapter_before(
         &self,
         owner_type: ExternalConditionOwnerType,
         owner_id: &str,
@@ -464,7 +466,7 @@ impl Store {
         connection
             .prepare(
                 "SELECT current_payload_json,current_payload_sha256 FROM external_conditions \
-                 WHERE adapter=?1 AND state='open' \
+                 WHERE adapter=?1 AND state IN ('open','unknown') \
                    AND json_extract(current_payload_json, '$.owner_type')=?2 \
                    AND json_extract(current_payload_json, '$.owner_id')=?3 \
                    AND (?4 IS NULL OR updated_at < ?4 OR (updated_at = ?4 AND id < ?5)) \
@@ -527,7 +529,8 @@ impl Store {
 
 /// Derives the controller-owned causal edge from one exact condition to its
 /// immutable observation. Adapter payload cannot supply trace context, and an
-/// observation retry repairs a missing old link without creating new facts.
+/// an exact observation retry requires its original causal link; it never
+/// repairs missing custody by creating new facts.
 fn condition_observation_correlation_link(
     observation: &ConditionObservation,
 ) -> Result<CorrelationLink, StoreError> {
@@ -875,6 +878,84 @@ mod tests {
     }
 
     #[test]
+    fn identical_observation_replay_rejects_missing_correlation_custody() {
+        let temp = TempDir::new().expect("temp");
+        let store =
+            Store::in_memory(Path::new(temp.path()).join("artifacts").as_path()).expect("store");
+        let condition = condition();
+        store
+            .register_external_condition(&condition)
+            .expect("registration");
+        let observation = observation(&condition);
+        store
+            .record_external_condition_observation(&condition.condition_id, 1, &observation)
+            .expect("observation");
+        let correlation =
+            condition_observation_correlation_link(&observation).expect("observation correlation");
+
+        // Simulate a legacy/incomplete durable transaction. The production
+        // trigger prevents this corruption; the replay must diagnose it and
+        // never recreate the missing causal receipt.
+        let connection = store.connection().expect("connection");
+        connection
+            .execute_batch("DROP TRIGGER correlation_links_no_delete")
+            .expect("test fixture can remove immutability trigger");
+        connection
+            .execute(
+                "DELETE FROM correlation_links WHERE id=?1",
+                [correlation.link_id.as_str()],
+            )
+            .expect("test fixture removes correlation");
+        drop(connection);
+
+        assert!(matches!(
+            store.record_external_condition_observation(&condition.condition_id, 1, &observation),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(
+            store
+                .correlation_links(&correlation.trace.trace_id, 10)
+                .expect("correlation list")
+                .is_empty(),
+            "the replay must not backfill missing correlation custody"
+        );
+    }
+
+    #[test]
+    fn owner_adapter_page_keeps_unknown_conditions_nonterminal() {
+        let temp = TempDir::new().expect("temp");
+        let store =
+            Store::in_memory(Path::new(temp.path()).join("artifacts").as_path()).expect("store");
+        let mut condition = condition();
+        condition.owner_type = ExternalConditionOwnerType::Run;
+        condition.owner_id = "run-target".to_owned();
+        condition.source_id = "ci:run-target".to_owned();
+        condition.sha256 = condition.digest().expect("condition digest");
+        store
+            .register_external_condition(&condition)
+            .expect("registration");
+        let mut unknown = observation(&condition);
+        unknown.state = ExternalConditionState::Unknown;
+        unknown.sha256 = unknown.digest().expect("observation digest");
+        let advanced = store
+            .record_external_condition_observation(&condition.condition_id, 1, &unknown)
+            .expect("unknown observation");
+
+        assert_eq!(
+            store
+                .list_nonterminal_external_conditions_for_owner_adapter(
+                    ExternalConditionOwnerType::Run,
+                    "run-target",
+                    ExternalConditionAdapter::CiCheck,
+                    10,
+                )
+                .expect("nonterminal page"),
+            vec![advanced],
+            "unknown is a nonterminal observation state and must remain pollable"
+        );
+    }
+
+    #[test]
     fn source_identity_registration_serializes_concurrent_replays() {
         let temp = TempDir::new().expect("temp");
         let database = temp.path().join("harness.sqlite3");
@@ -996,7 +1077,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .list_open_external_conditions_for_owner_adapter(
+                .list_nonterminal_external_conditions_for_owner_adapter(
                     ExternalConditionOwnerType::Run,
                     "run-target",
                     ExternalConditionAdapter::TimeGate,
@@ -1036,7 +1117,7 @@ mod tests {
         }
 
         let first = store
-            .list_open_external_conditions_for_owner_adapter(
+            .list_nonterminal_external_conditions_for_owner_adapter(
                 ExternalConditionOwnerType::Run,
                 "run-target",
                 ExternalConditionAdapter::TimeGate,
@@ -1053,7 +1134,7 @@ mod tests {
         let cursor = first.last().expect("full page has a final cursor");
         assert_eq!(
             store
-                .list_open_external_conditions_for_owner_adapter_before(
+                .list_nonterminal_external_conditions_for_owner_adapter_before(
                     ExternalConditionOwnerType::Run,
                     "run-target",
                     ExternalConditionAdapter::TimeGate,

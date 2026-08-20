@@ -185,7 +185,7 @@ impl Orchestrator {
         loop {
             let conditions = self
                 .store
-                .list_open_external_conditions_for_owner_adapter_before(
+                .list_nonterminal_external_conditions_for_owner_adapter_before(
                     ExternalConditionOwnerType::Run,
                     run.id.as_str(),
                     ExternalConditionAdapter::HardwareCapacity,
@@ -408,7 +408,10 @@ fn local_capacity_outcome(
     available_bytes: Result<u64, ()>,
 ) -> Option<LocalCapacityOutcome> {
     if condition.adapter != ExternalConditionAdapter::HardwareCapacity
-        || condition.state != ExternalConditionState::Open
+        || !matches!(
+            condition.state,
+            ExternalConditionState::Open | ExternalConditionState::Unknown
+        )
     {
         return None;
     }
@@ -625,6 +628,37 @@ mod tests {
                 available_bytes: 99,
                 minimum_available_bytes: 100
             })
+        );
+    }
+
+    #[test]
+    fn local_capacity_unknown_condition_repolls_and_can_recover() {
+        let mut condition = local_capacity_condition(Some(3_000));
+        condition.state = ExternalConditionState::Unknown;
+        condition.sequence = 1;
+        condition.last_observation = Some(ConditionObservation {
+            schema: "harness.condition-observation.v1".to_owned(),
+            observation_id: ConditionObservationId::new(),
+            condition_id: condition.condition_id.clone(),
+            source_event_id: "capacity-source-unavailable".to_owned(),
+            sequence: 1,
+            observed_at_ms: 1,
+            state: ExternalConditionState::Unknown,
+            payload: json!({"reason": "source_unavailable"}),
+            sha256: "a".repeat(64),
+        });
+
+        assert!(
+            local_capacity_poll_due(&condition, 2_000),
+            "an unknown source observation remains eligible for the next poll"
+        );
+        assert_eq!(
+            local_capacity_outcome(&condition, &"a".repeat(64), 2_000, Ok(100)),
+            Some(LocalCapacityOutcome::Satisfied {
+                available_bytes: 100,
+                minimum_available_bytes: 100,
+            }),
+            "a later controller-local reading may resolve the nonterminal unknown state"
         );
     }
 

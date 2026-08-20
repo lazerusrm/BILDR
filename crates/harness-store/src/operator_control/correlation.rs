@@ -94,6 +94,40 @@ pub(crate) fn record_correlation_link_in_transaction(
     Ok(link.clone())
 }
 
+/// Requires the exact causal receipt that an earlier successful admission
+/// committed. This is deliberately not an upsert: a replay may prove an
+/// existing observation only when every receipt from the original custody
+/// transaction is still present.
+pub(crate) fn require_correlation_link_in_transaction(
+    transaction: &Transaction<'_>,
+    link: &CorrelationLink,
+) -> Result<CorrelationLink, StoreError> {
+    link.validate()
+        .map_err(|error| StoreError::Validation(error.to_string()))?;
+    let raw = serde_json::to_string(link)?;
+    let Some((existing_raw, existing_digest)) = transaction
+        .query_row(
+            "SELECT payload_json,payload_sha256 FROM correlation_links WHERE id=?1",
+            [link.link_id.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+    else {
+        return Err(StoreError::Conflict(
+            "existing external-condition observation is missing its causal correlation link"
+                .to_owned(),
+        ));
+    };
+    let existing = checked_link_row(existing_raw, existing_digest)?;
+    if serde_json::to_string(&existing)? == raw {
+        return Ok(existing);
+    }
+    Err(StoreError::Conflict(
+        "existing external-condition observation has a different causal correlation link"
+            .to_owned(),
+    ))
+}
+
 fn checked_link_row(raw: String, payload_sha256: String) -> rusqlite::Result<CorrelationLink> {
     if digest(&raw) != payload_sha256 {
         return Err(rusqlite::Error::FromSqlConversionFailure(
