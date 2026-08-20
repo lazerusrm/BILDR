@@ -17,6 +17,7 @@ use ulid::Ulid;
 use crate::{MAX_OPERATOR_CONTROL_IDENTIFIER_LEN, is_safe_operator_control_identifier};
 
 const MAX_IDENTIFIER_LEN: usize = MAX_OPERATOR_CONTROL_IDENTIFIER_LEN;
+const MAX_TOPOLOGY_IDENTIFIER_LEN: usize = MAX_IDENTIFIER_LEN + "attempt:".len();
 const MAX_TITLE_LEN: usize = 240;
 const MAX_SUMMARY_LEN: usize = 4_000;
 const MAX_SECTION_ROWS: usize = 1_000;
@@ -59,6 +60,27 @@ fn validate_identifier(value: &str, field: &'static str) -> Result<(), OperatorC
             "contains a path-unsafe character"
         };
         return Err(OperatorControlError::InvalidField { field, reason });
+    }
+    Ok(())
+}
+
+/// Topology identifiers are controller IDs with a bounded relation-kind
+/// prefix (the longest is `attempt:`). They remain path-safe tokens while
+/// preserving a full-width controller identity in the projection.
+fn validate_topology_identifier(
+    value: &str,
+    field: &'static str,
+) -> Result<(), OperatorControlError> {
+    if value.is_empty()
+        || value.len() > MAX_TOPOLOGY_IDENTIFIER_LEN
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+    {
+        return Err(OperatorControlError::InvalidField {
+            field,
+            reason: "must be a bounded path-safe topology identifier",
+        });
     }
     Ok(())
 }
@@ -2629,12 +2651,12 @@ impl TopologySnapshot {
         }
         let mut node_ids = std::collections::BTreeSet::new();
         for node in &self.nodes {
-            validate_identifier(&node.id, "topology node id")?;
+            validate_topology_identifier(&node.id, "topology node id")?;
             validate_identifier(&node.kind, "topology node kind")?;
             validate_text(
                 &node.source_ref,
                 "topology node source ref",
-                MAX_IDENTIFIER_LEN,
+                MAX_TOPOLOGY_IDENTIFIER_LEN,
             )?;
             if !node_ids.insert(&node.id) {
                 return Err(OperatorControlError::InvalidField {
@@ -2644,13 +2666,13 @@ impl TopologySnapshot {
             }
         }
         for edge in &self.edges {
-            validate_identifier(&edge.from, "topology edge source")?;
-            validate_identifier(&edge.to, "topology edge destination")?;
+            validate_topology_identifier(&edge.from, "topology edge source")?;
+            validate_topology_identifier(&edge.to, "topology edge destination")?;
             validate_identifier(&edge.kind, "topology edge kind")?;
             validate_text(
                 &edge.source_ref,
                 "topology edge source ref",
-                MAX_IDENTIFIER_LEN,
+                MAX_TOPOLOGY_IDENTIFIER_LEN,
             )?;
             if !node_ids.contains(&edge.from) || !node_ids.contains(&edge.to) {
                 return Err(OperatorControlError::InvalidField {

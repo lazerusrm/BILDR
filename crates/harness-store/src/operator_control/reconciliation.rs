@@ -1477,6 +1477,20 @@ mod tests {
         NewTaskAttempt,
         i64,
     ) {
+        fresh_attempt_fixture_with_proof_ttl(temp, 60_000)
+    }
+
+    fn fresh_attempt_fixture_with_proof_ttl(
+        temp: &TempDir,
+        proof_ttl_ms: i64,
+    ) -> (
+        Store,
+        ReconciliationEpisode,
+        OwnershipProof,
+        TaskId,
+        NewTaskAttempt,
+        i64,
+    ) {
         let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
         let repository_id = RepositoryId::from("repository-fresh-attempt");
         store
@@ -1597,29 +1611,6 @@ mod tests {
         let episode = store
             .open_reconciliation_episode(&episode)
             .expect("episode");
-        let mut proof = OwnershipProof {
-            schema: "harness.exclusive-ownership-proof.v1".to_owned(),
-            proof_id: "proof-fresh-attempt".parse().expect("proof id"),
-            run_id: run_id.to_string(),
-            task_id: task_id.to_string(),
-            prior_attempt_id: prior_attempt.id.to_string(),
-            worktree_id: worktree_id.to_string(),
-            source_event_id: "event-fresh-attempt-proof".to_owned(),
-            head_sha: head_sha.clone(),
-            worktree_fingerprint: "b".repeat(64),
-            lease_generation: 3,
-            process_state: "proven_absent".to_owned(),
-            session_state: "proven_closed".to_owned(),
-            command_state: "terminal_or_none".to_owned(),
-            external_effect_state: "none_or_reconciled".to_owned(),
-            candidate_state: "preserved".to_owned(),
-            approved_actions: vec!["authorize_fresh_attempt".to_owned()],
-            observed_at_ms: now_ms(),
-            expires_at_ms: now_ms().saturating_add(60_000),
-            sha256: String::new(),
-        };
-        proof.sha256 = proof.digest().expect("proof digest");
-        let proof = store.record_ownership_proof(&proof).expect("proof");
         let human_action_id = store
             .record_human_action(
                 Some(&run_id),
@@ -1642,6 +1633,30 @@ mod tests {
             base_sha: head_sha,
             requested_model_route: "fixture-model".to_owned(),
         };
+        let observed_at_ms = now_ms();
+        let mut proof = OwnershipProof {
+            schema: "harness.exclusive-ownership-proof.v1".to_owned(),
+            proof_id: "proof-fresh-attempt".parse().expect("proof id"),
+            run_id: run_id.to_string(),
+            task_id: task_id.to_string(),
+            prior_attempt_id: prior_attempt.id.to_string(),
+            worktree_id: worktree_id.to_string(),
+            source_event_id: "event-fresh-attempt-proof".to_owned(),
+            head_sha: replacement.base_sha.clone(),
+            worktree_fingerprint: "b".repeat(64),
+            lease_generation: 3,
+            process_state: "proven_absent".to_owned(),
+            session_state: "proven_closed".to_owned(),
+            command_state: "terminal_or_none".to_owned(),
+            external_effect_state: "none_or_reconciled".to_owned(),
+            candidate_state: "preserved".to_owned(),
+            approved_actions: vec!["authorize_fresh_attempt".to_owned()],
+            observed_at_ms,
+            expires_at_ms: observed_at_ms.saturating_add(proof_ttl_ms),
+            sha256: String::new(),
+        };
+        proof.sha256 = proof.digest().expect("proof digest");
+        let proof = store.record_ownership_proof(&proof).expect("proof");
         (store, episode, proof, task_id, replacement, human_action_id)
     }
 
@@ -1808,7 +1823,7 @@ mod tests {
     fn proof_consumption_authorizes_exactly_one_replacement_and_scheduler_lease() {
         let temp = TempDir::new().expect("temp");
         let (store, episode, proof, task_id, replacement, human_action_id) =
-            fresh_attempt_fixture(&temp);
+            fresh_attempt_fixture_with_proof_ttl(&temp, 250);
         let receipt = fresh_attempt_receipt(
             episode.episode_id.clone(),
             &proof,
@@ -1903,19 +1918,10 @@ mod tests {
             Err(StoreError::Conflict(_))
         ));
 
-        let mut expired_proof = proof.clone();
-        expired_proof.expires_at_ms = now_ms().saturating_sub(1);
-        expired_proof.sha256 = expired_proof.digest().expect("expired proof digest");
-        let expired_raw = serde_json::to_string(&expired_proof).expect("expired proof serializes");
-        let expired_raw_digest = digest(&expired_raw);
-        store
-            .connection()
-            .expect("connection")
-            .execute(
-                "UPDATE ownership_proofs SET payload_json=?2,payload_sha256=?3 WHERE id=?1",
-                rusqlite::params![proof.proof_id.as_str(), expired_raw, expired_raw_digest,],
-            )
-            .expect("expired proof is installed for replay");
+        while now_ms() <= proof.expires_at_ms {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(ownership_proof_expired(&proof, now_ms()));
         store
             .consume_ownership_proof_for_fresh_attempt(
                 &proof.proof_id,

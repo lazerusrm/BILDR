@@ -180,7 +180,7 @@ struct AgentPromptLayers {
 
 /// Model-authored analysis only.  The controller owns every identity,
 /// repository, scope, timestamp, and digest field in the durable artifact.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct InvestigationResponse {
     schema: String,
@@ -9092,7 +9092,93 @@ impl Orchestrator {
         }
         let run = self.store.run(&task.run_id)?;
         let deadline_key = investigation_deadline_metadata_key(agent_id);
-        if !terminal_replay {
+        // Callback syntax, execution custody, the immutable task packet, and
+        // the exact compiled context are checked before looking for an
+        // existing artifact.  A committed artifact is then sufficient to
+        // replay the controller outcome even if a crash left the investigator
+        // nonterminal and its deadline subsequently elapsed or its read-only
+        // worktree has been reconciled.  It never bypasses those identity and
+        // evidence checks.
+        let outcome =
+            (|| -> Result<(_, _, _, _, Option<InvestigationArtifact>), OrchestratorError> {
+                if agent.sandbox_mode != SandboxMode::ReadOnly
+                    || self.store.agent_approval_policy(agent_id)? != "never"
+                    || agent.effective_model.as_deref() != Some(agent.requested_model.as_str())
+                    || agent.effective_reasoning_effort.as_deref()
+                        != Some(agent.requested_reasoning_effort.as_str())
+                {
+                    return Err(OrchestratorError::Protocol(
+                    "investigation response route, approval policy, or sandbox diverged from controller custody"
+                        .to_owned(),
+                ));
+                }
+                let (packet_attempt_id, packet) =
+                    self.store.task_packet(&task_id)?.ok_or_else(|| {
+                        OrchestratorError::Protocol("investigation packet disappeared".to_owned())
+                    })?;
+                if packet_attempt_id != attempt_id
+                    || packet.execution_kind != TaskExecutionKind::Investigation
+                {
+                    return Err(OrchestratorError::Protocol(
+                        "investigation response no longer matches the active task packet"
+                            .to_owned(),
+                    ));
+                }
+                let context_digest = self
+                    .store
+                    .context_packet_digest_for_attempt(&attempt_id, "investigator")?
+                    .ok_or_else(|| {
+                        OrchestratorError::Protocol(
+                            "investigation response has no persisted immutable context receipt"
+                                .to_owned(),
+                        )
+                    })?;
+                let artifact_id = investigation_artifact_id(&attempt_id)?;
+                let source_ref = investigation_context_evidence_ref(&context_digest);
+                validate_investigation_response_evidence(&response, &source_ref)?;
+                let existing = self.store.investigation_artifact(&artifact_id)?;
+                if let Some(existing) = &existing {
+                    existing
+                        .validate()
+                        .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
+                    validate_investigation_artifact_binding(
+                        existing,
+                        &run,
+                        &task,
+                        &attempt_id,
+                        &packet,
+                        &context_digest,
+                    )?;
+                }
+                Ok((packet, context_digest, artifact_id, source_ref, existing))
+            })();
+        let (packet, context_digest, artifact_id, source_ref, existing) = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // A terminal callback is a replay attempt, never authority to
+                // rewrite an already-recorded terminal outcome. Reject its
+                // malformed or mismatched payload without converting a valid
+                // completed artifact into a failure.
+                if terminal_replay {
+                    return Err(error);
+                }
+                self.fail_investigation_response(
+                    &run,
+                    &task,
+                    &attempt_id,
+                    agent_id,
+                    &error.to_string(),
+                )?;
+                return Err(error);
+            }
+        };
+        if existing.is_none() && terminal_replay {
+            let error = OrchestratorError::Protocol(
+                "terminal investigation callback has no immutable artifact to replay".to_owned(),
+            );
+            return Err(error);
+        }
+        if existing.is_none() && !terminal_replay {
             let deadline_ms =
                 match investigation_deadline_ms(&self.store, &deadline_key, &attempt_id) {
                     Ok(deadline_ms) => deadline_ms,
@@ -9144,115 +9230,50 @@ impl Orchestrator {
                 return Err(error);
             }
         }
-        let outcome = (|| -> Result<InvestigationArtifact, OrchestratorError> {
-            if agent.sandbox_mode != SandboxMode::ReadOnly
-                || self.store.agent_approval_policy(agent_id)? != "never"
-                || agent.effective_model.as_deref() != Some(agent.requested_model.as_str())
-                || agent.effective_reasoning_effort.as_deref()
-                    != Some(agent.requested_reasoning_effort.as_str())
-            {
-                return Err(OrchestratorError::Protocol(
-                    "investigation response route, approval policy, or sandbox diverged from controller custody"
-                        .to_owned(),
-                ));
-            }
-            let (packet_attempt_id, packet) =
-                self.store.task_packet(&task_id)?.ok_or_else(|| {
-                    OrchestratorError::Protocol("investigation packet disappeared".to_owned())
-                })?;
-            if packet_attempt_id != attempt_id
-                || packet.execution_kind != TaskExecutionKind::Investigation
-            {
-                return Err(OrchestratorError::Protocol(
-                    "investigation response no longer matches the active task packet".to_owned(),
-                ));
-            }
-            let context_digest = self
-                .store
-                .context_packet_digest_for_attempt(&attempt_id, "investigator")?
-                .ok_or_else(|| {
+        let artifact = match existing {
+            Some(existing) => existing,
+            None => {
+                let scope = packet.investigation_scope.clone().ok_or_else(|| {
                     OrchestratorError::Protocol(
-                        "investigation response has no persisted immutable context receipt"
-                            .to_owned(),
+                        "investigation response packet is missing its scope".to_owned(),
                     )
                 })?;
-            let artifact_id = InvestigationArtifactId::parse(format!("investigation-{attempt_id}"))
-                .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
-            let source_ref = investigation_context_evidence_ref(&context_digest);
-            validate_investigation_response_evidence(&response, &source_ref)?;
-            if let Some(existing) = self.store.investigation_artifact(&artifact_id)? {
-                existing
-                    .validate()
+                let mut artifact = InvestigationArtifact {
+                    schema: "harness.investigation-artifact.v1".to_owned(),
+                    artifact_id,
+                    run_id: run.id.to_string(),
+                    task_id: task.external_task_id.clone(),
+                    attempt_id: attempt_id.to_string(),
+                    question: packet.objective.clone(),
+                    scope,
+                    base_sha: run.base_sha.clone(),
+                    repository_state_digest: context_digest.clone(),
+                    methods: response.methods,
+                    sources: vec![source_ref],
+                    findings: response.findings,
+                    recommendations: response.recommendations,
+                    decision_inventory: response.decision_inventory,
+                    limitations: response.limitations,
+                    rejected_hypotheses: response.rejected_hypotheses,
+                    sensitivity: response.sensitivity,
+                    artifact_refs: response.artifact_refs,
+                    created_at_ms: now_ms(),
+                    sha256: String::new(),
+                };
+                artifact.sha256 = artifact
+                    .digest()
                     .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
                 validate_investigation_artifact_binding(
-                    &existing,
+                    &artifact,
                     &run,
                     &task,
                     &attempt_id,
                     &packet,
                     &context_digest,
                 )?;
-                return Ok(existing);
-            }
-            if terminal_replay {
-                return Err(OrchestratorError::Protocol(
-                    "terminal investigation callback has no immutable artifact to replay"
-                        .to_owned(),
-                ));
-            }
-            let scope = packet.investigation_scope.clone().ok_or_else(|| {
-                OrchestratorError::Protocol(
-                    "investigation response packet is missing its scope".to_owned(),
-                )
-            })?;
-            let mut artifact = InvestigationArtifact {
-                schema: "harness.investigation-artifact.v1".to_owned(),
-                artifact_id,
-                run_id: run.id.to_string(),
-                task_id: task.external_task_id.clone(),
-                attempt_id: attempt_id.to_string(),
-                question: packet.objective.clone(),
-                scope,
-                base_sha: run.base_sha.clone(),
-                repository_state_digest: context_digest.clone(),
-                methods: response.methods,
-                sources: vec![source_ref],
-                findings: response.findings,
-                recommendations: response.recommendations,
-                decision_inventory: response.decision_inventory,
-                limitations: response.limitations,
-                rejected_hypotheses: response.rejected_hypotheses,
-                sensitivity: response.sensitivity,
-                artifact_refs: response.artifact_refs,
-                created_at_ms: now_ms(),
-                sha256: String::new(),
-            };
-            artifact.sha256 = artifact
-                .digest()
-                .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
-            validate_investigation_artifact_binding(
-                &artifact,
-                &run,
-                &task,
-                &attempt_id,
-                &packet,
-                &context_digest,
-            )?;
-            InvestigationEvidenceService::new(self.store.clone())
-                .record(&artifact)
-                .map_err(|error| OrchestratorError::Validation(error.to_string()))
-        })();
-        let artifact = match outcome {
-            Ok(artifact) => artifact,
-            Err(error) => {
-                self.fail_investigation_response(
-                    &run,
-                    &task,
-                    &attempt_id,
-                    agent_id,
-                    &error.to_string(),
-                )?;
-                return Err(error);
+                InvestigationEvidenceService::new(self.store.clone())
+                    .record(&artifact)
+                    .map_err(|error| OrchestratorError::Validation(error.to_string()))?
             }
         };
         if terminal_replay {
@@ -10526,15 +10547,13 @@ impl Orchestrator {
                         | TaskState::Verifying
                         | TaskState::WaitingApproval
                 );
-                let recoverable_stall = task.state == TaskState::Stalled
-                    && self
-                        .store
-                        .latest_attempt_context(&task.id)?
-                        .as_ref()
-                        .is_some_and(|context| {
-                            context.terminal_class.as_deref() == Some("infrastructure_unavailable")
-                                && context.role.as_deref() == Some("governor")
-                        });
+                // A crash may have persisted the reconciliation receipt and
+                // one or more preservation mutations before the remaining
+                // task/attempt/worktree mutations. Re-enter every stalled
+                // task with a current attempt so that preservation is
+                // resumable; governor continuation still remains separately
+                // proof-gated below.
+                let recoverable_stall = task.state == TaskState::Stalled;
                 if active || recoverable_stall {
                     orphaned_tasks.push(task);
                 }
@@ -10542,15 +10561,10 @@ impl Orchestrator {
             for agent in agents.into_iter().filter(|agent| {
                 !matches!(
                     agent.state.as_str(),
-                    "COMPLETED"
-                        | "TURN_COMPLETE"
-                        | "FAILED"
-                        | "INTERRUPTED"
-                        | "CANCELED"
-                        | "STALLED"
+                    "COMPLETED" | "TURN_COMPLETE" | "FAILED" | "INTERRUPTED" | "CANCELED"
                 )
             }) {
-                affected = affected.saturating_add(1);
+                let newly_stalled = agent.state != "STALLED";
                 self.authorize_reconciliation_preservation(
                     &mut reconciliation,
                     json!({
@@ -10561,15 +10575,18 @@ impl Orchestrator {
                         "result": "authorized_preservation_only",
                     }),
                 )?;
-                self.store.clear_agent_active_turn(&agent.id)?;
-                self.store.update_agent_state(
-                    &agent.id,
-                    "STALLED",
-                    Some(reason),
-                    None,
-                    None,
-                    Some(("infrastructure_unavailable", reason)),
-                )?;
+                if newly_stalled {
+                    affected = affected.saturating_add(1);
+                    self.store.clear_agent_active_turn(&agent.id)?;
+                    self.store.update_agent_state(
+                        &agent.id,
+                        "STALLED",
+                        Some(reason),
+                        None,
+                        None,
+                        Some(("infrastructure_unavailable", reason)),
+                    )?;
+                }
                 let Some(attempt_id) = self.store.task_attempt_for_agent(&agent.id)? else {
                     continue;
                 };
@@ -10587,8 +10604,10 @@ impl Orchestrator {
                         | TaskState::Blocked
                         | TaskState::NeedsHelp
                 ) {
-                    self.store
-                        .transition_task(&task_id, TaskState::Stalled, None)?;
+                    if task.state != TaskState::Stalled {
+                        self.store
+                            .transition_task(&task_id, TaskState::Stalled, None)?;
+                    }
                     self.store.set_attempt_result(
                         &attempt_id,
                         "STALLED",
@@ -10617,36 +10636,35 @@ impl Orchestrator {
                         ))
                     })?;
                 let task = self.store.task(&orphaned.id)?;
+                self.authorize_reconciliation_preservation(
+                    &mut reconciliation,
+                    json!({
+                        "operation": "preserve_lost_task_attempt",
+                        "task_id": task.id,
+                        "attempt_id": attempt_id,
+                        "reason": reason,
+                        "result": "authorized_preservation_only",
+                    }),
+                )?;
                 if task.state != TaskState::Stalled {
-                    self.authorize_reconciliation_preservation(
-                        &mut reconciliation,
-                        json!({
-                            "operation": "preserve_lost_task_attempt",
-                            "task_id": task.id,
-                            "attempt_id": attempt_id,
-                            "reason": reason,
-                            "result": "authorized_preservation_only",
-                        }),
-                    )?;
                     self.store
                         .transition_task(&task.id, TaskState::Stalled, None)?;
-                    self.store.set_attempt_result(
-                        &attempt_id,
-                        "STALLED",
-                        task.head_sha.as_deref(),
-                        Some("infrastructure_unavailable"),
+                }
+                self.store.set_attempt_result(
+                    &attempt_id,
+                    "STALLED",
+                    task.head_sha.as_deref(),
+                    Some("infrastructure_unavailable"),
+                    Some(reason),
+                )?;
+                if let Ok((worktree_id, _, _, head)) = self.store.worktree_for_attempt(&attempt_id)
+                {
+                    self.store.update_worktree(
+                        &worktree_id,
+                        "PRESERVED",
+                        head.as_deref(),
                         Some(reason),
                     )?;
-                    if let Ok((worktree_id, _, _, head)) =
-                        self.store.worktree_for_attempt(&attempt_id)
-                    {
-                        self.store.update_worktree(
-                            &worktree_id,
-                            "PRESERVED",
-                            head.as_deref(),
-                            Some(reason),
-                        )?;
-                    }
                 }
 
                 let governor = self
@@ -15759,9 +15777,7 @@ fn validate_investigation_artifact_binding(
             "investigation artifact has no declared packet scope".to_owned(),
         )
     })?;
-    let expected_artifact_id =
-        InvestigationArtifactId::parse(format!("investigation-{attempt_id}"))
-            .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
+    let expected_artifact_id = investigation_artifact_id(attempt_id)?;
     if artifact.artifact_id != expected_artifact_id
         || artifact.run_id != run.id.as_str()
         || artifact.task_id != task.external_task_id
@@ -15777,6 +15793,27 @@ fn validate_investigation_artifact_binding(
         ));
     }
     Ok(())
+}
+
+/// Derive a bounded, deterministic artifact identity from the controller
+/// attempt.  Attempt IDs may use the full controller identifier allowance, so
+/// embedding the raw ID after an `investigation-` prefix would reject an
+/// otherwise valid attempt at artifact admission.
+fn investigation_artifact_id(
+    attempt_id: &AttemptId,
+) -> Result<InvestigationArtifactId, OrchestratorError> {
+    let digest = hex::encode(Sha256::digest(attempt_id.as_str().as_bytes()));
+    InvestigationArtifactId::parse(format!("investigation-{digest}"))
+        .map_err(|error| OrchestratorError::Validation(error.to_string()))
+}
+
+#[cfg(test)]
+#[test]
+fn investigation_artifact_id_preserves_full_width_attempt_admission() {
+    let attempt = AttemptId::from("a".repeat(160));
+    let artifact_id = investigation_artifact_id(&attempt).expect("artifact id derives");
+    assert!(artifact_id.as_str().len() <= 160);
+    assert_ne!(artifact_id.as_str(), format!("investigation-{attempt}"));
 }
 
 fn task_diff_policy(packet: &TaskPacket, profile: &RepositoryProfile) -> DiffPolicy {
@@ -18671,15 +18708,17 @@ mod tests {
             .store()
             .list_reconciliation_action_receipts(&episode.episode_id, 10)
             .expect("receipts read");
-        assert_eq!(receipts.len(), 1);
-        assert_eq!(
-            receipts[0].kind,
-            harness_domain::ReconciliationActionKind::Preserve
-        );
-        assert_eq!(
-            receipts[0].payload["result"],
-            Value::String("authorized_preservation_only".to_owned())
-        );
+        assert!(receipts.iter().all(|receipt| {
+            receipt.kind == harness_domain::ReconciliationActionKind::Preserve
+                && receipt.payload["result"]
+                    == Value::String("authorized_preservation_only".to_owned())
+        }));
+        assert!(receipts.iter().any(|receipt| {
+            receipt.payload["operation"] == Value::String("preserve_lost_agent_session".to_owned())
+        }));
+        assert!(receipts.iter().any(|receipt| {
+            receipt.payload["operation"] == Value::String("preserve_lost_task_attempt".to_owned())
+        }));
         assert_eq!(
             orchestrator
                 .store()
@@ -18688,6 +18727,77 @@ mod tests {
                 .state,
             TaskState::Stalled
         );
+    }
+
+    #[tokio::test]
+    async fn restart_reconciliation_resumes_a_receipted_partial_preservation() {
+        let (orchestrator, _temp, _runtime, run_id, task_id) = investigation_fixture().await;
+        orchestrator
+            .tick(&run_id)
+            .await
+            .expect("investigation starts before simulated crash");
+        let investigator = orchestrator
+            .store()
+            .list_agents(&run_id)
+            .expect("agents read")
+            .into_iter()
+            .find(|agent| agent.role == AgentRole::Investigator)
+            .expect("investigator exists");
+        let run = orchestrator.store().run(&run_id).expect("run reads");
+        let mut episode = orchestrator
+            .record_reconciliation_inventory(&run, "daemon restarted")
+            .expect("pre-mutation inventory persists");
+        orchestrator
+            .authorize_reconciliation_preservation(
+                &mut episode,
+                json!({
+                    "operation": "preserve_lost_agent_session",
+                    "agent_id": investigator.id,
+                    "task_id": task_id,
+                    "reason": "daemon restarted",
+                    "result": "authorized_preservation_only",
+                }),
+            )
+            .expect("receipt commits before state mutations");
+        orchestrator
+            .store()
+            .clear_agent_active_turn(&investigator.id)
+            .expect("agent turn clears before crash");
+        orchestrator
+            .store()
+            .update_agent_state(
+                &investigator.id,
+                "STALLED",
+                Some("daemon restarted"),
+                None,
+                None,
+                Some(("infrastructure_unavailable", "daemon restarted")),
+            )
+            .expect("agent state persists before crash");
+        orchestrator
+            .store()
+            .transition_task(&task_id, TaskState::Stalled, None)
+            .expect("task state persists before crash");
+
+        orchestrator
+            .reconcile_orphaned_sessions("daemon restarted")
+            .expect("restart resumes the remaining preservation mutations");
+        assert_eq!(
+            orchestrator
+                .store()
+                .task(&task_id)
+                .expect("task rereads")
+                .state,
+            TaskState::Stalled
+        );
+        let worktree = orchestrator
+            .store()
+            .list_worktrees(Some(&run_id))
+            .expect("worktrees read")
+            .into_iter()
+            .find(|worktree| worktree.task_id.as_ref() == Some(&task_id))
+            .expect("attempt worktree exists");
+        assert_eq!(worktree.state, "PRESERVED");
     }
 
     #[tokio::test]
@@ -18901,6 +19011,123 @@ mod tests {
                 .runtime_metadata(&investigation_deadline_metadata_key(&investigator.id))
                 .expect("deadline reads")
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_investigation_artifact_replays_after_deadline_and_worktree_drift() {
+        let (orchestrator, _temp, _runtime, run_id, task_id) = investigation_fixture().await;
+        orchestrator
+            .tick(&run_id)
+            .await
+            .expect("investigation starts");
+        let investigator = orchestrator
+            .store()
+            .list_agents(&run_id)
+            .expect("agents read")
+            .into_iter()
+            .find(|agent| agent.role == AgentRole::Investigator)
+            .expect("investigator exists");
+        let attempt_id = orchestrator
+            .store()
+            .task_attempt_for_agent(&investigator.id)
+            .expect("attempt reads")
+            .expect("attempt exists");
+        let run = orchestrator.store().run(&run_id).expect("run reads");
+        let task = orchestrator.store().task(&task_id).expect("task reads");
+        let (_, packet) = orchestrator
+            .store()
+            .task_packet(&task_id)
+            .expect("packet reads")
+            .expect("packet exists");
+        let context_digest = orchestrator
+            .store()
+            .context_packet_digest_for_attempt(&attempt_id, "investigator")
+            .expect("context reads")
+            .expect("context exists");
+        let response = json!({
+            "schema": "harness.investigation-response.v1",
+            "methods": ["bounded immutable context review"],
+            "findings": [{
+                "finding_id": "finding-replay",
+                "classification": "supported",
+                "summary": "The persisted context remains available.",
+                "confidence_milli": 900,
+                "evidence_refs": [investigation_context_evidence_ref(&context_digest)],
+                "affected_refs": [],
+                "risk": "normal",
+                "limitations": []
+            }],
+            "recommendations": [],
+            "decision_inventory": [],
+            "limitations": [],
+            "rejected_hypotheses": [],
+            "sensitivity": "internal",
+            "artifact_refs": []
+        });
+        let response_json = serde_json::to_string(&response).expect("response serializes");
+        let response = parse_investigation_response(&response_json).expect("response parses");
+        let mut artifact = InvestigationArtifact {
+            schema: "harness.investigation-artifact.v1".to_owned(),
+            artifact_id: investigation_artifact_id(&attempt_id).expect("artifact id"),
+            run_id: run.id.to_string(),
+            task_id: task.external_task_id.clone(),
+            attempt_id: attempt_id.to_string(),
+            question: packet.objective.clone(),
+            scope: packet
+                .investigation_scope
+                .clone()
+                .expect("investigation scope exists"),
+            base_sha: run.base_sha.clone(),
+            repository_state_digest: context_digest.clone(),
+            methods: response.methods,
+            sources: vec![investigation_context_evidence_ref(&context_digest)],
+            findings: response.findings,
+            recommendations: response.recommendations,
+            decision_inventory: response.decision_inventory,
+            limitations: response.limitations,
+            rejected_hypotheses: response.rejected_hypotheses,
+            sensitivity: response.sensitivity,
+            artifact_refs: response.artifact_refs,
+            created_at_ms: now_ms(),
+            sha256: String::new(),
+        };
+        artifact.sha256 = artifact.digest().expect("artifact digest");
+        InvestigationEvidenceService::new(orchestrator.store().clone())
+            .record(&artifact)
+            .expect("artifact commits before terminal state updates");
+        orchestrator
+            .store()
+            .put_runtime_metadata(
+                &investigation_deadline_metadata_key(&investigator.id),
+                &json!({"deadline_ms": 0, "attempt_id": attempt_id}),
+            )
+            .expect("expired deadline persists");
+        let (_, worktree, _, _) = orchestrator
+            .store()
+            .worktree_for_attempt(&attempt_id)
+            .expect("worktree reads");
+        fs::write(worktree.join("artifact-replay-probe"), "untracked").expect("worktree drifts");
+
+        orchestrator
+            .accept_investigation_response(&investigator.id, &response_json)
+            .await
+            .expect("verified committed artifact replays without liveness revalidation");
+        assert_eq!(
+            orchestrator
+                .store()
+                .task(&task_id)
+                .expect("task rereads")
+                .state,
+            TaskState::Closed
+        );
+        assert_eq!(
+            orchestrator
+                .store()
+                .agent(&investigator.id)
+                .expect("agent rereads")
+                .state,
+            "COMPLETED"
         );
     }
 
@@ -19276,12 +19503,7 @@ mod tests {
 
         orchestrator
             .store()
-            .connection()
-            .expect("connection")
-            .execute(
-                "UPDATE agent_sessions SET task_attempt_id=NULL WHERE id=?1",
-                [investigator.id.as_str()],
-            )
+            .test_set_agent_task_attempt(&investigator.id, None)
             .expect("fixture removes only the direct agent custody link");
         assert!(
             orchestrator
@@ -19312,17 +19534,6 @@ mod tests {
                 .state,
             TaskState::NeedsHelp
         );
-        let attempt_state: String = orchestrator
-            .store()
-            .connection()
-            .expect("connection")
-            .query_row(
-                "SELECT state FROM task_attempts WHERE id=?1",
-                [attempt_id.as_str()],
-                |row| row.get(0),
-            )
-            .expect("attempt remains addressable through the worktree binding");
-        assert_eq!(attempt_state, "FAILED");
         let worktree = orchestrator
             .store()
             .list_worktrees(Some(&run_id))
@@ -19362,12 +19573,7 @@ mod tests {
             .expect("worktree persists");
         orchestrator
             .store()
-            .connection()
-            .expect("connection")
-            .execute(
-                "UPDATE agent_sessions SET task_attempt_id=NULL WHERE id=?1",
-                [investigator.id.as_str()],
-            )
+            .test_set_agent_task_attempt(&investigator.id, None)
             .expect("fixture removes only the direct agent custody link");
 
         orchestrator
@@ -19391,17 +19597,6 @@ mod tests {
                 .state,
             TaskState::NeedsHelp
         );
-        let attempt_state: String = orchestrator
-            .store()
-            .connection()
-            .expect("connection")
-            .query_row(
-                "SELECT state FROM task_attempts WHERE id=?1",
-                [attempt_id.as_str()],
-                |row| row.get(0),
-            )
-            .expect("attempt remains addressable through the worktree binding");
-        assert_eq!(attempt_state, "FAILED");
         assert_eq!(
             orchestrator
                 .store()
@@ -22092,6 +22287,9 @@ mod tests {
             .is_err(),
             "a report cannot make an uncited conclusion"
         );
+        admitted.findings[0].evidence_refs = vec![
+            "context:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        ];
         let exact_response = serde_json::to_string(&admitted).expect("response serializes");
         assert!(parse_investigation_response(&exact_response).is_ok());
         assert!(

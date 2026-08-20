@@ -127,6 +127,30 @@ impl Store {
         self.connection.lock().map_err(|_| StoreError::Poisoned)
     }
 
+    /// Narrow fault-injection seam for cross-crate recovery tests. It is
+    /// compiled only when an explicit test-support feature is enabled and is
+    /// unavailable to production controller code.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_set_agent_task_attempt(
+        &self,
+        agent_id: &harness_domain::AgentSessionId,
+        attempt_id: Option<&harness_domain::AttemptId>,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection()?.execute(
+            "UPDATE agent_sessions SET task_attempt_id=?2 WHERE id=?1",
+            (
+                agent_id.as_str(),
+                attempt_id.map(harness_domain::AttemptId::as_str),
+            ),
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::NotFound(format!("agent {agent_id}")))
+        }
+    }
+
     #[must_use]
     pub fn artifacts(&self) -> &ArtifactStore {
         &self.artifacts
@@ -2294,11 +2318,21 @@ mod tests {
         taskset.sha256 = harness_eval::canonical_digest_without_self(&taskset).unwrap();
         let append = |id: &str, kind: K, schema: S, value: serde_json::Value| {
             let digest = crate::queries::sha256(serde_json::to_string(&value).unwrap().as_bytes());
+            let aggregate_id = match &schema {
+                S::EvalCaseV1 => value["case_id"].as_str().expect("case id").to_owned(),
+                S::TasksetV1 => value["taskset_id"].as_str().expect("taskset id").to_owned(),
+                S::GraderBundleV1 => value["grader_bundle_id"]
+                    .as_str()
+                    .expect("grader bundle id")
+                    .to_owned(),
+                S::OutcomeV1 => value["outcome_id"].as_str().expect("outcome id").to_owned(),
+                _ => id.to_owned(),
+            };
             store
                 .append_improvement_revision(&NewImprovementRevision {
                     id: id.into(),
                     aggregate_kind: kind,
-                    aggregate_id: id.into(),
+                    aggregate_id,
                     schema,
                     state: St::Proposed,
                     payload: value,

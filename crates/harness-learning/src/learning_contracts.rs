@@ -277,7 +277,7 @@ impl PolicyBundleV1 {
     pub fn verify(&self) -> Result<(), LearningContractError> {
         if self.schema != "harness.policy-bundle.v1"
             || !token(&self.bundle_id)
-            || !token(&self.repository_id)
+            || !controller_token(&self.repository_id)
             || !token(&self.task_family)
             || !hash(&self.safety_anchor_digest)
             || self.components.is_empty()
@@ -386,7 +386,7 @@ impl CandidateV1 {
         ];
         if self.schema != "harness.improvement-candidate.v1"
             || !token(&self.candidate_id)
-            || !token(&self.scope.repository_id)
+            || !controller_token(&self.scope.repository_id)
             || !token(&self.scope.task_family)
             || self
                 .scope
@@ -557,6 +557,13 @@ fn token(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
 }
+fn controller_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 160
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+}
 fn knowledge_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_KNOWLEDGE_TOKEN_LEN
@@ -688,7 +695,7 @@ mod tests {
     #[test]
     fn knowledge_tokens_accept_the_contract_ceiling_and_reject_one_more_byte() {
         let mut at_ceiling = active(10);
-        let token = |byte| byte.to_string().repeat(MAX_KNOWLEDGE_TOKEN_LEN);
+        let token = |byte: char| byte.to_string().repeat(MAX_KNOWLEDGE_TOKEN_LEN);
         at_ceiling.knowledge_id = token('a');
         at_ceiling.scope.repository_id = token('b');
         at_ceiling.scope.task_family = token('c');
@@ -730,6 +737,14 @@ mod tests {
         assert!(bundle.verify().is_err());
         bundle.components.pop();
         bundle.sha256 = digest(&bundle).unwrap();
+        bundle.repository_id = "r".repeat(160);
+        bundle.sha256 = digest(&bundle).unwrap();
+        assert!(bundle.verify().is_ok());
+        bundle.repository_id.push('r');
+        bundle.sha256 = digest(&bundle).unwrap();
+        assert!(bundle.verify().is_err());
+        bundle.repository_id = "repo".into();
+        bundle.sha256 = digest(&bundle).unwrap();
         let mut c = CandidateV1 {
             schema: "harness.improvement-candidate.v1".into(),
             candidate_id: "candidate-1".into(),
@@ -767,6 +782,14 @@ mod tests {
         };
         c.sha256 = digest(&c).unwrap();
         assert!(c.verify().is_ok());
+        c.scope.repository_id = "r".repeat(160);
+        c.sha256 = digest(&c).unwrap();
+        assert!(c.verify().is_ok());
+        c.scope.repository_id.push('r');
+        c.sha256 = digest(&c).unwrap();
+        assert!(c.verify().is_err());
+        c.scope.repository_id = "repo".into();
+        c.sha256 = digest(&c).unwrap();
         c.edit.risk_class = EditRisk::Amber;
         c.sha256 = digest(&c).unwrap();
         assert!(c.verify().is_err());

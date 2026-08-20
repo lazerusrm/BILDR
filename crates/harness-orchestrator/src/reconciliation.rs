@@ -53,11 +53,15 @@ impl Orchestrator {
                     version: 1,
                     opened_at_ms: now,
                     updated_at_ms: now,
-                    source_event_id: format!(
-                        "reconciliation-{}-{}-v{}",
-                        trigger_name(trigger),
-                        run.id,
-                        run.version
+                    // Keep the event ID independently bounded: controller run
+                    // IDs can use all 160 bytes, while this source identity
+                    // also needs reconciliation kind and revision markers.
+                    // The run ID remains an explicit episode field and the
+                    // hash binds this derived ID to that exact run/trigger.
+                    source_event_id: reconciliation_episode_source_event_id(
+                        trigger,
+                        run.id.as_str(),
+                        run.version,
                     ),
                     inventory_sha256: inventory_sha256.clone(),
                     finding_count: 0,
@@ -273,4 +277,42 @@ fn trigger_name(trigger: ReconciliationTrigger) -> &'static str {
 
 fn digest_bytes(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn reconciliation_episode_source_event_id(
+    trigger: ReconciliationTrigger,
+    run_id: &str,
+    version: u64,
+) -> String {
+    let identity = format!("{}\0{run_id}\0{version}", trigger_name(trigger));
+    let digest = digest_bytes(identity.as_bytes());
+    format!(
+        "reconciliation-{}-{}-v{version}",
+        trigger_name(trigger),
+        &digest[..48]
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconciliation_source_event_ids_bind_full_width_runs_without_overflow() {
+        let run_id = "r".repeat(160);
+        let id = reconciliation_episode_source_event_id(
+            ReconciliationTrigger::DaemonRestart,
+            &run_id,
+            u64::MAX,
+        );
+        assert!(id.len() <= 160);
+        assert_ne!(
+            id,
+            reconciliation_episode_source_event_id(
+                ReconciliationTrigger::DaemonRestart,
+                &"s".repeat(160),
+                u64::MAX,
+            )
+        );
+    }
 }

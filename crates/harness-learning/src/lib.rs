@@ -1094,20 +1094,36 @@ mod tests {
         let mut partial_cost = fixture;
         partial_cost["cost"]["scope_id"] = serde_json::Value::String("attempt-1".into());
         assert!(!validator.is_valid(&partial_cost));
+
+        let mut controller_scope: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../examples/self-improvement/failure.example.json"
+        ))
+        .expect("fixture parses");
+        controller_scope["cost"] = serde_json::json!({
+            "kind": "known",
+            "scope_id": format!("run:{}", "r".repeat(160)),
+            "lower_microusd": 1,
+            "additional_microusd": 0,
+        });
+        assert!(validator.is_valid(&controller_scope));
+
+        let mut oversized_plain_scope = controller_scope;
+        oversized_plain_scope["cost"]["scope_id"] = serde_json::Value::String("r".repeat(164));
+        assert!(!validator.is_valid(&oversized_plain_scope));
     }
 
     #[test]
     fn identifiers_and_cost_scopes_are_opaque_bounded_tokens() {
-        for invalid in [
-            "operator@example.com",
-            "path/segment",
-            "two words",
-            &"x".repeat(129),
-        ] {
+        for invalid in ["operator@example.com", "path/segment", "two words"] {
             let mut value = input("valid", None, CostAttribution::unknown());
             value.source_id = invalid.to_owned();
             assert!(FailureOccurrence::from_typed(value).is_err());
         }
+        let mut controller_source = input("valid", None, CostAttribution::unknown());
+        controller_source.source_id = "x".repeat(160);
+        assert!(FailureOccurrence::from_typed(controller_source.clone()).is_ok());
+        controller_source.source_id.push('x');
+        assert!(FailureOccurrence::from_typed(controller_source).is_err());
         assert!(
             FailureOccurrence::from_typed(input(
                 "valid",
