@@ -583,9 +583,6 @@ fn hash40(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
 }
-fn unique_tokens(values: &[String]) -> bool {
-    values.iter().all(|v| token(v)) && values.iter().collect::<BTreeSet<_>>().len() == values.len()
-}
 fn unique_knowledge_tokens(values: &[String]) -> bool {
     values.iter().all(|v| knowledge_token(v))
         && values.iter().collect::<BTreeSet<_>>().len() == values.len()

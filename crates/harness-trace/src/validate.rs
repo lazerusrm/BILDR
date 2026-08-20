@@ -18,15 +18,13 @@ pub fn validate_manifest(manifest: &TraceManifest) -> Result<(), ProjectionError
     if manifest.schema != "harness.trace.v2" {
         return invalid_manifest("schema");
     }
-    for (field, value, valid) in [
+    for (field, valid) in [
         (
             "trace_id",
-            &manifest.trace_id,
             safe_trace_id(&manifest.trace_id),
         ),
         (
             "run_id",
-            &manifest.run_id,
             safe_controller_id(&manifest.run_id),
         ),
     ] {
