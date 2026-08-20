@@ -360,8 +360,8 @@ const apiResponse = (pathname) => {
       codex: {
         state: "ready",
         detail: "Version and schema matched",
-        version: "codex-cli 0.147.0",
-        required_version: "codex-cli 0.147.0",
+        version: "codex-cli 0.148.0",
+        required_version: "codex-cli 0.148.0",
         protocol_schema_sha256: "d".repeat(64),
         schema_match: true,
         pid: 7310,

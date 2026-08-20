@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use ulid::Ulid;
 
-const VERSION: &str = "0.147.0";
+const VERSION: &str = "0.148.0";
 const ROOT_SCHEMA: &str = include_str!(
     "../../../generated/codex-app-server-schema/codex_app_server_protocol.v2.schemas.json"
 );

@@ -176,7 +176,7 @@ impl CodexSupervisor {
         let mut command = Command::new(&settings.binary);
         command
             .arg("app-server")
-            // Codex 0.147.0 can materialize the first command sandbox from the
+            // App Server can materialize the first command sandbox from the
             // thread-start defaults before a turn-level network override is
             // reflected in turn context. Start workspace-write threads with
             // network available, then let Harness narrow non-GitHub turns back

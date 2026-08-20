@@ -25,7 +25,7 @@ API-equivalent usage accounting.
 ## Requirements
 
 - Linux, Git, Rust 1.97.1, Node.js 22+, npm, and `rg`.
-- Codex CLI 0.147.0 authenticated for normal execution. The daemon verifies
+- Codex CLI 0.148.0 authenticated for normal execution. The daemon verifies
   both the CLI version and generated App Server v2 schema digest before it
   enables mutable work.
 - A clean Git coordination clone with `origin` and Git user name/email. The
@@ -144,11 +144,11 @@ The account strip discovers the default `~/.codex` home, Codex accounts already
 registered in Headroom, plus sibling
 `.codex-*`, `.codex_*`, `codex-*`, and `codex_*` homes that contain Codex
 credentials. It can also add a private Harness-managed Codex home using Codex
-0.147.0 device authorization, then rename, re-authenticate, or remove those
+0.148.0 device authorization, then rename, re-authenticate, or remove those
 managed profiles from Settings. Add explicit external homes with the colon-separated
 `HARNESS_CODEX_ACCOUNT_HOMES` environment variable. Selecting an account starts
 App Server with that `CODEX_HOME`, persists only the opaque local profile ID,
-and refreshes the 0.147.0 `account/read` and `account/rateLimits/read` telemetry.
+and refreshes the 0.148.0 `account/read` and `account/rateLimits/read` telemetry.
 The limits strip keeps local observations and reports a smoothed hourly burn
 forecast that weights the longer 24-hour trend most heavily, blends in the
 recent four-hour pace, and anchors both to the provider window average.

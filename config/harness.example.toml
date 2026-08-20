@@ -20,10 +20,10 @@ service_name = "harness_console"
 experimental_api = false
 # Release validated by generated/CODEX_COMPATIBILITY.json. Update both pins with
 # `cargo xtask codex-schema` when intentionally upgrading Codex.
-required_version = "0.147.0"
+required_version = "0.148.0"
 # SHA-256 over the parsed, canonical JSON generated with:
 # codex app-server generate-json-schema --out <dir>
-required_protocol_schema_sha256 = "9c8a7d0c96b8e33a989c7d0b178f271ec80d19aba90b9631c978fc985d289ff6"
+required_protocol_schema_sha256 = "19b656fe5132b97e8b233c8c3d7129f451d621113cbd7ed319972dd54eedc476"
 execution_on_schema_mismatch = "disabled"
 reasoning_summary = "concise"
 

@@ -140,7 +140,7 @@ budget, Harness interrupts the turn after the 90-percent handoff checkpoint and
 records `agent.governor.budget_hard_stop`. The preserved worktree and handoff
 remain retryable; the scheduler does not silently fund an unbounded turn.
 
-Codex 0.147.0 announces delegated children through parent-thread
+Codex 0.148.0 announces delegated children through parent-thread
 `item/started` or `item/completed` notifications whose item type is
 `subAgentActivity`. Harness uses `agentThreadId` as the child thread identity
 and `agentPath` as its display name, then attributes subsequent child-thread
@@ -156,7 +156,7 @@ wait. Harness prompts governors to use a five-minute wait rather than repeated
 default-interval polls; native child completion resumes the parent early. No
 external hook or synthetic keepalive turn is used.
 
-For Codex 0.147.0, the `turn/start` response can race with a
+For Codex 0.148.0, the `turn/start` response can race with a
 `turn/started` notification and the two observed turn IDs are not assumed to be
 interchangeable. The notification is authoritative for `active_turn_id`; a
 late response may fill an empty projection but must never overwrite that
@@ -169,7 +169,7 @@ authenticated GitHub capability probe and then start the Codex turn with
 network remains network-isolated. This prevents a Harness-created DNS denial
 from being misreported as a bad credential.
 
-The 0.147.0 App Server is launched with
+The 0.148.0 App Server is launched with
 `sandbox_workspace_write.network_access=true` so the initial thread context and
 native children do not materialize the default network-off sandbox before the
 first `turn/start` override arrives. Harness still sends
@@ -319,7 +319,7 @@ This is why write-owning parallel tasks are top-level controller sessions in sep
 
 ## 12. Token usage mapping
 
-Store both cumulative and last-call values if supplied. In Codex 0.147.0,
+Store both cumulative and last-call values if supplied. In Codex 0.148.0,
 `tokenUsage.last` describes one model call inside a turn; tool-heavy turns can
 emit many distinct calls. The durable ledger deduplicates notifications by the
 monotonic `tokenUsage.total` counter, then sums each distinct `last` call into
