@@ -45,6 +45,7 @@ const TRACE_SNAPSHOT_MAX_RAW_RECEIPTS: i64 = 10_000;
 const TRACE_SNAPSHOT_MAX_DOMAIN_RECEIPTS: i64 = 10_000;
 const TRACE_SNAPSHOT_MAX_PAYLOAD_BYTES: i64 = 32 * 1024 * 1024;
 const MAX_KNOWLEDGE_PAGE_SIZE: u32 = 200;
+type InvestigationWorktreeBinding = (WorktreeId, Option<AttemptId>, Option<String>);
 
 impl Store {
     pub fn bind_champion_policy(
@@ -3743,14 +3744,7 @@ impl Store {
         &self,
         run_id: &RunId,
         cwd: &str,
-    ) -> Result<
-        Option<(
-            harness_domain::WorktreeId,
-            Option<AttemptId>,
-            Option<String>,
-        )>,
-        StoreError,
-    > {
+    ) -> Result<Option<InvestigationWorktreeBinding>, StoreError> {
         self.connection()?
             .query_row(
                 "SELECT id,task_attempt_id,head_sha FROM worktrees WHERE run_id=?1 AND kind='investigation' AND path=?2 AND removed_at IS NULL ORDER BY created_at DESC LIMIT 1",

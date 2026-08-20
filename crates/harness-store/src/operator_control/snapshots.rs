@@ -220,16 +220,16 @@ impl Store {
             )?,
             "control plane snapshot revision",
         )?;
-        let (attention_rows, attention_truncation) = attention_rows(&transaction)?;
-        let (run_rows, run_truncation) = run_rows(&transaction)?;
-        let (attempt_rows, attempt_truncation) = attempt_rows(&transaction)?;
-        let (investigation_rows, investigation_truncation) = investigation_rows(&transaction)?;
+        let (attention_rows, attention_truncation) = attention_rows(transaction)?;
+        let (run_rows, run_truncation) = run_rows(transaction)?;
+        let (attempt_rows, attempt_truncation) = attempt_rows(transaction)?;
+        let (investigation_rows, investigation_truncation) = investigation_rows(transaction)?;
         let (external_condition_rows, external_condition_truncation) =
-            external_condition_rows(&transaction)?;
-        let (progress_rows, progress_truncation) = material_progress_rows(&transaction)?;
-        let (liveness_rows, liveness_truncation) = liveness_rows(&transaction)?;
-        let (reconciliation_rows, reconciliation_truncation) = reconciliation_rows(&transaction)?;
-        let (notification_rows, notification_truncation) = notification_rows(&transaction)?;
+            external_condition_rows(transaction)?;
+        let (progress_rows, progress_truncation) = material_progress_rows(transaction)?;
+        let (liveness_rows, liveness_truncation) = liveness_rows(transaction)?;
+        let (reconciliation_rows, reconciliation_truncation) = reconciliation_rows(transaction)?;
+        let (notification_rows, notification_truncation) = notification_rows(transaction)?;
         let active_agents: i64 = transaction.query_row(
             "SELECT count(*) FROM agent_sessions WHERE state NOT IN ('COMPLETED','FAILED','CANCELED')",
             [],
@@ -531,12 +531,12 @@ impl Store {
                 "return view snapshot changed; refresh before acknowledging it".to_owned(),
             ));
         }
-        if let Some((prior_cursor, _prior_revision)) = current {
-            if acknowledged_cursor < prior_cursor {
-                return Err(StoreError::Conflict(
-                    "return view acknowledgement cursor cannot move backwards".to_owned(),
-                ));
-            }
+        if let Some((prior_cursor, _prior_revision)) = current
+            && acknowledged_cursor < prior_cursor
+        {
+            return Err(StoreError::Conflict(
+                "return view acknowledgement cursor cannot move backwards".to_owned(),
+            ));
         }
         if acknowledged_cursor > current_event_cursor {
             return Err(StoreError::Validation(

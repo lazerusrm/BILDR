@@ -20,6 +20,18 @@ use super::correlation::record_correlation_link_in_transaction;
 
 const MAX_RECONCILIATION_PAGE_SIZE: u32 = 200;
 const FRESH_ATTEMPT_AUTHORIZED_STATE: &str = "AUTHORIZED";
+type FreshAttemptConsumptionRow = (
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 
 impl Store {
     /// Returns the one replacement attempt whose exclusive-ownership proof
@@ -273,18 +285,7 @@ impl Store {
             .optional()?
             .ok_or_else(|| StoreError::NotFound(format!("ownership proof {proof_id}")))?;
         let proof = checked_ownership_row(proof_raw, proof_digest)?;
-        let existing_consumption: Option<(
-            String,
-            String,
-            String,
-            String,
-            i64,
-            String,
-            String,
-            String,
-            String,
-            String,
-        )> = transaction
+        let existing_consumption: Option<FreshAttemptConsumptionRow> = transaction
             .query_row(
                 "SELECT c.replacement_attempt_id,c.task_id,a.payload_json,a.payload_sha256,ta.attempt_number,ta.state,ta.task_packet_json,ta.task_packet_sha256,ta.base_sha,ta.requested_model_route FROM reconciliation_proof_consumptions c JOIN reconciliation_actions a ON a.id=c.action_id JOIN task_attempts ta ON ta.id=c.replacement_attempt_id AND ta.task_id=c.task_id WHERE c.proof_id=?1",
                 [proof_id.as_str()],
