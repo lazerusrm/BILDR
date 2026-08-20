@@ -951,7 +951,7 @@ impl CodexRuntimeManager {
         let profiles = self.profiles.read().await.clone();
         for profile in profiles {
             let due = force
-                || profile.observed_at.map_or(true, |observed| {
+                || profile.observed_at.is_none_or(|observed| {
                     now.saturating_sub(observed) >= ACCOUNT_TELEMETRY_REFRESH_INTERVAL_MS
                 });
             if !due {
