@@ -1068,6 +1068,23 @@ fn validate_local_url(url: &Url) -> Result<()> {
     Ok(())
 }
 
+async fn integration_head(
+    api: &ApiClient,
+    run_id: &str,
+    supplied: Option<String>,
+) -> Result<String> {
+    match supplied {
+        Some(head) => Ok(head),
+        None => api
+            .get(&format!("/api/v1/runs/{run_id}"))
+            .await?
+            .pointer("/run/integration_sha")
+            .and_then(Value::as_str)
+            .context("run has no prepared integration head")
+            .map(ToOwned::to_owned),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1217,22 +1234,5 @@ mod tests {
             ])
             .is_err()
         );
-    }
-}
-
-async fn integration_head(
-    api: &ApiClient,
-    run_id: &str,
-    supplied: Option<String>,
-) -> Result<String> {
-    match supplied {
-        Some(head) => Ok(head),
-        None => api
-            .get(&format!("/api/v1/runs/{run_id}"))
-            .await?
-            .pointer("/run/integration_sha")
-            .and_then(Value::as_str)
-            .context("run has no prepared integration head")
-            .map(ToOwned::to_owned),
     }
 }

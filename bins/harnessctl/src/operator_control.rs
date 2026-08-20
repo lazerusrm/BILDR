@@ -185,35 +185,6 @@ fn local_capacity_request(minimum_available_bytes: u64, deadline_ms: Option<i64>
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::{local_capacity_request, time_gate_request};
-
-    #[test]
-    fn time_gate_request_keeps_an_omitted_deadline_explicitly_null() {
-        assert_eq!(
-            time_gate_request(1_786_809_600_000, None),
-            json!({
-                "not_before_ms": 1_786_809_600_000_i64,
-                "deadline_ms": null,
-            })
-        );
-    }
-
-    #[test]
-    fn local_capacity_request_has_only_the_closed_capacity_shape() {
-        assert_eq!(
-            local_capacity_request(1_048_576, None),
-            json!({
-                "minimum_available_bytes": 1_048_576_u64,
-                "deadline_ms": null,
-            })
-        );
-    }
-}
-
 pub(super) async fn progress(api: &ApiClient, run_id: Option<String>) -> Result<Value> {
     api.get(&bounded_run_query("/api/v1/material-progress", run_id))
         .await
@@ -313,4 +284,33 @@ fn bounded_run_query(path: &str, run_id: Option<String>) -> String {
         query.push(format!("run_id={run_id}"));
     }
     format!("{path}?{}", query.join("&"))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{local_capacity_request, time_gate_request};
+
+    #[test]
+    fn time_gate_request_keeps_an_omitted_deadline_explicitly_null() {
+        assert_eq!(
+            time_gate_request(1_786_809_600_000, None),
+            json!({
+                "not_before_ms": 1_786_809_600_000_i64,
+                "deadline_ms": null,
+            })
+        );
+    }
+
+    #[test]
+    fn local_capacity_request_has_only_the_closed_capacity_shape() {
+        assert_eq!(
+            local_capacity_request(1_048_576, None),
+            json!({
+                "minimum_available_bytes": 1_048_576_u64,
+                "deadline_ms": null,
+            })
+        );
+    }
 }
