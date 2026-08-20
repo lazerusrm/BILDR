@@ -19,14 +19,8 @@ pub fn validate_manifest(manifest: &TraceManifest) -> Result<(), ProjectionError
         return invalid_manifest("schema");
     }
     for (field, valid) in [
-        (
-            "trace_id",
-            safe_trace_id(&manifest.trace_id),
-        ),
-        (
-            "run_id",
-            safe_controller_id(&manifest.run_id),
-        ),
+        ("trace_id", safe_trace_id(&manifest.trace_id)),
+        ("run_id", safe_controller_id(&manifest.run_id)),
     ] {
         if !valid {
             return invalid_manifest(field);
