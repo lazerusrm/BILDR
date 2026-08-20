@@ -18874,34 +18874,36 @@ mod tests {
                 .worktree_has_active_path_lease(&worktree_id)
                 .expect("no mutable lease exists")
         );
-        let started_threads = runtime.started_threads.lock().expect("thread requests");
-        assert_eq!(started_threads.len(), 1);
-        assert_eq!(started_threads[0].sandbox, "read-only");
-        assert_eq!(started_threads[0].approval_policy, "never");
-        drop(started_threads);
-        let started_turns = runtime.started_turns.lock().expect("turn requests");
-        assert_eq!(started_turns.len(), 1);
-        assert_eq!(started_turns[0].approval_policy, "never");
-        assert_eq!(
-            started_turns[0].sandbox_policy,
-            json!({"type": "readOnly", "networkAccess": false})
-        );
-        assert_eq!(
-            started_turns[0]
-                .output_schema
-                .as_ref()
-                .and_then(|schema| schema.get("$id"))
-                .and_then(Value::as_str),
-            Some("urn:bildr:harness.investigation-response.v1")
-        );
-        let exact_controller_schema =
-            investigation_output_schema().expect("controller contract parses");
-        assert_eq!(
-            started_turns[0].output_schema.as_ref(),
-            Some(&exact_controller_schema),
-            "investigator receives the exact controller contract, not a normalized subset"
-        );
-        drop(started_turns);
+        {
+            let started_threads = runtime.started_threads.lock().expect("thread requests");
+            assert_eq!(started_threads.len(), 1);
+            assert_eq!(started_threads[0].sandbox, "read-only");
+            assert_eq!(started_threads[0].approval_policy, "never");
+        }
+        {
+            let started_turns = runtime.started_turns.lock().expect("turn requests");
+            assert_eq!(started_turns.len(), 1);
+            assert_eq!(started_turns[0].approval_policy, "never");
+            assert_eq!(
+                started_turns[0].sandbox_policy,
+                json!({"type": "readOnly", "networkAccess": false})
+            );
+            assert_eq!(
+                started_turns[0]
+                    .output_schema
+                    .as_ref()
+                    .and_then(|schema| schema.get("$id"))
+                    .and_then(Value::as_str),
+                Some("urn:bildr:harness.investigation-response.v1")
+            );
+            let exact_controller_schema =
+                investigation_output_schema().expect("controller contract parses");
+            assert_eq!(
+                started_turns[0].output_schema.as_ref(),
+                Some(&exact_controller_schema),
+                "investigator receives the exact controller contract, not a normalized subset"
+            );
+        }
 
         let context_digest = orchestrator
             .store()
@@ -21768,19 +21770,21 @@ mod tests {
         assert_eq!(fresh.thread_id.as_deref(), Some("fresh-plan-review-thread"));
         assert_eq!(fresh.sandbox_mode, SandboxMode::ReadOnly);
 
-        let started_threads = runtime.started_threads.lock().unwrap();
-        assert_eq!(started_threads.len(), 1);
-        assert_eq!(started_threads[0].sandbox, "read-only");
-        assert_eq!(started_threads[0].approval_policy, "never");
-        drop(started_threads);
-        let started_turns = runtime.started_turns.lock().unwrap();
-        assert_eq!(started_turns.len(), 1);
-        assert_eq!(started_turns[0].approval_policy, "never");
-        assert_eq!(
-            started_turns[0].sandbox_policy,
-            json!({"type": "readOnly", "networkAccess": false})
-        );
-        drop(started_turns);
+        {
+            let started_threads = runtime.started_threads.lock().unwrap();
+            assert_eq!(started_threads.len(), 1);
+            assert_eq!(started_threads[0].sandbox, "read-only");
+            assert_eq!(started_threads[0].approval_policy, "never");
+        }
+        {
+            let started_turns = runtime.started_turns.lock().unwrap();
+            assert_eq!(started_turns.len(), 1);
+            assert_eq!(started_turns[0].approval_policy, "never");
+            assert_eq!(
+                started_turns[0].sandbox_policy,
+                json!({"type": "readOnly", "networkAccess": false})
+            );
+        }
 
         let verdict = PlanReviewVerdict {
             verdict: "accept".to_owned(),

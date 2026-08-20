@@ -1041,8 +1041,10 @@ mod tests {
                 created_at: "2026-08-14T00:01:00Z".to_owned(),
             }),
         };
-        let mut config = SupervisionConfig::default();
-        config.mode = harness_domain::SupervisorMode::Advisory;
+        let config = SupervisionConfig {
+            mode: harness_domain::SupervisorMode::Advisory,
+            ..SupervisionConfig::default()
+        };
         let current_section = harness_domain::SnapshotSection {
             state: harness_domain::SnapshotSectionState::Current,
             rows: Vec::new(),
