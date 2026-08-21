@@ -13,13 +13,15 @@ use harness_learning::{
     CustodyState, KnowledgeFreshness, KnowledgeItemV1, KnowledgeKind, KnowledgeReview,
     KnowledgeScope, KnowledgeState, ReceiptKind, ReviewState, SourceReceipt,
 };
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{NewImprovementRevision, NewInvestigationKnowledgeCandidate, Store, StoreError};
 
-use super::correlation::record_correlation_link_in_transaction;
+use super::correlation::{
+    record_correlation_link_in_transaction, require_correlation_link_in_transaction,
+};
 
 const MAX_INVESTIGATION_PAGE_SIZE: u32 = 200;
 const MAX_KNOWLEDGE_STATEMENT_BYTES: usize = 4_096;
@@ -41,6 +43,43 @@ type InvestigationLifecycleBinding = (
     String,
     String,
 );
+
+/// A controller completion receipt belongs to the same SQLite transaction as
+/// the lifecycle change it describes. A later replay may require an existing
+/// exact receipt, but it must never manufacture or replace a different one.
+fn ensure_investigation_completion_event(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    aggregate_type: &str,
+    aggregate_id: &str,
+    event_type: &str,
+    payload: &serde_json::Value,
+    occurred_at_ms: i64,
+) -> Result<(), StoreError> {
+    let raw = serde_json::to_string(payload)?;
+    let existing = transaction
+        .prepare(
+            "SELECT payload_json FROM domain_events WHERE run_id=?1 AND aggregate_type=?2 AND aggregate_id=?3 AND event_type=?4 ORDER BY id",
+        )?
+        .query_map(params![run_id, aggregate_type, aggregate_id, event_type], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    match existing.as_slice() {
+        [] => {
+            transaction.execute(
+                "INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json,source_raw_event_id) VALUES(?1,?2,?3,?4,?5,?6,NULL)",
+                params![run_id, aggregate_type, aggregate_id, event_type, occurred_at_ms, raw],
+            )?;
+            Ok(())
+        }
+        [existing_raw] if *existing_raw == raw => Ok(()),
+        _ => Err(StoreError::Conflict(
+            "investigation lifecycle completion receipt is missing, duplicated, or differs from immutable custody"
+                .to_owned(),
+        )),
+    }
+}
 
 impl Store {
     /// Records one fully validated immutable investigation artifact. Retrying
@@ -68,7 +107,7 @@ impl Store {
         {
             let existing = checked_artifact_row(existing_raw, existing_digest)?;
             if existing == *artifact {
-                record_correlation_link_in_transaction(&transaction, &correlation)?;
+                require_correlation_link_in_transaction(&transaction, &correlation)?;
                 transaction.commit()?;
                 return Ok(existing);
             }
@@ -101,8 +140,8 @@ impl Store {
     /// to the exact task, attempt, agent, and live worktree before replacing a
     /// transient deadline failure with the proven terminal outcome.
     ///
-    /// It is safe to call after restart and returns `false` only when all
-    /// lifecycle rows were already in their exact completed state.
+    /// It is safe to call after restart: the lifecycle rows and both durable
+    /// completion receipts converge in one transaction.
     pub fn finalize_investigation_artifact_lifecycle(
         &self,
         artifact: &InvestigationArtifact,
@@ -110,7 +149,7 @@ impl Store {
         attempt_id: &AttemptId,
         agent_id: &AgentSessionId,
         deadline_metadata_key: &str,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<(), StoreError> {
         artifact
             .validate()
             .map_err(|error| StoreError::Validation(error.to_string()))?;
@@ -211,43 +250,71 @@ impl Store {
             [deadline_metadata_key],
             |row| row.get(0),
         )?;
-        let already_completed = task_state == "CLOSED"
+        let lifecycle_completed = task_state == "CLOSED"
             && attempt_state == "COMPLETED"
             && agent_state == "COMPLETED"
             && worktree_state == "PRESERVED"
             && !deadline_present;
-        if already_completed {
-            transaction.commit()?;
-            return Ok(false);
-        }
 
         let timestamp = now_ms();
-        transaction.execute(
-            "UPDATE worktrees SET state='PRESERVED',preserved_reason='immutable investigation artifact recorded; no mutable candidate exists',reconciled_at=?2,version=version+1 WHERE id=?1",
-            params![worktree_id, timestamp],
+        if !lifecycle_completed {
+            transaction.execute(
+                "UPDATE worktrees SET state='PRESERVED',preserved_reason='immutable investigation artifact recorded; no mutable candidate exists',reconciled_at=?2,version=version+1 WHERE id=?1",
+                params![worktree_id, timestamp],
+            )?;
+            transaction.execute(
+                "UPDATE task_attempts SET state='COMPLETED',head_sha=coalesce(head_sha,?2),terminal_class=NULL,failure_reason=NULL,started_at=coalesce(started_at,?3),completed_at=coalesce(completed_at,?3),updated_at=?3,version=version+1 WHERE id=?1",
+                params![attempt_id.as_str(), persisted.base_sha, timestamp],
+            )?;
+            transaction.execute(
+                "UPDATE tasks SET state='CLOSED',failure_reason=NULL,updated_at=?2,version=version+1 WHERE id=?1",
+                params![task_id.as_str(), timestamp],
+            )?;
+            transaction.execute(
+                "UPDATE agent_sessions SET state='COMPLETED',completed_at=coalesce(completed_at,?2),last_heartbeat_at=?2,failure_class=NULL,failure_reason=NULL,version=version+1 WHERE id=?1",
+                params![agent_id.as_str(), timestamp],
+            )?;
+            transaction.execute(
+                "UPDATE agent_runtime_details SET active_turn_id=NULL,current_action='Controller recorded the immutable investigation artifact',last_activity_kind='runtime',last_activity_at=?2,updated_at=?2 WHERE agent_session_id=?1",
+                params![agent_id.as_str(), timestamp],
+            )?;
+            transaction.execute(
+                "DELETE FROM runtime_metadata WHERE key=?1",
+                [deadline_metadata_key],
+            )?;
+        }
+        ensure_investigation_completion_event(
+            &transaction,
+            &run_id,
+            "agent",
+            agent_id.as_str(),
+            "agent.investigation.artifact_recorded",
+            &json!({
+                "artifact_id": persisted.artifact_id,
+                "artifact_sha256": persisted.sha256,
+                "task_id": task_id,
+                "attempt_id": attempt_id,
+                "mutable_candidate": false,
+                "path_leases": 0,
+            }),
+            timestamp,
         )?;
-        transaction.execute(
-            "UPDATE task_attempts SET state='COMPLETED',head_sha=coalesce(head_sha,?2),terminal_class=NULL,failure_reason=NULL,started_at=coalesce(started_at,?3),completed_at=coalesce(completed_at,?3),updated_at=?3,version=version+1 WHERE id=?1",
-            params![attempt_id.as_str(), persisted.base_sha, timestamp],
-        )?;
-        transaction.execute(
-            "UPDATE tasks SET state='CLOSED',failure_reason=NULL,updated_at=?2,version=version+1 WHERE id=?1",
-            params![task_id.as_str(), timestamp],
-        )?;
-        transaction.execute(
-            "UPDATE agent_sessions SET state='COMPLETED',completed_at=coalesce(completed_at,?2),last_heartbeat_at=?2,failure_class=NULL,failure_reason=NULL,version=version+1 WHERE id=?1",
-            params![agent_id.as_str(), timestamp],
-        )?;
-        transaction.execute(
-            "UPDATE agent_runtime_details SET active_turn_id=NULL,current_action='Controller recorded the immutable investigation artifact',last_activity_kind='runtime',last_activity_at=?2,updated_at=?2 WHERE agent_session_id=?1",
-            params![agent_id.as_str(), timestamp],
-        )?;
-        transaction.execute(
-            "DELETE FROM runtime_metadata WHERE key=?1",
-            [deadline_metadata_key],
+        ensure_investigation_completion_event(
+            &transaction,
+            &run_id,
+            "run",
+            &run_id,
+            "run.investigation.completed",
+            &json!({
+                "artifact_id": persisted.artifact_id,
+                "task_id": task_id,
+                "attempt_id": attempt_id,
+                "automatic_implementation": false,
+            }),
+            timestamp,
         )?;
         transaction.commit()?;
-        Ok(true)
+        Ok(())
     }
 
     /// Creates one unreviewed, display-only knowledge candidate from a fresh
@@ -668,13 +735,40 @@ mod tests {
             store
                 .correlation_links(&correlation.trace.trace_id, 10)
                 .expect("stored correlation"),
-            vec![correlation]
+            vec![correlation.clone()]
         );
         assert_eq!(
             store
                 .record_investigation_artifact(&artifact)
                 .expect("retry"),
             artifact
+        );
+        // Replays prove the original custody transaction; they must not
+        // recreate a causal receipt that was lost or tampered with later.
+        let connection = store.connection().expect("connection");
+        connection
+            .execute_batch("DROP TRIGGER correlation_links_no_delete;")
+            .expect("test drops immutable delete guard");
+        connection
+            .execute(
+                "DELETE FROM correlation_links WHERE id=?1",
+                [correlation.link_id.as_str()],
+            )
+            .expect("test removes immutable correlation receipt");
+        drop(connection);
+        assert!(matches!(
+            store.record_investigation_artifact(&artifact),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(
+            store
+                .connection()
+                .expect("connection")
+                .query_row("SELECT count(*) FROM correlation_links", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("correlation count"),
+            0,
+            "an exact artifact replay never backfills missing correlation custody"
         );
         let mut changed = artifact.clone();
         changed.question = "Different question".to_owned();

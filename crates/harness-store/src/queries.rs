@@ -1375,7 +1375,7 @@ impl Store {
             manifest
                 .get("run_id")
                 .and_then(Value::as_str)
-                .filter(|v| safe_outcome_identifier(v, 128))
+                .filter(|v| is_safe_operator_control_identifier(v))
                 .ok_or_else(|| StoreError::Validation("invalid persisted trace run_id".to_owned()))?
                 .to_owned(),
         );
@@ -8447,6 +8447,60 @@ mod tests {
         assert!(validate_failure_controller_identifier(&"a".repeat(160)).is_ok());
         assert!(validate_failure_controller_identifier(&"a".repeat(161)).is_err());
         assert!(validate_failure_scope_identifier(&format!("run:{}", "a".repeat(160))).is_ok());
+    }
+
+    #[test]
+    fn failure_trace_composition_reads_full_width_controller_run_identifiers() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let run_id = format!("{}:x", "r".repeat(158));
+        let trace = harness_trace::project(&harness_trace::TraceInput {
+            trace_id: "trace-controller-wide".to_owned(),
+            run_id: run_id.clone(),
+            task_attempt_id: Some(format!("{}:x", "a".repeat(158))),
+            runtime_digest: "a".repeat(64),
+            redaction_policy_digest: "b".repeat(64),
+            sensitivity: "internal".to_owned(),
+            raw_events: Vec::new(),
+            domain_events: Vec::new(),
+            structural_receipts: vec![harness_trace::StructuralReceipt {
+                id: "receipt-controller-wide".to_owned(),
+                kind: "run_boundary".to_owned(),
+                occurred_at: Some(1),
+                metadata: Default::default(),
+            }],
+            relations: Vec::new(),
+        })
+        .expect("trace projects");
+        let payload = serde_json::to_value(&trace).expect("trace serializes");
+        store
+            .append_improvement_revision(&NewImprovementRevision {
+                id: "trace-controller-wide-revision".to_owned(),
+                aggregate_kind: ImprovementRecordKind::Trace,
+                aggregate_id: trace.trace_id.clone(),
+                schema: ImprovementSchema::TraceV2,
+                state: ImprovementState::Captured,
+                payload: payload.clone(),
+                payload_sha256: sha256(
+                    serde_json::to_string(&payload)
+                        .expect("payload serializes")
+                        .as_bytes(),
+                ),
+                sensitivity: SensitivityClass::Internal,
+                retention_class: RetentionClass::Operational,
+                export_allowed: false,
+                idempotency_key: "trace-controller-wide-record".to_owned(),
+                event_id: harness_domain::ImprovementEventId::from("trace-controller-wide-event"),
+                source_raw_event_id: None,
+                source_domain_event_id: None,
+            })
+            .expect("trace revision records");
+
+        let composition = store
+            .failure_trace_composition(&trace.trace_id)
+            .expect("trace composition rereads the full controller run identifier");
+        assert_eq!(composition.run_id.as_str(), run_id);
+        assert!(composition.outcomes.items.is_empty());
     }
 
     #[test]

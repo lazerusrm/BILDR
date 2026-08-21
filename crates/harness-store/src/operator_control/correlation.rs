@@ -114,8 +114,7 @@ pub(crate) fn require_correlation_link_in_transaction(
         .optional()?
     else {
         return Err(StoreError::Conflict(
-            "existing external-condition observation is missing its causal correlation link"
-                .to_owned(),
+            "existing immutable record is missing its causal correlation link".to_owned(),
         ));
     };
     let existing = checked_link_row(existing_raw, existing_digest)?;
@@ -123,8 +122,7 @@ pub(crate) fn require_correlation_link_in_transaction(
         return Ok(existing);
     }
     Err(StoreError::Conflict(
-        "existing external-condition observation has a different causal correlation link"
-            .to_owned(),
+        "existing immutable record has a different causal correlation link".to_owned(),
     ))
 }
 

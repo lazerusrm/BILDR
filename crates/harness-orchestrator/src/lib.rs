@@ -9223,6 +9223,7 @@ impl Orchestrator {
                     existing
                         .validate()
                         .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
+                    validate_investigation_response_replay(existing, &response, &source_ref)?;
                     validate_investigation_artifact_binding(
                         existing,
                         &run,
@@ -9372,48 +9373,23 @@ impl Orchestrator {
     /// The immutable artifact commits before its mutable lifecycle rows. A
     /// process crash in that narrow interval must not let deadline processing
     /// manufacture a conflicting failure. This operation atomically repairs
-    /// those rows from the exact artifact and emits completion events only for
-    /// the transition that actually changed durable lifecycle custody.
+    /// those rows and the corresponding completion receipts from the exact
+    /// artifact.
     fn finalize_investigation_artifact_lifecycle(
         &self,
-        run: &RunSummary,
+        _run: &RunSummary,
         task: &TaskSummary,
         attempt_id: &AttemptId,
         agent_id: &AgentSessionId,
         deadline_key: &str,
         artifact: &InvestigationArtifact,
     ) -> Result<(), OrchestratorError> {
-        if !self.store.finalize_investigation_artifact_lifecycle(
+        self.store.finalize_investigation_artifact_lifecycle(
             artifact,
             &task.id,
             attempt_id,
             agent_id,
             deadline_key,
-        )? {
-            return Ok(());
-        }
-        self.emit_agent_event(
-            &run.id,
-            agent_id,
-            "agent.investigation.artifact_recorded",
-            json!({
-                "artifact_id": artifact.artifact_id,
-                "artifact_sha256": artifact.sha256,
-                "task_id": task.id,
-                "attempt_id": attempt_id,
-                "mutable_candidate": false,
-                "path_leases": 0,
-            }),
-        )?;
-        self.emit_run_event(
-            run,
-            "run.investigation.completed",
-            json!({
-                "artifact_id": artifact.artifact_id,
-                "task_id": task.id,
-                "attempt_id": attempt_id,
-                "automatic_implementation": false,
-            }),
         )?;
         Ok(())
     }
@@ -15938,6 +15914,32 @@ fn validate_investigation_artifact_binding(
     Ok(())
 }
 
+/// A terminal callback can replay a committed investigation only when its
+/// model-authored evidence fields are byte-for-byte the same values that were
+/// admitted into the immutable artifact. Controller-derived fields are bound
+/// separately by `validate_investigation_artifact_binding`.
+fn validate_investigation_response_replay(
+    artifact: &InvestigationArtifact,
+    response: &InvestigationResponse,
+    source_ref: &str,
+) -> Result<(), OrchestratorError> {
+    if artifact.methods != response.methods
+        || artifact.sources != [source_ref.to_owned()]
+        || artifact.findings != response.findings
+        || artifact.recommendations != response.recommendations
+        || artifact.decision_inventory != response.decision_inventory
+        || artifact.limitations != response.limitations
+        || artifact.rejected_hypotheses != response.rejected_hypotheses
+        || artifact.sensitivity != response.sensitivity
+        || artifact.artifact_refs != response.artifact_refs
+    {
+        return Err(OrchestratorError::Protocol(
+            "investigation callback differs from its committed immutable artifact".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Derive a bounded, deterministic artifact identity from the controller
 /// attempt.  Attempt IDs may use the full controller identifier allowance, so
 /// embedding the raw ID after an `investigation-` prefix would reject an
@@ -19136,10 +19138,39 @@ mod tests {
                 .is_err(),
             "an existing artifact cannot bypass the canonical response cardinality limits"
         );
+        let mut changed_methods_replay = response.clone();
+        changed_methods_replay["methods"] = json!(["different but schema-valid investigation"]);
+        assert!(
+            orchestrator
+                .accept_investigation_response(
+                    &investigator.id,
+                    &serde_json::to_string(&changed_methods_replay)
+                        .expect("changed replay serializes"),
+                )
+                .await
+                .is_err(),
+            "an existing artifact cannot silently substitute different schema-valid findings"
+        );
         orchestrator
             .accept_investigation_response(&investigator.id, &response_json)
             .await
             .expect("an exact terminal replay preserves the recorded artifact");
+        let completion_receipts = |event_type: &str| -> i64 {
+            orchestrator
+                .store()
+                .list_domain_events(0, Some(&run_id), 100)
+                .expect("completion receipts")
+                .into_iter()
+                .filter(|event| event.event_type == event_type)
+                .count()
+                .try_into()
+                .expect("bounded receipt count")
+        };
+        assert_eq!(
+            completion_receipts("agent.investigation.artifact_recorded"),
+            1
+        );
+        assert_eq!(completion_receipts("run.investigation.completed"), 1);
         // App Server normally emits turn/completed after the structured item.
         // The terminal turn callback must preserve, rather than overwrite, the
         // controller-bound artifact outcome.

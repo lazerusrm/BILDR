@@ -16,7 +16,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{NewTaskAttempt, Store, StoreError};
 
-use super::correlation::record_correlation_link_in_transaction;
+use super::correlation::{
+    record_correlation_link_in_transaction, require_correlation_link_in_transaction,
+};
 
 const MAX_RECONCILIATION_PAGE_SIZE: u32 = 200;
 const FRESH_ATTEMPT_AUTHORIZED_STATE: &str = "AUTHORIZED";
@@ -148,7 +150,7 @@ impl Store {
         {
             let existing = checked_reconciliation_row(existing_raw, existing_digest)?;
             if existing == *episode {
-                record_correlation_link_in_transaction(&transaction, &correlation)?;
+                require_correlation_link_in_transaction(&transaction, &correlation)?;
                 transaction.commit()?;
                 return Ok(existing);
             }
@@ -211,7 +213,7 @@ impl Store {
         {
             let existing = checked_ownership_row(existing_raw, existing_digest)?;
             if existing == *proof {
-                record_correlation_link_in_transaction(&transaction, &correlation)?;
+                require_correlation_link_in_transaction(&transaction, &correlation)?;
                 transaction.commit()?;
                 return Ok(existing);
             }
@@ -327,7 +329,7 @@ impl Store {
                 && existing_model_route == replacement.requested_model_route
                 && checked_action_receipt_row(existing_raw, existing_digest)? == *receipt
             {
-                record_correlation_link_in_transaction(&transaction, &correlation)?;
+                require_correlation_link_in_transaction(&transaction, &correlation)?;
                 transaction.commit()?;
                 return Ok(());
             }
@@ -642,7 +644,7 @@ impl Store {
                 ));
             }
             let episode = reconciliation_episode_in_transaction(&transaction, &finding.episode_id)?;
-            record_correlation_link_in_transaction(&transaction, &correlation)?;
+            require_correlation_link_in_transaction(&transaction, &correlation)?;
             transaction.commit()?;
             return Ok(episode);
         }
@@ -711,7 +713,7 @@ impl Store {
                 ));
             }
             let episode = reconciliation_episode_in_transaction(&transaction, &receipt.episode_id)?;
-            record_correlation_link_in_transaction(&transaction, &correlation)?;
+            require_correlation_link_in_transaction(&transaction, &correlation)?;
             transaction.commit()?;
             return Ok(episode);
         }
@@ -1873,7 +1875,7 @@ mod tests {
             store
                 .correlation_links(&correlation.trace.trace_id, 10)
                 .expect("fresh-attempt trace"),
-            vec![opening_correlation, correlation]
+            vec![opening_correlation, correlation.clone()]
         );
         assert_eq!(
             store
@@ -1932,6 +1934,39 @@ mod tests {
                 task_version,
             )
             .expect("exact committed replay survives later proof expiry");
+
+        store
+            .connection()
+            .expect("connection")
+            .execute_batch(&format!(
+                "DROP TRIGGER correlation_links_no_delete;
+                 DELETE FROM correlation_links WHERE id='{}';",
+                correlation.link_id
+            ))
+            .expect("test removes fresh-attempt correlation receipt");
+        assert!(matches!(
+            store.consume_ownership_proof_for_fresh_attempt(
+                &proof.proof_id,
+                &receipt,
+                episode.version,
+                &replacement,
+                task_version,
+            ),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(
+            store
+                .connection()
+                .expect("connection")
+                .query_row(
+                    "SELECT count(*) FROM correlation_links WHERE id=?1",
+                    [correlation.link_id.as_str()],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("missing receipt count"),
+            0,
+            "exact fresh-attempt replay rejects missing causal custody rather than repairing it"
+        );
 
         store
             .lease_authorized_fresh_attempt(&task_id, &replacement.id)
