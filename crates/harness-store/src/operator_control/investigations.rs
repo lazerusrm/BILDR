@@ -316,11 +316,10 @@ impl Store {
             [deadline_metadata_key],
             |row| row.get(0),
         )?;
-        let lifecycle_completed = task_state == "CLOSED"
+        let mutable_lifecycle_completed = task_state == "CLOSED"
             && attempt_state == "COMPLETED"
             && agent_state == "COMPLETED"
-            && worktree_state == "PRESERVED"
-            && !deadline_present;
+            && worktree_state == "PRESERVED";
 
         let agent_receipt = json!({
             "artifact_id": persisted.artifact_id,
@@ -352,7 +351,12 @@ impl Store {
             "run.investigation.completed",
             &run_receipt,
         )?;
-        if lifecycle_completed {
+        if mutable_lifecycle_completed {
+            if deadline_present {
+                return Err(StoreError::Conflict(
+                    "terminal investigation lifecycle retains its deadline metadata".to_owned(),
+                ));
+            }
             if !agent_receipt_exists || !run_receipt_exists {
                 return Err(StoreError::Conflict(
                     "terminal investigation lifecycle is missing an atomic completion receipt"

@@ -9998,6 +9998,66 @@ impl Orchestrator {
         Ok(())
     }
 
+    fn validate_terminal_investigation_callback(
+        &self,
+        agent_id: &AgentSessionId,
+        payload: &Value,
+        status: &str,
+    ) -> Result<(), OrchestratorError> {
+        let agent = self.store.agent(agent_id)?;
+        if agent.role != AgentRole::Investigator
+            || !matches!(agent.state.as_str(), "COMPLETED" | "FAILED")
+        {
+            return Err(OrchestratorError::Protocol(
+                "terminal investigation callback has no terminal investigator lifecycle".to_owned(),
+            ));
+        }
+        let callback_status = strict_turn_status(payload)?;
+        if callback_status != status
+            || !matches!(callback_status, "completed" | "failed" | "interrupted")
+        {
+            return Err(OrchestratorError::Protocol(
+                "terminal investigation callback has an invalid status".to_owned(),
+            ));
+        }
+        if agent.state == "COMPLETED" && callback_status != "completed" {
+            return Err(OrchestratorError::Protocol(
+                "completed investigation lifecycle received a non-completed callback".to_owned(),
+            ));
+        }
+        let (run_id, attempt_id) = self.store.agent_context(agent_id)?;
+        let attempt_id = attempt_id.ok_or_else(|| {
+            OrchestratorError::Protocol(
+                "terminal investigation callback has no task-attempt custody".to_owned(),
+            )
+        })?;
+        let task_id = self.store.task_for_attempt(&attempt_id)?;
+        let task = self.store.task(&task_id)?;
+        if task.run_id != run_id {
+            return Err(OrchestratorError::Protocol(
+                "terminal investigation callback task custody differs from its run".to_owned(),
+            ));
+        }
+        let run = self.store.run(&run_id)?;
+        let artifact = self
+            .validated_committed_investigation_artifact(&run, &task, &attempt_id)?
+            .ok_or_else(|| {
+                OrchestratorError::Protocol(
+                    "terminal investigation callback has no immutable artifact to replay"
+                        .to_owned(),
+                )
+            })?;
+        self.finalize_investigation_artifact_lifecycle(
+            &run,
+            &task,
+            &attempt_id,
+            agent_id,
+            &investigation_deadline_metadata_key(agent_id),
+            &artifact,
+        )?;
+        Ok(())
+    }
+
     async fn handle_turn_completed(
         &self,
         agent_id: &AgentSessionId,
@@ -10025,6 +10085,15 @@ impl Orchestrator {
         } else {
             status
         };
+        // A terminal investigator's callback is always a custody replay,
+        // even if a concurrent operator stop is in progress. Validate it
+        // before the generic stop path can acknowledge arbitrary payload.
+        if agent.role == AgentRole::Investigator
+            && matches!(agent.state.as_str(), "COMPLETED" | "FAILED")
+        {
+            let _guard = self.operation_lock.lock().await;
+            return self.validate_terminal_investigation_callback(agent_id, payload, status);
+        }
         if self.store.run(&run_id)?.state == RunState::Stopping {
             if let Some(attempt_id) = attempt_id.as_ref() {
                 let task_id = self.store.task_for_attempt(attempt_id)?;
@@ -10251,7 +10320,7 @@ impl Orchestrator {
             let _guard = self.operation_lock.lock().await;
             let agent = self.store.agent(agent_id)?;
             if matches!(agent.state.as_str(), "COMPLETED" | "FAILED") {
-                return Ok(());
+                return self.validate_terminal_investigation_callback(agent_id, payload, status);
             }
             let reason = if status == "completed" {
                 "investigation returned no controller-valid immutable artifact".to_owned()
@@ -17153,6 +17222,20 @@ fn value_text<'a>(value: &'a Value, paths: &[&[&str]]) -> Option<&'a str> {
     })
 }
 
+fn strict_turn_status(payload: &Value) -> Result<&str, OrchestratorError> {
+    let nested = payload.pointer("/turn/status").and_then(Value::as_str);
+    let top_level = payload.get("status").and_then(Value::as_str);
+    match (nested, top_level) {
+        (Some(nested), Some(top_level)) if nested != top_level => Err(OrchestratorError::Protocol(
+            "terminal investigation callback has conflicting statuses".to_owned(),
+        )),
+        (Some(status), _) | (None, Some(status)) => Ok(status),
+        (None, None) => Err(OrchestratorError::Protocol(
+            "terminal investigation callback has no explicit status".to_owned(),
+        )),
+    }
+}
+
 fn extract_agent_message(payload: &Value) -> Option<&str> {
     let item = payload.get("item")?;
     if item.get("type")?.as_str()? != "agentMessage"
@@ -18801,6 +18884,25 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn terminal_investigation_status_requires_one_explicit_unambiguous_value() {
+        assert_eq!(
+            strict_turn_status(&json!({"turn": {"status": "completed"}}))
+                .expect("nested status parses"),
+            "completed"
+        );
+        assert_eq!(
+            strict_turn_status(&json!({"turn": {"status": "completed"}, "status": "completed"}))
+                .expect("matching duplicate status parses"),
+            "completed"
+        );
+        assert!(
+            strict_turn_status(&json!({"turn": {"status": "completed"}, "status": "failed"}))
+                .is_err()
+        );
+        assert!(strict_turn_status(&json!({"turn": {}})).is_err());
+    }
+
     #[tokio::test]
     async fn restart_reconciliation_records_an_idempotent_pre_mutation_inventory() {
         let (orchestrator, _temp, _runtime, run_id, task_id) = investigation_fixture().await;
@@ -19234,6 +19336,13 @@ mod tests {
                 .is_err(),
             "an exact terminal replay must fail closed instead of repairing a missing atomic receipt"
         );
+        assert!(
+            orchestrator
+                .handle_turn_completed(&investigator.id, &json!({"turn": {"status": "completed"}}))
+                .await
+                .is_err(),
+            "a terminal turn replay must prove the exact artifact and paired receipts"
+        );
         assert_eq!(
             completion_receipts("run.investigation.completed"),
             0,
@@ -19529,6 +19638,31 @@ mod tests {
                 .expect("completed agent")
                 .state,
             "COMPLETED"
+        );
+        orchestrator
+            .store()
+            .test_delete_investigation_completion_receipts(&run_id, &investigator.id)
+            .expect("test removes both terminal receipts");
+        orchestrator
+            .store()
+            .put_runtime_metadata(
+                &investigation_deadline_metadata_key(&investigator.id),
+                &json!({"deadline_ms": now_ms().saturating_add(60_000), "attempt_id": attempt_id}),
+            )
+            .expect("test restores a stale terminal deadline");
+        assert!(
+            orchestrator
+                .accept_investigation_response(&investigator.id, &response_json)
+                .await
+                .is_err(),
+            "a terminal lifecycle with stale deadline metadata cannot recreate both lost receipts"
+        );
+        assert!(
+            orchestrator
+                .handle_turn_completed(&investigator.id, &json!({"turn": {"status": "completed"}}))
+                .await
+                .is_err(),
+            "the terminal callback must reject the same stale-deadline custody loss"
         );
     }
 
@@ -20499,6 +20633,68 @@ mod tests {
                 .state,
             TaskState::Ready,
             "failure observations remain non-authorizing"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_capacity_continuity_break_never_reads_or_recovers_without_reregistration() {
+        let (orchestrator, _temp, _runtime, run_id, _task_id) = investigation_fixture().await;
+        let registered = orchestrator
+            .register_run_local_capacity_gate(&run_id, 1, None)
+            .expect("normal capacity gate registers");
+        let mut mismatched = registered.clone();
+        mismatched.condition_id = harness_domain::ExternalConditionId::new();
+        mismatched.source_id = "operator-local-capacity-continuity-fixture".to_owned();
+        mismatched.source_identity_digest = "b".repeat(64);
+        mismatched.sha256 = mismatched.digest().expect("mismatched gate digest");
+        orchestrator
+            .store()
+            .register_external_condition(&mismatched)
+            .expect("mismatched custody fixture records");
+
+        let run = orchestrator.store().run(&run_id).expect("run reads");
+        let mut reads = 0_u32;
+        assert_eq!(
+            orchestrator
+                .reconcile_local_capacity_conditions_with_observer(&run, |_| {
+                    reads = reads.saturating_add(1);
+                    Ok(2_000_000)
+                })
+                .expect("first capacity pass records the continuity break"),
+            2
+        );
+        assert_eq!(
+            reads, 1,
+            "only the matched condition may observe the repository filesystem"
+        );
+        let latched = orchestrator
+            .store()
+            .external_condition(&mismatched.condition_id)
+            .expect("latched condition reads")
+            .expect("latched condition exists");
+        assert_eq!(latched.state, ExternalConditionState::Unknown);
+        assert_eq!(
+            latched
+                .last_observation
+                .as_ref()
+                .and_then(|observation| observation.payload.get("reason"))
+                .and_then(Value::as_str),
+            Some("controller_source_identity_changed")
+        );
+
+        reads = 0;
+        assert_eq!(
+            orchestrator
+                .reconcile_local_capacity_conditions_with_observer(&run, |_| {
+                    reads = reads.saturating_add(1);
+                    Ok(2_000_000)
+                })
+                .expect("latched continuity break stays quiescent"),
+            0
+        );
+        assert_eq!(
+            reads, 0,
+            "a latched continuity break cannot resume filesystem polling without re-registration"
         );
     }
 

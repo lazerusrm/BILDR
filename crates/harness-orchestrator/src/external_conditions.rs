@@ -13,7 +13,7 @@ use harness_domain::{
     ExternalConditionId, ExternalConditionOwnerType, ExternalConditionPollPolicy,
     ExternalConditionState, LocalCapacitySpec, RunId, RunSummary, now_ms,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
@@ -199,9 +199,6 @@ impl Orchestrator {
             };
             let next_cursor = (last.updated_at_ms, last.condition_id.clone());
             for condition in conditions {
-                if !local_capacity_poll_due(&condition, now) {
-                    continue;
-                }
                 let expected_identity = match local_capacity_expected_identity(
                     run,
                     &repository.id,
@@ -219,7 +216,24 @@ impl Orchestrator {
                         continue;
                     }
                 };
-                let availability = observe(Path::new(&repository.root_path));
+                // A recorded continuity break is terminal for this adapter.
+                // It must not touch the filesystem again, even if a later
+                // run revision happens to reconstruct the old source digest.
+                if local_capacity_continuity_break_latched(&condition) {
+                    continue;
+                }
+                let source_identity_changed = condition.source_identity_digest != expected_identity;
+                if !source_identity_changed && !local_capacity_poll_due(&condition, now) {
+                    continue;
+                }
+                // Identity custody is checked before the local observation.
+                // A mismatch may produce one Unknown continuity receipt but
+                // cannot read the filesystem and then reinterpret its result.
+                let availability = if source_identity_changed {
+                    Err(())
+                } else {
+                    observe(Path::new(&repository.root_path))
+                };
                 let Some(outcome) =
                     local_capacity_outcome(&condition, &expected_identity, now, availability)
                 else {
@@ -423,9 +437,7 @@ fn local_capacity_outcome(
     // observation persists `unknown` and emits one wake-only receipt; every
     // later tick must stop until an operator explicitly re-registers a new
     // condition, rather than repeatedly publishing the same custody break.
-    if condition.state == ExternalConditionState::Unknown
-        && condition.source_identity_digest != expected_identity
-    {
+    if local_capacity_continuity_break_latched(condition) {
         return None;
     }
     if condition.source_identity_digest != expected_identity {
@@ -457,6 +469,18 @@ fn local_capacity_outcome(
             minimum_available_bytes: spec.minimum_available_bytes,
         }),
     }
+}
+
+fn local_capacity_continuity_break_latched(condition: &ExternalCondition) -> bool {
+    condition.state == ExternalConditionState::Unknown
+        && condition
+            .last_observation
+            .as_ref()
+            .is_some_and(|observation| {
+                observation.state == ExternalConditionState::Unknown
+                    && observation.payload.get("reason").and_then(Value::as_str)
+                        == Some("controller_source_identity_changed")
+            })
 }
 
 fn local_capacity_poll_due(condition: &ExternalCondition, now: i64) -> bool {
@@ -633,10 +657,26 @@ mod tests {
         );
         let mut stopped = open.clone();
         stopped.state = ExternalConditionState::Unknown;
+        stopped.last_observation = Some(ConditionObservation {
+            schema: "harness.condition-observation.v1".to_owned(),
+            observation_id: ConditionObservationId::new(),
+            condition_id: stopped.condition_id.clone(),
+            source_event_id: "capacity-continuity-break".to_owned(),
+            sequence: 1,
+            observed_at_ms: 10,
+            state: ExternalConditionState::Unknown,
+            payload: json!({"reason": "controller_source_identity_changed"}),
+            sha256: "a".repeat(64),
+        });
         assert_eq!(
             local_capacity_outcome(&stopped, &"b".repeat(64), 10, Ok(1_000)),
             None,
             "a recorded continuity break must stop this adapter until explicit re-registration"
+        );
+        assert_eq!(
+            local_capacity_outcome(&stopped, &"a".repeat(64), 10, Ok(1_000)),
+            None,
+            "a continuity break remains latched even if a future controller state reconstructs the prior source digest"
         );
         assert_eq!(
             local_capacity_outcome(&open, &"a".repeat(64), 10, Ok(99)),

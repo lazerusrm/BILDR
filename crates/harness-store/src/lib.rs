@@ -174,6 +174,35 @@ impl Store {
         }
     }
 
+    /// Narrow fault-injection seam for a terminal lifecycle whose paired
+    /// investigation receipts have both been lost. Production code cannot
+    /// enable this feature.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_delete_investigation_completion_receipts(
+        &self,
+        run_id: &harness_domain::RunId,
+        agent_id: &harness_domain::AgentSessionId,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let agent_changed = transaction.execute(
+            "DELETE FROM domain_events WHERE run_id=?1 AND aggregate_type='agent' AND aggregate_id=?2 AND event_type='agent.investigation.artifact_recorded'",
+            [run_id.as_str(), agent_id.as_str()],
+        )?;
+        let run_changed = transaction.execute(
+            "DELETE FROM domain_events WHERE run_id=?1 AND aggregate_type='run' AND aggregate_id=?1 AND event_type='run.investigation.completed'",
+            [run_id.as_str()],
+        )?;
+        if agent_changed != 1 || run_changed != 1 {
+            return Err(StoreError::NotFound(format!(
+                "paired investigation completion receipts for run {run_id} and agent {agent_id}"
+            )));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     #[must_use]
     pub fn artifacts(&self) -> &ArtifactStore {
         &self.artifacts
