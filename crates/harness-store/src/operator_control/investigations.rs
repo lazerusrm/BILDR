@@ -26,6 +26,22 @@ const MAX_KNOWLEDGE_STATEMENT_BYTES: usize = 4_096;
 const KNOWLEDGE_REVALIDATE_AFTER_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const KNOWLEDGE_EXPIRES_AFTER_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
+/// Exact persisted lifecycle custody required before an immutable investigation
+/// artifact can complete a previously interrupted controller attempt.
+type InvestigationLifecycleBinding = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+);
+
 impl Store {
     /// Records one fully validated immutable investigation artifact. Retrying
     /// the exact same artifact is safe; changing bytes for an existing ID is a
@@ -122,19 +138,7 @@ impl Store {
             ));
         }
 
-        let (run_id, external_task_id, task_state, attempt_base_sha, attempt_state, agent_run_id, agent_attempt_id, agent_role, agent_state, worktree_id, worktree_state): (
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            String,
-            String,
-            String,
-            String,
-        ) = transaction
+        let (run_id, external_task_id, task_state, attempt_base_sha, attempt_state, agent_run_id, agent_attempt_id, agent_role, agent_state, worktree_id, worktree_state): InvestigationLifecycleBinding = transaction
             .query_row(
                 "SELECT t.run_id,t.external_task_id,t.state,a.base_sha,a.state,ag.run_id,ag.task_attempt_id,ag.role,ag.state,w.id,w.state \
                  FROM tasks t \
