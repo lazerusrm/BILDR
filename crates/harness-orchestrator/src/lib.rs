@@ -7374,6 +7374,22 @@ impl Orchestrator {
         } else {
             None
         };
+        let governor_route = governing.then(|| self.governor_route(run)).transpose()?;
+        let route = if governing {
+            governor_route
+                .as_ref()
+                .expect("governor route exists for governing task")
+        } else if packet.is_high_risk() || packet.owner_profile == "worker_escalation" {
+            &profile.profile.models.worker_escalation
+        } else {
+            &profile.profile.models.worker
+        };
+        if let Some(fresh_attempt) = fresh_attempt {
+            require_authorized_fresh_attempt_model_route(
+                &fresh_attempt.requested_model_route,
+                &route.model,
+            )?;
+        }
         let (attempt_id, attempt_number) = if let Some(fresh_attempt) = fresh_attempt {
             self.store
                 .lease_authorized_fresh_attempt(&task.id, &fresh_attempt.id)?;
@@ -7388,25 +7404,9 @@ impl Orchestrator {
                 packet: packet.clone(),
                 packet_sha256: packet_digest(&packet)?,
                 base_sha: launch_base_sha.clone(),
-                requested_model_route: if governing {
-                    self.governor_route(run)?.model
-                } else if packet.is_high_risk() || packet.owner_profile == "worker_escalation" {
-                    profile.profile.models.worker_escalation.model.clone()
-                } else {
-                    profile.profile.models.worker.model.clone()
-                },
+                requested_model_route: route.model.clone(),
             })?;
             (attempt_id, task.attempt.saturating_add(1))
-        };
-        let governor_route = governing.then(|| self.governor_route(run)).transpose()?;
-        let route = if governing {
-            governor_route
-                .as_ref()
-                .expect("governor route exists for governing task")
-        } else if packet.is_high_risk() || packet.owner_profile == "worker_escalation" {
-            &profile.profile.models.worker_escalation
-        } else {
-            &profile.profile.models.worker
         };
         let repository = self.store.repository(&run.repository_id)?;
         if packet.execution_kind == TaskExecutionKind::Investigation {
@@ -14976,6 +14976,18 @@ fn automatic_fresh_attempt_authorization_available() -> bool {
     false
 }
 
+fn require_authorized_fresh_attempt_model_route(
+    authorized_model_route: &str,
+    current_model_route: &str,
+) -> Result<(), OrchestratorError> {
+    if authorized_model_route == current_model_route {
+        return Ok(());
+    }
+    Err(OrchestratorError::Conflict(format!(
+        "fresh attempt was authorized for model route {authorized_model_route}, but the current controller route is {current_model_route}"
+    )))
+}
+
 enum TimeGateOutcome {
     Satisfied { not_before_ms: i64 },
     DeadlineElapsed { not_before_ms: i64 },
@@ -18779,6 +18791,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn authorized_fresh_attempt_model_route_must_match_runtime_route() {
+        require_authorized_fresh_attempt_model_route("gpt-5.6-sol", "gpt-5.6-sol")
+            .expect("exact route remains launchable");
+        assert!(matches!(
+            require_authorized_fresh_attempt_model_route("gpt-5.6-sol", "gpt-5.6-terra"),
+            Err(OrchestratorError::Conflict(_))
+        ));
+    }
+
     #[tokio::test]
     async fn restart_reconciliation_records_an_idempotent_pre_mutation_inventory() {
         let (orchestrator, _temp, _runtime, run_id, task_id) = investigation_fixture().await;
@@ -19200,6 +19222,22 @@ mod tests {
                 .runtime_metadata(&investigation_deadline_metadata_key(&investigator.id))
                 .expect("deadline reads")
                 .is_none()
+        );
+        orchestrator
+            .store()
+            .test_delete_run_investigation_completion_receipt(&run_id)
+            .expect("test removes one terminal receipt");
+        assert!(
+            orchestrator
+                .accept_investigation_response(&investigator.id, &response_json)
+                .await
+                .is_err(),
+            "an exact terminal replay must fail closed instead of repairing a missing atomic receipt"
+        );
+        assert_eq!(
+            completion_receipts("run.investigation.completed"),
+            0,
+            "the failed replay must not recreate lost terminal custody"
         );
     }
 

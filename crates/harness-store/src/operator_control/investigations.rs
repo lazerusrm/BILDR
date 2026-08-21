@@ -44,19 +44,27 @@ type InvestigationLifecycleBinding = (
     String,
 );
 
-/// A controller completion receipt belongs to the same SQLite transaction as
-/// the lifecycle change it describes. A later replay may require an existing
-/// exact receipt, but it must never manufacture or replace a different one.
-fn ensure_investigation_completion_event(
+/// Returns whether one exact controller completion receipt exists for this
+/// artifact. Multiple investigations may complete under one run, so the
+/// receipt identity includes the artifact ID in addition to the run aggregate.
+/// A malformed, duplicate, or differently shaped receipt is custody loss.
+fn investigation_completion_event_exists(
     transaction: &Transaction<'_>,
     run_id: &str,
     aggregate_type: &str,
     aggregate_id: &str,
     event_type: &str,
     payload: &serde_json::Value,
-    occurred_at_ms: i64,
-) -> Result<(), StoreError> {
+) -> Result<bool, StoreError> {
     let raw = serde_json::to_string(payload)?;
+    let artifact_id = payload
+        .get("artifact_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            StoreError::Validation(
+                "investigation completion receipt must bind an artifact ID".to_owned(),
+            )
+        })?;
     let existing = transaction
         .prepare(
             "SELECT payload_json FROM domain_events WHERE run_id=?1 AND aggregate_type=?2 AND aggregate_id=?3 AND event_type=?4 ORDER BY id",
@@ -65,20 +73,78 @@ fn ensure_investigation_completion_event(
             row.get::<_, String>(0)
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    match existing.as_slice() {
-        [] => {
-            transaction.execute(
-                "INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json,source_raw_event_id) VALUES(?1,?2,?3,?4,?5,?6,NULL)",
-                params![run_id, aggregate_type, aggregate_id, event_type, occurred_at_ms, raw],
-            )?;
-            Ok(())
+    let mut matching = 0_u8;
+    for existing_raw in existing {
+        let existing_payload: serde_json::Value =
+            serde_json::from_str(&existing_raw).map_err(|_| {
+                StoreError::Conflict(
+                    "investigation lifecycle completion receipt is not strict JSON".to_owned(),
+                )
+            })?;
+        let existing_artifact_id = existing_payload
+            .get("artifact_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                StoreError::Conflict(
+                    "investigation lifecycle completion receipt is missing its artifact identity"
+                        .to_owned(),
+                )
+            })?;
+        if existing_artifact_id == artifact_id {
+            if existing_raw != raw {
+                return Err(StoreError::Conflict(
+                    "investigation lifecycle completion receipt differs from immutable custody"
+                        .to_owned(),
+                ));
+            }
+            matching = matching.saturating_add(1);
         }
-        [existing_raw] if *existing_raw == raw => Ok(()),
-        _ => Err(StoreError::Conflict(
-            "investigation lifecycle completion receipt is missing, duplicated, or differs from immutable custody"
-                .to_owned(),
-        )),
     }
+    if matching > 1 {
+        return Err(StoreError::Conflict(
+            "investigation lifecycle completion receipt is duplicated".to_owned(),
+        ));
+    }
+    Ok(matching == 1)
+}
+
+/// Writes one completion receipt only while the associated lifecycle becomes
+/// terminal in this same transaction. Replays must use
+/// [`investigation_completion_event_exists`] and never repair receipt loss.
+fn record_investigation_completion_event(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    aggregate_type: &str,
+    aggregate_id: &str,
+    event_type: &str,
+    payload: &serde_json::Value,
+    occurred_at_ms: i64,
+) -> Result<(), StoreError> {
+    if investigation_completion_event_exists(
+        transaction,
+        run_id,
+        aggregate_type,
+        aggregate_id,
+        event_type,
+        payload,
+    )? {
+        return Err(StoreError::Conflict(
+            "investigation lifecycle completion receipt already exists before its atomic lifecycle transition"
+                .to_owned(),
+        ));
+    }
+    transaction.execute(
+        "INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json,source_raw_event_id) VALUES(?1,?2,?3,?4,?5,?6,NULL)",
+        params![
+            run_id,
+            aggregate_type,
+            aggregate_id,
+            event_type,
+            occurred_at_ms,
+            serde_json::to_string(payload)?,
+        ],
+    )?;
+    Ok(())
 }
 
 impl Store {
@@ -256,8 +322,55 @@ impl Store {
             && worktree_state == "PRESERVED"
             && !deadline_present;
 
+        let agent_receipt = json!({
+            "artifact_id": persisted.artifact_id,
+            "artifact_sha256": persisted.sha256,
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "mutable_candidate": false,
+            "path_leases": 0,
+        });
+        let run_receipt = json!({
+            "artifact_id": persisted.artifact_id,
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "automatic_implementation": false,
+        });
+        let agent_receipt_exists = investigation_completion_event_exists(
+            &transaction,
+            &run_id,
+            "agent",
+            agent_id.as_str(),
+            "agent.investigation.artifact_recorded",
+            &agent_receipt,
+        )?;
+        let run_receipt_exists = investigation_completion_event_exists(
+            &transaction,
+            &run_id,
+            "run",
+            &run_id,
+            "run.investigation.completed",
+            &run_receipt,
+        )?;
+        if lifecycle_completed {
+            if !agent_receipt_exists || !run_receipt_exists {
+                return Err(StoreError::Conflict(
+                    "terminal investigation lifecycle is missing an atomic completion receipt"
+                        .to_owned(),
+                ));
+            }
+            transaction.commit()?;
+            return Ok(());
+        }
+        if agent_receipt_exists != run_receipt_exists {
+            return Err(StoreError::Conflict(
+                "incomplete investigation lifecycle has only a partial completion receipt"
+                    .to_owned(),
+            ));
+        }
+
         let timestamp = now_ms();
-        if !lifecycle_completed {
+        {
             transaction.execute(
                 "UPDATE worktrees SET state='PRESERVED',preserved_reason='immutable investigation artifact recorded; no mutable candidate exists',reconciled_at=?2,version=version+1 WHERE id=?1",
                 params![worktree_id, timestamp],
@@ -283,36 +396,26 @@ impl Store {
                 [deadline_metadata_key],
             )?;
         }
-        ensure_investigation_completion_event(
-            &transaction,
-            &run_id,
-            "agent",
-            agent_id.as_str(),
-            "agent.investigation.artifact_recorded",
-            &json!({
-                "artifact_id": persisted.artifact_id,
-                "artifact_sha256": persisted.sha256,
-                "task_id": task_id,
-                "attempt_id": attempt_id,
-                "mutable_candidate": false,
-                "path_leases": 0,
-            }),
-            timestamp,
-        )?;
-        ensure_investigation_completion_event(
-            &transaction,
-            &run_id,
-            "run",
-            &run_id,
-            "run.investigation.completed",
-            &json!({
-                "artifact_id": persisted.artifact_id,
-                "task_id": task_id,
-                "attempt_id": attempt_id,
-                "automatic_implementation": false,
-            }),
-            timestamp,
-        )?;
+        if !agent_receipt_exists {
+            record_investigation_completion_event(
+                &transaction,
+                &run_id,
+                "agent",
+                agent_id.as_str(),
+                "agent.investigation.artifact_recorded",
+                &agent_receipt,
+                timestamp,
+            )?;
+            record_investigation_completion_event(
+                &transaction,
+                &run_id,
+                "run",
+                &run_id,
+                "run.investigation.completed",
+                &run_receipt,
+                timestamp,
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -715,6 +818,81 @@ mod tests {
         };
         artifact.sha256 = artifact.digest().expect("digest");
         artifact
+    }
+
+    #[test]
+    fn run_completion_receipts_are_per_artifact_and_exact() {
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        let mut connection = store.connection().expect("connection");
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .expect("test disables run fixture foreign key");
+        let transaction = connection.transaction().expect("transaction");
+        let first = json!({
+            "artifact_id": "artifact-first",
+            "task_id": "task-first",
+            "attempt_id": "attempt-first",
+            "automatic_implementation": false,
+        });
+        let second = json!({
+            "artifact_id": "artifact-second",
+            "task_id": "task-second",
+            "attempt_id": "attempt-second",
+            "automatic_implementation": false,
+        });
+        record_investigation_completion_event(
+            &transaction,
+            "run-shared",
+            "run",
+            "run-shared",
+            "run.investigation.completed",
+            &first,
+            1,
+        )
+        .expect("first run receipt records");
+        record_investigation_completion_event(
+            &transaction,
+            "run-shared",
+            "run",
+            "run-shared",
+            "run.investigation.completed",
+            &second,
+            2,
+        )
+        .expect("second run receipt records independently");
+        assert!(
+            investigation_completion_event_exists(
+                &transaction,
+                "run-shared",
+                "run",
+                "run-shared",
+                "run.investigation.completed",
+                &first,
+            )
+            .expect("first receipt rereads")
+        );
+        let altered = json!({
+            "artifact_id": "artifact-first",
+            "task_id": "task-first",
+            "attempt_id": "attempt-first",
+            "automatic_implementation": true,
+        });
+        assert!(matches!(
+            investigation_completion_event_exists(
+                &transaction,
+                "run-shared",
+                "run",
+                "run-shared",
+                "run.investigation.completed",
+                &altered,
+            ),
+            Err(StoreError::Conflict(_))
+        ));
+        transaction.commit().expect("receipts commit");
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .expect("test restores foreign keys");
     }
 
     #[test]

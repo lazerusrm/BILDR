@@ -419,6 +419,15 @@ fn local_capacity_outcome(
     if spec.validate().is_err() {
         return None;
     }
+    // Source-identity mismatch is a terminal adapter condition. Its first
+    // observation persists `unknown` and emits one wake-only receipt; every
+    // later tick must stop until an operator explicitly re-registers a new
+    // condition, rather than repeatedly publishing the same custody break.
+    if condition.state == ExternalConditionState::Unknown
+        && condition.source_identity_digest != expected_identity
+    {
+        return None;
+    }
     if condition.source_identity_digest != expected_identity {
         return Some(LocalCapacityOutcome::ContinuityBreak {
             minimum_available_bytes: spec.minimum_available_bytes,
@@ -621,6 +630,13 @@ mod tests {
                 minimum_available_bytes: 100
             }),
             "a repository source change must not be reinterpreted as capacity"
+        );
+        let mut stopped = open.clone();
+        stopped.state = ExternalConditionState::Unknown;
+        assert_eq!(
+            local_capacity_outcome(&stopped, &"b".repeat(64), 10, Ok(1_000)),
+            None,
+            "a recorded continuity break must stop this adapter until explicit re-registration"
         );
         assert_eq!(
             local_capacity_outcome(&open, &"a".repeat(64), 10, Ok(99)),

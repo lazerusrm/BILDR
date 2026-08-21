@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::operator_control::correlation::record_correlation_link_in_transaction;
+use crate::operator_control::correlation::{
+    record_correlation_link_in_transaction, require_correlation_link_in_transaction,
+};
 use crate::{
     ArtifactRecord, AuthoritativeOutcomeInput, EvaluationArm, EvaluationInvalidationReason,
     EvaluationInvalidationTarget, EvaluationLaunchPins, EvaluationRunReceipt, EvaluationRunStatus,
@@ -2273,7 +2275,8 @@ impl Store {
             .optional()?
         {
             let record = read_improvement_revision(&transaction, &revision_id)?;
-            if record.aggregate_kind != input.aggregate_kind
+            if record.id != input.id
+                || record.aggregate_kind != input.aggregate_kind
                 || record.aggregate_id != input.aggregate_id
                 || record.payload_sha256 != input.payload_sha256
                 || record.schema != input.schema
@@ -2296,7 +2299,7 @@ impl Store {
                 ));
             }
             for correlation in correlations {
-                record_correlation_link_in_transaction(&transaction, correlation)?;
+                require_correlation_link_in_transaction(&transaction, correlation)?;
             }
             transaction.commit()?;
             return Ok((record, event));
@@ -8553,6 +8556,17 @@ mod tests {
             source_domain_event_id: None,
         };
         assert!(validate_improvement_input(&input).is_ok());
+        let temp = TempDir::new().expect("temp");
+        let store = Store::in_memory(&temp.path().join("artifacts")).expect("store");
+        store
+            .append_improvement_revision(&input)
+            .expect("first immutable revision records");
+        input.id = "outcome-revision-intake-substituted".to_owned();
+        assert!(matches!(
+            store.append_improvement_revision(&input),
+            Err(StoreError::Conflict(_))
+        ));
+        input.id = "outcome-revision-intake".to_owned();
         input.aggregate_id = "different-outcome".to_owned();
         assert!(validate_improvement_input(&input).is_err());
         input.aggregate_id = outcome.outcome_id.to_string();

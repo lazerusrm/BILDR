@@ -151,6 +151,29 @@ impl Store {
         }
     }
 
+    /// Narrow fault-injection seam for cross-crate terminal-replay tests.
+    /// It deliberately removes only the run-scoped investigation completion
+    /// receipt, so a test can prove that recovery fails closed instead of
+    /// recreating a receipt after a simulated post-commit loss.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_delete_run_investigation_completion_receipt(
+        &self,
+        run_id: &harness_domain::RunId,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection()?.execute(
+            "DELETE FROM domain_events WHERE run_id=?1 AND aggregate_type='run' AND aggregate_id=?1 AND event_type='run.investigation.completed'",
+            [run_id.as_str()],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::NotFound(format!(
+                "run investigation completion receipt for {run_id}"
+            )))
+        }
+    }
+
     #[must_use]
     pub fn artifacts(&self) -> &ArtifactStore {
         &self.artifacts
