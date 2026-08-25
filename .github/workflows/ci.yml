@@ -74,6 +74,15 @@ jobs:
           sudo chmod 4755 /usr/bin/bwrap
           test "$(stat --format '%a:%U:%G' /usr/bin/bwrap)" = "4755:root:root"
           test "$(/usr/bin/bwrap --version)" = "bubblewrap 0.11.0"
+      - name: Install Linux webview libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            patchelf \
+            libayatana-appindicator3-dev
       - name: Install browser dependencies
         run: npm --prefix ui ci && npm --prefix ui exec -- playwright install --with-deps chromium
       - name: Validate browser application

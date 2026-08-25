@@ -16,6 +16,9 @@ API-equivalent usage accounting.
   approval, agent, worktree, evidence, and usage operations.
 - `harness-probe`: bounded search, multi-file read, Cargo mapping, test
   selection, log summarization, and compiled-context inspection.
+- `harness-desktop`: Tauri 2 / wry OS-webview shell that loads the same
+  localhost UI, starts or attaches to `harnessd`, and adds a tray, approval
+  notifications, a native folder picker, and `bildr://` / `harness://` openers.
 - `fake-app-server`: deterministic protocol simulator for smoke and failure
   testing without consuming a Codex turn.
 - A repository-neutral default profile, an opt-in strict BILDR profile,
@@ -79,6 +82,21 @@ For UI and API inspection without Codex:
 ```bash
 cargo run -p harnessd -- serve --without-codex --no-browser
 ```
+
+The native desktop app uses the OS webview (WebKitGTK, WKWebView, or WebView2),
+not a bundled Chromium. It probes loopback, starts `harnessd` when needed, and
+opens one window on that origin:
+
+```bash
+cargo run -p harness-desktop -- --without-codex
+```
+
+Close the window to keep the app in the tray. Use **Register repository…** on
+the tray, or **Browse…** in the registration dialog, to pick a local checkout
+with the native folder picker. `bildr://open` and `harness://open` show the
+window. Operator mutations still use the localhost REST and CSRF API; the
+desktop process does not create runs, approve plans, or talk to Git or Codex
+itself.
 
 ## First run
 

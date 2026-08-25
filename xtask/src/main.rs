@@ -1726,6 +1726,7 @@ fn dist(root: &Path, check_only: bool) -> Result<()> {
         "profiles/general/profile.toml",
         "profiles/bildr/profile.toml",
         "packaging/systemd/harnessd.service",
+        "packaging/desktop/bildr.desktop",
         "generated/CODEX_COMPATIBILITY.json",
         "LICENSE",
         "README.md",
@@ -1749,6 +1750,8 @@ fn dist(root: &Path, check_only: bool) -> Result<()> {
                 "harnessctl",
                 "--package",
                 "harness-probe",
+                "--package",
+                "harness-desktop",
             ])
             .current_dir(root),
         "release build",
@@ -1762,7 +1765,7 @@ fn dist(root: &Path, check_only: bool) -> Result<()> {
     fs::create_dir_all(stage.join("bin"))?;
     fs::create_dir_all(stage.join("share/harness-console"))?;
     let target_dir = cargo_target_dir(root);
-    for binary in ["harnessd", "harnessctl", "harness-probe"] {
+    for binary in ["harnessd", "harnessctl", "harness-probe", "harness-desktop"] {
         fs::copy(
             target_dir.join("release").join(binary),
             stage.join("bin").join(binary),
@@ -1775,6 +1778,7 @@ fn dist(root: &Path, check_only: bool) -> Result<()> {
         "generated/CODEX_COMPATIBILITY.json",
         "openapi/harness-api.yaml",
         "packaging/systemd/harnessd.service",
+        "packaging/desktop/bildr.desktop",
     ] {
         let destination = stage.join("share/harness-console").join(path);
         if let Some(parent) = destination.parent() {

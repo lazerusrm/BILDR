@@ -1938,7 +1938,7 @@ development.
 
 ### 16.6 Browser/PWA vs Tauri
 
-V1 uses a browser/PWA because it is easier to install, debug, secure locally, and operate remotely through SSH forwarding. Add Tauri later only for desktop affordances such as tray, native notifications, file pickers, and protocol registration. Keep the daemon/API architecture so Tauri remains a shell rather than a second controller.
+V1 uses a browser/PWA because it is easier to install, debug, secure locally, and operate remotely through SSH forwarding. `harness-desktop` is the Tauri 2 / wry OS-webview shell for tray, native notifications, file pickers, and protocol registration. Keep the daemon/API architecture so the desktop process remains a shell rather than a second controller.
 
 ### 16.7 Upgrade
 
