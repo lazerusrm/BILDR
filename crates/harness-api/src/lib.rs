@@ -13,8 +13,9 @@ use axum::{
     routing::{get, post},
 };
 use harness_domain::{
-    AgentRole, AgentSessionId, ApprovalId, ArtifactId, OutcomeClassification, OutcomeDimension,
-    OutcomeId, OutcomeSubject, RepositoryId, RunId, TaskId, WorktreeId,
+    AgentRole, AgentSessionId, ApprovalId, ArtifactId, ImprovementRecordKind, ImprovementSchema,
+    ImprovementState, OutcomeClassification, OutcomeDimension, OutcomeId, OutcomeSubject,
+    RepositoryId, RetentionClass, RunId, SensitivityClass, TaskId, WorktreeId,
     is_safe_operator_control_identifier, is_safe_outcome_identifier, is_safe_outcome_reason_code,
 };
 use harness_orchestrator::{
@@ -56,6 +57,7 @@ pub fn router(orchestrator: Arc<Orchestrator>) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/session", post(create_session))
         .route("/api/v1/runtime", get(runtime))
+        .route("/api/v1/models", get(run_model_catalog))
         .route("/api/v1/codex/accounts", get(codex_accounts))
         .route(
             "/api/v1/codex/accounts/{account_id}/select",
@@ -203,6 +205,14 @@ pub fn router(orchestrator: Arc<Orchestrator>) -> Router {
             "/api/v1/improvement/outcomes/{outcome_id}",
             get(outcome_history),
         )
+        .route(
+            "/api/v1/improvement/avo-episodes",
+            get(list_avo_episodes).post(record_avo_episode),
+        )
+        .route(
+            "/api/v1/improvement/avo-episodes/{episode_id}",
+            get(get_avo_episode),
+        )
         .route("/api/v1/improvement/failures", get(list_failure_overview))
         .route(
             "/api/v1/improvement/traces/{trace_id}",
@@ -295,6 +305,14 @@ async fn runtime(
 ) -> Result<Json<harness_domain::RuntimeStatus>, ApiError> {
     authenticate(&state, &headers, false)?;
     Ok(Json(state.orchestrator.runtime_status().await))
+}
+
+async fn run_model_catalog(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<harness_orchestrator::RunModelCatalog>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(state.orchestrator.run_model_catalog()?))
 }
 
 #[derive(Default, Deserialize)]
@@ -1280,6 +1298,224 @@ struct OutcomeVectorQuery {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct AvoEpisodeQuery {
+    #[serde(default = "default_avo_episode_limit")]
+    limit: u32,
+}
+
+const fn default_avo_episode_limit() -> u32 {
+    25
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordAvoEpisodeBody {
+    episode: harness_promotion::AvoEpisodeV1,
+    state: ImprovementState,
+}
+
+#[derive(Serialize)]
+struct AvoTrajectoryResponse {
+    incumbent_score_milli: u64,
+    incumbent_candidate_id: Option<String>,
+    completed_variations: u16,
+    stagnant_variations: u16,
+    directive: &'static str,
+}
+
+#[derive(Serialize)]
+struct AvoEpisodeResponse {
+    revision_id: String,
+    revision: u64,
+    state: ImprovementState,
+    payload_sha256: String,
+    created_at: i64,
+    episode: harness_promotion::AvoEpisodeV1,
+    trajectory: AvoTrajectoryResponse,
+    automatic_execution: bool,
+    automatic_promotion: bool,
+}
+
+async fn list_avo_episodes(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<AvoEpisodeQuery>,
+) -> Result<Json<Vec<AvoEpisodeResponse>>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    let records = state
+        .orchestrator
+        .store()
+        .list_current_avo_episodes(query.limit)?;
+    records
+        .into_iter()
+        .map(avo_episode_response)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
+async fn get_avo_episode(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(episode_id): Path<String>,
+) -> Result<Json<AvoEpisodeResponse>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    validate_avo_episode_id(&episode_id)?;
+    let record = state
+        .orchestrator
+        .store()
+        .improvement_current_revision(ImprovementRecordKind::AvoEpisode, &episode_id)?
+        .ok_or_else(|| {
+            OrchestratorError::Store(harness_store::StoreError::NotFound(format!(
+                "AVO episode {episode_id}"
+            )))
+        })?;
+    Ok(Json(avo_episode_response(record)?))
+}
+
+async fn record_avo_episode(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<RecordAvoEpisodeBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    validate_avo_episode_request(&body)?;
+    let state_name = avo_episode_state_name(body.state)?;
+    let payload = serde_json::to_value(&body.episode)
+        .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
+    let payload_sha256 = sha256(
+        serde_json::to_string(&payload)
+            .map_err(|error| OrchestratorError::Validation(error.to_string()))?
+            .as_bytes(),
+    );
+    let revision_identity = sha256(
+        format!(
+            "harness.avo-episode.operator-import.v1\\0{}\\0{}\\0{state_name}",
+            body.episode.episode_id, body.episode.sha256
+        )
+        .as_bytes(),
+    );
+    let (record, _) = state.orchestrator.store().append_improvement_revision(
+        &harness_store::NewImprovementRevision {
+            id: format!("avo-episode-revision-{revision_identity}"),
+            aggregate_kind: ImprovementRecordKind::AvoEpisode,
+            aggregate_id: body.episode.episode_id.clone(),
+            schema: ImprovementSchema::AvoEpisodeV1,
+            state: body.state,
+            payload,
+            payload_sha256,
+            sensitivity: SensitivityClass::Internal,
+            retention_class: RetentionClass::Governance,
+            export_allowed: false,
+            idempotency_key: format!("avo-episode:{revision_identity}"),
+            event_id: harness_domain::ImprovementEventId::from(format!(
+                "avo-episode-event-{revision_identity}"
+            )),
+            source_raw_event_id: None,
+            source_domain_event_id: None,
+        },
+    )?;
+    Ok((StatusCode::CREATED, Json(avo_episode_response(record)?)))
+}
+
+fn avo_episode_response(
+    record: harness_store::ImprovementRevisionRecord,
+) -> Result<AvoEpisodeResponse, ApiError> {
+    if record.aggregate_kind != ImprovementRecordKind::AvoEpisode
+        || record.schema != ImprovementSchema::AvoEpisodeV1
+    {
+        return Err(OrchestratorError::Validation(
+            "stored record is not an AVO episode".to_owned(),
+        )
+        .into());
+    }
+    let episode: harness_promotion::AvoEpisodeV1 =
+        serde_json::from_value(record.payload).map_err(|error| {
+            OrchestratorError::Validation(format!("invalid stored AVO episode: {error}"))
+        })?;
+    harness_promotion::verify_avo_episode(&episode).map_err(|error| {
+        OrchestratorError::Validation(format!("invalid stored AVO episode: {error}"))
+    })?;
+    if episode.episode_id != record.aggregate_id {
+        return Err(OrchestratorError::Validation(
+            "stored AVO aggregate identity does not match the episode".to_owned(),
+        )
+        .into());
+    }
+    let trajectory = harness_promotion::avo_trajectory(&episode).map_err(|error| {
+        OrchestratorError::Validation(format!("invalid AVO trajectory: {error}"))
+    })?;
+    Ok(AvoEpisodeResponse {
+        revision_id: record.id,
+        revision: record.revision,
+        state: record.state,
+        payload_sha256: record.payload_sha256,
+        created_at: record.created_at,
+        episode,
+        trajectory: AvoTrajectoryResponse {
+            incumbent_score_milli: trajectory.incumbent_score_milli,
+            incumbent_candidate_id: trajectory.incumbent_candidate_id,
+            completed_variations: trajectory.completed_variations,
+            stagnant_variations: trajectory.stagnant_variations,
+            directive: match trajectory.directive {
+                harness_promotion::AvoDirective::Continue => "continue",
+                harness_promotion::AvoDirective::RequestAdvisoryRedirect => {
+                    "request_advisory_redirect"
+                }
+                harness_promotion::AvoDirective::StopBudget => "stop_budget",
+            },
+        },
+        automatic_execution: false,
+        automatic_promotion: false,
+    })
+}
+
+fn validate_avo_episode_request(body: &RecordAvoEpisodeBody) -> Result<(), ApiError> {
+    validate_avo_episode_id(&body.episode.episode_id)?;
+    if !matches!(
+        body.state,
+        ImprovementState::Proposed
+            | ImprovementState::Running
+            | ImprovementState::Passed
+            | ImprovementState::Failed
+            | ImprovementState::Inconclusive
+    ) {
+        return Err(OrchestratorError::Validation(
+            "AVO episodes accept only their closed lifecycle states".to_owned(),
+        )
+        .into());
+    }
+    harness_promotion::verify_avo_episode(&body.episode)
+        .map_err(|error| OrchestratorError::Validation(error.to_string()))?;
+    Ok(())
+}
+
+fn validate_avo_episode_id(value: &str) -> Result<(), ApiError> {
+    // AVO is a native improvement contract rather than a controller identity:
+    // retain its canonical 128-character identifier ceiling.  Controller
+    // run/attempt/repository references remain independently validated at 160.
+    if harness_promotion::id(value) {
+        Ok(())
+    } else {
+        Err(OrchestratorError::Validation("invalid AVO episode id".to_owned()).into())
+    }
+}
+
+fn avo_episode_state_name(state: ImprovementState) -> Result<&'static str, ApiError> {
+    match state {
+        ImprovementState::Proposed => Ok("proposed"),
+        ImprovementState::Running => Ok("running"),
+        ImprovementState::Passed => Ok("passed"),
+        ImprovementState::Failed => Ok("failed"),
+        ImprovementState::Inconclusive => Ok("inconclusive"),
+        _ => Err(OrchestratorError::Validation(
+            "AVO episodes accept only their closed lifecycle states".to_owned(),
+        )
+        .into()),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FailureOverviewQuery {
     repository_id: String,
 }
@@ -2038,8 +2274,14 @@ async fn events(
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<i64>().ok());
-    let mut cursor = header_cursor.or(query.cursor).unwrap_or_default().max(0);
     let run_id = query.run_id.map(RunId::from);
+    let mut cursor = match header_cursor.or(query.cursor) {
+        Some(cursor) => cursor.max(0),
+        None => state
+            .orchestrator
+            .store()
+            .latest_domain_event_id(run_id.as_ref())?,
+    };
     let store = state.orchestrator.store().clone();
     let replay_limit = state.event_replay_limit;
     let stream = stream! {
@@ -2370,6 +2612,27 @@ mod tests {
         assert!(validate_outcome_read_identifier("run_01", "run_id").is_ok());
         assert!(validate_outcome_read_identifier("run/../01", "run_id").is_err());
         assert!(validate_outcome_read_identifier("outcome space", "outcome_id").is_err());
+    }
+
+    #[test]
+    fn avo_episode_lifecycle_is_closed_and_nonexecuting() {
+        assert_eq!(
+            avo_episode_state_name(ImprovementState::Proposed).unwrap(),
+            "proposed"
+        );
+        assert_eq!(
+            avo_episode_state_name(ImprovementState::Running).unwrap(),
+            "running"
+        );
+        assert_eq!(
+            avo_episode_state_name(ImprovementState::Passed).unwrap(),
+            "passed"
+        );
+        assert!(avo_episode_state_name(ImprovementState::Active).is_err());
+        assert!(validate_avo_episode_id("avo:episode-1").is_ok());
+        assert!(validate_avo_episode_id("avo/episode").is_err());
+        assert!(validate_avo_episode_id(&"a".repeat(128)).is_ok());
+        assert!(validate_avo_episode_id(&"a".repeat(129)).is_err());
     }
 
     #[test]

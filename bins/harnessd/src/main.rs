@@ -82,7 +82,11 @@ enum Command {
 #[folder = "../../ui/dist/"]
 struct UiAssets;
 
-#[tokio::main]
+// The control plane mixes App Server streams with synchronous SQLite
+// projection. Keep enough scheduler workers that a slow local-model stream or
+// a waiting database caller cannot make the approval and health endpoints
+// disappear on a small development host.
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();

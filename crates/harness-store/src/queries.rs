@@ -6,9 +6,10 @@ use std::{
 use harness_domain::{
     ActivityItem, AgentSessionId, AgentSummary, ApprovalId, ApprovalSummary, ArtifactId, AttemptId,
     CorrelationLink, CostConfidence, CostEstimate, DomainEvent, ImprovementRecordKind,
-    ImprovementSchema, ImprovementState, LatestAgentMessage, ModelUsageSummary, OutcomeConfidence,
-    OutcomeHistory, OutcomeId, OutcomeRevisionReceipt, OutcomeRevisionView, OutcomeSource,
-    OutcomeSourceKind, OutcomeVector, OutcomeVectorItem, OutcomeWireV1, PlanRevisionId,
+    ImprovementSchema, ImprovementState, LatestAgentMessage, ModelUsageSummary,
+    OutcomeClassification, OutcomeConfidence, OutcomeDimension, OutcomeHistory, OutcomeId,
+    OutcomeRevisionReceipt, OutcomeRevisionView, OutcomeSource, OutcomeSourceKind,
+    OutcomeSubjectKind, OutcomeVector, OutcomeVectorItem, OutcomeWireV1, PlanRevisionId,
     RepositoryId, RepositorySummary, RetentionClass, RunId, RunPlan, RunState, RunSummary,
     SensitivityClass, TaskId, TaskState, TaskSummary, TokenUsage, UsageBreakdown, UsageGroup,
     UsageSummary, WorktreeId, WorktreeSummary, format_timestamp,
@@ -27,20 +28,21 @@ use crate::operator_control::correlation::{
     record_correlation_link_in_transaction, require_correlation_link_in_transaction,
 };
 use crate::{
-    ArtifactRecord, AuthoritativeOutcomeInput, EvaluationArm, EvaluationInvalidationReason,
-    EvaluationInvalidationTarget, EvaluationLaunchPins, EvaluationRunReceipt, EvaluationRunStatus,
-    EvaluationSampleReceipt, FailureClusterOverview, FailureDevelopmentCaseSource,
-    FailureProjectionReceipt, FailureSplitMove, FailureTraceComposition, FailureTraceSummary,
-    HoldoutAccessReceipt, ImmutableRevision, ImprovementEventRecord, ImprovementRevisionRecord,
-    NativeSubagentActivityRecord, NewAgentSession, NewApproval, NewArtifact, NewCommandRecord,
-    NewContextPacket, NewEvaluationInvalidation, NewEvaluationRun, NewEvaluationRunStatus,
-    NewEvaluationSample, NewEvidenceRecord, NewHoldoutAccess, NewImprovementRevision,
-    NewOperatorOutcome, NewPairedStatVerdict, NewPolicyChampionBinding, NewRepository, NewRun,
-    NewTaskAttempt, NewTasksetMembership, NewValidationRecord, NewWorktree,
-    PairedStatVerdictReceipt, PolicyChampionBinding, PriorAttemptContext, RawEventInput,
-    RepositoryHealthInput, Store, StoreError, StoredSession, TraceProjectionDomainReceipt,
-    TraceProjectionRawReceipt, TraceProjectionSnapshot, TraceProjectionStructuralReceipt,
-    TraceProjectionWatermark,
+    AgentModelRouteBinding, ArtifactRecord, AuthoritativeOutcomeInput, EvaluationArm,
+    EvaluationInvalidationReason, EvaluationInvalidationTarget, EvaluationLaunchPins,
+    EvaluationRunReceipt, EvaluationRunStatus, EvaluationSampleReceipt, FailureClusterOverview,
+    FailureDevelopmentCaseSource, FailureProjectionReceipt, FailureSplitMove,
+    FailureTraceComposition, FailureTraceSummary, HoldoutAccessReceipt, ImmutableRevision,
+    ImmutableRunModelRoute, ImprovementEventRecord, ImprovementRevisionRecord,
+    NativeSubagentActivityRecord, NewAgentModelRouteBinding, NewAgentSession, NewApproval,
+    NewArtifact, NewCommandRecord, NewContextPacket, NewEvaluationInvalidation, NewEvaluationRun,
+    NewEvaluationRunStatus, NewEvaluationSample, NewEvidenceRecord, NewHoldoutAccess,
+    NewImmutableRunModelRoute, NewImprovementRevision, NewOperatorOutcome, NewPairedStatVerdict,
+    NewPolicyChampionBinding, NewRepository, NewRun, NewTaskAttempt, NewTasksetMembership,
+    NewValidationRecord, NewWorktree, PairedStatVerdictReceipt, PolicyChampionBinding,
+    PriorAttemptContext, RawEventInput, RepositoryHealthInput, Store, StoreError, StoredSession,
+    TraceProjectionDomainReceipt, TraceProjectionRawReceipt, TraceProjectionSnapshot,
+    TraceProjectionStructuralReceipt, TraceProjectionWatermark,
 };
 
 const TRACE_SNAPSHOT_MAX_RAW_RECEIPTS: i64 = 10_000;
@@ -1597,11 +1599,17 @@ impl Store {
             } else {
                 (harness_domain::OutcomeDimension::Validation, code)
             };
-            let receipt = json!({
-                "id": id, "task_attempt_id": task_attempt_id, "validator_id": validator_id,
-                "proof_tier": proof_tier, "result_class": result, "source_sha": source_sha,
-                "command_run_id": command_run_id, "started_at": started_at, "completed_at": observed_at,
-            });
+            let receipt_sha256 = canonical_validation_receipt_sha256(
+                &id,
+                task_attempt_id.as_deref(),
+                &validator_id,
+                &proof_tier,
+                &result,
+                &source_sha,
+                command_run_id.as_deref(),
+                started_at,
+                observed_at,
+            )?;
             inputs.push(AuthoritativeOutcomeInput {
                 run_id: run_id.clone(),
                 subject: outcome_subject(run_id, task_attempt_id),
@@ -1609,7 +1617,7 @@ impl Store {
                 classification,
                 code: code.to_owned(),
                 source_kind: harness_domain::OutcomeSourceKind::Validation,
-                source_record_sha256: sha256(serde_json::to_string(&receipt)?.as_bytes()),
+                source_record_sha256: receipt_sha256,
                 source_record_id: id,
                 source_sha: Some(source_sha),
                 source_domain_event_id: None,
@@ -2355,6 +2363,23 @@ impl Store {
         connection.query_row("SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_current_revisions WHERE aggregate_kind=?1 AND aggregate_id=?2", params![enum_text(&kind)?, aggregate_id], map_improvement_revision).optional().map_err(Into::into)
     }
 
+    /// Returns the latest immutable snapshot for each bounded AVO episode.
+    /// This is read-only: callers cannot use it to schedule a variation or
+    /// alter a candidate.
+    pub fn list_current_avo_episodes(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<ImprovementRevisionRecord>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_current_revisions WHERE aggregate_kind='avo_episode' ORDER BY created_at DESC,aggregate_id DESC LIMIT ?1",
+        )?;
+        statement
+            .query_map([i64::from(limit.clamp(1, 100))], map_improvement_revision)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     pub fn list_improvement_events(
         &self,
         kind: ImprovementRecordKind,
@@ -2376,6 +2401,128 @@ impl Store {
             params![key, serde_json::to_string(value)?, now_ms()],
         )?;
         Ok(())
+    }
+
+    /// Atomically retain an invalid plan-review response for corrective replay
+    /// and append its immutable audit receipt.  The aggregate key is supplied
+    /// by the controller as an exact-response digest, so delivery and terminal
+    /// replay of the same malformed response are idempotent while a distinct
+    /// response remains independently observable.
+    pub fn record_plan_review_rejection(
+        &self,
+        run_id: &RunId,
+        agent_id: &AgentSessionId,
+        metadata_key: &str,
+        aggregate_id: &str,
+        receipt: &Value,
+    ) -> Result<(), StoreError> {
+        let occurred_at = now_ms();
+        let receipt_json = serde_json::to_string(receipt)?;
+        let receipt_sha256 = receipt
+            .get("receipt_sha256")
+            .and_then(Value::as_str)
+            .filter(|value| value.len() == 64)
+            .ok_or_else(|| {
+                StoreError::Validation(
+                    "plan-review rejection receipt lacks a 64-character receipt digest".to_owned(),
+                )
+            })?;
+        if aggregate_id != format!("{agent_id}:{receipt_sha256}") {
+            return Err(StoreError::Conflict(
+                "plan-review rejection aggregate does not bind the full receipt digest".to_owned(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let agent_run_id: String = transaction.query_row(
+            "SELECT run_id FROM agent_sessions WHERE id=?1",
+            [agent_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if agent_run_id != run_id.as_str() {
+            return Err(StoreError::Conflict(
+                "plan-review rejection agent is not owned by run".to_owned(),
+            ));
+        }
+        // SQLite permits multiple NULL members of a UNIQUE key.  Do not rely
+        // on the table constraint for a source-less controller receipt: the
+        // explicit lookup keeps retransmission and terminal replay idempotent.
+        let recorded_payload: Option<String> = transaction
+            .query_row(
+            "SELECT payload_json FROM domain_events WHERE aggregate_type='agent' AND aggregate_id=?1 AND event_type='agent.plan_reviewer.verdict_rejected' AND source_raw_event_id IS NULL",
+            [aggregate_id],
+            |row| row.get(0),
+        )
+            .optional()?;
+        if let Some(recorded_payload) = recorded_payload {
+            if recorded_payload != receipt_json {
+                return Err(StoreError::Conflict(
+                    "plan-review rejection digest collides with a different journal receipt"
+                        .to_owned(),
+                ));
+            }
+        } else {
+            transaction.execute(
+                "INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json,source_raw_event_id) VALUES(?1,'agent',?2,'agent.plan_reviewer.verdict_rejected',?3,?4,NULL)",
+                params![run_id.as_str(), aggregate_id, occurred_at, serde_json::to_string(receipt)?],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO runtime_metadata(key,value_json,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+            params![metadata_key, receipt_json, occurred_at],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Return the append-only receipt that must match the controller's
+    /// mutable retry index.  The aggregate address deliberately includes the
+    /// digest of the complete receipt, not just the response text.
+    pub fn plan_review_rejection_journal_receipt(
+        &self,
+        run_id: &RunId,
+        agent_id: &AgentSessionId,
+        receipt_sha256: &str,
+    ) -> Result<Option<Value>, StoreError> {
+        let aggregate_id = format!("{agent_id}:{receipt_sha256}");
+        self.connection()?
+            .query_row(
+                "SELECT payload_json FROM domain_events WHERE run_id=?1 AND aggregate_type='agent' AND aggregate_id=?2 AND event_type='agent.plan_reviewer.verdict_rejected' AND source_raw_event_id IS NULL",
+                params![run_id.as_str(), aggregate_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|raw| serde_json::from_str(&raw).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn latest_thread_completed_turn_id(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT turn_id FROM raw_events WHERE thread_id=?1 AND method='turn/completed' AND turn_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+                [thread_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn agent_message_turn_id(
+        &self,
+        agent_id: &AgentSessionId,
+        item_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT pi.turn_id FROM projected_items pi JOIN codex_threads ct ON ct.thread_id=pi.thread_id WHERE ct.agent_session_id=?1 AND pi.item_id=?2 AND pi.item_type='agentMessage' AND pi.state='completed' AND pi.turn_id IS NOT NULL",
+                params![agent_id.as_str(), item_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     /// Persist an operator settings update and its audit receipt as one
@@ -2669,6 +2816,141 @@ impl Store {
             ],
         )?;
         self.run(&input.id)
+    }
+
+    /// Atomically creates a run and its controller-owned immutable model route.
+    /// Production creation must use this rather than attaching mutable metadata
+    /// after the run becomes visible.
+    pub fn create_run_with_immutable_model_route(
+        &self,
+        input: &NewRun,
+        route: &NewImmutableRunModelRoute,
+    ) -> Result<RunSummary, StoreError> {
+        if input.id != route.run_id {
+            return Err(StoreError::Validation(
+                "immutable model route must belong to the new run".to_owned(),
+            ));
+        }
+        validate_immutable_run_model_route(route)?;
+        let now = now_ms();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO runs(id,repository_id,title,requested_objective,mode,publication_mode,state,phase,base_ref,base_sha,authority_digest,profile_digest,codex_version,protocol_schema_sha256,requested_by,run_token_budget,created_at,updated_at,started_at,version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?17,?17,1)",
+            params![
+                input.id.as_str(),
+                input.repository_id.as_str(),
+                input.title,
+                input.objective,
+                input.mode,
+                input.publication_mode,
+                input.state,
+                input.phase,
+                input.base_ref,
+                input.base_sha,
+                input.authority_digest,
+                input.profile_digest,
+                input.codex_version,
+                input.protocol_schema_sha256,
+                input.requested_by,
+                input.token_budget.map(|value| value as i64),
+                now,
+            ],
+        )?;
+        insert_immutable_run_model_route(&transaction, route, now)?;
+        transaction.commit()?;
+        // `self.connection()` is a single mutex-protected SQLite handle.
+        // Release this creation transaction's guard before using the normal
+        // read API, otherwise the post-commit receipt read deadlocks every
+        // caller after the run has already become durable.
+        drop(connection);
+        self.run(&input.id)
+    }
+
+    /// Fixture and recovery seam that creates the receipt only when an exact
+    /// identical receipt does not already exist. Production run creation uses
+    /// the atomic API above; differing values fail closed.
+    pub fn record_immutable_run_model_route(
+        &self,
+        route: &NewImmutableRunModelRoute,
+    ) -> Result<ImmutableRunModelRoute, StoreError> {
+        validate_immutable_run_model_route(route)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        insert_immutable_run_model_route(&transaction, route, now_ms())?;
+        let stored = read_immutable_run_model_route(&transaction, &route.run_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("run model route {}", route.run_id)))?;
+        if stored.schema != route.schema
+            || stored.provider != route.provider
+            || stored.model != route.model
+            || stored.reasoning_effort != route.reasoning_effort
+            || stored.model_profile_sha256 != route.model_profile_sha256
+            || stored.route_sha256 != route.route_sha256
+        {
+            return Err(StoreError::Conflict(
+                "immutable run model route already exists with different authority".to_owned(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(stored)
+    }
+
+    pub fn immutable_run_model_route(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<ImmutableRunModelRoute>, StoreError> {
+        let connection = self.connection()?;
+        read_immutable_run_model_route(&connection, run_id)
+    }
+
+    /// Binds a normal controller session to its exact provider/model receipt
+    /// before thread startup. Idempotent replay is allowed only for byte-for-
+    /// byte equal authority.
+    pub fn bind_agent_model_route(
+        &self,
+        binding: &NewAgentModelRouteBinding,
+    ) -> Result<AgentModelRouteBinding, StoreError> {
+        validate_agent_model_route_binding(binding)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO agent_model_route_bindings(agent_session_id,run_id,provider,model,reasoning_effort,model_profile_sha256,route_sha256,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                binding.agent_session_id.as_str(),
+                binding.run_id.as_str(),
+                binding.provider,
+                binding.model,
+                binding.reasoning_effort,
+                binding.model_profile_sha256,
+                binding.route_sha256,
+                now_ms(),
+            ],
+        )?;
+        let stored = read_agent_model_route_binding(&transaction, &binding.agent_session_id)?
+            .ok_or_else(|| {
+                StoreError::NotFound(format!("agent model route {}", binding.agent_session_id))
+            })?;
+        if stored.run_id != binding.run_id
+            || stored.provider != binding.provider
+            || stored.model != binding.model
+            || stored.reasoning_effort != binding.reasoning_effort
+            || stored.model_profile_sha256 != binding.model_profile_sha256
+            || stored.route_sha256 != binding.route_sha256
+        {
+            return Err(StoreError::Conflict(
+                "agent model route binding already exists with different authority".to_owned(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(stored)
+    }
+
+    pub fn agent_model_route_binding(
+        &self,
+        agent_session_id: &AgentSessionId,
+    ) -> Result<Option<AgentModelRouteBinding>, StoreError> {
+        let connection = self.connection()?;
+        read_agent_model_route_binding(&connection, agent_session_id)
     }
 
     pub fn run(&self, id: &RunId) -> Result<RunSummary, StoreError> {
@@ -3092,7 +3374,7 @@ impl Store {
         let connection = self.connection()?;
         let transaction = connection.unchecked_transaction()?;
         transaction.execute(
-            "INSERT INTO codex_turns(turn_id,thread_id,status,requested_model,requested_reasoning_effort,started_at,version) VALUES(?1,?2,'inProgress',?3,?4,?5,1) ON CONFLICT(turn_id) DO UPDATE SET status='inProgress',started_at=coalesce(started_at,excluded.started_at),version=version+1",
+            "INSERT INTO codex_turns(turn_id,thread_id,status,requested_model,requested_reasoning_effort,started_at,version) VALUES(?1,?2,'inProgress',?3,?4,?5,1) ON CONFLICT(turn_id) DO UPDATE SET status='inProgress',requested_model=coalesce(requested_model,excluded.requested_model),requested_reasoning_effort=coalesce(requested_reasoning_effort,excluded.requested_reasoning_effort),started_at=coalesce(started_at,excluded.started_at),version=version+1",
             params![turn_id, thread_id, requested_model, requested_effort, now],
         )?;
         transaction.execute(
@@ -3105,6 +3387,437 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Return exactly the route fields that arrived with the authoritative
+    /// notification for this concrete thread/turn pair.  Callers must not
+    /// infer a route from a matching turn id alone: an App Server can publish
+    /// notifications before the corresponding RPC response is delivered.
+    pub fn codex_turn_requested_route(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT requested_model,requested_reasoning_effort FROM codex_turns WHERE thread_id=?1 AND turn_id=?2",
+                params![thread_id, turn_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// A response can name a turn before any notification is projected. Route
+    /// fields alone are therefore insufficient to establish notification
+    /// authority (they may legitimately be absent); require this exact raw
+    /// notification receipt before resolving a pending turn start.
+    pub fn codex_turn_started_notification_exists(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM raw_events WHERE thread_id=?1 AND turn_id=?2 AND direction='inbound' AND method='turn/started')",
+                params![thread_id, turn_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Persist the controller's uncertainty boundary before `turn/start` is
+    /// sent.  The metadata is the recovery index; the matching immutable
+    /// domain event makes it impossible to lose the exact pending packet
+    /// between a process crash and later runtime containment.
+    pub fn record_pending_turn_start(
+        &self,
+        run_id: &RunId,
+        agent_id: &AgentSessionId,
+        metadata_key: &str,
+        receipt: &Value,
+    ) -> Result<(), StoreError> {
+        let now = now_ms();
+        let receipt_json = serde_json::to_string(receipt)?;
+        let receipt_digest = hex::encode(Sha256::digest(receipt_json.as_bytes()));
+        let aggregate_id = format!("{agent_id}:{receipt_digest}");
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let owner_run_id: String = transaction
+            .query_row(
+                "SELECT run_id FROM agent_sessions WHERE id=?1",
+                [agent_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("agent {agent_id}")))?;
+        if owner_run_id != run_id.as_str() {
+            return Err(StoreError::Conflict(
+                "pending turn-start receipt is not owned by its run".to_owned(),
+            ));
+        }
+        if metadata_key != format!("pending-turn-start:{agent_id}") {
+            return Err(StoreError::Validation(
+                "pending turn-start metadata key is not bound to its agent".to_owned(),
+            ));
+        }
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT value_json FROM runtime_metadata WHERE key=?1",
+                [metadata_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing != receipt_json {
+                return Err(StoreError::Conflict(
+                    "pending turn-start receipt conflicts with an existing receipt".to_owned(),
+                ));
+            }
+        } else {
+            transaction.execute(
+                "INSERT INTO runtime_metadata(key,value_json,updated_at) VALUES(?1,?2,?3)",
+                params![metadata_key, receipt_json, now],
+            )?;
+        }
+        let existing_event: Option<String> = transaction
+            .query_row(
+                "SELECT payload_json FROM domain_events WHERE run_id=?1 AND aggregate_type='agent' AND aggregate_id=?2 AND event_type='agent.turn_start.pending' AND source_raw_event_id IS NULL",
+                params![run_id.as_str(), &aggregate_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_event) = existing_event {
+            if existing_event != receipt_json {
+                return Err(StoreError::Conflict(
+                    "pending turn-start journal receipt conflicts with its existing receipt"
+                        .to_owned(),
+                ));
+            }
+        } else {
+            transaction.execute(
+                "INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json,source_raw_event_id) VALUES(?1,'agent',?2,'agent.turn_start.pending',?3,?4,NULL)",
+                params![run_id.as_str(), &aggregate_id, now, receipt_json],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Resolve exactly the retained pending-start receipt and delete its
+    /// recovery index in the same transaction as the terminal receipt.
+    pub fn resolve_pending_turn_start(
+        &self,
+        run_id: &RunId,
+        agent_id: &AgentSessionId,
+        metadata_key: &str,
+        receipt: &Value,
+        resolution: &Value,
+    ) -> Result<(), StoreError> {
+        let now = now_ms();
+        let receipt_json = serde_json::to_string(receipt)?;
+        let receipt_digest = hex::encode(Sha256::digest(receipt_json.as_bytes()));
+        let aggregate_id = format!("{agent_id}:{receipt_digest}");
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let stored: String = transaction
+            .query_row(
+                "SELECT value_json FROM runtime_metadata WHERE key=?1",
+                [metadata_key],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound("pending turn-start receipt".to_owned()))?;
+        if stored != receipt_json {
+            return Err(StoreError::Conflict(
+                "pending turn-start resolution does not match the retained receipt".to_owned(),
+            ));
+        }
+        let owner_run_id: String = transaction
+            .query_row(
+                "SELECT run_id FROM agent_sessions WHERE id=?1",
+                [agent_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("agent {agent_id}")))?;
+        if owner_run_id != run_id.as_str()
+            || metadata_key != format!("pending-turn-start:{agent_id}")
+        {
+            return Err(StoreError::Conflict(
+                "pending turn-start resolution is not bound to its agent/run".to_owned(),
+            ));
+        }
+        transaction.execute("DELETE FROM runtime_metadata WHERE key=?1", [metadata_key])?;
+        transaction.execute(
+            "DELETE FROM runtime_metadata WHERE key=?1",
+            [format!("pending-turn-start-containment:{agent_id}")],
+        )?;
+        transaction.execute(
+            "INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json,source_raw_event_id) VALUES(?1,'agent',?2,'agent.turn_start.resolved',?3,?4,NULL)",
+            params![run_id.as_str(), &aggregate_id, now, serde_json::to_string(resolution)?],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Persist an irreversible containment phase before attempting
+    /// `thread/delete`. A delayed notification can prove that a turn existed,
+    /// but it can never undo the controller's decision to delete the fresh
+    /// unacknowledged thread.
+    pub fn begin_pending_turn_start_containment(
+        &self,
+        run_id: &RunId,
+        agent_id: &AgentSessionId,
+        pending_metadata_key: &str,
+        containment_metadata_key: &str,
+        receipt: &Value,
+    ) -> Result<(), StoreError> {
+        let now = now_ms();
+        let receipt_json = serde_json::to_string(receipt)?;
+        let receipt_digest = hex::encode(Sha256::digest(receipt_json.as_bytes()));
+        let aggregate_id = format!("{agent_id}:{receipt_digest}");
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let pending: String = transaction
+            .query_row(
+                "SELECT value_json FROM runtime_metadata WHERE key=?1",
+                [pending_metadata_key],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound("pending turn-start receipt".to_owned()))?;
+        if pending != receipt_json
+            || pending_metadata_key != format!("pending-turn-start:{agent_id}")
+            || containment_metadata_key != format!("pending-turn-start-containment:{agent_id}")
+        {
+            return Err(StoreError::Conflict(
+                "pending turn-start containment is not bound to its exact receipt".to_owned(),
+            ));
+        }
+        let owner_run_id: String = transaction
+            .query_row(
+                "SELECT run_id FROM agent_sessions WHERE id=?1",
+                [agent_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("agent {agent_id}")))?;
+        if owner_run_id != run_id.as_str() {
+            return Err(StoreError::Conflict(
+                "pending turn-start containment agent is not owned by its run".to_owned(),
+            ));
+        }
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT value_json FROM runtime_metadata WHERE key=?1",
+                [containment_metadata_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing != receipt_json {
+                return Err(StoreError::Conflict(
+                    "pending turn-start containment conflicts with its retained receipt".to_owned(),
+                ));
+            }
+        } else {
+            transaction.execute(
+                "INSERT INTO runtime_metadata(key,value_json,updated_at) VALUES(?1,?2,?3)",
+                params![containment_metadata_key, receipt_json, now],
+            )?;
+        }
+        let recorded: Option<i64> = transaction
+            .query_row(
+                "SELECT 1 FROM domain_events WHERE run_id=?1 AND aggregate_type='agent' AND aggregate_id=?2 AND event_type='agent.turn_start.containment_initiated' AND source_raw_event_id IS NULL",
+                params![run_id.as_str(), &aggregate_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if recorded.is_none() {
+            transaction.execute(
+                "INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json,source_raw_event_id) VALUES(?1,'agent',?2,'agent.turn_start.containment_initiated',?3,?4,NULL)",
+                params![run_id.as_str(), &aggregate_id, now, receipt_json],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically record a `turn/start` RPC acknowledgement while retaining
+    /// the receipt for the authoritative `turn/started` notification.  A
+    /// `Some(false)` means a concurrent notification already resolved this
+    /// exact receipt, so a late response must be a no-op. `None` means the
+    /// irreversible containment marker won and must be retried instead.
+    pub fn record_pending_turn_start_response(
+        &self,
+        run_id: &RunId,
+        agent_id: &AgentSessionId,
+        metadata_key: &str,
+        receipt: &Value,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<bool>, StoreError> {
+        let now = now_ms();
+        let receipt_json = serde_json::to_string(receipt)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        // This write is the receipt CAS and deliberately obtains the SQLite
+        // writer lock before either session state can change.
+        let retained = transaction.execute(
+            "UPDATE runtime_metadata SET updated_at=?3 WHERE key=?1 AND value_json=?2",
+            params![metadata_key, receipt_json, now],
+        )?;
+        if retained == 0 {
+            transaction.commit()?;
+            return Ok(Some(false));
+        }
+        let owner_run_id: String = transaction
+            .query_row(
+                "SELECT run_id FROM agent_sessions WHERE id=?1",
+                [agent_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("agent {agent_id}")))?;
+        if owner_run_id != run_id.as_str()
+            || metadata_key != format!("pending-turn-start:{agent_id}")
+        {
+            return Err(StoreError::Conflict(
+                "pending turn-start response is not bound to its exact agent/run".to_owned(),
+            ));
+        }
+        let containment_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runtime_metadata WHERE key=?1)",
+            [format!("pending-turn-start-containment:{agent_id}")],
+            |row| row.get(0),
+        )?;
+        if containment_exists {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        transaction.execute(
+            "INSERT INTO codex_turns(turn_id,thread_id,status,requested_model,requested_reasoning_effort,started_at,version) VALUES(?1,?2,'inProgress',NULL,NULL,?3,1) ON CONFLICT(turn_id) DO UPDATE SET status='inProgress',started_at=coalesce(started_at,excluded.started_at),version=version+1",
+            params![turn_id, thread_id, now],
+        )?;
+        transaction.execute(
+            "UPDATE agent_runtime_details SET active_turn_id=coalesce(active_turn_id,?2),last_activity_kind='turn',last_activity_at=?3,updated_at=?3 WHERE agent_session_id=?1",
+            params![agent_id.as_str(), turn_id, now],
+        )?;
+        transaction.execute(
+            "UPDATE agent_sessions SET state='STARTING',last_heartbeat_at=?2,version=version+1 WHERE id=?1",
+            params![agent_id.as_str(), now],
+        )?;
+        transaction.execute(
+            "UPDATE agent_runtime_details SET current_action='turn/start RPC acknowledged; awaiting authoritative turn/started notification',last_activity_at=?2,updated_at=?2 WHERE agent_session_id=?1",
+            params![agent_id.as_str(), now],
+        )?;
+        transaction.commit()?;
+        Ok(Some(true))
+    }
+
+    /// Atomically promote a raw-notification-backed turn start to RUNNING and
+    /// resolve its receipt. `Some(false)` is a benign late notification: a
+    /// concurrent response/notification path has already resolved it. `None`
+    /// means containment won and remains irreversible.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_pending_turn_start_notification(
+        &self,
+        run_id: &RunId,
+        agent_id: &AgentSessionId,
+        metadata_key: &str,
+        receipt: &Value,
+        thread_id: &str,
+        turn_id: &str,
+        model: &str,
+        reasoning_effort: &str,
+        resolution: &Value,
+    ) -> Result<Option<bool>, StoreError> {
+        let now = now_ms();
+        let receipt_json = serde_json::to_string(receipt)?;
+        let receipt_digest = hex::encode(Sha256::digest(receipt_json.as_bytes()));
+        let aggregate_id = format!("{agent_id}:{receipt_digest}");
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let retained = transaction.execute(
+            "UPDATE runtime_metadata SET updated_at=?3 WHERE key=?1 AND value_json=?2",
+            params![metadata_key, receipt_json, now],
+        )?;
+        if retained == 0 {
+            transaction.commit()?;
+            return Ok(Some(false));
+        }
+        let owner_run_id: String = transaction
+            .query_row(
+                "SELECT run_id FROM agent_sessions WHERE id=?1",
+                [agent_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("agent {agent_id}")))?;
+        if owner_run_id != run_id.as_str()
+            || metadata_key != format!("pending-turn-start:{agent_id}")
+        {
+            return Err(StoreError::Conflict(
+                "pending turn-start notification is not bound to its exact agent/run".to_owned(),
+            ));
+        }
+        let containment_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runtime_metadata WHERE key=?1)",
+            [format!("pending-turn-start-containment:{agent_id}")],
+            |row| row.get(0),
+        )?;
+        if containment_exists {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let observed: Option<(Option<String>, Option<String>)> = transaction
+            .query_row(
+                "SELECT requested_model,requested_reasoning_effort FROM codex_turns WHERE thread_id=?1 AND turn_id=?2",
+                params![thread_id, turn_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((observed_model, observed_effort)) = observed else {
+            return Err(StoreError::Conflict(
+                "pending turn-start notification has no exact projected thread/turn record"
+                    .to_owned(),
+            ));
+        };
+        if observed_model
+            .as_deref()
+            .is_some_and(|value| value != model)
+            || observed_effort
+                .as_deref()
+                .is_some_and(|value| value != reasoning_effort)
+        {
+            return Err(StoreError::Conflict(
+                "pending turn-start notification route conflicts with its receipt".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE codex_turns SET requested_model=coalesce(requested_model,?3),requested_reasoning_effort=coalesce(requested_reasoning_effort,?4),status='inProgress',version=version+1 WHERE thread_id=?1 AND turn_id=?2",
+            params![thread_id, turn_id, model, reasoning_effort],
+        )?;
+        transaction.execute(
+            "UPDATE agent_runtime_details SET active_turn_id=?2,last_activity_kind='turn',last_activity_at=?3,current_action='turn/start acknowledged against immutable pending receipt',updated_at=?3 WHERE agent_session_id=?1",
+            params![agent_id.as_str(), turn_id, now],
+        )?;
+        transaction.execute(
+            "UPDATE agent_sessions SET state='RUNNING',effective_model=coalesce(effective_model,?2),effective_reasoning_effort=coalesce(effective_reasoning_effort,?3),last_heartbeat_at=?4,version=version+1 WHERE id=?1",
+            params![agent_id.as_str(), model, reasoning_effort, now],
+        )?;
+        transaction.execute("DELETE FROM runtime_metadata WHERE key=?1", [metadata_key])?;
+        transaction.execute(
+            "DELETE FROM runtime_metadata WHERE key=?1",
+            [format!("pending-turn-start-containment:{agent_id}")],
+        )?;
+        transaction.execute(
+            "INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json,source_raw_event_id) VALUES(?1,'agent',?2,'agent.turn_start.resolved',?3,?4,NULL)",
+            params![run_id.as_str(), &aggregate_id, now, serde_json::to_string(resolution)?],
+        )?;
+        transaction.commit()?;
+        Ok(Some(true))
     }
 
     pub fn update_agent_state(
@@ -3134,6 +3847,159 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Atomically halt all controller scheduling and preserve the affected
+    /// attempt when a local single-model runtime reports a native child it
+    /// cannot bind to the selected run route.  The active turn intentionally
+    /// remains attached until the caller has attempted the corresponding
+    /// runtime interruption.
+    ///
+    /// Returning `false` means the exact parent/child rejection was already
+    /// committed; callers should still retry interruption if an active turn is
+    /// present, so a crash between durable quarantine and the RPC cannot let a
+    /// child continue unchecked.
+    pub fn quarantine_unenforceable_native_child(
+        &self,
+        agent_id: &AgentSessionId,
+        child_thread_id: &str,
+        source_kind: &str,
+        raw_event: &RawEventInput,
+    ) -> Result<(RunId, bool, i64), StoreError> {
+        if child_thread_id.trim().is_empty() || child_thread_id.chars().count() > 512 {
+            return Err(StoreError::Validation(
+                "native child thread id is missing or exceeds 512 characters".to_owned(),
+            ));
+        }
+        if !matches!(source_kind, "thread_started" | "subagent_activity") {
+            return Err(StoreError::Validation(
+                "native child quarantine source is unknown".to_owned(),
+            ));
+        }
+        let reason = format!(
+            "Qwodex single-model containment rejected unbound native child thread {child_thread_id} ({source_kind})"
+        );
+        let now = now_ms();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let (run_id, attempt_id, state, failure_class, failure_reason) = transaction
+            .query_row(
+                "SELECT run_id,task_attempt_id,state,failure_class,failure_reason FROM agent_sessions WHERE id=?1",
+                [agent_id.as_str()],
+                |row| {
+                    Ok((
+                        RunId::from(row.get::<_, String>(0)?),
+                        row.get::<_, Option<String>>(1)?.map(AttemptId::from),
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("agent {agent_id}")))?;
+        if raw_event.run_id.as_ref() != Some(&run_id)
+            || raw_event.agent_session_id.as_ref() != Some(agent_id)
+            || raw_event.direction != "inbound"
+            || raw_event.method.is_empty()
+        {
+            return Err(StoreError::Validation(
+                "native-child raw event is not bound to the quarantined parent".to_owned(),
+            ));
+        }
+        let raw_id = append_raw_event_in_transaction(&transaction, raw_event, now)?;
+        if state == "FAILED"
+            && failure_class.as_deref() == Some("protocol_error")
+            && failure_reason.as_deref() == Some(reason.as_str())
+        {
+            transaction.execute(
+                "INSERT INTO projector_checkpoints(projector_name,last_raw_event_id,updated_at) VALUES('codex-v2',?1,?2) ON CONFLICT(projector_name) DO UPDATE SET last_raw_event_id=max(last_raw_event_id,excluded.last_raw_event_id),updated_at=excluded.updated_at",
+                params![raw_id, now],
+            )?;
+            transaction.commit()?;
+            return Ok((run_id, false, raw_id));
+        }
+
+        transaction.execute(
+            "UPDATE runs SET scheduler_paused=1,updated_at=?2,version=version+1 WHERE id=?1 AND scheduler_paused=0",
+            params![run_id.as_str(), now],
+        )?;
+        transaction.execute(
+            "UPDATE agent_sessions SET state='FAILED',last_heartbeat_at=?2,completed_at=?2,failure_class='protocol_error',failure_reason=?3,version=version+1 WHERE id=?1",
+            params![agent_id.as_str(), now, &reason],
+        )?;
+        transaction.execute(
+            "UPDATE agent_runtime_details SET current_action='Qwodex native child detected; parent quarantined',last_activity_kind='runtime',last_activity_at=?2,updated_at=?2 WHERE agent_session_id=?1",
+            params![agent_id.as_str(), now],
+        )?;
+
+        let task_id = if let Some(attempt_id) = attempt_id.as_ref() {
+            transaction.execute(
+                "UPDATE task_attempts SET state='FAILED',terminal_class='protocol_error',failure_reason=?2,started_at=coalesce(started_at,?3),completed_at=?3,updated_at=?3,version=version+1 WHERE id=?1",
+                params![attempt_id.as_str(), &reason, now],
+            )?;
+            let task_id = transaction
+                .query_row(
+                    "SELECT task_id FROM task_attempts WHERE id=?1",
+                    [attempt_id.as_str()],
+                    |row| row.get::<_, String>(0).map(TaskId::from),
+                )
+                .optional()?;
+            if let Some(task_id) = task_id.as_ref() {
+                transaction.execute(
+                    "UPDATE tasks SET state='NEEDS_HELP',failure_reason=?2,updated_at=?3,version=version+1 WHERE id=?1 AND state NOT IN ('CLOSED','FAILED','SUPERSEDED','CANCELED')",
+                    params![task_id.as_str(), &reason, now],
+                )?;
+                transaction.execute(
+                    "UPDATE worktrees SET state='PRESERVED',preserved_reason=?2,reconciled_at=?3,updated_at=?3,version=version+1 WHERE task_attempt_id=?1 AND state != 'REMOVED'",
+                    params![attempt_id.as_str(), &reason, now],
+                )?;
+            }
+            task_id
+        } else {
+            None
+        };
+        let payload = json!({
+            "schema": "harness.qwodex-native-child-containment.v1",
+            "agent_id": agent_id,
+            "child_thread_id": child_thread_id,
+            "source_kind": source_kind,
+            "attempt_id": attempt_id.as_ref(),
+            "task_id": task_id.as_ref(),
+            "scheduler_paused": true,
+            "reason": &reason,
+        });
+        let payload_json = serde_json::to_string(&payload)?;
+        transaction.execute(
+            "INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json,source_raw_event_id) VALUES(?1,'agent',?2,'agent.qwodex.native_child.quarantined',?3,?4,?5)",
+            params![run_id.as_str(), agent_id.as_str(), now, payload_json, raw_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO domain_events(run_id,aggregate_type,aggregate_id,event_type,occurred_at,payload_json,source_raw_event_id) VALUES(?1,'run',?1,'run.qwodex.native_child.quarantined',?2,?3,?4)",
+            params![run_id.as_str(), now, serde_json::to_string(&payload)?, raw_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO projector_checkpoints(projector_name,last_raw_event_id,updated_at) VALUES('codex-v2',?1,?2) ON CONFLICT(projector_name) DO UPDATE SET last_raw_event_id=max(last_raw_event_id,excluded.last_raw_event_id),updated_at=excluded.updated_at",
+            params![raw_id, now],
+        )?;
+        transaction.commit()?;
+        Ok((run_id, true, raw_id))
+    }
+
+    /// A successful `thread/delete` is recorded separately from the initial
+    /// quarantine. That lets a replay retry only the still-pending parent-turn
+    /// interruption without treating a post-delete "not found" response as a
+    /// new uncertainty.
+    pub fn native_child_delete_receipted(
+        &self,
+        agent_id: &AgentSessionId,
+        child_thread_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.connection()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM domain_events WHERE aggregate_type='agent' AND aggregate_id=?1 AND event_type='agent.qwodex.native_child.delete_confirmed' AND json_extract(payload_json,'$.child_thread_id')=?2)",
+            params![agent_id.as_str(), child_thread_id],
+            |row| row.get(0),
+        ).map_err(Into::into)
     }
 
     pub fn clear_agent_active_turn(&self, id: &AgentSessionId) -> Result<(), StoreError> {
@@ -3947,32 +4813,11 @@ impl Store {
     }
 
     pub fn append_raw_event(&self, input: &RawEventInput) -> Result<i64, StoreError> {
-        let payload = serde_json::to_string(&input.payload)?;
-        let digest = sha256(payload.as_bytes());
-        let connection = self.connection()?;
-        let result = connection.execute(
-            "INSERT INTO raw_events(run_id,agent_session_id,thread_id,turn_id,direction,method,request_id,received_at,payload_json,payload_sha256,source_sequence,redaction_class) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-            params![input.run_id.as_ref().map(RunId::as_str),input.agent_session_id.as_ref().map(AgentSessionId::as_str),input.thread_id,input.turn_id,input.direction,input.method,input.request_id,now_ms(),payload,digest,input.source_sequence,input.redaction_class],
-        );
-        match result {
-            Ok(_) => Ok(connection.last_insert_rowid()),
-            Err(rusqlite::Error::SqliteFailure(error, _))
-                if error.code == rusqlite::ErrorCode::ConstraintViolation =>
-            {
-                if let (Some(thread), Some(sequence)) = (&input.thread_id, &input.source_sequence) {
-                    connection
-                        .query_row(
-                            "SELECT id FROM raw_events WHERE thread_id=?1 AND source_sequence=?2",
-                            params![thread, sequence],
-                            |row| row.get(0),
-                        )
-                        .map_err(Into::into)
-                } else {
-                    Err(StoreError::Conflict("duplicate raw event".to_owned()))
-                }
-            }
-            Err(error) => Err(error.into()),
-        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let raw_id = append_raw_event_in_transaction(&transaction, input, now_ms())?;
+        transaction.commit()?;
+        Ok(raw_id)
     }
 
     pub fn emit_domain_event(
@@ -4030,6 +4875,27 @@ impl Store {
             statement.query_map(params![after, limit], map_domain_event)?
         };
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Cursor for a newly opened UI event stream. Initial UI state is loaded
+    /// through the normal snapshot endpoints, so an EventSource without a
+    /// resume cursor must begin at the present rather than replaying every
+    /// historical transition from the local database.
+    pub fn latest_domain_event_id(&self, run_id: Option<&RunId>) -> Result<i64, StoreError> {
+        let connection = self.connection()?;
+        match run_id {
+            Some(run_id) => connection.query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM domain_events WHERE run_id=?1",
+                [run_id.as_str()],
+                |row| row.get(0),
+            ),
+            None => connection.query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM domain_events",
+                [],
+                |row| row.get(0),
+            ),
+        }
+        .map_err(Into::into)
     }
 
     pub fn latest_domain_cursor(&self) -> Result<i64, StoreError> {
@@ -4276,20 +5142,26 @@ impl Store {
                 "approval {id} changed concurrently"
             )));
         }
-        let connection = self.connection()?;
-        let transaction = connection.unchecked_transaction()?;
-        let rpc: String = transaction.query_row(
-            "SELECT rpc_id_json FROM runtime_rpc_requests WHERE request_key=?1 AND state='pending'",
-            [id.as_str()],
-            |row| row.get(0),
-        )?;
-        let now = now_ms();
-        let current_version = sqlite_version(approval.version)?;
-        transaction.execute(
-            "UPDATE approvals SET state='delivering',decision=?2,decision_note=?3,decided_by=?4,resolved_at=?5,version=version+1 WHERE id=?1 AND version=?6",
-            params![id.as_str(),decision,note,actor,now,current_version],
-        )?;
-        transaction.commit()?;
+        let rpc = {
+            let connection = self.connection()?;
+            let transaction = connection.unchecked_transaction()?;
+            let rpc: String = transaction.query_row(
+                "SELECT rpc_id_json FROM runtime_rpc_requests WHERE request_key=?1 AND state='pending'",
+                [id.as_str()],
+                |row| row.get(0),
+            )?;
+            let now = now_ms();
+            let current_version = sqlite_version(approval.version)?;
+            transaction.execute(
+                "UPDATE approvals SET state='delivering',decision=?2,decision_note=?3,decided_by=?4,resolved_at=?5,version=version+1 WHERE id=?1 AND version=?6",
+                params![id.as_str(),decision,note,actor,now,current_version],
+            )?;
+            transaction.commit()?;
+            // `Store` owns one process-wide SQLite connection.  Drop its
+            // mutex guard before re-reading the changed approval below;
+            // retaining it here makes this method deadlock itself.
+            rpc
+        };
         Ok((self.approval(id)?, serde_json::from_str(&rpc)?))
     }
 
@@ -5315,6 +6187,7 @@ fn parse_improvement_schema(value: &str) -> rusqlite::Result<ImprovementSchema> 
         "harness.grader-bundle.v1" => ImprovementSchema::GraderBundleV1,
         "harness.policy-bundle.v1" => ImprovementSchema::PolicyBundleV1,
         "harness.improvement-candidate.v1" => ImprovementSchema::ImprovementCandidateV1,
+        "harness.avo-episode.v1" => ImprovementSchema::AvoEpisodeV1,
         "harness.experiment.v1" => ImprovementSchema::ExperimentV1,
         "harness.knowledge-item.v1" => ImprovementSchema::KnowledgeItemV1,
         "harness.promotion-decision.v1" => ImprovementSchema::PromotionDecisionV1,
@@ -5354,6 +6227,121 @@ fn valid_digest(value: &str) -> Result<(), StoreError> {
     } else {
         Err(StoreError::Validation("invalid evaluation digest".into()))
     }
+}
+
+fn validate_immutable_run_model_route(route: &NewImmutableRunModelRoute) -> Result<(), StoreError> {
+    valid_route_text(route.run_id.as_str(), "run model route run id")?;
+    valid_route_text(&route.schema, "run model route schema")?;
+    valid_route_text(&route.provider, "run model route provider")?;
+    valid_route_text(&route.model, "run model route model")?;
+    if route.reasoning_effort.is_empty() || route.reasoning_effort.len() > 32 {
+        return Err(StoreError::Validation(
+            "invalid run model route reasoning effort".to_owned(),
+        ));
+    }
+    if let Some(profile) = route.model_profile_sha256.as_deref() {
+        valid_digest(profile)?;
+    }
+    valid_digest(&route.route_sha256)
+}
+
+fn validate_agent_model_route_binding(
+    binding: &NewAgentModelRouteBinding,
+) -> Result<(), StoreError> {
+    valid_route_text(
+        binding.agent_session_id.as_str(),
+        "agent model route session id",
+    )?;
+    valid_route_text(binding.run_id.as_str(), "agent model route run id")?;
+    valid_route_text(&binding.provider, "agent model route provider")?;
+    valid_route_text(&binding.model, "agent model route model")?;
+    if binding.reasoning_effort.is_empty() || binding.reasoning_effort.len() > 32 {
+        return Err(StoreError::Validation(
+            "invalid agent model route reasoning effort".to_owned(),
+        ));
+    }
+    if let Some(profile) = binding.model_profile_sha256.as_deref() {
+        valid_digest(profile)?;
+    }
+    valid_digest(&binding.route_sha256)
+}
+
+fn valid_route_text(value: &str, field: &str) -> Result<(), StoreError> {
+    if !value.is_empty() && value.len() <= 160 && !value.bytes().any(|byte| byte.is_ascii_control())
+    {
+        Ok(())
+    } else {
+        Err(StoreError::Validation(format!("invalid {field}")))
+    }
+}
+
+fn insert_immutable_run_model_route(
+    transaction: &rusqlite::Transaction<'_>,
+    route: &NewImmutableRunModelRoute,
+    created_at: i64,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "INSERT OR IGNORE INTO run_model_routes(run_id,schema,provider,model,reasoning_effort,model_profile_sha256,route_sha256,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![
+            route.run_id.as_str(),
+            route.schema,
+            route.provider,
+            route.model,
+            route.reasoning_effort,
+            route.model_profile_sha256,
+            route.route_sha256,
+            created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn read_immutable_run_model_route(
+    connection: &rusqlite::Connection,
+    run_id: &RunId,
+) -> Result<Option<ImmutableRunModelRoute>, StoreError> {
+    connection
+        .query_row(
+            "SELECT run_id,schema,provider,model,reasoning_effort,model_profile_sha256,route_sha256 FROM run_model_routes WHERE run_id=?1",
+            [run_id.as_str()],
+            |row| {
+                Ok(ImmutableRunModelRoute {
+                    run_id: RunId::from(row.get::<_, String>(0)?),
+                    schema: row.get(1)?,
+                    provider: row.get(2)?,
+                    model: row.get(3)?,
+                    reasoning_effort: row.get(4)?,
+                    model_profile_sha256: row.get(5)?,
+                    route_sha256: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn read_agent_model_route_binding(
+    connection: &rusqlite::Connection,
+    agent_session_id: &AgentSessionId,
+) -> Result<Option<AgentModelRouteBinding>, StoreError> {
+    connection
+        .query_row(
+            "SELECT agent_session_id,run_id,provider,model,reasoning_effort,model_profile_sha256,route_sha256 FROM agent_model_route_bindings WHERE agent_session_id=?1",
+            [agent_session_id.as_str()],
+            |row| {
+                Ok(AgentModelRouteBinding {
+                    agent_session_id: AgentSessionId::from(row.get::<_, String>(0)?),
+                    run_id: RunId::from(row.get::<_, String>(1)?),
+                    provider: row.get(2)?,
+                    model: row.get(3)?,
+                    reasoning_effort: row.get(4)?,
+                    model_profile_sha256: row.get(5)?,
+                    route_sha256: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 fn is_lower_hex_digest(value: &str) -> bool {
@@ -6284,6 +7272,191 @@ fn validate_learning_references_tx(
                 }
             }
         }
+        ImprovementSchema::AvoEpisodeV1 => {
+            let episode: harness_promotion::AvoEpisodeV1 =
+                serde_json::from_value(input.payload.clone())?;
+            if episode.episode_id != input.aggregate_id {
+                return Err(StoreError::Conflict(
+                    "AVO episode aggregate ID does not match immutable wire".into(),
+                ));
+            }
+            let champion = resolve_promotion_record(
+                ImprovementRecordKind::PolicyBundle,
+                &episode.champion_bundle_id,
+                &episode.champion_bundle_receipt.digest,
+            )?;
+            if champion.payload.get("sha256").and_then(Value::as_str)
+                != Some(episode.champion_bundle_receipt.digest.as_str())
+            {
+                return Err(StoreError::Conflict(
+                    "AVO champion receipt does not resolve exactly".into(),
+                ));
+            }
+            for variation in &episode.variations {
+                let candidate = resolve_promotion_record(
+                    ImprovementRecordKind::Candidate,
+                    &variation.candidate_id,
+                    &variation.candidate_receipt.digest,
+                )?;
+                if candidate.payload.get("sha256").and_then(Value::as_str)
+                    != Some(variation.candidate_receipt.digest.as_str())
+                {
+                    return Err(StoreError::Conflict(
+                        "AVO variation candidate receipt does not resolve exactly".into(),
+                    ));
+                }
+                // A hard-gate receipt is an exact immutable, controller-
+                // projected OutcomeV1 revision.  It must in turn resolve to
+                // the completed, non-invalidated validation receipt that
+                // belongs to this candidate task attempt; a syntactically
+                // valid OutcomeV1 cannot mint validation authority.
+                let gate: ImprovementRevisionRecord = tx
+                    .query_row(
+                        "SELECT id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,source_domain_event_id,created_at FROM improvement_revisions WHERE id=?1",
+                        [&variation.correctness_evidence.id],
+                        map_improvement_revision,
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        StoreError::Conflict(
+                            "AVO hard-gate receipt does not resolve exactly".into(),
+                        )
+                    })?;
+                if gate.aggregate_kind != ImprovementRecordKind::Outcome
+                    || gate.schema != ImprovementSchema::OutcomeV1
+                    || gate.state != ImprovementState::Observed
+                    || gate.payload_sha256 != variation.correctness_evidence.digest
+                {
+                    return Err(StoreError::Conflict(
+                        "AVO hard-gate receipt does not resolve exactly".into(),
+                    ));
+                }
+                let outcome: OutcomeWireV1 = serde_json::from_value(gate.payload)?;
+                outcome
+                    .validate()
+                    .map_err(|error| StoreError::Conflict(error.to_string()))?;
+                let expected_gate = match variation.correctness {
+                    harness_promotion::CorrectnessResult::Passed => {
+                        (OutcomeClassification::Positive, "passed")
+                    }
+                    harness_promotion::CorrectnessResult::Failed => {
+                        (OutcomeClassification::Negative, "failed")
+                    }
+                    harness_promotion::CorrectnessResult::Inconclusive
+                    | harness_promotion::CorrectnessResult::InfrastructureUnavailable => {
+                        (OutcomeClassification::Unknown, "unavailable")
+                    }
+                };
+                let validation: (
+                    String,
+                    String,
+                    String,
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<i64>,
+                    i64,
+                ) = tx
+                    .query_row(
+                        "SELECT run_id,task_attempt_id,validator_id,proof_tier,result_class,source_sha,command_run_id,started_at,completed_at FROM validations WHERE id=?1 AND state='completed' AND result_class IS NOT NULL AND invalidated_at IS NULL",
+                        [&outcome.source.record_id],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get(6)?,
+                                row.get(7)?,
+                                row.get(8)?,
+                            ))
+                        },
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        StoreError::Conflict(
+                            "AVO hard-gate outcome source is not a completed validation".into(),
+                        )
+                    })?;
+                let (
+                    validation_run_id,
+                    validation_attempt_id,
+                    validator_id,
+                    proof_tier,
+                    validation_result,
+                    validation_source_sha,
+                    command_run_id,
+                    started_at,
+                    completed_at,
+                ) = validation;
+                let validation_source_sha = validation_source_sha.ok_or_else(|| {
+                    StoreError::Conflict(
+                        "AVO hard-gate validation has no canonical source revision".into(),
+                    )
+                })?;
+                let validation_receipt_sha256 = canonical_validation_receipt_sha256(
+                    &outcome.source.record_id,
+                    Some(&validation_attempt_id),
+                    &validator_id,
+                    &proof_tier,
+                    &validation_result,
+                    &validation_source_sha,
+                    command_run_id.as_deref(),
+                    started_at,
+                    completed_at,
+                )?;
+                let (validation_classification, validation_code) =
+                    authoritative_result_label(&validation_result);
+                let validation_attempt_is_owned: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM task_attempts a JOIN tasks t ON t.id=a.task_id WHERE a.id=?1 AND t.run_id=?2)",
+                    params![validation_attempt_id, validation_run_id],
+                    |row| row.get(0),
+                )?;
+                let canonical_outcome_id =
+                    stable_authoritative_outcome_id(&AuthoritativeOutcomeInput {
+                        run_id: RunId::from(validation_run_id.clone()),
+                        subject: harness_domain::OutcomeSubject {
+                            kind: OutcomeSubjectKind::TaskAttempt,
+                            id: validation_attempt_id.clone(),
+                        },
+                        dimension: OutcomeDimension::Validation,
+                        classification: validation_classification,
+                        code: validation_code.to_owned(),
+                        source_kind: OutcomeSourceKind::Validation,
+                        source_record_id: outcome.source.record_id.clone(),
+                        source_record_sha256: validation_receipt_sha256.clone(),
+                        source_sha: Some(validation_source_sha.clone()),
+                        source_domain_event_id: None,
+                        observed_at: completed_at,
+                    })?;
+                if gate.aggregate_id != outcome.outcome_id.as_str()
+                    || outcome.outcome_id != canonical_outcome_id
+                    || outcome.run_id.as_str() != validation_run_id
+                    || outcome.subject.kind != OutcomeSubjectKind::TaskAttempt
+                    || outcome.subject.id != variation.candidate_id
+                    || validation_attempt_id != variation.candidate_id
+                    || !validation_attempt_is_owned
+                    || outcome.dimension != OutcomeDimension::Validation
+                    || outcome.confidence != OutcomeConfidence::Authoritative
+                    || outcome.source.kind != OutcomeSourceKind::Validation
+                    || outcome.source.record_sha256 != validation_receipt_sha256
+                    || outcome.source.source_sha.as_deref() != Some(validation_source_sha.as_str())
+                    || outcome.source.source_domain_event_id.is_some()
+                    || outcome.observed_at != completed_at
+                    || outcome.classification != validation_classification
+                    || outcome.code != validation_code
+                    || outcome.classification != expected_gate.0
+                    || outcome.code != expected_gate.1
+                {
+                    return Err(StoreError::Conflict(
+                        "AVO hard-gate outcome is not authoritative candidate validation".into(),
+                    ));
+                }
+            }
+        }
         ImprovementSchema::ExperimentV1 => {
             let experiment: harness_promotion::ExperimentV1 =
                 serde_json::from_value(input.payload.clone())?;
@@ -6591,6 +7764,17 @@ fn validate_improvement_input(input: &NewImprovementRevision) -> Result<(), Stor
                 .verify()
                 .map_err(|error| StoreError::Validation(error.to_string()))?;
         }
+        ImprovementSchema::AvoEpisodeV1 => {
+            let value: harness_promotion::AvoEpisodeV1 =
+                serde_json::from_value(input.payload.clone())?;
+            harness_promotion::verify_avo_episode(&value)
+                .map_err(|error| StoreError::Validation(error.to_string()))?;
+            if input.aggregate_id != value.episode_id {
+                return Err(StoreError::Validation(
+                    "AVO episode aggregate identity must equal the canonical episode_id".to_owned(),
+                ));
+            }
+        }
         ImprovementSchema::ExperimentV1 => {
             let value: harness_promotion::ExperimentV1 =
                 serde_json::from_value(input.payload.clone())?;
@@ -6747,8 +7931,16 @@ fn improvement_transition_allowed(
     {
         return true;
     }
-    if kind == ImprovementRecordKind::Experiment
-        && from == ImprovementState::Validated
+    if matches!(
+        kind,
+        ImprovementRecordKind::Experiment | ImprovementRecordKind::AvoEpisode
+    ) && from == ImprovementState::Validated
+        && to == ImprovementState::Running
+    {
+        return true;
+    }
+    if kind == ImprovementRecordKind::AvoEpisode
+        && from == ImprovementState::Proposed
         && to == ImprovementState::Running
     {
         return true;
@@ -6905,6 +8097,23 @@ pub(crate) fn map_improvement_revision(
                     )
                 })?;
             value.verify().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        }
+        ImprovementSchema::AvoEpisodeV1 => {
+            let value: harness_promotion::AvoEpisodeV1 =
+                serde_json::from_value(record.payload.clone()).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            harness_promotion::verify_avo_episode(&value).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
                     6,
                     rusqlite::types::Type::Text,
@@ -7534,6 +8743,35 @@ fn authoritative_result_label(
     }
 }
 
+/// The digest deliberately covers exactly the receipt emitted by
+/// `project_authoritative_outcomes`.  Keeping this construction in one helper
+/// prevents an AVO gate from accepting a hash that describes a subtly
+/// different validation row.
+pub(crate) fn canonical_validation_receipt_sha256(
+    id: &str,
+    task_attempt_id: Option<&str>,
+    validator_id: &str,
+    proof_tier: &str,
+    result_class: &str,
+    source_sha: &str,
+    command_run_id: Option<&str>,
+    started_at: Option<i64>,
+    completed_at: i64,
+) -> Result<String, StoreError> {
+    let receipt = json!({
+        "id": id,
+        "task_attempt_id": task_attempt_id,
+        "validator_id": validator_id,
+        "proof_tier": proof_tier,
+        "result_class": result_class,
+        "source_sha": source_sha,
+        "command_run_id": command_run_id,
+        "started_at": started_at,
+        "completed_at": completed_at,
+    });
+    Ok(sha256(serde_json::to_string(&receipt)?.as_bytes()))
+}
+
 fn authoritative_evidence_label(
     result: &str,
 ) -> (harness_domain::OutcomeClassification, &'static str) {
@@ -7569,7 +8807,7 @@ fn outcome_subject(
     }
 }
 
-fn stable_authoritative_outcome_id(
+pub(crate) fn stable_authoritative_outcome_id(
     input: &AuthoritativeOutcomeInput,
 ) -> Result<OutcomeId, StoreError> {
     let subject_kind = serde_json::to_string(&input.subject.kind)?;
@@ -7827,11 +9065,43 @@ pub fn operation_payload(kind: &str, target: &str) -> Value {
     json!({"kind": kind, "target": target})
 }
 
+fn append_raw_event_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    input: &RawEventInput,
+    received_at: i64,
+) -> Result<i64, StoreError> {
+    let payload = serde_json::to_string(&input.payload)?;
+    let digest = sha256(payload.as_bytes());
+    let result = transaction.execute(
+        "INSERT INTO raw_events(run_id,agent_session_id,thread_id,turn_id,direction,method,request_id,received_at,payload_json,payload_sha256,source_sequence,redaction_class) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![input.run_id.as_ref().map(RunId::as_str),input.agent_session_id.as_ref().map(AgentSessionId::as_str),input.thread_id,input.turn_id,input.direction,input.method,input.request_id,received_at,payload,digest,input.source_sequence,input.redaction_class],
+    );
+    match result {
+        Ok(_) => Ok(transaction.last_insert_rowid()),
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if error.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            if let (Some(thread), Some(sequence)) = (&input.thread_id, &input.source_sequence) {
+                transaction
+                    .query_row(
+                        "SELECT id FROM raw_events WHERE thread_id=?1 AND source_sequence=?2",
+                        params![thread, sequence],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            } else {
+                Err(StoreError::Conflict("duplicate raw event".to_owned()))
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use harness_domain::{AgentRole, SandboxMode};
+    use harness_domain::{AgentRole, RiskLevel, SandboxMode};
     use tempfile::TempDir;
 
     use super::*;
@@ -7876,6 +9146,406 @@ mod tests {
             })
             .unwrap();
         (store, run_id)
+    }
+
+    #[test]
+    fn deciding_an_approval_releases_the_store_connection_before_reread() {
+        let (store, run_id) = store_with_created_run();
+        let approval_id = ApprovalId::from("approval-lock-lifetime");
+        store
+            .create_approval(
+                &NewApproval {
+                    id: approval_id.clone(),
+                    run_id,
+                    task_attempt_id: None,
+                    agent_session_id: None,
+                    thread_id: "approval-lock-thread".to_owned(),
+                    turn_id: Some("approval-lock-turn".to_owned()),
+                    item_id: Some("approval-lock-item".to_owned()),
+                    approval_type: "item/commandExecution/requestApproval".to_owned(),
+                    risk_level: RiskLevel::Low,
+                    request: json!({"command": "true"}),
+                    expected_head_sha: None,
+                    expected_worktree_fingerprint: None,
+                },
+                &json!(42),
+            )
+            .unwrap();
+
+        let (approval, rpc_id) = store
+            .decide_approval(
+                &approval_id,
+                "accept",
+                Some("fixture approval"),
+                "test",
+                Some(1),
+            )
+            .expect("approval decision must not self-deadlock");
+        assert_eq!(approval.state, "delivering");
+        assert_eq!(approval.decision.as_deref(), Some("accept"));
+        assert_eq!(rpc_id, json!(42));
+    }
+
+    #[test]
+    fn late_turn_acknowledgement_enriches_notification_route_without_replacing_turn() {
+        let (store, run_id) = store_with_created_run();
+        let agent_id = AgentSessionId::from("turn-route-enrichment-agent");
+        store
+            .create_agent_session(&NewAgentSession {
+                id: agent_id.clone(),
+                run_id,
+                task_attempt_id: None,
+                parent_agent_session_id: None,
+                runtime_kind: "test".to_owned(),
+                codex_account_id: None,
+                role: AgentRole::Governor,
+                nickname: None,
+                requested_model: "ornith-1.5-35b-a3b-nvfp4".to_owned(),
+                requested_reasoning_effort: "xhigh".to_owned(),
+                sandbox_mode: SandboxMode::WorkspaceWrite,
+                approval_policy: "untrusted".to_owned(),
+                cwd: PathBuf::from("/tmp/turn-route-enrichment-agent"),
+                state: "STARTING".to_owned(),
+                current_goal: None,
+                token_budget: None,
+            })
+            .unwrap();
+        store
+            .attach_codex_thread(&agent_id, "notification-thread", None, "test", None, None)
+            .unwrap();
+        store
+            .attach_codex_turn(
+                &agent_id,
+                "notification-thread",
+                "notification-turn",
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+        store
+            .attach_codex_turn(
+                &agent_id,
+                "notification-thread",
+                "notification-turn",
+                Some("ornith-1.5-35b-a3b-nvfp4"),
+                Some("xhigh"),
+                false,
+            )
+            .unwrap();
+
+        let agent = store.agent(&agent_id).unwrap();
+        assert_eq!(agent.active_turn_id.as_deref(), Some("notification-turn"));
+        let (model, effort) = store
+            .codex_turn_requested_route("notification-thread", "notification-turn")
+            .unwrap()
+            .expect("the exact notification thread/turn remains queryable");
+        assert_eq!(model.as_deref(), Some("ornith-1.5-35b-a3b-nvfp4"));
+        assert_eq!(effort.as_deref(), Some("xhigh"));
+        assert!(
+            store
+                .codex_turn_requested_route("other-thread", "notification-turn")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pending_turn_start_receipt_is_atomic_and_exactly_resolved() {
+        let (store, run_id) = store_with_created_run();
+        let agent_id = AgentSessionId::from("pending-turn-start-agent");
+        store
+            .create_agent_session(&NewAgentSession {
+                id: agent_id.clone(),
+                run_id: run_id.clone(),
+                task_attempt_id: None,
+                parent_agent_session_id: None,
+                runtime_kind: "test".to_owned(),
+                codex_account_id: None,
+                role: AgentRole::Governor,
+                nickname: None,
+                requested_model: "ornith-1.5-35b-a3b-nvfp4".to_owned(),
+                requested_reasoning_effort: "xhigh".to_owned(),
+                sandbox_mode: SandboxMode::WorkspaceWrite,
+                approval_policy: "untrusted".to_owned(),
+                cwd: PathBuf::from("/tmp/pending-turn-start-agent"),
+                state: "STARTING".to_owned(),
+                current_goal: None,
+                token_budget: None,
+            })
+            .unwrap();
+        let key = format!("pending-turn-start:{agent_id}");
+        let receipt = json!({
+            "schema": "harness.pending-turn-start.v1",
+            "run_id": run_id.as_str(),
+            "agent_session_id": agent_id.as_str(),
+            "thread_id": "thread-1",
+            "model": "ornith-1.5-35b-a3b-nvfp4",
+            "reasoning_effort": "xhigh",
+            "created_at_ms": 1,
+        });
+        store
+            .record_pending_turn_start(&run_id, &agent_id, &key, &receipt)
+            .unwrap();
+        store
+            .record_pending_turn_start(&run_id, &agent_id, &key, &receipt)
+            .unwrap();
+        assert_eq!(store.runtime_metadata(&key).unwrap(), Some(receipt.clone()));
+        store
+            .resolve_pending_turn_start(
+                &run_id,
+                &agent_id,
+                &key,
+                &receipt,
+                &json!({"outcome": "acknowledged"}),
+            )
+            .unwrap();
+        assert!(store.runtime_metadata(&key).unwrap().is_none());
+        let events: i64 = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM domain_events WHERE run_id=?1 AND aggregate_type='agent' AND event_type IN ('agent.turn_start.pending','agent.turn_start.resolved')",
+                [run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 2);
+    }
+
+    #[test]
+    fn plan_review_rejection_receipt_is_atomic_and_idempotent() {
+        let (store, run_id) = store_with_created_run();
+        let agent_id = AgentSessionId::from("plan-review-rejection-agent");
+        store
+            .create_agent_session(&NewAgentSession {
+                id: agent_id.clone(),
+                run_id: run_id.clone(),
+                task_attempt_id: None,
+                parent_agent_session_id: None,
+                runtime_kind: "test".to_owned(),
+                codex_account_id: None,
+                role: AgentRole::PlanReviewer,
+                nickname: None,
+                requested_model: "test-model".to_owned(),
+                requested_reasoning_effort: "medium".to_owned(),
+                sandbox_mode: SandboxMode::ReadOnly,
+                approval_policy: "never".to_owned(),
+                cwd: PathBuf::from("/tmp/plan-review-rejection-agent"),
+                state: "RUNNING".to_owned(),
+                current_goal: None,
+                token_budget: None,
+            })
+            .unwrap();
+        let receipt = json!({
+            "schema": "harness.plan-review-rejection.v1",
+            "run_id": run_id.as_str(),
+            "agent_session_id": agent_id.as_str(),
+            "thread_id": "thread-review",
+            "turn_id": "turn-review",
+            "rejected_text": "{not strict JSON}",
+            "rejected_text_sha256": "a".repeat(64),
+            "reason": "JSON error: invalid response",
+            "receipt_sha256": "b".repeat(64),
+        });
+        let metadata_key = "plan-review-rejection:plan-review-rejection-agent";
+        let aggregate_id = format!("{}:{}", agent_id, "b".repeat(64));
+
+        store
+            .record_plan_review_rejection(&run_id, &agent_id, metadata_key, &aggregate_id, &receipt)
+            .unwrap();
+        store
+            .record_plan_review_rejection(&run_id, &agent_id, metadata_key, &aggregate_id, &receipt)
+            .unwrap();
+
+        assert_eq!(
+            store.runtime_metadata(metadata_key).unwrap(),
+            Some(receipt.clone())
+        );
+        let receipts = store
+            .list_domain_events(0, Some(&run_id), 20)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == "agent.plan_reviewer.verdict_rejected")
+            .collect::<Vec<_>>();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].aggregate_id, aggregate_id);
+        assert_eq!(receipts[0].payload["rejected_text"], "{not strict JSON}");
+        assert_eq!(
+            store
+                .plan_review_rejection_journal_receipt(&run_id, &agent_id, &"b".repeat(64))
+                .unwrap(),
+            Some(receipt)
+        );
+    }
+
+    #[test]
+    fn atomic_run_creation_returns_after_persisting_its_model_route() {
+        let (store, _) = store_with_created_run();
+        let run_id = RunId::from("atomic-model-route-run");
+        let input = NewRun {
+            id: run_id.clone(),
+            repository_id: RepositoryId::from("repository-lifecycle-event"),
+            title: "Atomic model route fixture".to_owned(),
+            objective: "Verify atomic run route persistence returns to its caller".to_owned(),
+            mode: "standard".to_owned(),
+            publication_mode: "none".to_owned(),
+            state: RunState::Created.to_string(),
+            phase: "created".to_owned(),
+            base_ref: "main".to_owned(),
+            base_sha: "b".repeat(40),
+            authority_digest: "fixture".to_owned(),
+            profile_digest: "fixture".to_owned(),
+            codex_version: None,
+            protocol_schema_sha256: None,
+            requested_by: "test".to_owned(),
+            token_budget: None,
+        };
+        let route = NewImmutableRunModelRoute {
+            run_id: run_id.clone(),
+            schema: "harness.run-model-route.v2".to_owned(),
+            provider: "qwen-local-switcher".to_owned(),
+            model: "future-local-model".to_owned(),
+            reasoning_effort: "medium".to_owned(),
+            model_profile_sha256: Some("a".repeat(64)),
+            route_sha256: "b".repeat(64),
+        };
+
+        let created = store
+            .create_run_with_immutable_model_route(&input, &route)
+            .expect("atomic creation returns after committing the run and route");
+        assert_eq!(created.id, run_id);
+        assert_eq!(
+            store
+                .immutable_run_model_route(&run_id)
+                .expect("route query succeeds")
+                .expect("route was written")
+                .model,
+            "future-local-model"
+        );
+    }
+
+    #[test]
+    fn immutable_model_route_receipts_bind_provider_and_refuse_mutation() {
+        let (store, run_id) = store_with_created_run();
+        let route = NewImmutableRunModelRoute {
+            run_id: run_id.clone(),
+            schema: "harness.run-model-route.v2".to_owned(),
+            provider: "qwen-local-switcher".to_owned(),
+            model: "future-local-model".to_owned(),
+            reasoning_effort: "medium".to_owned(),
+            model_profile_sha256: Some("a".repeat(64)),
+            route_sha256: "b".repeat(64),
+        };
+        let stored = store.record_immutable_run_model_route(&route).unwrap();
+        assert_eq!(stored.provider, "qwen-local-switcher");
+        assert_eq!(
+            store.record_immutable_run_model_route(&route).unwrap(),
+            stored
+        );
+
+        let mut changed = route.clone();
+        changed.provider = "openai".to_owned();
+        assert!(matches!(
+            store.record_immutable_run_model_route(&changed),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(
+            store
+                .connection()
+                .unwrap()
+                .execute(
+                    "UPDATE run_model_routes SET provider='openai' WHERE run_id=?1",
+                    [run_id.as_str()],
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .connection()
+                .unwrap()
+                .execute(
+                    "DELETE FROM run_model_routes WHERE run_id=?1",
+                    [run_id.as_str()],
+                )
+                .is_err()
+        );
+
+        let agent_id = AgentSessionId::from("route-bound-agent");
+        store
+            .create_agent_session(&NewAgentSession {
+                id: agent_id.clone(),
+                run_id: run_id.clone(),
+                task_attempt_id: None,
+                parent_agent_session_id: None,
+                runtime_kind: "test".to_owned(),
+                codex_account_id: None,
+                role: AgentRole::Architect,
+                nickname: None,
+                requested_model: route.model.clone(),
+                requested_reasoning_effort: route.reasoning_effort.clone(),
+                sandbox_mode: SandboxMode::ReadOnly,
+                approval_policy: "never".to_owned(),
+                cwd: PathBuf::from("/tmp/route-bound-agent"),
+                state: "STARTING".to_owned(),
+                current_goal: None,
+                token_budget: None,
+            })
+            .unwrap();
+        let binding = NewAgentModelRouteBinding {
+            agent_session_id: agent_id.clone(),
+            run_id: run_id.clone(),
+            provider: route.provider.clone(),
+            model: route.model.clone(),
+            reasoning_effort: route.reasoning_effort.clone(),
+            model_profile_sha256: route.model_profile_sha256.clone(),
+            route_sha256: route.route_sha256.clone(),
+        };
+        assert_eq!(
+            store.bind_agent_model_route(&binding).unwrap().provider,
+            "qwen-local-switcher"
+        );
+        assert_eq!(
+            store
+                .bind_agent_model_route(&binding)
+                .unwrap()
+                .agent_session_id,
+            agent_id
+        );
+        assert!(store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE agent_model_route_bindings SET provider='openai' WHERE agent_session_id=?1",
+                [agent_id.as_str()],
+            )
+            .is_err());
+
+        let mismatched_agent = AgentSessionId::from("route-mismatched-agent");
+        store
+            .create_agent_session(&NewAgentSession {
+                id: mismatched_agent.clone(),
+                run_id: run_id.clone(),
+                task_attempt_id: None,
+                parent_agent_session_id: None,
+                runtime_kind: "test".to_owned(),
+                codex_account_id: None,
+                role: AgentRole::Architect,
+                nickname: None,
+                requested_model: route.model.clone(),
+                requested_reasoning_effort: route.reasoning_effort.clone(),
+                sandbox_mode: SandboxMode::ReadOnly,
+                approval_policy: "never".to_owned(),
+                cwd: PathBuf::from("/tmp/route-mismatched-agent"),
+                state: "STARTING".to_owned(),
+                current_goal: None,
+                token_budget: None,
+            })
+            .unwrap();
+        let mut mismatched = binding;
+        mismatched.agent_session_id = mismatched_agent;
+        mismatched.provider = "openai".to_owned();
+        assert!(store.bind_agent_model_route(&mismatched).is_err());
     }
 
     fn new_evaluation_run() -> NewEvaluationRun {

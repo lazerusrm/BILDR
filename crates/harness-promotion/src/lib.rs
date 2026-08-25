@@ -1,8 +1,10 @@
 //! Pure M4/M5 promotion contracts; validation and command construction only.
+mod avo;
 mod digest;
 mod experiment;
 mod promotion;
 mod telemetry;
+pub use avo::*;
 pub use digest::*;
 pub use experiment::*;
 pub use promotion::*;

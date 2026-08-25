@@ -489,7 +489,7 @@ select:focus-visible {
 .account-bar {
   min-width: 0;
   display: grid;
-  grid-template-columns: 255px minmax(0, 1fr) 116px;
+  grid-template-columns: 255px 205px minmax(0, 1fr) 116px;
   align-items: center;
   gap: 18px;
   padding: 8px 17px 9px;
@@ -541,6 +541,37 @@ select:focus-visible {
   pointer-events: none;
 }
 .account-identity > span {
+  display: block;
+  overflow: hidden;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.provider-identity {
+  min-width: 0;
+  padding-left: 14px;
+  border-left: 1px solid var(--line);
+}
+.provider-identity > label {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.provider-identity > strong {
+  display: block;
+  color: var(--text);
+  font: 700 11px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.provider-identity.local > strong {
+  color: var(--ok);
+}
+.provider-identity > span {
   display: block;
   overflow: hidden;
   margin-top: 3px;
@@ -1440,6 +1471,29 @@ kbd {
 .knowledge-item-actions {
   justify-content: flex-start;
   gap: 6px;
+}
+.improvement-import {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.improvement-import summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.improvement-import p,
+.improvement-import form {
+  margin: 0;
+}
+.improvement-import form {
+  display: grid;
+  gap: 10px;
+}
+.improvement-import textarea {
+  width: 100%;
+  resize: vertical;
 }
 .trace-explorer header {
   margin-bottom: 8px;

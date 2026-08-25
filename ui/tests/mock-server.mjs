@@ -360,8 +360,8 @@ const apiResponse = (pathname) => {
       codex: {
         state: "ready",
         detail: "Version and schema matched",
-        version: "codex-cli 0.148.0",
-        required_version: "codex-cli 0.148.0",
+        version: "codex-cli 0.149.1",
+        required_version: "codex-cli 0.149.1",
         protocol_schema_sha256: "d".repeat(64),
         schema_match: true,
         pid: 7310,
@@ -424,6 +424,7 @@ const apiResponse = (pathname) => {
   if (interviewRun && pathname === `/api/v1/runs/${interviewRun.id}/usage`)
     return usage;
   if (pathname === "/api/v1/usage") return usageBreakdown;
+  if (pathname === "/api/v1/improvement/avo-episodes") return [];
   if (pathname === `/api/v1/runs/${run.id}/evidence`) {
     return {
       schema: "harness.evidence.snapshot.v1",

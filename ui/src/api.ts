@@ -1,6 +1,9 @@
 import type {
   ActivityPage,
   Agent,
+  AvoEpisode,
+  AvoEpisodePayload,
+  AvoEpisodeState,
   AttentionItem,
   AttentionPage,
   Approval,
@@ -34,6 +37,7 @@ import type {
   OperatorSettings,
   Repository,
   RepositoryDiscovery,
+  RunModelCatalog,
   Run,
   RunDetail,
   RuntimeStatus,
@@ -122,6 +126,7 @@ class HarnessApi {
   }
 
   runtime = () => this.get<RuntimeStatus>("/runtime");
+  runModelCatalog = () => this.get<RunModelCatalog>("/models");
   codexAccounts = (force = false) =>
     this.get<CodexAccountsSnapshot>(
       `/codex/accounts${force ? "?force=true" : ""}`,
@@ -145,6 +150,9 @@ class HarnessApi {
     this.get<EvidenceSnapshot>(`/runs/${runId}/evidence`);
   outcomes = (runId: string) =>
     this.get<OutcomeVector>(`/improvement/outcomes?run_id=${encodeURIComponent(runId)}`);
+  avoEpisodes = () => this.get<AvoEpisode[]>("/improvement/avo-episodes?limit=50");
+  recordAvoEpisode = (episode: AvoEpisodePayload, state: AvoEpisodeState) =>
+    this.post<AvoEpisode>("/improvement/avo-episodes", { episode, state });
   improvementFailures = (repositoryId: string) =>
     this.get<FailureOverview>(
       `/improvement/failures?repository_id=${encodeURIComponent(repositoryId)}`,
@@ -358,11 +366,13 @@ class HarnessApi {
     repositoryId: string,
     objective: string,
     publication: string,
-    governorModel: string,
-    governorReasoningEffort: string,
+    runModel: string,
+    runReasoningEffort: string,
     automaticPlanApproval: boolean,
     runTokenBudget: number,
     deepInterview: boolean,
+    minimalImplementation: boolean,
+    compactHandoffs: boolean,
     codexAccountId?: string,
   ) {
     return this.post<Run>("/runs", {
@@ -370,11 +380,15 @@ class HarnessApi {
       objective,
       mode: "plan_and_implement",
       publication,
-      governor_model: governorModel,
-      governor_reasoning_effort: governorReasoningEffort,
+      run_model: {
+        model: runModel,
+        reasoning_effort: runReasoningEffort,
+      },
       automatic_plan_approval: automaticPlanApproval,
       run_token_budget: runTokenBudget,
       deep_interview: deepInterview,
+      minimal_implementation: minimalImplementation,
+      compact_handoffs: compactHandoffs,
       codex_account_id: codexAccountId || null,
     });
   }

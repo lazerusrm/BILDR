@@ -60,6 +60,8 @@ const RECONCILIATION_PROOF_CONSUMPTION_MIGRATION: &str =
     include_str!("../../../migrations/0018_reconciliation_proof_consumption.sql");
 const NOTIFICATION_SHADOW_BATCHES_MIGRATION: &str =
     include_str!("../../../migrations/0019_notification_shadow_batches.sql");
+const IMMUTABLE_MODEL_ROUTES_MIGRATION: &str =
+    include_str!("../../../migrations/0020_immutable_model_routes.sql");
 
 #[derive(Clone)]
 pub struct Store {
@@ -323,6 +325,7 @@ fn apply_runtime_migrations(connection: &mut Connection) -> Result<(), StoreErro
             "legacy v8 evaluation custody contains receipts that lack controller/evidence ownership; restore a pre-v8 backup or retain this database with the matching binary".to_owned(),
         ));
     }
+    validate_model_route_custody_preflight(connection)?;
     connection.execute_batch(RUNTIME_MIGRATION)?;
     let has_worktree_fingerprint: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('approvals') WHERE name='expected_worktree_fingerprint')",
@@ -490,6 +493,28 @@ fn apply_runtime_migrations(connection: &mut Connection) -> Result<(), StoreErro
     } else {
         set_runtime_schema_version(connection, "18")?;
     }
+    if !immutable_model_routes_schema_current(connection)? {
+        let route_custody_table_exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name IN ('run_model_routes','agent_model_route_bindings'))",
+            [],
+            |row| row.get(0),
+        )?;
+        if route_custody_table_exists {
+            return Err(StoreError::Migration(
+                "immutable model route schema is incomplete; create a new greenfield database rather than applying a compatibility migration".to_owned(),
+            ));
+        }
+        let has_existing_runs: bool =
+            connection.query_row("SELECT EXISTS(SELECT 1 FROM runs)", [], |row| row.get(0))?;
+        if has_existing_runs {
+            return Err(StoreError::Migration(
+                "existing runs predate immutable model-route custody; create a new greenfield database rather than inventing route receipts".to_owned(),
+            ));
+        }
+        apply_immutable_model_routes_migration(connection, || Ok(()))?;
+    } else {
+        set_runtime_schema_version(connection, "19")?;
+    }
     Ok(())
 }
 
@@ -601,6 +626,96 @@ where
     set_runtime_schema_version(&transaction, "18")?;
     transaction.commit()?;
     Ok(())
+}
+
+/// Install model-route custody in one transaction. A controller must not
+/// observe v19 without both run authority and session-provider bindings.
+fn apply_immutable_model_routes_migration<F>(
+    connection: &mut Connection,
+    after_schema: F,
+) -> Result<(), StoreError>
+where
+    F: FnOnce() -> Result<(), StoreError>,
+{
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(IMMUTABLE_MODEL_ROUTES_MIGRATION)?;
+    after_schema()?;
+    set_runtime_schema_version(&transaction, "19")?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// A populated database cannot be upgraded by manufacturing model authority.
+/// Check this before any unrelated migration writes so an unsafe database is
+/// left exactly as found for recovery with its matching binary or backup.
+fn validate_model_route_custody_preflight(connection: &Connection) -> Result<(), StoreError> {
+    let route_custody_table_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name IN ('run_model_routes','agent_model_route_bindings'))",
+        [],
+        |row| row.get(0),
+    )?;
+    let schema_current = immutable_model_routes_schema_current(connection)?;
+    if route_custody_table_exists && !schema_current {
+        return Err(StoreError::Migration(
+            "immutable model route schema is incomplete; create a new greenfield database rather than applying a compatibility migration".to_owned(),
+        ));
+    }
+    let has_existing_runs: bool =
+        connection.query_row("SELECT EXISTS(SELECT 1 FROM runs)", [], |row| row.get(0))?;
+    if !has_existing_runs {
+        return Ok(());
+    }
+    if !schema_current {
+        return Err(StoreError::Migration(
+            "existing runs predate immutable model-route custody; create a new greenfield database rather than inventing route receipts".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn immutable_model_routes_schema_current(connection: &Connection) -> Result<bool, StoreError> {
+    let columns = [
+        ("run_model_routes", "run_id"),
+        ("run_model_routes", "schema"),
+        ("run_model_routes", "provider"),
+        ("run_model_routes", "model"),
+        ("run_model_routes", "reasoning_effort"),
+        ("run_model_routes", "model_profile_sha256"),
+        ("run_model_routes", "route_sha256"),
+        ("agent_model_route_bindings", "agent_session_id"),
+        ("agent_model_route_bindings", "run_id"),
+        ("agent_model_route_bindings", "provider"),
+        ("agent_model_route_bindings", "model"),
+        ("agent_model_route_bindings", "reasoning_effort"),
+        ("agent_model_route_bindings", "model_profile_sha256"),
+        ("agent_model_route_bindings", "route_sha256"),
+    ];
+    let triggers = [
+        "run_model_routes_no_update",
+        "run_model_routes_no_delete",
+        "agent_model_route_bindings_require_run_route",
+        "agent_model_route_bindings_no_update",
+        "agent_model_route_bindings_no_delete",
+    ];
+    let columns_present = columns
+        .into_iter()
+        .map(|(table, column)| table_has_column(connection, table, column))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .all(|present| present);
+    let triggers_present = triggers
+        .into_iter()
+        .map(|trigger| {
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)",
+                [trigger],
+                |row| row.get::<_, bool>(0),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .all(|present| present);
+    Ok(columns_present && triggers_present)
 }
 
 fn notification_shadow_batches_schema_current(connection: &Connection) -> Result<bool, StoreError> {
@@ -791,7 +906,7 @@ mod tests {
         assert!(store.check().unwrap().ready);
         drop(store);
         let reopened = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(reopened.migration_version().unwrap(), "18");
+        assert_eq!(reopened.migration_version().unwrap(), "19");
         let has_worktree_fingerprint: bool = reopened
             .connection()
             .unwrap()
@@ -948,6 +1063,61 @@ mod tests {
             error
                 .to_string()
                 .contains("notification shadow batch schema is incomplete")
+        );
+    }
+
+    #[test]
+    fn immutable_model_route_schema_and_v19_marker_roll_back_together_on_failure() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(INITIAL_MIGRATION).unwrap();
+        connection.execute_batch(RUNTIME_MIGRATION).unwrap();
+        let error = apply_immutable_model_routes_migration(&mut connection, || {
+            Err(StoreError::Migration(
+                "injected failure after model-route DDL".to_owned(),
+            ))
+        })
+        .expect_err("a migration failure must roll back its schema marker");
+        assert!(error.to_string().contains("injected failure"));
+        let table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_model_routes')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let version: String = connection
+            .query_row(
+                "SELECT value FROM schema_migrations_meta WHERE key='runtime_schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!table_exists);
+        assert_ne!(version, "19");
+    }
+
+    #[test]
+    fn populated_database_without_model_route_custody_fails_closed() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("legacy.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        connection.execute_batch(INITIAL_MIGRATION).unwrap();
+        connection.execute_batch(RUNTIME_MIGRATION).unwrap();
+        connection
+            .execute("INSERT INTO repositories(id,profile_id,profile_version,display_name,root_path,default_branch,state,created_at,updated_at,version) VALUES('repo','fixture',1,'fixture','/tmp','main','READY',1,1,1)", [])
+            .unwrap();
+        connection
+            .execute("INSERT INTO runs(id,repository_id,title,requested_objective,mode,publication_mode,state,phase,base_ref,base_sha,authority_digest,profile_digest,requested_by,created_at,updated_at) VALUES('legacy-route-run','repo','title','objective','standard','none','CREATED','created','main','0000000000000000000000000000000000000000','authority','profile','test',1,1)", [])
+            .unwrap();
+        drop(connection);
+        let error = match Store::open(&database, &temp.path().join("artifacts")) {
+            Ok(_) => panic!("a legacy run cannot receive an invented model receipt"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("existing runs predate immutable model-route custody")
         );
     }
 
@@ -1392,6 +1562,273 @@ mod tests {
     }
 
     #[test]
+    fn avo_episode_is_immutable_and_resolves_each_lineage_receipt_exactly() {
+        use harness_domain::{
+            ImprovementEventId, ImprovementRecordKind, ImprovementSchema, ImprovementState,
+            RetentionClass, SensitivityClass,
+        };
+
+        fn seed(
+            store: &Store,
+            id: &str,
+            kind: &str,
+            aggregate_id: &str,
+            schema: &str,
+            payload: &serde_json::Value,
+        ) {
+            let raw = payload.to_string();
+            let state = if kind == "outcome" {
+                "observed"
+            } else {
+                "proposed"
+            };
+            store
+                .connection()
+                .unwrap()
+                .execute(
+                    "INSERT INTO improvement_revisions(id,aggregate_kind,aggregate_id,revision,schema_name,lifecycle_state,payload_json,payload_sha256,sensitivity,retention_class,export_allowed,created_at) VALUES(?1,?2,?3,(SELECT coalesce(max(revision),0)+1 FROM improvement_revisions WHERE aggregate_kind=?2 AND aggregate_id=?3),?4,?5,?6,?7,'internal','governance',0,1)",
+                    rusqlite::params![id, kind, aggregate_id, schema, state, raw, crate::queries::sha256(payload.to_string().as_bytes())],
+                )
+                .unwrap();
+        }
+        fn input(payload: serde_json::Value, id: &str, key: &str) -> NewImprovementRevision {
+            NewImprovementRevision {
+                id: id.into(),
+                aggregate_kind: ImprovementRecordKind::AvoEpisode,
+                aggregate_id: "episode-1".into(),
+                schema: ImprovementSchema::AvoEpisodeV1,
+                state: ImprovementState::Running,
+                payload_sha256: crate::queries::sha256(payload.to_string().as_bytes()),
+                payload,
+                sensitivity: SensitivityClass::Internal,
+                retention_class: RetentionClass::Governance,
+                export_allowed: false,
+                idempotency_key: key.into(),
+                event_id: ImprovementEventId::new(),
+                source_raw_event_id: None,
+                source_domain_event_id: None,
+            }
+        }
+        fn redigest(value: &mut serde_json::Value) {
+            let typed: harness_promotion::AvoEpisodeV1 =
+                serde_json::from_value(value.clone()).unwrap();
+            value["sha256"] =
+                serde_json::Value::String(harness_promotion::digest_without_self(&typed).unwrap());
+        }
+        fn seed_validation_authority(store: &Store) -> String {
+            let connection = store.connection().unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO repositories(id,profile_id,profile_version,display_name,root_path,default_branch,state,created_at,updated_at) VALUES('repository-gate-1','fixture',1,'gate fixture','/tmp/avo-gate-fixture','main','READY',1,1);
+                     INSERT INTO runs(id,repository_id,title,requested_objective,mode,publication_mode,state,phase,base_ref,base_sha,authority_digest,profile_digest,requested_by,created_at,updated_at) VALUES('run-gate-1','repository-gate-1','gate fixture','gate fixture','standard','none','CREATED','created','main','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','fixture','fixture','test',1,1);
+                     INSERT INTO run_plan_revisions(id,run_id,revision,plan_json,plan_sha256,state,created_at) VALUES('plan-gate-1','run-gate-1',1,'{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','draft',1);
+                     INSERT INTO tasks(id,run_id,plan_revision_id,external_task_id,title,objective,priority,owner_profile,reviewer_profile,state,created_at,updated_at) VALUES('task-gate-1','run-gate-1','plan-gate-1','gate','gate fixture','gate fixture','normal','worker','reviewer','PENDING',1,1);
+                     INSERT INTO task_attempts(id,task_id,attempt_number,state,task_packet_json,task_packet_sha256,base_sha,requested_model_route,created_at,updated_at) VALUES('candidate-1','task-gate-1',1,'PENDING','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','route-gate',1,1);
+                     INSERT INTO worktrees(id,run_id,task_attempt_id,kind,path,base_sha,state,created_at) VALUES('worktree-gate-1','run-gate-1','candidate-1','task','/tmp/avo-gate-worktree','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','ACTIVE',1);
+                     INSERT INTO validations(id,run_id,task_attempt_id,worktree_id,validator_id,proof_tier,source_sha,selector_reason,state,result_class,command_run_id,started_at,completed_at) VALUES('validation-record-1','run-gate-1','candidate-1','worktree-gate-1','validator-gate','T1','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','fixture','completed','success',NULL,1,2);",
+                )
+                .unwrap();
+            crate::queries::canonical_validation_receipt_sha256(
+                "validation-record-1",
+                Some("candidate-1"),
+                "validator-gate",
+                "T1",
+                "success",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                None,
+                Some(1),
+                2,
+            )
+            .unwrap()
+        }
+
+        let temp = TempDir::new().unwrap();
+        let store = Store::in_memory(&temp.path().join("artifacts")).unwrap();
+        let policy: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../examples/self-improvement/policy-bundle.example.json"
+        ))
+        .unwrap();
+        let candidate: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../examples/self-improvement/candidate.example.json"
+        ))
+        .unwrap();
+        seed(
+            &store,
+            "bundle-revision-1",
+            "policy_bundle",
+            "bundle-1",
+            "harness.policy-bundle.v1",
+            &policy,
+        );
+        seed(
+            &store,
+            "candidate-revision-1",
+            "candidate",
+            "candidate-1",
+            "harness.improvement-candidate.v1",
+            &candidate,
+        );
+        let validation_receipt_sha256 = seed_validation_authority(&store);
+        let gate_outcome_id =
+            crate::queries::stable_authoritative_outcome_id(&crate::AuthoritativeOutcomeInput {
+                run_id: harness_domain::RunId::from("run-gate-1"),
+                subject: harness_domain::OutcomeSubject {
+                    kind: harness_domain::OutcomeSubjectKind::TaskAttempt,
+                    id: "candidate-1".to_owned(),
+                },
+                dimension: harness_domain::OutcomeDimension::Validation,
+                classification: harness_domain::OutcomeClassification::Positive,
+                code: "passed".to_owned(),
+                source_kind: harness_domain::OutcomeSourceKind::Validation,
+                source_record_id: "validation-record-1".to_owned(),
+                source_record_sha256: validation_receipt_sha256.clone(),
+                source_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+                source_domain_event_id: None,
+                observed_at: 2,
+            })
+            .unwrap();
+        let gate_outcome = serde_json::json!({
+            "schema": "harness.outcome.v1",
+            "outcome_id": gate_outcome_id,
+            "run_id": "run-gate-1",
+            "subject": {"kind": "task_attempt", "id": "candidate-1"},
+            "dimension": "validation",
+            "classification": "positive",
+            "code": "passed",
+            "observed_at": 2,
+            "confidence": "authoritative",
+            "source": {
+                "kind": "validation",
+                "record_id": "validation-record-1",
+                "record_sha256": validation_receipt_sha256,
+                "source_sha": "a".repeat(40),
+                "source_domain_event_id": serde_json::Value::Null,
+            },
+            "supersedes": [],
+            "reason_code": serde_json::Value::Null,
+            "correction_artifact_id": serde_json::Value::Null,
+            "redactor_version": "outcome-redactor.v1",
+            "free_text_redacted": false,
+        });
+        let gate_digest = crate::queries::sha256(gate_outcome.to_string().as_bytes());
+        seed(
+            &store,
+            "gate-revision-1",
+            "outcome",
+            gate_outcome["outcome_id"].as_str().unwrap(),
+            "harness.outcome.v1",
+            &gate_outcome,
+        );
+
+        let mut episode: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../examples/self-improvement/avo-episode.example.json"
+        ))
+        .unwrap();
+        episode["champion_bundle_id"] = serde_json::json!("bundle-1");
+        episode["champion_bundle_receipt"]["id"] = serde_json::json!("bundle-1");
+        episode["champion_bundle_receipt"]["digest"] = policy["sha256"].clone();
+        episode["variation_budget"] = serde_json::json!(1);
+        episode["stagnation_limit"] = serde_json::json!(1);
+        episode["variations"].as_array_mut().unwrap().truncate(1);
+        episode["variations"][0]["candidate_receipt"]["digest"] = candidate["sha256"].clone();
+        episode["variations"][0]["correctness_evidence"]["id"] =
+            serde_json::json!("gate-revision-1");
+        episode["variations"][0]["correctness_evidence"]["digest"] = serde_json::json!(gate_digest);
+        redigest(&mut episode);
+
+        store
+            .append_improvement_revision(&input(
+                episode.clone(),
+                "episode-revision-1",
+                "episode-key-1",
+            ))
+            .unwrap();
+        let current = store.list_current_avo_episodes(10).unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].id, "episode-revision-1");
+        assert_eq!(current[0].aggregate_id, "episode-1");
+        assert_eq!(current[0].revision, 1);
+
+        let mut forged_receipt_gate = gate_outcome.clone();
+        forged_receipt_gate["source"]["record_sha256"] = serde_json::json!("b".repeat(64));
+        let forged_receipt_digest =
+            crate::queries::sha256(forged_receipt_gate.to_string().as_bytes());
+        seed(
+            &store,
+            "gate-revision-forged-receipt",
+            "outcome",
+            forged_receipt_gate["outcome_id"].as_str().unwrap(),
+            "harness.outcome.v1",
+            &forged_receipt_gate,
+        );
+        let mut forged_receipt_episode = episode.clone();
+        forged_receipt_episode["variations"][0]["correctness_evidence"]["id"] =
+            serde_json::json!("gate-revision-forged-receipt");
+        forged_receipt_episode["variations"][0]["correctness_evidence"]["digest"] =
+            serde_json::json!(forged_receipt_digest);
+        redigest(&mut forged_receipt_episode);
+        assert!(
+            store
+                .append_improvement_revision(&input(
+                    forged_receipt_episode,
+                    "episode-revision-forged-receipt",
+                    "episode-key-forged-receipt",
+                ))
+                .is_err()
+        );
+
+        let mut substituted_gate = episode.clone();
+        substituted_gate["variations"][0]["correctness_evidence"]["digest"] =
+            serde_json::json!("b".repeat(64));
+        redigest(&mut substituted_gate);
+        assert!(
+            store
+                .append_improvement_revision(&input(
+                    substituted_gate,
+                    "episode-revision-2",
+                    "episode-key-2",
+                ))
+                .is_err()
+        );
+
+        let mut other_candidate_gate = gate_outcome;
+        other_candidate_gate["subject"]["id"] = serde_json::json!("candidate-other");
+        let other_gate_digest = crate::queries::sha256(other_candidate_gate.to_string().as_bytes());
+        seed(
+            &store,
+            "gate-revision-2",
+            "outcome",
+            "gate-outcome-2",
+            "harness.outcome.v1",
+            &other_candidate_gate,
+        );
+        let mut wrong_candidate_gate = episode.clone();
+        wrong_candidate_gate["variations"][0]["correctness_evidence"]["id"] =
+            serde_json::json!("gate-revision-2");
+        wrong_candidate_gate["variations"][0]["correctness_evidence"]["digest"] =
+            serde_json::json!(other_gate_digest);
+        redigest(&mut wrong_candidate_gate);
+        assert!(
+            store
+                .append_improvement_revision(&input(
+                    wrong_candidate_gate,
+                    "episode-revision-3",
+                    "episode-key-3",
+                ))
+                .is_err()
+        );
+
+        let mut stale = episode;
+        stale["variations"][0]["candidate_receipt"]["digest"] = serde_json::json!("b".repeat(64));
+        redigest(&mut stale);
+        assert!(
+            store
+                .append_improvement_revision(&input(stale, "episode-revision-4", "episode-key-4",))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn v5_upgrade_creates_improvement_schema_and_accepts_records() {
         let temp = TempDir::new().unwrap();
         let database = temp.path().join("v5.sqlite3");
@@ -1415,7 +1852,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let store = Store::open(&database, &temp.path().join("artifacts")).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "18");
+        assert_eq!(store.migration_version().unwrap(), "19");
         for name in [
             "improvement_revisions",
             "improvement_events",
@@ -1485,7 +1922,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "18");
+        assert_eq!(store.migration_version().unwrap(), "19");
         for name in [
             "failure_occurrences",
             "failure_clusters",
@@ -1545,7 +1982,7 @@ mod tests {
         );
         drop(store);
         let reopened = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(reopened.migration_version().unwrap(), "18");
+        assert_eq!(reopened.migration_version().unwrap(), "19");
         assert!(
             reopened
                 .backup(&temp.path().join("v6-backup.sqlite3"))
@@ -1584,7 +2021,7 @@ mod tests {
         drop(connection);
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "18");
+        assert_eq!(store.migration_version().unwrap(), "19");
         for name in [
             "taskset_revision_memberships",
             "evaluation_runs",
@@ -1618,7 +2055,7 @@ mod tests {
                 .unwrap()
                 .migration_version()
                 .unwrap(),
-            "18"
+            "19"
         );
         assert!(
             Store::open(&backup, &temp.path().join("backup-artifacts"))
@@ -1664,7 +2101,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "18");
+        assert_eq!(store.migration_version().unwrap(), "19");
         for name in [
             "policy_champion_bindings",
             "policy_current_champions",
@@ -1813,7 +2250,7 @@ mod tests {
                 .unwrap()
                 .migration_version()
                 .unwrap(),
-            "18"
+            "19"
         );
     }
 
@@ -1902,7 +2339,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "18");
+        assert_eq!(store.migration_version().unwrap(), "19");
         for (table, column) in [
             ("evaluation_runs", "controller_run_id"),
             ("evaluation_samples", "controller_evidence_id"),
@@ -2006,7 +2443,7 @@ mod tests {
     }
 
     #[test]
-    fn v9_upgrade_backfills_artifact_run_custody_and_reopens() {
+    fn populated_v9_database_without_model_route_custody_fails_closed_before_upgrade() {
         let temp = TempDir::new().unwrap();
         let database = temp.path().join("v9.sqlite3");
         let connection = rusqlite::Connection::open(&database).unwrap();
@@ -2043,37 +2480,37 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let artifacts = temp.path().join("artifacts");
-        let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "18");
-        let backfilled: bool = store
-            .connection()
-            .unwrap()
+        let error = match Store::open(&database, &temp.path().join("artifacts")) {
+            Ok(_) => {
+                panic!("a populated pre-v19 database cannot receive invented model-route custody")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("existing runs predate immutable model-route custody")
+        );
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let version: String = connection
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM artifact_run_bindings WHERE artifact_id='v9-artifact' AND run_id='v9-run')",
+                "SELECT value FROM schema_migrations_meta WHERE key='runtime_schema_version'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(backfilled);
-        assert!(store
-            .connection()
-            .unwrap()
-            .execute(
-                "DELETE FROM artifact_run_bindings WHERE artifact_id='v9-artifact' AND run_id='v9-run'",
-                [],
-            )
-            .is_err());
-        let backup = temp.path().join("v10-backup.sqlite3");
-        store.backup(&backup).unwrap();
-        drop(store);
         assert_eq!(
-            Store::open(&backup, &temp.path().join("backup-artifacts"))
-                .unwrap()
-                .migration_version()
-                .unwrap(),
-            "18"
+            version, "9",
+            "preflight must not partially upgrade legacy state"
         );
+        let artifact_bindings_exist: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='artifact_run_bindings')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!artifact_bindings_exist);
     }
 
     #[test]

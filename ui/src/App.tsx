@@ -56,6 +56,7 @@ import type {
   RepositoryDiscovery,
   Run,
   RunDetail,
+  RunModelCatalog,
   RuntimeStatus,
   Task,
   Usage,
@@ -63,6 +64,8 @@ import type {
   Worktree,
   WorktreeDiffSummary,
 } from "./types";
+
+const EMPTY_STRING_ARRAY: string[] = [];
 
 type View = "home" | "repositories" | "runs" | "control" | "improvement" | "usage" | "host" | "settings";
 type Modal =
@@ -109,6 +112,10 @@ type RateLimitHistory = Record<string, RateLimitSample[]>;
 export default function App() {
   const [view, setView] = useState<View>("home");
   const [runtime, setRuntime] = useState<RuntimeStatus>();
+  const [runModelCatalog, setRunModelCatalog] = useState<RunModelCatalog>({
+    provider: "",
+    models: [],
+  });
   const [codexAccounts, setCodexAccounts] = useState<CodexAccountsSnapshot>({
     accounts: [],
   });
@@ -182,6 +189,7 @@ export default function App() {
   const loadGlobal = useCallback(async () => {
     const [
       nextRuntime,
+      nextRunModelCatalog,
       nextAccounts,
       nextRepositories,
       nextRuns,
@@ -190,6 +198,7 @@ export default function App() {
       nextSettings,
     ] = await Promise.all([
       api.runtime(),
+      api.runModelCatalog(),
       api.codexAccounts().catch(() => ({ accounts: [] })),
       api.repositories(),
       api.runs(),
@@ -198,6 +207,7 @@ export default function App() {
       api.settings().catch(() => undefined),
     ]);
     setRuntime(nextRuntime);
+    setRunModelCatalog(nextRunModelCatalog);
     setCodexAccounts(nextAccounts);
     setRepositories(nextRepositories);
     setRuns(nextRuns);
@@ -545,6 +555,7 @@ export default function App() {
       />
       <AccountBar
         snapshot={codexAccounts}
+        modelCatalog={runModelCatalog}
         history={rateHistory}
         busy={busy === "codex-account"}
         onSelect={(accountId) =>
@@ -920,6 +931,7 @@ export default function App() {
             <SettingsView
               light={light}
               accounts={codexAccounts}
+              modelCatalog={runModelCatalog}
               onAccounts={setCodexAccounts}
               onSettings={setOperatorSettings}
               onRefresh={refresh}
@@ -1039,6 +1051,7 @@ export default function App() {
         <NewRunModal
           repositories={repositories}
           accounts={codexAccounts}
+          modelCatalog={runModelCatalog}
           settings={operatorSettings}
           onClose={() => setModal(null)}
           onDone={async (run, startError) => {
@@ -1172,6 +1185,7 @@ type AccountMeter = {
 
 function AccountBar({
   snapshot,
+  modelCatalog,
   history,
   busy,
   onSelect,
@@ -1180,6 +1194,7 @@ function AccountBar({
   onReauthenticate,
 }: {
   snapshot: CodexAccountsSnapshot;
+  modelCatalog: RunModelCatalog;
   history: RateLimitHistory;
   busy: boolean;
   onSelect: (accountId: string) => void;
@@ -1197,81 +1212,107 @@ function AccountBar({
     account.observed_at &&
     Date.now() - account.observed_at < 90_000,
   );
+  const isQwodex = modelCatalog.provider === "qwen-local-switcher";
+  const localModelLabel = isQwodex
+    ? modelCatalog.models.find((model) => model.id === "ornith-1.5-35b-a3b-nvfp4")
+        ?.display_name || "Local model catalog ready"
+    : "Hosted model catalog ready";
   return (
     <section
       className="account-bar"
-      aria-label="Codex account and usage limits"
+      aria-label={isQwodex ? "Local model route" : "Codex account and usage limits"}
     >
-      <div className="account-identity">
-        <label htmlFor="codex-account-select">Codex account</label>
-        <div>
-          <select
-            id="codex-account-select"
-            value={snapshot.selected_account_id || ""}
-            disabled={busy}
-            onChange={(event) =>
-              event.target.value === "__add__"
-                ? onAdd()
-                : onSelect(event.target.value)
-            }
-            title={account?.codex_home}
-          >
-            {!snapshot.accounts.length && (
-              <option value="">No account detected</option>
-            )}
-            {snapshot.accounts.map((item) => (
-              <option value={item.id} key={item.id}>
-                {accountOptionLabel(item)}
-              </option>
-            ))}
-            <option value="__add__">＋ Add Codex account…</option>
-          </select>
-          <ChevronDown size={12} />
+      {isQwodex ? (
+        <div className="account-identity">
+          <label>Execution account</label>
+          <strong>Qwodex · local</strong>
+          <span>No Codex account is used for this local-model run.</span>
         </div>
-        <span>
-          {account
-            ? `${account.label} · ${account.plan_type || account.account_type || account.state}`
-            : "Codex App Server unavailable"}
-        </span>
-      </div>
-      <div className="account-meters">
-        {meters.map((meter) => (
-          <LimitMeter
-            meter={meter}
-            samples={meter.historyKey ? history[meter.historyKey] || [] : []}
-            key={meter.key}
-          />
-        ))}
-      </div>
-      <div className={`account-live ${live ? "live" : "stale"}`}>
-        {account?.managed &&
-          ["signed_out", "unavailable"].includes(account.state) && (
-            <button
-              className="button subtle account-reauth"
-              onClick={() => onReauthenticate(account.id)}
+      ) : (
+        <div className="account-identity">
+          <label htmlFor="codex-account-select">Codex account</label>
+          <div>
+            <select
+              id="codex-account-select"
+              value={snapshot.selected_account_id || ""}
+              disabled={busy}
+              onChange={(event) =>
+                event.target.value === "__add__"
+                  ? onAdd()
+                  : onSelect(event.target.value)
+              }
+              title={account?.codex_home}
             >
-              Re-authenticate
-            </button>
-          )}
-        <button
-          className="account-refresh"
-          onClick={onRefresh}
-          disabled={busy}
-          title="Refresh limits for every detected Codex account"
-          aria-label="Refresh limits for every detected Codex account"
-        >
-          <RefreshCw size={12} className={busy ? "spin" : ""} />
-        </button>
-        <strong>
-          <i />
-          {live ? "Live" : account?.observed_at ? "Stale" : "Waiting"}
-        </strong>
-        <span>
-          {account?.observed_at
-            ? `observed ${relativeObserved(account.observed_at)}`
-            : account?.detail || "no telemetry"}
+              {!snapshot.accounts.length && (
+                <option value="">No account detected</option>
+              )}
+              {snapshot.accounts.map((item) => (
+                <option value={item.id} key={item.id}>
+                  {accountOptionLabel(item)}
+                </option>
+              ))}
+              <option value="__add__">＋ Add Codex account…</option>
+            </select>
+            <ChevronDown size={12} />
+          </div>
+          <span>
+            {account
+              ? `${account.label} · ${account.plan_type || account.account_type || account.state}`
+              : "Codex App Server unavailable"}
+          </span>
+        </div>
+      )}
+      <div className={`provider-identity ${isQwodex ? "local" : "hosted"}`}>
+        <label>Model provider</label>
+        <strong>{isQwodex ? "Qwodex · local" : "OpenAI · hosted"}</strong>
+        <span title={localModelLabel}>
+          {isQwodex
+            ? `Ornith available · select it in New run`
+            : `${modelCatalog.models.length} approved models · select one in New run`}
         </span>
       </div>
+      {!isQwodex && (
+        <>
+          <div className="account-meters">
+            {meters.map((meter) => (
+              <LimitMeter
+                meter={meter}
+                samples={meter.historyKey ? history[meter.historyKey] || [] : []}
+                key={meter.key}
+              />
+            ))}
+          </div>
+          <div className={`account-live ${live ? "live" : "stale"}`}>
+            {account?.managed &&
+              ["signed_out", "unavailable"].includes(account.state) && (
+                <button
+                  className="button subtle account-reauth"
+                  onClick={() => onReauthenticate(account.id)}
+                >
+                  Re-authenticate
+                </button>
+              )}
+            <button
+              className="account-refresh"
+              onClick={onRefresh}
+              disabled={busy}
+              title="Refresh limits for every detected Codex account"
+              aria-label="Refresh limits for every detected Codex account"
+            >
+              <RefreshCw size={12} className={busy ? "spin" : ""} />
+            </button>
+            <strong>
+              <i />
+              {live ? "Live" : account?.observed_at ? "Stale" : "Waiting"}
+            </strong>
+            <span>
+              {account?.observed_at
+                ? `observed ${relativeObserved(account.observed_at)}`
+                : account?.detail || "no telemetry"}
+            </span>
+          </div>
+        </>
+      )}
     </section>
   );
 }
@@ -5026,6 +5067,7 @@ function HostView({
 export function SettingsView({
   light,
   accounts,
+  modelCatalog,
   onAccounts,
   onSettings,
   onRefresh,
@@ -5035,6 +5077,7 @@ export function SettingsView({
 }: {
   light: boolean;
   accounts: CodexAccountsSnapshot;
+  modelCatalog: RunModelCatalog;
   onAccounts: (snapshot: CodexAccountsSnapshot) => void;
   onSettings: (settings: OperatorSettings) => void;
   onRefresh: () => Promise<void>;
@@ -5045,6 +5088,7 @@ export function SettingsView({
   const [settings, setSettings] = useState<OperatorSettings>();
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const isQwodex = modelCatalog.provider === "qwen-local-switcher";
   const settingsUpdateLocked = !settings || busy !== "";
   useEffect(() => {
     api
@@ -5127,13 +5171,15 @@ export function SettingsView({
         disabled={settingsUpdateLocked}
         onChange={(value) => update("automatic_governor_continuation", value)}
       />
-      <SettingToggle
-        title="Automatic account handoff"
-        text="Between attempts, move new work to a ready Codex account when the selected account has 10% capacity or less. Active threads are never transplanted."
-        enabled={settings?.automatic_account_handoff ?? true}
-        disabled={settingsUpdateLocked}
-        onChange={(value) => update("automatic_account_handoff", value)}
-      />
+      {!isQwodex && (
+        <SettingToggle
+          title="Automatic account handoff"
+          text="Between attempts, move new work to a ready Codex account when the selected account has 10% capacity or less. Active threads are never transplanted."
+          enabled={settings?.automatic_account_handoff ?? true}
+          disabled={settingsUpdateLocked}
+          onChange={(value) => update("automatic_account_handoff", value)}
+        />
+      )}
       <SettingToggle
         title="Adaptive attempt budgets"
         text="Use successful governor history to choose the next attempt budget while respecting your hard ceiling."
@@ -5200,13 +5246,30 @@ export function SettingsView({
           </label>
         </div>
       </div>
-      <div className="settings-section-title">Codex accounts</div>
-      <AccountSettings
-        accounts={accounts}
-        onAccounts={onAccounts}
-        onAdd={onAddAccount}
-        onReauthenticate={onReauthenticate}
-      />
+      {isQwodex ? (
+        <>
+          <div className="settings-section-title">Local model route</div>
+          <div className="settings-card">
+            <div>
+              <strong>Qwodex is active</strong>
+              <span>
+                Local-model runs use the one model selected when the run is
+                created. They do not use, rotate, or require a Codex account.
+              </span>
+            </div>
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="settings-section-title">Codex accounts</div>
+          <AccountSettings
+            accounts={accounts}
+            onAccounts={onAccounts}
+            onAdd={onAddAccount}
+            onReauthenticate={onReauthenticate}
+          />
+        </>
+      )}
       <div className="settings-section-title">Privacy and permissions</div>
       <SettingToggle
         title="Reasoning summaries"
@@ -5831,12 +5894,14 @@ function suggestedCoordinationPath(root?: string) {
 function NewRunModal({
   repositories,
   accounts,
+  modelCatalog,
   settings,
   onClose,
   onDone,
 }: {
   repositories: Repository[];
   accounts: CodexAccountsSnapshot;
+  modelCatalog: RunModelCatalog;
   settings?: OperatorSettings;
   onClose: () => void;
   onDone: (run: Run, startError?: string) => Promise<void>;
@@ -5845,10 +5910,12 @@ function NewRunModal({
   const [objective, setObjective] = useState("");
   const [automaticPlanApproval, setAutomaticPlanApproval] = useState(false);
   const [deepInterview, setDeepInterview] = useState(false);
+  const [minimalImplementation, setMinimalImplementation] = useState(true);
+  const [compactHandoffs, setCompactHandoffs] = useState(true);
   const [codexAccountId, setCodexAccountId] = useState("");
   const [publication, setPublication] = useState("local_only");
-  const [governorModel, setGovernorModel] = useState("gpt-5.6-sol");
-  const [governorEffort, setGovernorEffort] = useState("xhigh");
+  const [runModel, setRunModel] = useState(modelCatalog.models[0]?.id || "");
+  const [runEffort, setRunEffort] = useState("");
   const [runTokenBudget, setRunTokenBudget] = useState(
     settings?.governor_goal_token_budget || 5_000_000,
   );
@@ -5859,9 +5926,28 @@ function NewRunModal({
       setAutomaticPlanApproval(settings?.automatic_plan_approval || false),
     [settings?.automatic_plan_approval],
   );
+  useEffect(() => {
+    setRunModel((current) =>
+      modelCatalog.models.some((model) => model.id === current)
+        ? current
+        : (modelCatalog.models[0]?.id || ""),
+    );
+  }, [modelCatalog]);
+  const selectedModel = modelCatalog.models.find((model) => model.id === runModel);
+  const selectedModelEfforts = selectedModel?.reasoning_efforts ?? EMPTY_STRING_ARRAY;
+  useEffect(() => {
+    setRunEffort((current) =>
+      selectedModelEfforts.includes(current)
+        ? current
+        : (selectedModelEfforts.includes("xhigh")
+          ? "xhigh"
+          : (selectedModelEfforts[0] || "")),
+    );
+  }, [selectedModelEfforts]);
   const selectedRepository = repositories.find(
     (item) => item.id === repository,
   );
+  const isQwodex = modelCatalog.provider === "qwen-local-switcher";
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setBusy(true);
@@ -5871,11 +5957,13 @@ function NewRunModal({
         repository,
         objective,
         publication,
-        governorModel,
-        governorEffort,
+        runModel,
+        runEffort,
         automaticPlanApproval,
         runTokenBudget,
         deepInterview,
+        minimalImplementation,
+        compactHandoffs,
         codexAccountId || undefined,
       );
       try {
@@ -5927,6 +6015,36 @@ function NewRunModal({
             </small>
           </span>
         </label>
+        <label className={`interview-option ${minimalImplementation ? "selected" : ""}`}>
+          <input
+            type="checkbox"
+            checked={minimalImplementation}
+            onChange={(event) => setMinimalImplementation(event.target.checked)}
+          />
+          <span>
+            <strong>Ponytail minimal implementation</strong>
+            <small>
+              On by default · use the Ponytail-inspired decision ladder: avoid
+              unnecessary change, reuse what exists, then make the smallest
+              clear solution without weakening requirements or proof.
+            </small>
+          </span>
+        </label>
+        <label className={`interview-option ${compactHandoffs ? "selected" : ""}`}>
+          <input
+            type="checkbox"
+            checked={compactHandoffs}
+            onChange={(event) => setCompactHandoffs(event.target.checked)}
+          />
+          <span>
+            <strong>Caveman compact handoffs</strong>
+            <small>
+              On by default · keeps narration and handoffs concise, while exact
+              evidence, JSON, patches, command output, and safety requirements
+              remain uncompressed.
+            </small>
+          </span>
+        </label>
         <div className="form-grid">
           <label className="field">
             <span>Repository</span>
@@ -5959,31 +6077,41 @@ function NewRunModal({
         />
         <div className="form-grid">
           <label className="field">
-            <span>Governor model</span>
+            <span>Run model</span>
             <select
-              value={governorModel}
-              onChange={(event) => setGovernorModel(event.target.value)}
+              value={runModel}
+              onChange={(event) => setRunModel(event.target.value)}
             >
-              <option value="gpt-5.6-sol">SOL · strongest governor</option>
-              <option value="gpt-5.6-terra">Terra · balanced</option>
-              <option value="gpt-5.6-luna">Luna · economical</option>
+              {modelCatalog.models.map((model) => (
+                <option value={model.id} key={model.id}>
+                  {model.display_name || model.id}
+                </option>
+              ))}
             </select>
+            <small>
+              {modelCatalog.provider || "Configured"} · immutable for this
+              run and used by every BILDR task role. Qwodex runs refuse native
+              child agents whose model route cannot be controller-bound.
+            </small>
           </label>
           <label className="field">
             <span>Thinking level</span>
             <select
-              value={governorEffort}
-              onChange={(event) => setGovernorEffort(event.target.value)}
+              value={runEffort}
+              onChange={(event) => setRunEffort(event.target.value)}
             >
-              <option value="low">Low</option>
-              <option value="medium">Medium</option>
-              <option value="high">High</option>
-              <option value="xhigh">XHigh</option>
-              <option value="max">Max</option>
+              {selectedModelEfforts.map((effort) => (
+                <option value={effort} key={effort}>
+                  {effort === "xhigh"
+                    ? "XHigh"
+                    : effort[0].toUpperCase() + effort.slice(1)}
+                </option>
+              ))}
             </select>
           </label>
         </div>
         <div className="form-grid">
+          {!isQwodex && (
           <label className="field">
             <span>Codex account</span>
             <select
@@ -6002,6 +6130,17 @@ function NewRunModal({
               Automatic mode can hand off when capacity is low.
             </small>
           </label>
+          )}
+          {isQwodex && (
+            <div className="field local-provider-note">
+              <span>Local provider</span>
+              <strong>Qwodex uses no Codex account</strong>
+              <small>
+                The selected local model is used by every BILDR role, including
+                its read-only supervisor.
+              </small>
+            </div>
+          )}
           <div className="field">
             <span>Plan approval</span>
             <div className="compact-choice">
@@ -6052,8 +6191,9 @@ function NewRunModal({
         <div className="pin-note">
           <ShieldCheck size={15} />
           <span>
-            Every task intends implementation. The selected governor manages the
-            work; independent SOL verification and final signoff remain fixed.
+            The selected model is pinned for architecture, execution, review,
+            verification, and final audit. The controller keeps sandbox and
+            approval policy role-specific.
           </span>
         </div>
         {error && <div className="form-error">{error}</div>}
@@ -6063,7 +6203,7 @@ function NewRunModal({
           </button>
           <button
             className="button primary"
-            disabled={!objective.trim() || !repository || busy}
+            disabled={!objective.trim() || !repository || !runModel || !runEffort || busy}
           >
             {busy ? "Creating and starting…" : "Create and start task"}
           </button>

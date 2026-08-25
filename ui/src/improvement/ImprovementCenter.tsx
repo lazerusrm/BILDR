@@ -1,6 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { api } from "../api";
 import type {
+  AvoEpisode,
+  AvoEpisodePayload,
+  AvoEpisodeState,
   EvaluationOccurrenceSource,
   FailureClusterSummary,
   FailureOverview,
@@ -69,6 +72,11 @@ export function ImprovementCenter({
   const [knowledgeItems, setKnowledgeItems] = useState<KnowledgeItem[]>();
   const [knowledgeError, setKnowledgeError] = useState("");
   const [reviewingKnowledgeId, setReviewingKnowledgeId] = useState("");
+  const [avoEpisodes, setAvoEpisodes] = useState<AvoEpisode[]>();
+  const [avoError, setAvoError] = useState("");
+  const [avoDraft, setAvoDraft] = useState("");
+  const [avoState, setAvoState] = useState<AvoEpisodeState>("proposed");
+  const [recordingAvo, setRecordingAvo] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -117,6 +125,24 @@ export function ImprovementCenter({
     };
   }, [repositoryId]);
 
+  useEffect(() => {
+    let active = true;
+    const load = () => api.avoEpisodes().then(
+      (value) => {
+        if (!active) return;
+        setAvoEpisodes(value);
+        setAvoError("");
+      },
+      (cause: unknown) => active && setAvoError(displayError(cause, "Could not load AVO episodes")),
+    );
+    void load();
+    const timer = window.setInterval(load, 15_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
   const traceId = selected?.representative_trace_id;
   useEffect(() => {
     let active = true;
@@ -158,6 +184,31 @@ export function ImprovementCenter({
       },
       (cause: unknown) => setKnowledgeError(displayError(cause, "Could not record knowledge review")),
     ).finally(() => setReviewingKnowledgeId(""));
+  };
+  const recordAvo = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setAvoError("");
+    let episode: AvoEpisodePayload;
+    try {
+      episode = JSON.parse(avoDraft) as AvoEpisodePayload;
+    } catch {
+      setAvoError("Enter one canonical AVO episode JSON object.");
+      return;
+    }
+    if (!episode || typeof episode !== "object" || Array.isArray(episode)) {
+      setAvoError("Enter one canonical AVO episode JSON object.");
+      return;
+    }
+    setRecordingAvo(true);
+    void api.recordAvoEpisode(episode, avoState).then(
+      (recorded) => {
+        setAvoEpisodes((current) => [recorded, ...(current || []).filter((item) => (
+          item.episode.episode_id !== recorded.episode.episode_id
+        ))]);
+        setAvoDraft("");
+      },
+      (cause: unknown) => setAvoError(displayError(cause, "Could not record the AVO episode")),
+    ).finally(() => setRecordingAvo(false));
   };
   const mode = improvementModePresentation(runtime);
   return (
@@ -222,6 +273,43 @@ export function ImprovementCenter({
             </div>}
           </article>}
         />}
+      </section>
+      <section aria-label="Bounded AVO episodes" className="improvement-section">
+        <header><span className="eyebrow">Operator controlled</span><h2>Bounded AVO episodes</h2></header>
+        <p>Episodes retain exact candidate and gate receipts. Recording one provides no automatic execution or promotion: it never starts a variation, invokes a supervisor, changes a worktree, or promotes a candidate.</p>
+        {avoError && <p role="alert" className="form-error">{avoError}</p>}
+        {!avoEpisodes && !avoError && <p className="improvement-empty">Loading bounded AVO episodes…</p>}
+        {avoEpisodes && !avoEpisodes.length && <p className="improvement-empty">No AVO episodes have been recorded.</p>}
+        {avoEpisodes && avoEpisodes.length > 0 && <VirtualRows
+          items={avoEpisodes}
+          rowHeight={126}
+          renderRow={(item) => <article className="knowledge-item">
+            <strong>{item.episode.episode_id} · {item.state}</strong>
+            <span>{item.trajectory.directive.replaceAll("_", " ")} · {item.trajectory.completed_variations}/{item.episode.variation_budget} variations · incumbent {item.trajectory.incumbent_candidate_id || "baseline"}</span>
+            <small>Score {item.trajectory.incumbent_score_milli} · stagnant {item.trajectory.stagnant_variations} · no automatic execution or promotion</small>
+          </article>}
+        />}
+        <details className="improvement-import">
+          <summary>Record a canonical episode</summary>
+          <p>Import only a SHA-256-bound episode whose champion and candidates already exist in BILDR’s immutable ledger. Each hard-gate receipt must identify the controller-projected, completed validation outcome for that candidate task attempt.</p>
+          <form onSubmit={recordAvo}>
+            <label className="field">
+              <span>Episode lifecycle state</span>
+              <select value={avoState} onChange={(event) => setAvoState(event.target.value as AvoEpisodeState)}>
+                <option value="proposed">Proposed</option>
+                <option value="running">Running</option>
+                <option value="passed">Passed</option>
+                <option value="failed">Failed</option>
+                <option value="inconclusive">Inconclusive</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>Canonical AVO episode JSON</span>
+              <textarea rows={10} value={avoDraft} onChange={(event) => setAvoDraft(event.target.value)} placeholder='{"schema":"harness.avo-episode.v1", ...}' required />
+            </label>
+            <button className="button primary" type="submit" disabled={recordingAvo}>{recordingAvo ? "Recording…" : "Record immutable episode"}</button>
+          </form>
+        </details>
       </section>
       {traceError && <p role="alert" className="form-error">{traceError}</p>}
       <TraceExplorer traceId={traceId || undefined} rows={trace?.rows || []} loading={Boolean(traceId && !trace && !traceError)} />

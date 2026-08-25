@@ -63,6 +63,16 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/RuntimeStatus'}
+  /models:
+    get:
+      tags: [Runtime]
+      operationId: getRunModelCatalog
+      responses:
+        '200':
+          description: Operator-configured model catalog available for one immutable run route.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RunModelCatalog'}
   /codex/accounts:
     get:
       tags: [Runtime]
@@ -1848,6 +1858,57 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/OutcomeHistory'}
         '404': {$ref: '#/components/responses/NotFound'}
+  /improvement/avo-episodes:
+    get:
+      tags: [Improvement]
+      operationId: listAvoEpisodes
+      description: Read the latest immutable snapshot of each bounded AVO episode. This endpoint has no execution or promotion authority.
+      parameters:
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 100, default: 25}
+      responses:
+        '200':
+          description: Current canonical AVO episode snapshots.
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/AvoEpisodeResponse'}}
+    post:
+      tags: [Improvement]
+      operationId: recordAvoEpisode
+      description: Persist one canonical, receipt-resolved AVO snapshot. It cannot start an agent, invoke supervision, change a worktree, or promote a candidate.
+      parameters:
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RecordAvoEpisodeRequest'}
+      responses:
+        '201':
+          description: The immutable episode revision was recorded or its exact idempotent replay was returned.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AvoEpisodeResponse'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /improvement/avo-episodes/{episodeId}:
+    get:
+      tags: [Improvement]
+      operationId: getAvoEpisode
+      description: Read one current canonical AVO episode snapshot. Raw evidence payloads are not returned.
+      parameters:
+        - name: episodeId
+          in: path
+          required: true
+          schema: {$ref: '#/components/schemas/OpaqueId'}
+      responses:
+        '200':
+          description: The current immutable episode snapshot and its bounded trajectory.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AvoEpisodeResponse'}
+        '404': {$ref: '#/components/responses/NotFound'}
   /improvement/failures:
     get:
       tags: [Improvement]
@@ -2197,7 +2258,7 @@ components:
       properties:
         id: {type: string, maxLength: 176}
         kind: {type: string, maxLength: 160}
-        source_ref: {type: string, maxLength: 160}
+        source_ref: {type: string, maxLength: 512}
     TopologyEdge:
       type: object
       additionalProperties: false
@@ -2206,7 +2267,7 @@ components:
         from: {type: string, maxLength: 176}
         to: {type: string, maxLength: 176}
         kind: {type: string, maxLength: 160}
-        source_ref: {type: string, maxLength: 160}
+        source_ref: {type: string, maxLength: 512}
     TopologySnapshot:
       type: object
       additionalProperties: false
@@ -3047,6 +3108,95 @@ components:
         - properties: {dimension: {const: rollback}, classification: {const: neutral}, code: {const: no_rollback}}
         - properties: {dimension: {const: downstream_regression}, classification: {const: negative}, code: {const: downstream_regression}}
         - properties: {dimension: {const: downstream_regression}, classification: {const: positive}, code: {const: no_downstream_regression}}
+    AvoChampionReceipt:
+      type: object
+      additionalProperties: false
+      required: [kind, id, digest]
+      properties:
+        kind: {const: champion_bundle}
+        id: {type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        digest: {$ref: '#/components/schemas/Digest'}
+    AvoCandidateReceipt:
+      type: object
+      additionalProperties: false
+      required: [kind, id, digest]
+      properties:
+        kind: {const: candidate}
+        id: {type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        digest: {$ref: '#/components/schemas/Digest'}
+    AvoHardGateReceipt:
+      type: object
+      description: An exact immutable controller-projected OutcomeV1 revision hash for a completed, non-invalidated validation of the variation candidate task attempt.
+      additionalProperties: false
+      required: [kind, id, digest]
+      properties:
+        kind: {const: hard_gate}
+        id: {type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        digest: {$ref: '#/components/schemas/Digest'}
+    AvoVariation:
+      type: object
+      additionalProperties: false
+      required: [sequence, variation_id, parent_candidate_id, strategy, parent_score_milli, candidate_id, candidate_receipt, correctness, correctness_evidence, candidate_score_milli, outcome]
+      properties:
+        sequence: {type: integer, minimum: 1, maximum: 64}
+        variation_id: {type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        parent_candidate_id: {type: [string, 'null'], pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        strategy: {enum: [refine, repair, reframe, retrieval]}
+        parent_score_milli: {type: integer, minimum: 0}
+        candidate_id: {type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        candidate_receipt: {$ref: '#/components/schemas/AvoCandidateReceipt'}
+        correctness: {enum: [passed, failed, inconclusive, infrastructure_unavailable]}
+        correctness_evidence: {$ref: '#/components/schemas/AvoHardGateReceipt'}
+        candidate_score_milli: {type: [integer, 'null'], minimum: 0}
+        outcome: {enum: [improved, not_improved, rejected, inconclusive]}
+    AvoEpisode:
+      type: object
+      additionalProperties: false
+      required: [schema, episode_id, task_family, champion_bundle_id, champion_bundle_receipt, knowledge_snapshot_digest, hard_gate_policy_digest, initial_score_milli, variation_budget, stagnation_limit, variations, sha256]
+      properties:
+        schema: {const: harness.avo-episode.v1}
+        episode_id: {type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        task_family: {enum: [development_eval, shadow_replay, canary_traffic]}
+        champion_bundle_id: {type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        champion_bundle_receipt: {$ref: '#/components/schemas/AvoChampionReceipt'}
+        knowledge_snapshot_digest: {$ref: '#/components/schemas/Digest'}
+        hard_gate_policy_digest: {$ref: '#/components/schemas/Digest'}
+        initial_score_milli: {type: integer, minimum: 0}
+        variation_budget: {type: integer, minimum: 1, maximum: 64}
+        stagnation_limit: {type: integer, minimum: 1, maximum: 64}
+        variations: {type: array, maxItems: 64, items: {$ref: '#/components/schemas/AvoVariation'}}
+        sha256: {$ref: '#/components/schemas/Digest'}
+    AvoTrajectory:
+      type: object
+      additionalProperties: false
+      required: [incumbent_score_milli, incumbent_candidate_id, completed_variations, stagnant_variations, directive]
+      properties:
+        incumbent_score_milli: {type: integer, minimum: 0}
+        incumbent_candidate_id: {type: [string, 'null'], pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        completed_variations: {type: integer, minimum: 0, maximum: 64}
+        stagnant_variations: {type: integer, minimum: 0, maximum: 64}
+        directive: {enum: [continue, request_advisory_redirect, stop_budget]}
+    RecordAvoEpisodeRequest:
+      type: object
+      additionalProperties: false
+      required: [episode, state]
+      properties:
+        episode: {$ref: '#/components/schemas/AvoEpisode'}
+        state: {enum: [proposed, running, passed, failed, inconclusive]}
+    AvoEpisodeResponse:
+      type: object
+      additionalProperties: false
+      required: [revision_id, revision, state, payload_sha256, created_at, episode, trajectory, automatic_execution, automatic_promotion]
+      properties:
+        revision_id: {type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$'}
+        revision: {type: integer, minimum: 1}
+        state: {enum: [proposed, running, passed, failed, inconclusive]}
+        payload_sha256: {$ref: '#/components/schemas/Digest'}
+        created_at: {type: integer}
+        episode: {$ref: '#/components/schemas/AvoEpisode'}
+        trajectory: {$ref: '#/components/schemas/AvoTrajectory'}
+        automatic_execution: {const: false}
+        automatic_promotion: {const: false}
     OutcomeSubject:
       type: object
       additionalProperties: false
@@ -3463,7 +3613,7 @@ components:
     CreateRunRequest:
       type: object
       additionalProperties: false
-      required: [repository_id, objective, mode]
+      required: [repository_id, objective, mode, run_model]
       properties:
         repository_id: {type: string}
         objective: {type: string, minLength: 1, maxLength: 50000}
@@ -3472,14 +3622,51 @@ components:
         mode: {enum: [plan_only, plan_and_implement]}
         publication: {enum: [local_only, draft_pr_after_approval], default: local_only}
         run_token_budget: {type: integer, minimum: 500000, maximum: 1000000000}
-        governor_model: {enum: [gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna]}
-        governor_reasoning_effort: {enum: [low, medium, high, xhigh, max]}
+        run_model: {$ref: '#/components/schemas/RunModelRoute'}
         automatic_plan_approval: {type: boolean, default: false}
         codex_account_id: {type: [string, 'null']}
         deep_interview:
           type: boolean
           default: false
           description: Pause before architecture for a human-confirmed intent interview.
+        minimal_implementation:
+          type: boolean
+          default: true
+          description: Apply the run-scoped, Ponytail-inspired minimal implementation discipline to planning and implementation roles.
+        compact_handoffs:
+          type: boolean
+          default: true
+          description: Apply the run-scoped, Caveman-inspired compact handoff discipline without lossy compression of custody or required exact material.
+    RunModelRoute:
+      type: object
+      additionalProperties: false
+      required: [model, reasoning_effort]
+      description: A controller-persisted model choice used by every normal BILDR task role in this run. The provider and role sandbox remain daemon configuration.
+      properties:
+        model: {type: string}
+        reasoning_effort: {enum: [low, medium, high, xhigh, max]}
+    RunModelCatalog:
+      type: object
+      additionalProperties: false
+      required: [provider, models]
+      properties:
+        provider: {type: string}
+        models:
+          type: array
+          minItems: 1
+          items: {$ref: '#/components/schemas/RunModelDescriptor'}
+    RunModelDescriptor:
+      type: object
+      additionalProperties: false
+      required: [id, display_name, reasoning_efforts, profile_sha256]
+      properties:
+        id: {type: string}
+        display_name: {type: [string, 'null']}
+        profile_sha256: {type: [string, 'null'], description: Canonical hash of the local Qwodex profile object; null for the static OpenAI catalog.}
+        reasoning_efforts:
+          type: array
+          minItems: 1
+          items: {enum: [low, medium, high, xhigh, max]}
     Run:
       type: object
       additionalProperties: false

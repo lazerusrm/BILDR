@@ -124,6 +124,7 @@ pub enum ImprovementRecordKind {
     GraderBundle,
     PolicyBundle,
     Candidate,
+    AvoEpisode,
     Experiment,
     Promotion,
     Rollback,
@@ -141,6 +142,7 @@ pub enum ImprovementSchema {
     GraderBundleV1,
     PolicyBundleV1,
     ImprovementCandidateV1,
+    AvoEpisodeV1,
     ExperimentV1,
     KnowledgeItemV1,
     PromotionDecisionV1,
@@ -159,6 +161,7 @@ impl ImprovementSchema {
             Self::GraderBundleV1 => "harness.grader-bundle.v1",
             Self::PolicyBundleV1 => "harness.policy-bundle.v1",
             Self::ImprovementCandidateV1 => "harness.improvement-candidate.v1",
+            Self::AvoEpisodeV1 => "harness.avo-episode.v1",
             Self::ExperimentV1 => "harness.experiment.v1",
             Self::KnowledgeItemV1 => "harness.knowledge-item.v1",
             Self::PromotionDecisionV1 => "harness.promotion-decision.v1",
@@ -176,6 +179,7 @@ impl ImprovementSchema {
             Self::GraderBundleV1 => ImprovementRecordKind::GraderBundle,
             Self::PolicyBundleV1 => ImprovementRecordKind::PolicyBundle,
             Self::ImprovementCandidateV1 => ImprovementRecordKind::Candidate,
+            Self::AvoEpisodeV1 => ImprovementRecordKind::AvoEpisode,
             Self::ExperimentV1 => ImprovementRecordKind::Experiment,
             Self::KnowledgeItemV1 => ImprovementRecordKind::Knowledge,
             Self::PromotionDecisionV1 => ImprovementRecordKind::Promotion,
@@ -250,6 +254,10 @@ impl ImprovementState {
             K::Candidate => matches!(
                 self,
                 S::Proposed | S::Validated | S::Rejected | S::ExperimentReady | S::Superseded
+            ),
+            K::AvoEpisode => matches!(
+                self,
+                S::Proposed | S::Running | S::Passed | S::Failed | S::Inconclusive
             ),
             K::Experiment => matches!(
                 self,

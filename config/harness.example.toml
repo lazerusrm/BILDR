@@ -15,15 +15,21 @@ artifact_root = ""
 
 [codex]
 binary = "codex"
+model_provider = "openai"
+allowed_models = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+# Qwodex uses its own mutable local catalog instead of source-coded model
+# names. Set model_provider = "qwen-local-switcher", make allowed_models = [],
+# and set this to the same regular catalog file used by its App Server home.
+# model_catalog_json = "/absolute/path/to/qwodex/catalog.json"
 transport = "stdio"
 service_name = "harness_console"
 experimental_api = false
 # Release validated by generated/CODEX_COMPATIBILITY.json. Update both pins with
 # `cargo xtask codex-schema` when intentionally upgrading Codex.
-required_version = "0.148.0"
+required_version = "0.149.1"
 # SHA-256 over the parsed, canonical JSON generated with:
 # codex app-server generate-json-schema --out <dir>
-required_protocol_schema_sha256 = "19b656fe5132b97e8b233c8c3d7129f451d621113cbd7ed319972dd54eedc476"
+required_protocol_schema_sha256 = "a09caf2ab07d69a3ef48384b40793d32718efe953134efd28d7276be9282cfe7"
 execution_on_schema_mismatch = "disabled"
 reasoning_summary = "concise"
 

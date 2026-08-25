@@ -13,6 +13,18 @@
     "brief"
   ],
   "properties": {
+    "schema": { "$ref": "#/$defs/schema" },
+    "status": { "$ref": "#/$defs/status" },
+    "question": { "$ref": "#/$defs/question" },
+    "why_it_matters": { "$ref": "#/$defs/whyItMatters" },
+    "recommended_answer": { "$ref": "#/$defs/recommendedAnswer" },
+    "brief": { "$ref": "#/$defs/brief" }
+  },
+  "anyOf": [
+    { "$ref": "#/$defs/questionTurn" },
+    { "$ref": "#/$defs/readyTurn" }
+  ],
+  "$defs": {
     "schema": {
       "type": "string",
       "const": "harness.intent-interview-turn.v1"
@@ -25,11 +37,11 @@
       "type": ["string", "null"],
       "maxLength": 4000
     },
-    "why_it_matters": {
+    "whyItMatters": {
       "type": ["string", "null"],
       "maxLength": 2000
     },
-    "recommended_answer": {
+    "recommendedAnswer": {
       "type": ["string", "null"],
       "maxLength": 4000
     },
@@ -52,31 +64,15 @@
           "minLength": 1,
           "maxLength": 12000
         },
-        "intended_final_shape": {
-          "$ref": "#/$defs/briefItems"
-        },
-        "hard_constraints": {
-          "$ref": "#/$defs/briefItems"
-        },
-        "preferences": {
-          "$ref": "#/$defs/briefItems"
-        },
-        "non_goals": {
-          "$ref": "#/$defs/briefItems"
-        },
-        "acceptance_examples": {
-          "$ref": "#/$defs/briefItems"
-        },
-        "planner_may_decide": {
-          "$ref": "#/$defs/briefItems"
-        },
-        "assumptions_to_validate": {
-          "$ref": "#/$defs/briefItems"
-        }
+        "intended_final_shape": { "$ref": "#/$defs/briefItems" },
+        "hard_constraints": { "$ref": "#/$defs/briefItems" },
+        "preferences": { "$ref": "#/$defs/briefItems" },
+        "non_goals": { "$ref": "#/$defs/briefItems" },
+        "acceptance_examples": { "$ref": "#/$defs/briefItems" },
+        "planner_may_decide": { "$ref": "#/$defs/briefItems" },
+        "assumptions_to_validate": { "$ref": "#/$defs/briefItems" }
       }
-    }
-  },
-  "$defs": {
+    },
     "briefItems": {
       "type": "array",
       "maxItems": 32,
@@ -84,6 +80,74 @@
         "type": "string",
         "minLength": 1,
         "maxLength": 4000
+      }
+    },
+    "questionTurn": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "status",
+        "question",
+        "why_it_matters",
+        "recommended_answer",
+        "brief"
+      ],
+      "properties": {
+        "schema": { "$ref": "#/$defs/schema" },
+        "status": { "type": "string", "const": "question" },
+        "question": { "type": "string", "minLength": 1, "maxLength": 4000 },
+        "why_it_matters": { "type": "string", "minLength": 1, "maxLength": 2000 },
+        "recommended_answer": { "$ref": "#/$defs/recommendedAnswer" },
+        "brief": { "type": "null" }
+      }
+    },
+    "readyTurn": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "status",
+        "question",
+        "why_it_matters",
+        "recommended_answer",
+        "brief"
+      ],
+      "properties": {
+        "schema": { "$ref": "#/$defs/schema" },
+        "status": { "type": "string", "const": "ready" },
+        "question": { "type": "null" },
+        "why_it_matters": { "type": "null" },
+        "recommended_answer": { "type": "null" },
+        "brief": { "$ref": "#/$defs/completeBrief" }
+      }
+    },
+    "completeBrief": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "refined_objective",
+        "intended_final_shape",
+        "hard_constraints",
+        "preferences",
+        "non_goals",
+        "acceptance_examples",
+        "planner_may_decide",
+        "assumptions_to_validate"
+      ],
+      "properties": {
+        "refined_objective": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 12000
+        },
+        "intended_final_shape": { "$ref": "#/$defs/briefItems" },
+        "hard_constraints": { "$ref": "#/$defs/briefItems" },
+        "preferences": { "$ref": "#/$defs/briefItems" },
+        "non_goals": { "$ref": "#/$defs/briefItems" },
+        "acceptance_examples": { "$ref": "#/$defs/briefItems" },
+        "planner_may_decide": { "$ref": "#/$defs/briefItems" },
+        "assumptions_to_validate": { "$ref": "#/$defs/briefItems" }
       }
     }
   }

@@ -67,6 +67,55 @@ pub struct NewRun {
     pub token_budget: Option<u64>,
 }
 
+/// Controller-selected route receipt owned by exactly one run. This is a
+/// write-once custody record, deliberately separate from operational metadata.
+#[derive(Clone, Debug)]
+pub struct NewImmutableRunModelRoute {
+    pub run_id: RunId,
+    pub schema: String,
+    pub provider: String,
+    pub model: String,
+    pub reasoning_effort: String,
+    pub model_profile_sha256: Option<String>,
+    pub route_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImmutableRunModelRoute {
+    pub run_id: RunId,
+    pub schema: String,
+    pub provider: String,
+    pub model: String,
+    pub reasoning_effort: String,
+    pub model_profile_sha256: Option<String>,
+    pub route_sha256: String,
+}
+
+/// Immutable launch-time binding between a controller session and the route
+/// receipt for its run. It makes provider identity durable even where model
+/// slugs overlap between providers.
+#[derive(Clone, Debug)]
+pub struct NewAgentModelRouteBinding {
+    pub agent_session_id: AgentSessionId,
+    pub run_id: RunId,
+    pub provider: String,
+    pub model: String,
+    pub reasoning_effort: String,
+    pub model_profile_sha256: Option<String>,
+    pub route_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentModelRouteBinding {
+    pub agent_session_id: AgentSessionId,
+    pub run_id: RunId,
+    pub provider: String,
+    pub model: String,
+    pub reasoning_effort: String,
+    pub model_profile_sha256: Option<String>,
+    pub route_sha256: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct NewWorktree {
     pub id: WorktreeId,

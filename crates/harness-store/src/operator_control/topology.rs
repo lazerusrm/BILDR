@@ -294,6 +294,8 @@ mod tests {
 
         let long_run = "r".repeat(160);
         let long_attempt = "a".repeat(160);
+        let long_task = "t".repeat(160);
+        let long_dependency = "d".repeat(160);
         store
             .connection()
             .unwrap()
@@ -301,6 +303,9 @@ mod tests {
                 "INSERT INTO runs(id,repository_id,title,requested_objective,mode,publication_mode,state,phase,base_ref,base_sha,authority_digest,profile_digest,requested_by,created_at,updated_at) VALUES('{long_run}','repo-a','run','objective','plan_and_implement','local_only','BLOCKED','planning','main','0000000000000000000000000000000000000000','0000000000000000000000000000000000000000000000000000000000000000','0000000000000000000000000000000000000000000000000000000000000000','operator',1,1);
                  INSERT INTO run_plan_revisions(id,run_id,revision,plan_json,plan_sha256,state,created_at) VALUES('plan-long','{long_run}',1,'{{}}','0000000000000000000000000000000000000000000000000000000000000000','proposed',1);
                  INSERT INTO tasks(id,run_id,plan_revision_id,external_task_id,title,objective,priority,owner_profile,reviewer_profile,state,created_at,updated_at) VALUES('task-long','{long_run}','plan-long','task-long','task','objective','normal','general','general','BLOCKED',1,1);
+                 INSERT INTO tasks(id,run_id,plan_revision_id,external_task_id,title,objective,priority,owner_profile,reviewer_profile,state,created_at,updated_at) VALUES('{long_task}','{long_run}','plan-long','task-long-a','task','objective','normal','general','general','BLOCKED',1,1);
+                 INSERT INTO tasks(id,run_id,plan_revision_id,external_task_id,title,objective,priority,owner_profile,reviewer_profile,state,created_at,updated_at) VALUES('{long_dependency}','{long_run}','plan-long','task-long-b','task','objective','normal','general','general','BLOCKED',1,1);
+                 INSERT INTO task_dependencies(task_id,depends_on_task_id) VALUES('{long_task}','{long_dependency}');
                  INSERT INTO task_attempts(id,task_id,attempt_number,state,task_packet_json,task_packet_sha256,base_sha,requested_model_route,created_at,updated_at) VALUES('{long_attempt}','task-long',1,'CREATED','{{}}','0000000000000000000000000000000000000000000000000000000000000000','0000000000000000000000000000000000000000','same',1,1);"
             ))
             .expect("full-width controller topology setup");
@@ -315,7 +320,29 @@ mod tests {
             topology
                 .nodes
                 .iter()
+                .any(|node| node.source_ref == format!("run:{long_run}"))
+        );
+        assert!(
+            topology
+                .nodes
+                .iter()
                 .any(|node| node.id == format!("attempt:{long_attempt}"))
         );
+        assert!(
+            topology
+                .nodes
+                .iter()
+                .any(|node| node.source_ref == format!("attempt:{long_attempt}"))
+        );
+        assert!(
+            topology.edges.iter().any(|edge| {
+                edge.kind == "depends_on"
+                    && edge.source_ref == format!("dependency:{long_task}:{long_dependency}")
+            }),
+            "a dependency provenance reference must retain two full-width task IDs"
+        );
+        topology
+            .validate()
+            .expect("full-width topology remains domain-valid");
     }
 }

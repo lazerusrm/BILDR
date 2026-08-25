@@ -119,6 +119,7 @@ describe("workspace presentation helpers", () => {
       createElement(SettingsView, {
         light: false,
         accounts: { accounts: [] },
+        modelCatalog: { provider: "openai", models: [] },
         onAccounts: () => undefined,
         onSettings: () => undefined,
         onRefresh: async () => undefined,
@@ -129,6 +130,26 @@ describe("workspace presentation helpers", () => {
     );
     expect(settings).toContain("Human-approved thread supervision");
     expect(settings).toContain("never resumes, retries, replans");
+  });
+
+  it("does not present hosted-account controls while Qwodex is active", () => {
+    const settings = renderToStaticMarkup(
+      createElement(SettingsView, {
+        light: false,
+        accounts: { accounts: [] },
+        modelCatalog: { provider: "qwen-local-switcher", models: [] },
+        onAccounts: () => undefined,
+        onSettings: () => undefined,
+        onRefresh: async () => undefined,
+        onAddAccount: () => undefined,
+        onReauthenticate: () => undefined,
+        onTheme: () => undefined,
+      }),
+    );
+    expect(settings).toContain("Qwodex is active");
+    expect(settings).toContain("They do not use, rotate, or require a Codex account");
+    expect(settings).not.toContain("Signed-in Codex accounts");
+    expect(settings).not.toContain("Automatic account handoff");
   });
 
   it("offers a concrete recovery for an interrupted plan review before tasks exist", () => {

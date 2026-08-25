@@ -67,6 +67,19 @@ pub struct PathsConfig {
 #[serde(deny_unknown_fields)]
 pub struct CodexConfig {
     pub binary: String,
+    /// The App Server provider selected by the operator-owned runtime config.
+    /// A run may choose only models listed for this provider; it cannot name
+    /// a provider or endpoint itself.
+    pub model_provider: String,
+    /// Operator-approved static catalog for an OpenAI-backed controller.
+    /// Qwodex deliberately leaves this empty and reads its local catalog file
+    /// at run-admission time, so a local profile change never needs a BILDR
+    /// source change.
+    pub allowed_models: Vec<String>,
+    /// Qwodex's local, operator-owned Codex model catalog. It is the same
+    /// catalog consumed by the credential-free local App Server home.
+    #[serde(default)]
+    pub model_catalog_json: Option<PathBuf>,
     pub transport: String,
     pub service_name: String,
     pub experimental_api: bool,
@@ -496,6 +509,7 @@ impl HarnessConfig {
                 "only Codex App Server stdio transport is supported".to_owned(),
             ));
         }
+        self.validate_codex_model_catalog()?;
         if !matches!(
             self.security.approval_policy.as_str(),
             "untrusted" | "on-request" | "never"
@@ -543,6 +557,49 @@ impl HarnessConfig {
         self.validate_supervision()?;
         for snapshot in &self.pricing.snapshots {
             snapshot.to_domain()?;
+        }
+        Ok(())
+    }
+
+    fn validate_codex_model_catalog(&self) -> Result<(), ProfileError> {
+        let provider = self.codex.model_provider.as_str();
+        if !matches!(provider, "openai" | "qwen-local-switcher") {
+            return Err(ProfileError::Validation(
+                "Codex model provider must be openai or qwen-local-switcher".to_owned(),
+            ));
+        }
+        match provider {
+            "openai" => {
+                if self.codex.model_catalog_json.is_some() {
+                    return Err(ProfileError::Validation(
+                        "OpenAI controller configuration must not set a Qwodex model catalog path"
+                            .to_owned(),
+                    ));
+                }
+                validate_static_model_catalog(&self.codex.allowed_models)?;
+                let expected = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
+                if !self
+                    .codex
+                    .allowed_models
+                    .iter()
+                    .all(|model| expected.contains(&model.as_str()))
+                {
+                    return Err(ProfileError::Validation(
+                        "OpenAI model catalog contains a model unsupported by this controller"
+                            .to_owned(),
+                    ));
+                }
+            }
+            "qwen-local-switcher" => {
+                if !self.codex.allowed_models.is_empty() {
+                    return Err(ProfileError::Validation(
+                        "Qwodex controller model catalog is discovered from model_catalog_json; allowed_models must be empty"
+                            .to_owned(),
+                    ));
+                }
+                validate_qwodex_model_catalog_path(self.codex.model_catalog_json.as_deref())?;
+            }
+            _ => unreachable!("provider is checked above"),
         }
         Ok(())
     }
@@ -633,6 +690,62 @@ impl HarnessConfig {
             worktree_root,
         })
     }
+}
+
+pub fn valid_model_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 120
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'-'
+        })
+}
+
+fn validate_static_model_catalog(models: &[String]) -> Result<(), ProfileError> {
+    if models.is_empty()
+        || models.len() > 32
+        || models.iter().any(|model| !valid_model_identifier(model))
+    {
+        return Err(ProfileError::Validation(
+            "Codex model catalog must contain one to 32 lowercase model identifiers".to_owned(),
+        ));
+    }
+    if models.iter().collect::<BTreeSet<_>>().len() != models.len() {
+        return Err(ProfileError::Validation(
+            "Codex model catalog contains a duplicate model identifier".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_qwodex_model_catalog_path(path: Option<&Path>) -> Result<(), ProfileError> {
+    let path = path.ok_or_else(|| {
+        ProfileError::Validation(
+            "Qwodex controller requires an absolute operator-owned model_catalog_json path"
+                .to_owned(),
+        )
+    })?;
+    if !path.is_absolute() {
+        return Err(ProfileError::Validation(
+            "Qwodex model_catalog_json path must be absolute".to_owned(),
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        ProfileError::Validation(format!(
+            "Qwodex model_catalog_json is unavailable at {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(ProfileError::Validation(
+            "Qwodex model_catalog_json must be a regular non-symlink file".to_owned(),
+        ));
+    }
+    if metadata.len() == 0 || metadata.len() > 2 * 1024 * 1024 {
+        return Err(ProfileError::Validation(
+            "Qwodex model_catalog_json must be between one byte and two MiB".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 impl ResolvedPaths {
@@ -1143,6 +1256,15 @@ mod tests {
     fn supplied_config_and_profile_parse() {
         let config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
         config.validate().expect("config validates");
+        assert_eq!(config.codex.model_provider, "openai");
+        assert_eq!(
+            config.codex.allowed_models,
+            vec![
+                "gpt-5.6-sol".to_owned(),
+                "gpt-5.6-terra".to_owned(),
+                "gpt-5.6-luna".to_owned(),
+            ]
+        );
         let profile: RepositoryProfile = toml::from_str(BILDR_PROFILE).expect("profile parses");
         validate_profile(&profile).expect("profile validates");
         assert_eq!(profile.models.governor.model, "gpt-5.6-sol");
@@ -1173,6 +1295,30 @@ mod tests {
         assert!(improvement.anchor_match);
         assert!(!improvement.candidate_generation_enabled);
         assert!(!improvement.candidate_execution_enabled);
+    }
+
+    #[test]
+    fn qwodex_catalog_is_operator_owned_and_permits_advisory_supervision() {
+        let temp = TempDir::new().expect("temporary Qwodex catalog root");
+        let catalog = temp.path().join("catalog.json");
+        fs::write(&catalog, r#"{"models":[{"slug":"future-local-model"}]}"#)
+            .expect("Qwodex catalog writes");
+        let mut config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
+        config.codex.model_provider = "qwen-local-switcher".to_owned();
+        config.codex.allowed_models.clear();
+        config.codex.model_catalog_json = Some(catalog);
+        config
+            .validate()
+            .expect("operator-owned Qwodex catalog validates without source model names");
+
+        config.codex.allowed_models = vec!["unreviewed-local-model".to_owned()];
+        assert!(config.validate().is_err());
+
+        config.codex.allowed_models.clear();
+        config.supervision.mode = SupervisorMode::Advisory;
+        config
+            .validate()
+            .expect("Qwodex advisory supervision validates; the controller binds every role to the run route");
     }
 
     #[test]

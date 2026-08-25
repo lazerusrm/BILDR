@@ -26,7 +26,7 @@ describe("Improvement Center", () => {
   it("renders disabled, observe-only, and anchor-mismatch states without claiming observation", () => {
     const runtime = (selfImprovement: RuntimeStatus["self_improvement"]): RuntimeStatus => ({
       daemon: { state: "ready", detail: null },
-      codex: { state: "ready", detail: null, version: "0.148.0", required_version: "0.148.0", protocol_schema_sha256: "a".repeat(64), schema_match: true, native_multi_agent: true, native_multi_agent_feature: "multi_agent", pid: 1, restart_count: 0 },
+      codex: { state: "ready", detail: null, version: "0.149.1", required_version: "0.149.1", protocol_schema_sha256: "a".repeat(64), schema_match: true, native_multi_agent: true, native_multi_agent_feature: "multi_agent", pid: 1, restart_count: 0 },
       database: { state: "ready", detail: null },
       scheduler: { paused: false, active_total: 0, max_total: 6, active_mutable: 0, max_mutable: 3, active_verifiers: 0, max_verifiers: 1, queued_tasks: 0 },
       self_improvement: selfImprovement,
@@ -69,6 +69,9 @@ describe("Improvement Center", () => {
     expect(canReviewKnowledge({ ...item, state: "rejected", review: { ...item.review, state: "rejected" } })).toBe(false);
     const markup = renderToStaticMarkup(createElement(ImprovementCenter, { runtime: undefined }));
     expect(markup).toContain("Governed knowledge");
+    expect(markup).toContain("Bounded AVO episodes");
+    expect(markup).toContain("controller-projected, completed validation outcome");
+    expect(markup).toContain("no automatic execution or promotion");
     expect(markup).toContain("Human review");
     expect(markup).toContain("neither decision injects task context or changes execution authority");
   });

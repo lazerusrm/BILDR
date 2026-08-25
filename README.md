@@ -28,7 +28,7 @@ API-equivalent usage accounting.
 ## Requirements
 
 - Linux, Git, Rust 1.97.1, Node.js 22+, npm, and `rg`.
-- Codex CLI 0.148.0 authenticated for normal execution. The daemon verifies
+- Codex CLI 0.149.1 authenticated for normal execution. The daemon verifies
   both the CLI version and generated App Server v2 schema digest before it
   enables mutable work.
 - A clean Git coordination clone with `origin` and Git user name/email. The
@@ -142,14 +142,16 @@ integration worktree. Local runs complete only after explicit integration
 approval and the final audit. Draft PR publication is a separate, explicit
 action and the harness never merges automatically.
 
-At run creation, choose the governor family (Sol, Terra, or Luna) and thinking
-level from low through max. Independent Sol verification and Sol final signoff
-remain fixed. The Runs page keeps the governor as the primary conversation,
-shows its latest update and meaningful activity, exposes delegated child
-threads with their own token and API-equivalent cost for read-only inspection,
-and renders pending approvals inline. Governor message history opens at the
-latest update; manual scrollback gets a twelve-second reading grace before new
-messages resume following the bottom.
+At run creation, choose one catalog model and thinking level from the
+controller-provided list. The immutable route is used for every normal BILDR
+task role; Qwodex therefore stays a true one-model local run rather than a
+hidden ensemble. Repository profiles still own each role's sandbox and other
+authority limits. The Runs page keeps the governor as the primary
+conversation, shows its latest update and meaningful activity, exposes
+delegated child threads with their own token and API-equivalent cost for
+read-only inspection, and renders pending approvals inline. Governor message
+history opens at the latest update; manual scrollback gets a twelve-second
+reading grace before new messages resume following the bottom.
 
 The Settings page persists plan approval posture, reasoning-summary retention,
 raw-reasoning retention, bounded governor continuation/budgets, account
@@ -162,11 +164,11 @@ The account strip discovers the default `~/.codex` home, Codex accounts already
 registered in Headroom, plus sibling
 `.codex-*`, `.codex_*`, `codex-*`, and `codex_*` homes that contain Codex
 credentials. It can also add a private Harness-managed Codex home using Codex
-0.148.0 device authorization, then rename, re-authenticate, or remove those
+0.149.1 device authorization, then rename, re-authenticate, or remove those
 managed profiles from Settings. Add explicit external homes with the colon-separated
 `HARNESS_CODEX_ACCOUNT_HOMES` environment variable. Selecting an account starts
 App Server with that `CODEX_HOME`, persists only the opaque local profile ID,
-and refreshes the 0.148.0 `account/read` and `account/rateLimits/read` telemetry.
+and refreshes the 0.149.1 `account/read` and `account/rateLimits/read` telemetry.
 The limits strip keeps local observations and reports a smoothed hourly burn
 forecast that weights the longer 24-hour trend most heavily, blends in the
 recent four-hour pace, and anchors both to the provider window average.

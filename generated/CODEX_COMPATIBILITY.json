@@ -1,9 +1,9 @@
 {
-  "codex_cli_version": "0.148.0",
-  "generated_at": "2026-08-20",
+  "codex_cli_version": "0.149.1",
+  "generated_at": "2026-08-24",
   "generated_schema_root": "generated/codex-app-server-schema",
   "root_schema": "codex_app_server_protocol.v2.schemas.json",
-  "root_schema_sha256": "19b656fe5132b97e8b233c8c3d7129f451d621113cbd7ed319972dd54eedc476",
+  "root_schema_sha256": "a09caf2ab07d69a3ef48384b40793d32718efe953134efd28d7276be9282cfe7",
   "root_schema_sha256_encoding": "normalized-compact-json",
   "schema": "harness-codex-compatibility/v1",
   "transport": "stdio-jsonl"

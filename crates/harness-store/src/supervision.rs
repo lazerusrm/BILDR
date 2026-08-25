@@ -1846,7 +1846,7 @@ mod tests {
             .expect("snapshot persists");
         assert_eq!(first.revision, 1);
         assert_eq!(store.supervisor_observation_cursor(&run).unwrap(), 41);
-        assert_eq!(store.check().unwrap().schema_version, "18");
+        assert_eq!(store.check().unwrap().schema_version, "19");
 
         let duplicate = store
             .record_supervisor_snapshot(&run, 41, "task_stalled", |_, _| {

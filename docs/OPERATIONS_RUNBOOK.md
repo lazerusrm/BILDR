@@ -8,7 +8,7 @@ the browser/API boundary. It never needs a public listener.
 
 Required:
 
-- Codex CLI 0.148.0, authenticated through the normal Codex login flow;
+- Codex CLI 0.149.1, authenticated through the normal Codex login flow;
 - Bubblewrap exactly 0.11.0 with unprivileged user and network namespaces available when `self_improvement.mode = "observe_only"`; `harnessd doctor` probes this boundary and refuses observe-only startup readiness when it is unavailable;
 - Git, `rg`, Bash, and the build tools required by the target repository;
 - a clean Git coordination clone with `origin` and Git identity;

@@ -28,6 +28,10 @@ use tokio::{
 use tracing::{error, info, warn};
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// App Server writes must not allow a stalled durable-event consumer to pin an
+/// HTTP mutation forever.  A response that cannot enter the writer queue has
+/// not been sent, so retaining its ownership makes an explicit retry safe.
+const WRITER_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STDERR_TAIL_BYTES: usize = 64 * 1024;
 const MAX_STDERR_LINE_BYTES: usize = 64 * 1024;
@@ -35,6 +39,11 @@ const MAX_CONSECUTIVE_PROTOCOL_ERRORS: u8 = 3;
 /// Keep passive account telemetry fresh without relaunching an App Server for
 /// every account on every dashboard poll. A manual refresh bypasses this cap.
 const ACCOUNT_TELEMETRY_REFRESH_INTERVAL_MS: i64 = 60_000;
+const SCOPED_READ_RUNTIME_SCHEMA: &str = "harness.scoped-read-runtime.v1";
+const SCOPED_READ_BWRAP: &str = "/usr/bin/bwrap";
+const SCOPED_READ_WORKSPACE: &str = "/work/investigation";
+const SCOPED_READ_CODEX_BINARY: &str = "/opt/harness/codex";
+const MAX_SCOPED_READ_FILES: usize = 4_096;
 static NEXT_SCHEMA_PROBE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
@@ -64,6 +73,177 @@ impl Default for CodexSettings {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
+}
+
+/// Controller-derived file admission for one read-only App Server process.
+///
+/// The App Server protocol currently has no readable-root field or read event
+/// stream.  This is therefore deliberately a runtime launch policy, not an
+/// advisory `sandboxPolicy` extension: the process receives a new mount and
+/// network namespace in which only the admitted regular files exist below the
+/// virtual working directory.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedReadRuntime {
+    pub schema: String,
+    pub source_root: PathBuf,
+    pub allowed_relative_paths: Vec<PathBuf>,
+    pub policy_digest: String,
+}
+
+impl ScopedReadRuntime {
+    /// Bound the controller materialization before an untrusted repository can
+    /// turn a broad but otherwise valid glob into an unbounded launch packet.
+    pub const MAX_FILES: usize = MAX_SCOPED_READ_FILES;
+
+    pub fn new(
+        source_root: PathBuf,
+        allowed_relative_paths: Vec<PathBuf>,
+    ) -> Result<Self, CodexError> {
+        let mut scope = Self {
+            schema: SCOPED_READ_RUNTIME_SCHEMA.to_owned(),
+            source_root,
+            allowed_relative_paths,
+            policy_digest: String::new(),
+        };
+        scope.canonicalize_paths()?;
+        scope.policy_digest = scope.digest();
+        Ok(scope)
+    }
+
+    #[must_use]
+    pub fn virtual_cwd() -> PathBuf {
+        PathBuf::from(SCOPED_READ_WORKSPACE)
+    }
+
+    fn validate(&self) -> Result<(), CodexError> {
+        if self.schema != SCOPED_READ_RUNTIME_SCHEMA {
+            return Err(CodexError::ScopedReadRuntime(
+                "scoped read runtime schema is not recognized".to_owned(),
+            ));
+        }
+        if !self.source_root.is_absolute() {
+            return Err(CodexError::ScopedReadRuntime(
+                "scoped read source root must be absolute".to_owned(),
+            ));
+        }
+        if self.allowed_relative_paths.is_empty()
+            || self.allowed_relative_paths.len() > Self::MAX_FILES
+        {
+            return Err(CodexError::ScopedReadRuntime(format!(
+                "scoped read runtime must admit between one and {} files",
+                Self::MAX_FILES,
+            )));
+        }
+        let mut prior: Option<&PathBuf> = None;
+        for path in &self.allowed_relative_paths {
+            validate_scoped_relative_path(path)?;
+            if prior == Some(path) {
+                return Err(CodexError::ScopedReadRuntime(
+                    "scoped read runtime contains a duplicate path".to_owned(),
+                ));
+            }
+            prior = Some(path);
+        }
+        if !is_lower_hex_digest(&self.policy_digest) || self.policy_digest != self.digest() {
+            return Err(CodexError::ScopedReadRuntime(
+                "scoped read runtime policy digest does not match its canonical admission"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn canonicalize_paths(&mut self) -> Result<(), CodexError> {
+        self.source_root = std::fs::canonicalize(&self.source_root).map_err(|error| {
+            CodexError::ScopedReadRuntime(format!(
+                "could not canonicalize scoped read source root {}: {error}",
+                self.source_root.display()
+            ))
+        })?;
+        if !self.source_root.is_dir() {
+            return Err(CodexError::ScopedReadRuntime(
+                "scoped read source root is not a directory".to_owned(),
+            ));
+        }
+        self.allowed_relative_paths.sort();
+        self.allowed_relative_paths.dedup();
+        if self.allowed_relative_paths.is_empty()
+            || self.allowed_relative_paths.len() > Self::MAX_FILES
+        {
+            return Err(CodexError::ScopedReadRuntime(format!(
+                "scoped read runtime must admit between one and {} files",
+                Self::MAX_FILES,
+            )));
+        }
+        for path in &self.allowed_relative_paths {
+            validate_scoped_relative_path(path)?;
+            let source = self.source_root.join(path);
+            let metadata = std::fs::symlink_metadata(&source).map_err(|error| {
+                CodexError::ScopedReadRuntime(format!(
+                    "scoped read source {} is unavailable: {error}",
+                    path.display()
+                ))
+            })?;
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                return Err(CodexError::ScopedReadRuntime(format!(
+                    "scoped read source {} must be a regular non-symlink file",
+                    path.display()
+                )));
+            }
+            let canonical = std::fs::canonicalize(&source).map_err(|error| {
+                CodexError::ScopedReadRuntime(format!(
+                    "could not canonicalize scoped read source {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if !canonical.starts_with(&self.source_root) {
+                return Err(CodexError::ScopedReadRuntime(format!(
+                    "scoped read source {} escapes its controller root",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    fn digest(&self) -> String {
+        let paths = self
+            .allowed_relative_paths
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\0");
+        hex::encode(Sha256::digest(
+            format!(
+                "{SCOPED_READ_RUNTIME_SCHEMA}\0{}\0{paths}",
+                self.source_root.display()
+            )
+            .as_bytes(),
+        ))
+    }
+}
+
+fn validate_scoped_relative_path(path: &Path) -> Result<(), CodexError> {
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(CodexError::ScopedReadRuntime(format!(
+            "scoped read path {} is not a normal relative path",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn is_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -156,6 +336,7 @@ pub struct CodexSupervisor {
     next_id: Arc<AtomicU64>,
     writer: mpsc::Sender<Value>,
     pending: Arc<Mutex<HashMap<String, PendingRequest>>>,
+    server_requests: Arc<Mutex<BTreeSet<String>>>,
     status: Arc<RwLock<CodexRuntimeStatus>>,
     stderr_tail: Arc<Mutex<VecDeque<u8>>>,
     events: broadcast::Sender<CodexEvent>,
@@ -168,40 +349,63 @@ impl CodexSupervisor {
         settings: CodexSettings,
         durable_sink: mpsc::Sender<CodexEvent>,
     ) -> Result<Self, CodexError> {
+        Self::start_with_scoped_read(settings, durable_sink, None).await
+    }
+
+    async fn start_scoped_read(
+        settings: CodexSettings,
+        durable_sink: mpsc::Sender<CodexEvent>,
+        scope: ScopedReadRuntime,
+    ) -> Result<Self, CodexError> {
+        Self::start_with_scoped_read(settings, durable_sink, Some(scope)).await
+    }
+
+    async fn start_with_scoped_read(
+        settings: CodexSettings,
+        durable_sink: mpsc::Sender<CodexEvent>,
+        scoped_read: Option<ScopedReadRuntime>,
+    ) -> Result<Self, CodexError> {
         let compatibility = probe_compatibility(&settings).await?;
         if !compatibility.version_match || !compatibility.schema_match {
             return Err(CodexError::Compatibility(compatibility));
         }
 
-        let mut command = Command::new(&settings.binary);
+        let mut command = if let Some(scope) = scoped_read.as_ref() {
+            scoped_read_command(&settings, scope)?
+        } else {
+            let mut command = Command::new(&settings.binary);
+            command
+                .arg("app-server")
+                // App Server can materialize the first command sandbox from the
+                // thread-start defaults before a turn-level network override is
+                // reflected in turn context. Start workspace-write threads with
+                // network available, then let Harness narrow non-GitHub turns back
+                // to networkAccess=false in turn/start.
+                .arg("--config")
+                .arg("sandbox_workspace_write.network_access=true")
+                .arg("--listen")
+                .arg("stdio://")
+                // Harness persists App Server stderr diagnostics. Do not inherit a
+                // broad operator RUST_LOG filter that can turn span enter/exit
+                // telemetry into an unbounded durable event stream.
+                .env("RUST_LOG", "warn");
+            if let Some(codex_home) = &settings.codex_home {
+                command.env("CODEX_HOME", codex_home);
+            }
+            if let Some(github_config) = host_github_config_dir() {
+                // Point every ordinary App Server account at the host's existing
+                // gh store. Scoped-read runtimes deliberately never receive it:
+                // their network namespace is absent and their only authority is
+                // the mounted repository evidence.
+                command.env("GH_CONFIG_DIR", github_config);
+            }
+            command
+        };
         command
-            .arg("app-server")
-            // App Server can materialize the first command sandbox from the
-            // thread-start defaults before a turn-level network override is
-            // reflected in turn context. Start workspace-write threads with
-            // network available, then let Harness narrow non-GitHub turns back
-            // to networkAccess=false in turn/start.
-            .arg("--config")
-            .arg("sandbox_workspace_write.network_access=true")
-            .arg("--listen")
-            .arg("stdio://")
-            // Harness persists App Server stderr diagnostics. Do not inherit a
-            // broad operator RUST_LOG filter that can turn span enter/exit
-            // telemetry into an unbounded durable event stream.
-            .env("RUST_LOG", "warn")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        if let Some(codex_home) = &settings.codex_home {
-            command.env("CODEX_HOME", codex_home);
-        }
-        if let Some(github_config) = host_github_config_dir() {
-            // Point every App Server account at the host's existing gh store.
-            // This delegates access to that store without copying or rendering
-            // a token, and remains stable if a worker changes its cwd.
-            command.env("GH_CONFIG_DIR", github_config);
-        }
         #[cfg(unix)]
         command.process_group(0);
         let mut child = command.spawn().map_err(|source| CodexError::Spawn {
@@ -222,6 +426,7 @@ impl CodexSupervisor {
         let (writer_tx, writer_rx) = mpsc::channel::<Value>(256);
         let (events, _) = broadcast::channel(2_048);
         let pending = Arc::new(Mutex::new(HashMap::new()));
+        let server_requests = Arc::new(Mutex::new(BTreeSet::new()));
         let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_STDERR_TAIL_BYTES)));
         let child = Arc::new(Mutex::new(Some(child)));
         let status = Arc::new(RwLock::new(CodexRuntimeStatus {
@@ -247,6 +452,7 @@ impl CodexSupervisor {
         let reader_task = tokio::spawn(reader_loop(
             stdout,
             pending.clone(),
+            server_requests.clone(),
             events.clone(),
             durable_sink.clone(),
             status.clone(),
@@ -278,6 +484,7 @@ impl CodexSupervisor {
             next_id: Arc::new(AtomicU64::new(1)),
             writer: writer_tx,
             pending,
+            server_requests,
             status,
             stderr_tail,
             events,
@@ -448,9 +655,11 @@ impl CodexSupervisor {
                 response: response_tx,
             },
         );
-        if self.writer.send(message).await.is_err() {
+        if let Err(error) =
+            enqueue_writer_message(&self.writer, method, message, WRITER_ENQUEUE_TIMEOUT).await
+        {
             self.pending.lock().await.remove(&key);
-            return Err(CodexError::Disconnected);
+            return Err(error);
         }
         match timeout(self.settings.request_timeout, response_rx).await {
             Ok(Ok(result)) => result,
@@ -465,17 +674,24 @@ impl CodexSupervisor {
     }
 
     pub async fn notify(&self, method: &str, params: Value) -> Result<(), CodexError> {
-        self.writer
-            .send(json!({"method": method, "params": params}))
-            .await
-            .map_err(|_| CodexError::Disconnected)
+        enqueue_writer_message(
+            &self.writer,
+            method,
+            json!({"method": method, "params": params}),
+            WRITER_ENQUEUE_TIMEOUT,
+        )
+        .await
     }
 
     pub async fn respond(&self, id: Value, result: Value) -> Result<(), CodexError> {
-        self.writer
-            .send(json!({"id": id, "result": result}))
-            .await
-            .map_err(|_| CodexError::Disconnected)
+        enqueue_server_response(
+            &self.writer,
+            &self.server_requests,
+            id.clone(),
+            json!({"id": id, "result": result}),
+            WRITER_ENQUEUE_TIMEOUT,
+        )
+        .await
     }
 
     pub async fn respond_error(
@@ -484,10 +700,14 @@ impl CodexSupervisor {
         code: i64,
         message: &str,
     ) -> Result<(), CodexError> {
-        self.writer
-            .send(json!({"id": id, "error": {"code": code, "message": message}}))
-            .await
-            .map_err(|_| CodexError::Disconnected)
+        enqueue_server_response(
+            &self.writer,
+            &self.server_requests,
+            id.clone(),
+            json!({"id": id, "error": {"code": code, "message": message}}),
+            WRITER_ENQUEUE_TIMEOUT,
+        )
+        .await
     }
 
     pub async fn shutdown(&self) -> Result<(), CodexError> {
@@ -518,6 +738,248 @@ impl CodexSupervisor {
         }
         Ok(())
     }
+
+    async fn owns_server_request(&self, id: &Value) -> bool {
+        self.server_requests.lock().await.contains(&request_key(id))
+    }
+}
+
+async fn enqueue_writer_message(
+    writer: &mpsc::Sender<Value>,
+    method: &str,
+    message: Value,
+    timeout_duration: Duration,
+) -> Result<(), CodexError> {
+    match timeout(timeout_duration, writer.send(message)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(CodexError::Disconnected),
+        Err(_) => Err(CodexError::Timeout {
+            method: method.to_owned(),
+        }),
+    }
+}
+
+async fn enqueue_server_response(
+    writer: &mpsc::Sender<Value>,
+    server_requests: &Mutex<BTreeSet<String>>,
+    id: Value,
+    message: Value,
+    timeout_duration: Duration,
+) -> Result<(), CodexError> {
+    // Do not forget the source request until its response has entered the
+    // protocol writer. If bounded admission fails, the controller can retain
+    // its durable decision as pending and retry against the same request.
+    enqueue_writer_message(writer, "server response", message, timeout_duration).await?;
+    server_requests.lock().await.remove(&request_key(&id));
+    Ok(())
+}
+
+fn scoped_read_command(
+    settings: &CodexSettings,
+    scope: &ScopedReadRuntime,
+) -> Result<Command, CodexError> {
+    if settings.codex_home.is_some() {
+        // A direct read-only bind of an authenticated CODEX_HOME would give a
+        // model-controlled command process access to its long-lived token
+        // material. The scoped runtime needs a separate credential broker;
+        // neither prompt instructions nor the generic App Server sandbox are
+        // a substitute for that authority boundary.
+        return Err(CodexError::ScopedReadRuntime(
+            "scoped read runtime requires a credential broker and refuses a direct CODEX_HOME mount"
+                .to_owned(),
+        ));
+    }
+    scope.validate()?;
+    let canonical_root = std::fs::canonicalize(&scope.source_root).map_err(|error| {
+        CodexError::ScopedReadRuntime(format!(
+            "could not canonicalize scoped read source root {}: {error}",
+            scope.source_root.display()
+        ))
+    })?;
+    if canonical_root != scope.source_root || !canonical_root.is_dir() {
+        return Err(CodexError::ScopedReadRuntime(
+            "scoped read source root must remain a canonical directory".to_owned(),
+        ));
+    }
+    let binary = resolve_scoped_runtime_binary(&settings.binary)?;
+    let mut paths = scope.allowed_relative_paths.clone();
+    paths.sort();
+    paths.dedup();
+    if paths != scope.allowed_relative_paths {
+        return Err(CodexError::ScopedReadRuntime(
+            "scoped read path admission is not canonical".to_owned(),
+        ));
+    }
+    let mut directory_mounts = BTreeSet::new();
+    let mut file_mounts = Vec::with_capacity(paths.len());
+    for relative in paths {
+        validate_scoped_relative_path(&relative)?;
+        let source = canonical_root.join(&relative);
+        let metadata = std::fs::symlink_metadata(&source).map_err(|error| {
+            CodexError::ScopedReadRuntime(format!(
+                "scoped read source {} is unavailable: {error}",
+                relative.display()
+            ))
+        })?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(CodexError::ScopedReadRuntime(format!(
+                "scoped read source {} must be a regular non-symlink file",
+                relative.display()
+            )));
+        }
+        let canonical_source = std::fs::canonicalize(&source).map_err(|error| {
+            CodexError::ScopedReadRuntime(format!(
+                "could not canonicalize scoped read source {}: {error}",
+                relative.display()
+            ))
+        })?;
+        if !canonical_source.starts_with(&canonical_root) {
+            return Err(CodexError::ScopedReadRuntime(format!(
+                "scoped read source {} escapes its controller root",
+                relative.display()
+            )));
+        }
+        let destination = PathBuf::from(SCOPED_READ_WORKSPACE).join(&relative);
+        let mut parent = destination.parent();
+        while let Some(directory) = parent {
+            directory_mounts.insert(directory.to_path_buf());
+            if directory == Path::new(SCOPED_READ_WORKSPACE) {
+                break;
+            }
+            parent = directory.parent();
+        }
+        file_mounts.push((canonical_source, destination));
+    }
+    let mut args = scoped_read_bwrap_base_arguments();
+    args.extend(runtime_ro_binds());
+    args.extend([
+        "--dir".to_owned(),
+        "/opt".to_owned(),
+        "--dir".to_owned(),
+        "/opt/harness".to_owned(),
+        "--dir".to_owned(),
+        "/work".to_owned(),
+    ]);
+    for directory in directory_mounts {
+        args.extend(["--dir".to_owned(), directory.to_string_lossy().into_owned()]);
+    }
+    for (source, destination) in file_mounts {
+        args.extend([
+            "--ro-bind".to_owned(),
+            source.to_string_lossy().into_owned(),
+            destination.to_string_lossy().into_owned(),
+        ]);
+    }
+    args.extend([
+        "--ro-bind".to_owned(),
+        binary.to_string_lossy().into_owned(),
+        SCOPED_READ_CODEX_BINARY.to_owned(),
+    ]);
+    args.extend([
+        "--proc".to_owned(),
+        "/proc".to_owned(),
+        "--dev".to_owned(),
+        "/dev".to_owned(),
+        "--chdir".to_owned(),
+        SCOPED_READ_WORKSPACE.to_owned(),
+        "--".to_owned(),
+        SCOPED_READ_CODEX_BINARY.to_owned(),
+        "app-server".to_owned(),
+        "--config".to_owned(),
+        "sandbox_workspace_write.network_access=true".to_owned(),
+        "--listen".to_owned(),
+        "stdio://".to_owned(),
+    ]);
+    let mut command = Command::new(SCOPED_READ_BWRAP);
+    command.args(args);
+    Ok(command)
+}
+
+fn scoped_read_bwrap_base_arguments() -> Vec<String> {
+    [
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup",
+        "--unshare-net",
+        "--cap-drop",
+        "ALL",
+        "--clearenv",
+        "--tmpfs",
+        "/tmp",
+        "--tmpfs",
+        "/run",
+        "--setenv",
+        "HOME",
+        "/tmp",
+        "--setenv",
+        "TMPDIR",
+        "/tmp",
+        "--setenv",
+        "XDG_CACHE_HOME",
+        "/tmp",
+        "--setenv",
+        "XDG_CONFIG_HOME",
+        "/tmp",
+        "--setenv",
+        "XDG_DATA_HOME",
+        "/tmp",
+        "--setenv",
+        "XDG_STATE_HOME",
+        "/tmp",
+        "--setenv",
+        "PATH",
+        "/usr/bin:/bin",
+        "--setenv",
+        "RUST_LOG",
+        "warn",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn runtime_ro_binds() -> Vec<String> {
+    ["/usr", "/bin", "/lib", "/lib64"]
+        .into_iter()
+        .filter(|path| Path::new(path).is_dir())
+        .flat_map(|path| ["--ro-bind".to_owned(), path.to_owned(), path.to_owned()])
+        .collect()
+}
+
+fn resolve_scoped_runtime_binary(configured: &Path) -> Result<PathBuf, CodexError> {
+    let candidate = if configured.is_absolute() || configured.components().count() > 1 {
+        configured.to_path_buf()
+    } else {
+        let search_paths = std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+            .unwrap_or_default();
+        search_paths
+            .into_iter()
+            .map(|directory| directory.join(configured))
+            .find(|path| path.is_file())
+            .ok_or_else(|| {
+                CodexError::ScopedReadRuntime(format!(
+                    "configured Codex binary {} is not on PATH",
+                    configured.display()
+                ))
+            })?
+    };
+    let binary = std::fs::canonicalize(&candidate).map_err(|error| {
+        CodexError::ScopedReadRuntime(format!(
+            "could not canonicalize configured Codex binary {}: {error}",
+            candidate.display()
+        ))
+    })?;
+    if !binary.is_file() {
+        return Err(CodexError::ScopedReadRuntime(
+            "configured Codex binary is not a regular file".to_owned(),
+        ));
+    }
+    Ok(binary)
 }
 
 fn rate_limit_refresh_failed(
@@ -548,12 +1010,21 @@ fn account_read_failed(mut profile: CodexAccountProfile, detail: &str) -> CodexA
 pub struct StartThread {
     pub cwd: PathBuf,
     pub model: String,
+    /// Controller-selected provider. This is explicit on every thread so a
+    /// process configured with more than one provider cannot silently route a
+    /// task to its ambient/default backend.
+    pub model_provider: String,
     pub sandbox: String,
     pub approval_policy: String,
     pub developer_instructions: String,
     pub service_name: String,
     #[serde(default)]
     pub ephemeral: bool,
+    /// Omitted for ordinary threads. When supplied, the runtime manager must
+    /// launch a dedicated OS-confined App Server before forwarding this
+    /// request; it is never serialized into the App Server protocol.
+    #[serde(skip)]
+    pub scoped_read_runtime: Option<ScopedReadRuntime>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -572,6 +1043,13 @@ pub struct StartTurn {
 #[async_trait]
 pub trait CodexRuntime: Send + Sync {
     async fn runtime_status(&self) -> CodexRuntimeStatus;
+    /// Whether this runtime can create a per-thread, operating-system-enforced
+    /// scoped-read process. Ordinary App Server `readOnly` sandbox settings do
+    /// not satisfy this requirement because they carry neither a readable-root
+    /// restriction nor read-event evidence.
+    async fn supports_scoped_read_runtime(&self) -> bool {
+        false
+    }
     async fn codex_accounts(&self) -> Result<CodexAccountsSnapshot, CodexError> {
         Ok(CodexAccountsSnapshot {
             selected_account_id: None,
@@ -603,6 +1081,14 @@ pub trait CodexRuntime: Send + Sync {
         message: &str,
     ) -> Result<Value, CodexError>;
     async fn interrupt_turn(&self, thread_id: &str, turn_id: &str) -> Result<Value, CodexError>;
+    /// Delete an unbound native child thread when the controller cannot issue
+    /// it a model/provider custody receipt.  This is distinct from interrupting
+    /// the parent turn: a child may already be independently live.
+    async fn delete_thread(&self, _thread_id: &str) -> Result<Value, CodexError> {
+        Err(CodexError::Protocol(
+            "runtime does not support thread/delete for native-child containment".to_owned(),
+        ))
+    }
     async fn set_goal(
         &self,
         thread_id: &str,
@@ -631,20 +1117,8 @@ impl CodexRuntime for CodexSupervisor {
     }
 
     async fn start_thread(&self, request: StartThread) -> Result<Value, CodexError> {
-        self.request(
-            "thread/start",
-            json!({
-                "cwd": request.cwd,
-                "model": request.model,
-                "sandbox": request.sandbox,
-                "approvalPolicy": request.approval_policy,
-                "approvalsReviewer": "user",
-                "developerInstructions": request.developer_instructions,
-                "serviceName": request.service_name,
-                "ephemeral": request.ephemeral,
-            }),
-        )
-        .await
+        self.request("thread/start", start_thread_params(request))
+            .await
     }
 
     async fn resume_thread(&self, thread_id: &str) -> Result<Value, CodexError> {
@@ -693,6 +1167,11 @@ impl CodexRuntime for CodexSupervisor {
             json!({"threadId": thread_id, "turnId": turn_id}),
         )
         .await
+    }
+
+    async fn delete_thread(&self, thread_id: &str) -> Result<Value, CodexError> {
+        self.request("thread/delete", json!({"threadId": thread_id}))
+            .await
     }
 
     async fn set_goal(
@@ -744,6 +1223,26 @@ impl CodexRuntime for CodexSupervisor {
     }
 }
 
+fn start_thread_params(request: StartThread) -> Value {
+    json!({
+        "cwd": request.cwd,
+        "model": request.model,
+        "modelProvider": request.model_provider,
+        "sandbox": request.sandbox,
+        "approvalPolicy": request.approval_policy,
+        "approvalsReviewer": "user",
+        "developerInstructions": request.developer_instructions,
+        "serviceName": request.service_name,
+        "ephemeral": request.ephemeral,
+    })
+}
+
+#[derive(Clone)]
+struct ScopedSupervisor {
+    supervisor: Arc<CodexSupervisor>,
+    virtual_cwd: PathBuf,
+}
+
 #[derive(Clone)]
 pub struct CodexRuntimeManager {
     settings: Arc<CodexSettings>,
@@ -751,6 +1250,7 @@ pub struct CodexRuntimeManager {
     profiles: Arc<RwLock<Vec<CodexAccountProfile>>>,
     active_account_id: Arc<RwLock<Option<String>>>,
     active: Arc<RwLock<Option<Arc<CodexSupervisor>>>>,
+    scoped: Arc<RwLock<HashMap<String, ScopedSupervisor>>>,
     switch_lock: Arc<Mutex<()>>,
     account_telemetry_refreshing: Arc<AtomicBool>,
     restart_count: Arc<AtomicU32>,
@@ -802,6 +1302,7 @@ impl CodexRuntimeManager {
             profiles: Arc::new(RwLock::new(profiles)),
             active_account_id: Arc::new(RwLock::new(Some(selected_id))),
             active: Arc::new(RwLock::new(Some(supervisor))),
+            scoped: Arc::new(RwLock::new(HashMap::new())),
             switch_lock: Arc::new(Mutex::new(())),
             account_telemetry_refreshing: Arc::new(AtomicBool::new(false)),
             restart_count: Arc::new(AtomicU32::new(0)),
@@ -845,6 +1346,12 @@ impl CodexRuntimeManager {
     }
 
     pub async fn shutdown(&self) -> Result<(), CodexError> {
+        let scoped = std::mem::take(&mut *self.scoped.write().await)
+            .into_values()
+            .collect::<Vec<_>>();
+        for runtime in scoped {
+            runtime.supervisor.shutdown().await?;
+        }
         if let Some(supervisor) = self.active.write().await.take() {
             supervisor.shutdown().await?;
         }
@@ -857,6 +1364,154 @@ impl CodexRuntimeManager {
             .await
             .clone()
             .ok_or(CodexError::Disconnected)
+    }
+
+    async fn selected_settings(&self) -> Result<CodexSettings, CodexError> {
+        let account_id = self
+            .active_account_id
+            .read()
+            .await
+            .clone()
+            .ok_or(CodexError::NoCodexAccountHomes)?;
+        let profile = self
+            .profiles
+            .read()
+            .await
+            .iter()
+            .find(|profile| profile.id == account_id)
+            .cloned()
+            .ok_or(CodexError::UnknownAccount(account_id))?;
+        let mut settings = self.settings.as_ref().clone();
+        settings.codex_home = Some(profile.codex_home);
+        Ok(settings)
+    }
+
+    async fn scoped_supervisor(&self, thread_id: &str) -> Option<ScopedSupervisor> {
+        self.scoped.read().await.get(thread_id).cloned()
+    }
+
+    async fn start_scoped_thread(
+        &self,
+        mut request: StartThread,
+        scope: ScopedReadRuntime,
+    ) -> Result<Value, CodexError> {
+        if request.sandbox != "read-only" || request.approval_policy != "never" {
+            return Err(CodexError::ScopedReadRuntime(
+                "scoped read runtime requires read-only sandbox and never approval policy"
+                    .to_owned(),
+            ));
+        }
+        let request_cwd = std::fs::canonicalize(&request.cwd).map_err(|error| {
+            CodexError::ScopedReadRuntime(format!(
+                "could not canonicalize scoped thread cwd {}: {error}",
+                request.cwd.display()
+            ))
+        })?;
+        if request_cwd != scope.source_root {
+            return Err(CodexError::ScopedReadRuntime(
+                "scoped read runtime root does not match the controller thread cwd".to_owned(),
+            ));
+        }
+        let supervisor = Arc::new(
+            CodexSupervisor::start_scoped_read(
+                self.selected_settings().await?,
+                self.durable_sink.clone(),
+                scope,
+            )
+            .await?,
+        );
+        request.cwd = ScopedReadRuntime::virtual_cwd();
+        request.scoped_read_runtime = None;
+        let result = supervisor.start_thread(request).await;
+        let thread_id = result
+            .as_ref()
+            .ok()
+            .and_then(thread_id_from_start_response)
+            .map(ToOwned::to_owned);
+        match (result, thread_id) {
+            (Ok(result), Some(thread_id)) => {
+                self.scoped.write().await.insert(
+                    thread_id,
+                    ScopedSupervisor {
+                        supervisor,
+                        virtual_cwd: ScopedReadRuntime::virtual_cwd(),
+                    },
+                );
+                Ok(result)
+            }
+            (Ok(_), None) => {
+                let _ = supervisor.shutdown().await;
+                Err(CodexError::Protocol(
+                    "scoped App Server thread/start response lacks thread id".to_owned(),
+                ))
+            }
+            (Err(error), _) => {
+                let _ = supervisor.shutdown().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn scoped_read_runtime_available(&self) -> bool {
+        // The active account home contains long-lived authentication. Until a
+        // dedicated broker proves a one-way, scoped credential handoff, do not
+        // turn a filesystem boundary into a credential-exfiltration boundary.
+        if self
+            .selected_settings()
+            .await
+            .map_or(true, |settings| settings.codex_home.is_some())
+        {
+            return false;
+        }
+        if !Path::new(SCOPED_READ_BWRAP).is_file() {
+            return false;
+        }
+        let mut command = Command::new(SCOPED_READ_BWRAP);
+        command
+            .args(scoped_read_bwrap_base_arguments())
+            .args(runtime_ro_binds())
+            .args(["--proc", "/proc", "--dev", "/dev", "--", "/usr/bin/true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        matches!(
+            timeout(Duration::from_secs(5), command.status()).await,
+            Ok(Ok(status)) if status.success()
+        )
+    }
+
+    async fn owner_for_server_request(
+        &self,
+        id: &Value,
+    ) -> Result<Arc<CodexSupervisor>, CodexError> {
+        let mut matches = Vec::new();
+        if let Ok(active) = self.active_supervisor().await
+            && active.owns_server_request(id).await
+        {
+            matches.push(active);
+        }
+        let scoped = self
+            .scoped
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for runtime in scoped {
+            if runtime.supervisor.owns_server_request(id).await {
+                matches.push(runtime.supervisor);
+            }
+        }
+        match matches.len() {
+            1 => Ok(matches.remove(0)),
+            0 => Err(CodexError::Protocol(
+                "App Server response id is not owned by an active runtime".to_owned(),
+            )),
+            _ => Err(CodexError::Protocol(
+                "App Server response id is ambiguous across runtimes".to_owned(),
+            )),
+        }
     }
 
     async fn refresh_discovery(&self) -> Result<(), CodexError> {
@@ -1055,6 +1710,10 @@ impl CodexRuntime for CodexRuntimeManager {
         }
     }
 
+    async fn supports_scoped_read_runtime(&self) -> bool {
+        self.scoped_read_runtime_available().await
+    }
+
     async fn codex_accounts(&self) -> Result<CodexAccountsSnapshot, CodexError> {
         self.accounts_snapshot(true, false).await
     }
@@ -1074,10 +1733,16 @@ impl CodexRuntime for CodexRuntimeManager {
     }
 
     async fn start_thread(&self, request: StartThread) -> Result<Value, CodexError> {
+        if let Some(scope) = request.scoped_read_runtime.clone() {
+            return self.start_scoped_thread(request, scope).await;
+        }
         self.active_supervisor().await?.start_thread(request).await
     }
 
     async fn resume_thread(&self, thread_id: &str) -> Result<Value, CodexError> {
+        if let Some(runtime) = self.scoped_supervisor(thread_id).await {
+            return runtime.supervisor.resume_thread(thread_id).await;
+        }
         self.active_supervisor()
             .await?
             .resume_thread(thread_id)
@@ -1085,6 +1750,11 @@ impl CodexRuntime for CodexRuntimeManager {
     }
 
     async fn start_turn(&self, request: StartTurn) -> Result<Value, CodexError> {
+        if let Some(runtime) = self.scoped_supervisor(&request.thread_id).await {
+            let mut request = request;
+            request.cwd = runtime.virtual_cwd;
+            return runtime.supervisor.start_turn(request).await;
+        }
         self.active_supervisor().await?.start_turn(request).await
     }
 
@@ -1094,6 +1764,12 @@ impl CodexRuntime for CodexRuntimeManager {
         turn_id: &str,
         message: &str,
     ) -> Result<Value, CodexError> {
+        if let Some(runtime) = self.scoped_supervisor(thread_id).await {
+            return runtime
+                .supervisor
+                .steer_turn(thread_id, turn_id, message)
+                .await;
+        }
         self.active_supervisor()
             .await?
             .steer_turn(thread_id, turn_id, message)
@@ -1101,9 +1777,22 @@ impl CodexRuntime for CodexRuntimeManager {
     }
 
     async fn interrupt_turn(&self, thread_id: &str, turn_id: &str) -> Result<Value, CodexError> {
+        if let Some(runtime) = self.scoped_supervisor(thread_id).await {
+            return runtime.supervisor.interrupt_turn(thread_id, turn_id).await;
+        }
         self.active_supervisor()
             .await?
             .interrupt_turn(thread_id, turn_id)
+            .await
+    }
+
+    async fn delete_thread(&self, thread_id: &str) -> Result<Value, CodexError> {
+        if let Some(runtime) = self.scoped_supervisor(thread_id).await {
+            return runtime.supervisor.delete_thread(thread_id).await;
+        }
+        self.active_supervisor()
+            .await?
+            .delete_thread(thread_id)
             .await
     }
 
@@ -1113,6 +1802,12 @@ impl CodexRuntime for CodexRuntimeManager {
         objective: &str,
         token_budget: Option<u64>,
     ) -> Result<Value, CodexError> {
+        if let Some(runtime) = self.scoped_supervisor(thread_id).await {
+            return runtime
+                .supervisor
+                .set_goal(thread_id, objective, token_budget)
+                .await;
+        }
         self.active_supervisor()
             .await?
             .set_goal(thread_id, objective, token_budget)
@@ -1125,6 +1820,12 @@ impl CodexRuntime for CodexRuntimeManager {
         target: Value,
         detached: bool,
     ) -> Result<Value, CodexError> {
+        if let Some(runtime) = self.scoped_supervisor(thread_id).await {
+            return runtime
+                .supervisor
+                .start_review(thread_id, target, detached)
+                .await;
+        }
         self.active_supervisor()
             .await?
             .start_review(thread_id, target, detached)
@@ -1132,7 +1833,7 @@ impl CodexRuntime for CodexRuntimeManager {
     }
 
     async fn respond_rpc(&self, id: Value, result: Value) -> Result<(), CodexError> {
-        self.active_supervisor()
+        self.owner_for_server_request(&id)
             .await?
             .respond_rpc(id, result)
             .await
@@ -1144,7 +1845,7 @@ impl CodexRuntime for CodexRuntimeManager {
         code: i64,
         message: &str,
     ) -> Result<(), CodexError> {
-        self.active_supervisor()
+        self.owner_for_server_request(&id)
             .await?
             .respond_rpc_error(id, code, message)
             .await
@@ -1691,6 +2392,7 @@ async fn writer_loop(
 async fn reader_loop(
     stdout: tokio::process::ChildStdout,
     pending: Arc<Mutex<HashMap<String, PendingRequest>>>,
+    server_requests: Arc<Mutex<BTreeSet<String>>>,
     events: broadcast::Sender<CodexEvent>,
     durable_sink: mpsc::Sender<CodexEvent>,
     status: Arc<RwLock<CodexRuntimeStatus>>,
@@ -1764,6 +2466,11 @@ async fn reader_loop(
             request_id: id.clone(),
             message: message.clone(),
         };
+        if kind == EventKind::ServerRequest {
+            if let Some(id) = id.as_ref() {
+                server_requests.lock().await.insert(request_key(id));
+            }
+        }
         let _ = events.send(event.clone());
         let _ = durable_sink.send(event).await;
 
@@ -1968,6 +2675,14 @@ fn request_key(id: &Value) -> String {
     }
 }
 
+fn thread_id_from_start_response(response: &Value) -> Option<&str> {
+    response
+        .pointer("/thread/id")
+        .or_else(|| response.get("threadId"))
+        .or_else(|| response.get("id"))
+        .and_then(Value::as_str)
+}
+
 fn host_github_config_dir() -> Option<PathBuf> {
     std::env::var_os("GH_CONFIG_DIR")
         .map(PathBuf::from)
@@ -2020,6 +2735,8 @@ pub enum CodexError {
     },
     #[error("App Server protocol error: {0}")]
     Protocol(String),
+    #[error("scoped read runtime rejected its controller admission: {0}")]
+    ScopedReadRuntime(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
@@ -2029,6 +2746,7 @@ pub enum CodexError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     fn account_profile(id: &str, selected: bool) -> CodexAccountProfile {
         CodexAccountProfile {
@@ -2051,6 +2769,156 @@ mod tests {
     fn request_keys_preserve_string_ids() {
         assert_eq!(request_key(&json!(7)), "7");
         assert_eq!(request_key(&json!("rpc-7")), "rpc-7");
+    }
+
+    #[tokio::test]
+    async fn stalled_writer_keeps_server_request_owned_for_retry() {
+        let (writer, mut receiver) = mpsc::channel(1);
+        writer.send(json!({"method": "occupied"})).await.unwrap();
+        let requests = Mutex::new(BTreeSet::from([request_key(&json!("approval-1"))]));
+
+        let error = enqueue_server_response(
+            &writer,
+            &requests,
+            json!("approval-1"),
+            json!({"id": "approval-1", "result": {"decision": "accept"}}),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("a full writer must time out rather than pin the caller");
+        assert!(matches!(error, CodexError::Timeout { method } if method == "server response"));
+        assert!(
+            requests
+                .lock()
+                .await
+                .contains(&request_key(&json!("approval-1")))
+        );
+
+        assert!(receiver.recv().await.is_some());
+        enqueue_server_response(
+            &writer,
+            &requests,
+            json!("approval-1"),
+            json!({"id": "approval-1", "result": {"decision": "accept"}}),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("a writable queue accepts the response");
+        assert!(
+            !requests
+                .lock()
+                .await
+                .contains(&request_key(&json!("approval-1")))
+        );
+    }
+
+    #[test]
+    fn thread_start_binds_the_controller_selected_provider() {
+        let params = start_thread_params(StartThread {
+            cwd: PathBuf::from("/worktree"),
+            model: "ornith-1.5-35b-a3b-nvfp4".to_owned(),
+            model_provider: "qwen-local-switcher".to_owned(),
+            sandbox: "workspace-write".to_owned(),
+            approval_policy: "never".to_owned(),
+            developer_instructions: "controller-owned".to_owned(),
+            service_name: "test".to_owned(),
+            ephemeral: false,
+            scoped_read_runtime: None,
+        });
+        assert_eq!(
+            params.get("modelProvider").and_then(Value::as_str),
+            Some("qwen-local-switcher")
+        );
+        assert_eq!(
+            params.get("model").and_then(Value::as_str),
+            Some("ornith-1.5-35b-a3b-nvfp4")
+        );
+    }
+
+    #[test]
+    fn scoped_read_runtime_mounts_only_controller_admitted_regular_files() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("investigation");
+        std::fs::create_dir_all(root.join("allowed/nested")).unwrap();
+        std::fs::write(root.join("allowed/nested/evidence.rs"), "visible").unwrap();
+        std::fs::write(root.join("secret.txt"), "must not be mounted").unwrap();
+
+        let scope = ScopedReadRuntime::new(
+            root.clone(),
+            vec![PathBuf::from("allowed/nested/evidence.rs")],
+        )
+        .unwrap();
+        let command = scoped_read_command(
+            &CodexSettings {
+                binary: PathBuf::from("/usr/bin/true"),
+                ..CodexSettings::default()
+            },
+            &scope,
+        )
+        .unwrap();
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let canonical_root = std::fs::canonicalize(root).unwrap();
+        let admitted = canonical_root.join("allowed/nested/evidence.rs");
+        let denied = canonical_root.join("secret.txt");
+        let admitted = admitted.to_string_lossy().into_owned();
+        let denied = denied.to_string_lossy().into_owned();
+
+        assert!(args.windows(3).any(|arguments| {
+            arguments[0] == "--ro-bind"
+                && arguments[1] == admitted
+                && arguments[2] == "/work/investigation/allowed/nested/evidence.rs"
+        }));
+        assert!(!args.iter().any(|argument| argument == &denied));
+        assert!(
+            args.windows(2).any(|arguments| {
+                arguments[0] == "--unshare-net" && arguments[1] == "--cap-drop"
+            })
+        );
+        assert!(args.windows(3).any(|arguments| {
+            arguments[0] == "--ro-bind"
+                && arguments[1] == "/usr/bin/true"
+                && arguments[2] == SCOPED_READ_CODEX_BINARY
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_read_runtime_rejects_admitted_symbolic_links() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("investigation");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("outside.txt"), "outside").unwrap();
+        std::os::unix::fs::symlink("outside.txt", root.join("linked.txt")).unwrap();
+
+        let error = ScopedReadRuntime::new(root, vec![PathBuf::from("linked.txt")])
+            .expect_err("indirect source must not be admitted");
+        assert!(error.to_string().contains("regular non-symlink"));
+    }
+
+    #[test]
+    fn scoped_read_runtime_refuses_to_mount_an_authenticated_codex_home() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("investigation");
+        let codex_home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::write(root.join("evidence.txt"), "visible").unwrap();
+        let scope = ScopedReadRuntime::new(root, vec![PathBuf::from("evidence.txt")]).unwrap();
+
+        let error = scoped_read_command(
+            &CodexSettings {
+                binary: PathBuf::from("/usr/bin/true"),
+                codex_home: Some(codex_home),
+                ..CodexSettings::default()
+            },
+            &scope,
+        )
+        .expect_err("long-lived credentials must remain outside the agent namespace");
+        assert!(error.to_string().contains("credential broker"));
     }
 
     #[test]
@@ -2204,6 +3072,7 @@ mod tests {
             ])),
             active_account_id: Arc::new(RwLock::new(Some("active".to_owned()))),
             active: Arc::new(RwLock::new(None)),
+            scoped: Arc::new(RwLock::new(HashMap::new())),
             switch_lock: Arc::new(Mutex::new(())),
             account_telemetry_refreshing: Arc::new(AtomicBool::new(false)),
             restart_count: Arc::new(AtomicU32::new(0)),

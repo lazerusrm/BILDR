@@ -779,6 +779,15 @@ mod tests {
         };
         c.sha256 = digest(&c).unwrap();
         assert!(c.verify().is_ok());
+        c.evidence = vec![receipt(
+            ReceiptKind::ReconciliationEpisode,
+            "reconciliation-episode-1",
+        )];
+        c.sha256 = digest(&c).unwrap();
+        assert!(
+            c.verify().is_ok(),
+            "the runtime-supported reconciliation receipt is valid candidate evidence"
+        );
         c.scope.repository_id = "r".repeat(160);
         c.sha256 = digest(&c).unwrap();
         assert!(c.verify().is_ok());

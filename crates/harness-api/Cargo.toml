@@ -10,6 +10,7 @@ harness-domain = { path = "../harness-domain" }
 harness-eval = { path = "../harness-eval" }
 harness-learning = { path = "../harness-learning" }
 harness-orchestrator = { path = "../harness-orchestrator" }
+harness-promotion = { path = "../harness-promotion" }
 harness-store = { path = "../harness-store" }
 async-stream.workspace = true
 axum.workspace = true

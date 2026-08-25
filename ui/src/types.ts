@@ -68,6 +68,19 @@ export interface RuntimeStatus {
   };
 }
 
+/** Controller-owned catalog for an immutable, uniform run model route. */
+export interface RunModelCatalog {
+  provider: string;
+  models: RunModelDescriptor[];
+}
+
+export interface RunModelDescriptor {
+  id: string;
+  display_name: string | null;
+  reasoning_efforts: string[];
+  profile_sha256: string | null;
+}
+
 export type OutcomeDimension =
   | "operator_acceptance"
   | "operator_correction"
@@ -85,6 +98,61 @@ export type OutcomeDimension =
 export interface OutcomeVector {
   run_id: string;
   items: OutcomeVectorItem[];
+}
+
+export type AvoEpisodeState = "proposed" | "running" | "passed" | "failed" | "inconclusive";
+
+export interface AvoReceipt {
+  kind: "champion_bundle" | "candidate" | "hard_gate";
+  id: string;
+  digest: string;
+}
+
+export interface AvoEpisodeVariation {
+  sequence: number;
+  variation_id: string;
+  parent_candidate_id: string | null;
+  strategy: "refine" | "repair" | "reframe" | "retrieval";
+  parent_score_milli: number;
+  candidate_id: string;
+  candidate_receipt: AvoReceipt;
+  correctness: "passed" | "failed" | "inconclusive" | "infrastructure_unavailable";
+  correctness_evidence: AvoReceipt;
+  candidate_score_milli: number | null;
+  outcome: "improved" | "not_improved" | "rejected" | "inconclusive";
+}
+
+export interface AvoEpisodePayload {
+  schema: "harness.avo-episode.v1";
+  episode_id: string;
+  task_family: string;
+  champion_bundle_id: string;
+  champion_bundle_receipt: AvoReceipt;
+  knowledge_snapshot_digest: string;
+  hard_gate_policy_digest: string;
+  initial_score_milli: number;
+  variation_budget: number;
+  stagnation_limit: number;
+  variations: AvoEpisodeVariation[];
+  sha256: string;
+}
+
+export interface AvoEpisode {
+  revision_id: string;
+  revision: number;
+  state: AvoEpisodeState;
+  payload_sha256: string;
+  created_at: number;
+  episode: AvoEpisodePayload;
+  trajectory: {
+    incumbent_score_milli: number;
+    incumbent_candidate_id: string | null;
+    completed_variations: number;
+    stagnant_variations: number;
+    directive: "continue" | "request_advisory_redirect" | "stop_budget";
+  };
+  automatic_execution: false;
+  automatic_promotion: false;
 }
 
 export interface OutcomeVectorItem {

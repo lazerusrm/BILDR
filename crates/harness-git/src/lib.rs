@@ -807,6 +807,57 @@ impl GitManager {
         })
     }
 
+    /// Return the exact binary patch only when the supplied worktree is a
+    /// clean checkout at the controller-recorded head.  This is deliberately
+    /// narrower than a general diff helper: callers can bind model-visible
+    /// evidence to a single immutable source revision without accepting a
+    /// staged, unstaged, or untracked change.
+    pub async fn exact_clean_patch(
+        &self,
+        worktree: &Path,
+        base_sha: &str,
+        expected_head_sha: &str,
+    ) -> Result<Vec<u8>, GitError> {
+        ensure_sha(base_sha)?;
+        ensure_sha(expected_head_sha)?;
+        let root = canonical_repo_root(worktree).await?;
+        if root != fs::canonicalize(worktree)? {
+            return Err(GitError::Policy(
+                "worktree root did not canonicalize exactly".to_owned(),
+            ));
+        }
+        let actual_head_sha = git_text(&root, ["rev-parse", "HEAD"]).await?;
+        if actual_head_sha != expected_head_sha {
+            return Err(GitError::Policy(
+                "worktree head differs from controller-recorded source revision".to_owned(),
+            ));
+        }
+        let status = git_bytes(&root, ["status", "--porcelain=v2", "-z"]).await?;
+        if !status.is_empty() {
+            return Err(GitError::Policy(
+                "worktree has mutable changes outside the controller-recorded commit".to_owned(),
+            ));
+        }
+        let patch = git_bytes(
+            &root,
+            [
+                "diff",
+                "--binary",
+                "--find-renames",
+                base_sha,
+                expected_head_sha,
+                "--",
+            ],
+        )
+        .await?;
+        if patch.len() > 128 * 1024 * 1024 {
+            return Err(GitError::Policy(
+                "controller evidence patch exceeds the 128 MiB boundary".to_owned(),
+            ));
+        }
+        Ok(patch)
+    }
+
     /// Returns a stable digest of HEAD plus every staged, unstaged, and
     /// untracked worktree change. Two consecutive snapshots must agree so an
     /// approval cannot be minted from an internally inconsistent read.

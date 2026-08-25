@@ -1113,6 +1113,33 @@ mod tests {
     }
 
     #[test]
+    fn candidate_schema_accepts_runtime_reconciliation_episode_receipts() {
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../schemas/harness.improvement-candidate.v1.schema.json"
+        ))
+        .expect("candidate schema parses");
+        let validator = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft202012)
+            .build(&schema)
+            .expect("candidate schema compiles");
+        let mut candidate: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../examples/self-improvement/candidate.example.json"
+        ))
+        .expect("candidate fixture parses");
+        candidate["evidence"] = serde_json::json!([{
+            "kind": "reconciliation_episode",
+            "revision_id": "reconciliation-episode-1",
+            "digest": "a".repeat(64),
+            "split": null,
+            "custody": "clean",
+        }]);
+        assert!(
+            validator.is_valid(&candidate),
+            "the canonical candidate schema must admit every receipt kind the runtime resolves"
+        );
+    }
+
+    #[test]
     fn identifiers_and_cost_scopes_are_opaque_bounded_tokens() {
         for invalid in ["operator@example.com", "path/segment", "two words"] {
             let mut value = input("valid", None, CostAttribution::unknown());

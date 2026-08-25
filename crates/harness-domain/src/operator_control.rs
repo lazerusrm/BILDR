@@ -18,6 +18,10 @@ use crate::{MAX_OPERATOR_CONTROL_IDENTIFIER_LEN, is_safe_operator_control_identi
 
 const MAX_IDENTIFIER_LEN: usize = MAX_OPERATOR_CONTROL_IDENTIFIER_LEN;
 const MAX_TOPOLOGY_IDENTIFIER_LEN: usize = MAX_IDENTIFIER_LEN + "attempt:".len();
+// Topology source references are typed provenance strings rather than single
+// identifiers. A dependency can join two full-width controller IDs, so keep a
+// separate bounded ceiling instead of truncating either identity.
+const MAX_TOPOLOGY_SOURCE_REF_LEN: usize = 512;
 const MAX_TITLE_LEN: usize = 240;
 const MAX_SUMMARY_LEN: usize = 4_000;
 const MAX_SECTION_ROWS: usize = 1_000;
@@ -2656,7 +2660,7 @@ impl TopologySnapshot {
             validate_text(
                 &node.source_ref,
                 "topology node source ref",
-                MAX_TOPOLOGY_IDENTIFIER_LEN,
+                MAX_TOPOLOGY_SOURCE_REF_LEN,
             )?;
             if !node_ids.insert(&node.id) {
                 return Err(OperatorControlError::InvalidField {
@@ -2672,7 +2676,7 @@ impl TopologySnapshot {
             validate_text(
                 &edge.source_ref,
                 "topology edge source ref",
-                MAX_TOPOLOGY_IDENTIFIER_LEN,
+                MAX_TOPOLOGY_SOURCE_REF_LEN,
             )?;
             if !node_ids.contains(&edge.from) || !node_ids.contains(&edge.to) {
                 return Err(OperatorControlError::InvalidField {

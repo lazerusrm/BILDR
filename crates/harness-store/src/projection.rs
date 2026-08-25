@@ -6,9 +6,7 @@ use std::{
     },
 };
 
-use harness_domain::{
-    AgentSessionId, CostEstimate, DomainEvent, PricingSnapshot, RunId, TokenUsage, now_ms,
-};
+use harness_domain::{AgentSessionId, CostEstimate, PricingSnapshot, RunId, TokenUsage, now_ms};
 use harness_usage::{add_sample, estimate};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
@@ -118,7 +116,7 @@ impl ProtocolProjection {
         context: &ProjectionContext,
         method: &str,
         payload: &Value,
-    ) -> Result<(i64, DomainEvent), StoreError> {
+    ) -> Result<i64, StoreError> {
         let (stored_payload, redaction_class) = redact_reasoning(
             method,
             payload,
@@ -162,6 +160,15 @@ impl ProtocolProjection {
         }
         self.store.touch_projector("codex-v2", raw_id)?;
 
+        // Token and message deltas are immutable raw evidence, but they are
+        // not domain state transitions. Mirroring each character fragment to
+        // the UI event stream makes a long local-model turn generate tens of
+        // thousands of SSE messages and can starve the command-approval path.
+        // The completed item still publishes the consolidated result.
+        if Self::is_transient_stream_delta(method) {
+            return Ok(raw_id);
+        }
+
         let aggregate_id = context
             .agent_session_id
             .as_ref()
@@ -169,7 +176,7 @@ impl ProtocolProjection {
             .or(thread_id)
             .unwrap_or_else(|| "runtime".to_owned());
         let event_type = method.replace('/', ".");
-        let event = self.store.emit_domain_event(
+        self.store.emit_domain_event(
             context.run_id.as_ref(),
             if context.agent_session_id.is_some() {
                 "agent"
@@ -181,7 +188,49 @@ impl ProtocolProjection {
             &stored_payload,
             Some(raw_id),
         )?;
-        Ok((raw_id, event))
+        Ok(raw_id)
+    }
+
+    fn is_transient_stream_delta(method: &str) -> bool {
+        matches!(
+            method,
+            "item/reasoning/textDelta" | "item/agentMessage/delta"
+        )
+    }
+
+    /// Build the redacted raw receipt for an inbound notification that the
+    /// controller deliberately refuses to project.  The caller commits this
+    /// with its terminal containment state in one transaction, so an unbound
+    /// child can never acquire a parent session binding through projection.
+    pub fn unprojected_notification_input(
+        &self,
+        context: &ProjectionContext,
+        method: &str,
+        payload: &Value,
+        source_sequence: String,
+    ) -> RawEventInput {
+        let (stored_payload, redaction_class) = redact_reasoning(
+            method,
+            payload,
+            self.store_raw_reasoning(),
+            self.store_reasoning_summaries(),
+        );
+        RawEventInput {
+            run_id: context.run_id.clone(),
+            agent_session_id: context.agent_session_id.clone(),
+            thread_id: find_text(&stored_payload, &["threadId"])
+                .or_else(|| find_text(&stored_payload, &["thread", "id"]))
+                .map(ToOwned::to_owned),
+            turn_id: find_text(&stored_payload, &["turnId"])
+                .or_else(|| find_text(&stored_payload, &["turn", "id"]))
+                .map(ToOwned::to_owned),
+            direction: "inbound".to_owned(),
+            method: method.to_owned(),
+            request_id: None,
+            payload: stored_payload,
+            source_sequence: Some(source_sequence),
+            redaction_class,
+        }
     }
 
     pub fn ingest_outbound(
@@ -789,6 +838,42 @@ mod tests {
             })),
             "Waiting for delegated threads · in progress"
         );
+    }
+
+    #[test]
+    fn stream_deltas_remain_raw_evidence_without_domain_event_fanout() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::in_memory(&temp.path().join("artifacts")).unwrap();
+        let projection = ProtocolProjection::new(store.clone(), [], false, true);
+        let context = ProjectionContext {
+            run_id: None,
+            agent_session_id: None,
+        };
+
+        projection
+            .ingest_notification(
+                &context,
+                "item/reasoning/textDelta",
+                &json!({"threadId": "thread-1", "delta": "consider"}),
+            )
+            .unwrap();
+        projection
+            .ingest_notification(
+                &context,
+                "item/agentMessage/delta",
+                &json!({"threadId": "thread-1", "delta": "done"}),
+            )
+            .unwrap();
+
+        let connection = store.connection().unwrap();
+        let raw_count: i64 = connection
+            .query_row("SELECT count(*) FROM raw_events", [], |row| row.get(0))
+            .unwrap();
+        let domain_count: i64 = connection
+            .query_row("SELECT count(*) FROM domain_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(raw_count, 2);
+        assert_eq!(domain_count, 0);
     }
 
     #[test]
