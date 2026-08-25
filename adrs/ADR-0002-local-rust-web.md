@@ -4,7 +4,7 @@
 
 ## Decision
 
-Ship `harnessd` and `harnessctl` as Rust binaries. `harnessd` serves an embedded React/TypeScript UI on localhost and runs under `systemd --user`. A Tauri shell is optional after v1.
+Ship `harnessd` and `harnessctl` as Rust binaries. `harnessd` serves an embedded React/TypeScript UI on localhost and runs under `systemd --user`. `harness-desktop` is a Tauri 2 / wry OS-webview shell that loads that same loopback origin; it is not a second controller.
 
 ## Rationale
 

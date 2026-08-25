@@ -142,6 +142,14 @@ export default function App() {
   const [light, setLight] = useState(
     () => localStorage.getItem("harness-theme") === "light",
   );
+  const desktopShell = isDesktopShell(
+    typeof window === "undefined" ? "" : window.location.search,
+  );
+  const [registerPrefill, setRegisterPrefill] = useState(() =>
+    registerPathFromSearch(
+      typeof window === "undefined" ? "" : window.location.search,
+    ),
+  );
   const reloadTimer = useRef<number | undefined>(undefined);
   const refreshInFlight = useRef(false);
   const requestedRunRef = useRef<string | undefined>(undefined);
@@ -258,6 +266,18 @@ export default function App() {
     document.documentElement.dataset.theme = light ? "light" : "dark";
     localStorage.setItem("harness-theme", light ? "light" : "dark");
   }, [light]);
+
+  useEffect(() => {
+    if (!desktopShell) return;
+    document.documentElement.dataset.shell = "desktop";
+    document.title = "BILDR";
+  }, [desktopShell]);
+
+  useEffect(() => {
+    if (!registerPrefill) return;
+    setView("repositories");
+    setModal("register");
+  }, [registerPrefill]);
 
   useEffect(() => {
     let alive = true;
@@ -951,9 +971,15 @@ export default function App() {
       />
       {modal === "register" && (
         <RegisterModal
-          onClose={() => setModal(null)}
+          initialPath={registerPrefill}
+          allowNativeBrowse={desktopShell}
+          onClose={() => {
+            setModal(null);
+            setRegisterPrefill("");
+          }}
           onDone={async () => {
             setModal(null);
+            setRegisterPrefill("");
             await loadGlobal();
           }}
         />
@@ -2027,18 +2053,24 @@ function RunWorkspace({
       ? 8
       : 0;
   const architectAgents = agents.filter((agent) => !agent.task_id);
+  const currentArchitect =
+    architectAgents.find(
+      (agent) => agent.active_turn_id && activeAgentState(agent.state),
+    ) || architectAgents.at(-1);
   const previousArchitectureAttempts = architectAgents.filter(
     (agent) =>
-      agent.role === "architect" &&
-      ["FAILED", "STALLED", "INTERRUPTED"].includes(agent.state),
+      agent.id !== currentArchitect?.id &&
+      [
+        "FAILED",
+        "STALLED",
+        "INTERRUPTED",
+        "TURN_COMPLETE",
+        "COMPLETED",
+      ].includes(agent.state),
   );
   const visibleArchitectureAgents = architectAgents.filter(
     (agent) => !previousArchitectureAttempts.includes(agent),
   );
-  const currentArchitect =
-    visibleArchitectureAgents.find(
-      (agent) => agent.active_turn_id && activeAgentState(agent.state),
-    ) || visibleArchitectureAgents.at(-1);
   const interviewAgent = detail.intent_interview?.agent_id
     ? agents.find((agent) => agent.id === detail.intent_interview?.agent_id)
     : undefined;
@@ -2654,7 +2686,6 @@ function GoalPlanPanel({
         <header>
           <div>
             <span>Goal</span>
-            <strong>What the governor is pursuing</strong>
           </div>
           <StatusBadge
             value={
@@ -2707,7 +2738,11 @@ function GoalPlanPanel({
         <div className="goal-plan-scroll">
           {detail.plan ? (
             <>
-              <p className="plan-summary">{detail.plan.summary}</p>
+              {detail.plan.summary &&
+                detail.plan.summary.trim() !==
+                  (detail.plan.tasks[0]?.objective || "").trim() && (
+                  <p className="plan-summary">{detail.plan.summary}</p>
+                )}
               <ol className="plan-task-list">
                 {detail.plan.tasks.map((task) => {
                   const runtimeTask = detail.tasks.find(
@@ -2727,7 +2762,9 @@ function GoalPlanPanel({
                   return (
                     <li key={task.task_id}>
                       <b>{task.title}</b>
-                      <span>{task.objective}</span>
+                      {task.objective.trim() !== task.title.trim() && (
+                        <span>{task.objective}</span>
+                      )}
                       {milestones.length > 0 ? (
                         <ol className="milestone-list">
                           {milestones.map((milestone) => (
@@ -2744,10 +2781,7 @@ function GoalPlanPanel({
                           ))}
                         </ol>
                       ) : (
-                        <small>
-                          This legacy task predates milestone checkpoints. The
-                          governor will publish its bounded steps on continuation.
-                        </small>
+                        <small>Milestones will appear when work continues.</small>
                       )}
                     </li>
                   );
@@ -3235,17 +3269,17 @@ function NeedsHelpPanel({
           </div>
           <h2>
             {budgetPaused
-              ? "The controller is reconciling a bounded governor turn"
+              ? "Turn budget hit"
               : noProgressPaused
-                ? "The governor exhausted its no-progress safety window"
+                ? "No progress — paused"
                 : governing
-                  ? "The governor paused after this bounded attempt"
-                  : "The task owner finished this attempt and needs your direction"}
+                  ? "Governor paused"
+                  : "Needs your direction"}
           </h2>
           <p>
             {latestMessage
-              ? `Governor update ${timeAgo(latestMessage.occurred_at)}`
-              : "The governor's final message is loading."}
+              ? timeAgo(latestMessage.occurred_at)
+              : "Waiting for the last governor update"}
           </p>
         </div>
       </header>
@@ -3274,7 +3308,7 @@ function NeedsHelpPanel({
         <div className="handoff-message">
           {latestMessage
             ? humanAgentMessage(latestMessage.text)
-            : "No completed governor update was projected for this attempt. Harness can still continue from controller-owned history."}
+            : "No update yet. You can still continue from controller history."}
         </div>
       </div>
       <div className="help-compose">
@@ -3283,7 +3317,7 @@ function NeedsHelpPanel({
           onChange={(event) => setGuidance(event.target.value)}
           maxLength={1000}
           rows={3}
-          placeholder="Optional: add a priority, decision, or new fact. Leave blank and Harness will choose the next action."
+          placeholder="Decision or fact (optional)"
         />
         <BudgetControl
           label="Next attempt"
@@ -3295,13 +3329,12 @@ function NeedsHelpPanel({
               ? `Adaptive + ${formatTokens(additionalTokenBudget)} tokens`
               : "Adaptive"
           }
-          hint={`Harness currently recommends ${formatTokens(settings?.recommended_governor_attempt_tokens || 650_000)} governor tokens. Bounded child-thread headroom is reserved automatically; manual additions are available through 50m with a 100m hard attempt ceiling.`}
+          hint={`${formatTokens(settings?.recommended_governor_attempt_tokens || 650_000)} recommended for the next governor turn.`}
           compact
         />
         <div>
           <span>
-            {guidance.length}/1000 · durable progress and recent attempts are
-            included automatically
+            {guidance.length}/1000
           </span>
           <button
             className="button primary"
@@ -3847,7 +3880,7 @@ function Inspector({
             rows={3}
           />
           <div>
-            <span>Send without leaving this run</span>
+            <span />
             <button
               className="icon-button danger-hover"
               onClick={onInterrupt}
@@ -3884,7 +3917,6 @@ function InspectorContent({
   detail,
   latestMessage,
   messages,
-  governorLatestMessage,
   onOpenMessages,
 }: {
   task?: Task;
@@ -3907,17 +3939,8 @@ function InspectorContent({
   return (
     <>
       {viewingChild && (
-        <InspectorCard label="Read-only child inspection">
-          <p>
-            You are viewing this delegated thread's work. Continue and Steer
-            remain routed to the governor.
-          </p>
-          <small>
-            Governor: {governor?.state.replaceAll("_", " ")} ·{" "}
-            {governor?.current_action ||
-              governorLatestMessage?.text.slice(0, 180) ||
-              "no recent action"}
-          </small>
+        <InspectorCard label="Child thread">
+          <p>Steer still goes to the governor.</p>
         </InspectorCard>
       )}
       <PlanProgressPanel task={task} governor={governor} detail={detail} />
@@ -3944,8 +3967,8 @@ function InspectorContent({
               : task
                 ? humanTaskState(task.state)
                 : "Unknown"}
-          </strong>{" "}
-          · {agent?.current_action || "No current action"}
+          </strong>
+          {agent?.current_action ? ` · ${agent.current_action}` : ""}
         </p>
         <div className="mini-progress">
           <i
@@ -3955,13 +3978,10 @@ function InspectorContent({
           />
         </div>
         <small>
-          {shortModel(agentModel(agent))} · {agentEffort(agent)} thinking
-        </small>
-        <small>
-          Current turn usage / budget · {formatTokens(agentBudgetUsage(agent))} /{" "}
-          {formatTokens(agent?.token_budget || 0)} · API cost ·{" "}
-          {agent?.estimated_cost_upper || "$0.00"} ·{" "}
-          {agent?.active_turn_id ? "turn active" : "no active turn"}
+          {shortModel(agentModel(agent))} {agentEffort(agent)} ·{" "}
+          {formatTokens(agentBudgetUsage(agent))}/
+          {formatTokens(agent?.token_budget || 0)} ·{" "}
+          {agent?.estimated_cost_upper || "$0.00"}
         </small>
         <details className="thread-details">
           <summary>Goal and runtime</summary>
@@ -4110,40 +4130,64 @@ function PlanProgressPanel({
           })}
         </div>
       )}
-      <div className="selected-phase-summary">
-        <span>
-          Selected phase {selectedPhaseNumber} of {phases.length || 1}
-        </span>
-        <strong>{planTask?.title || task.title}</strong>
-        <small>
-          {completed} of {milestones.length || "—"} outcomes completed ·{" "}
-          {active
-            ? `${active} active outcome${active === 1 ? "" : "s"}`
-            : "no active outcome"}
-        </small>
-      </div>
+      {phases.length > 1 && (
+        <div className="selected-phase-summary">
+          <span>
+            Phase {selectedPhaseNumber} of {phases.length}
+          </span>
+          <strong>{planTask?.title || task.title}</strong>
+        </div>
+      )}
       <div className="inspector-plan-scroll">
         {milestones.length ? (
-          <ol className="inspector-milestones">
-            {milestones.map((milestone) => (
-              <li
-                className={`inspector-milestone ${milestone.status}`}
-                key={milestone.id}
-              >
-                <StatusBadge value={milestone.status} />
-                <div>
-                  <strong>{milestone.title}</strong>
-                  {milestone.outcome !== milestone.title && (
-                    <span>{milestone.outcome}</span>
-                  )}
-                </div>
-              </li>
-            ))}
-          </ol>
+          <>
+            <ol className="inspector-milestones">
+              {(
+                milestones.filter((milestone) =>
+                  ["in_progress", "blocked"].includes(milestone.status),
+                ).length
+                  ? milestones.filter((milestone) =>
+                      ["in_progress", "blocked"].includes(milestone.status),
+                    )
+                  : milestones.filter(
+                      (milestone) => milestone.status === "pending",
+                    ).slice(0, 1)
+              ).map((milestone) => (
+                <li
+                  className={`inspector-milestone ${milestone.status}`}
+                  key={milestone.id}
+                >
+                  <StatusBadge value={milestone.status} />
+                  <div>
+                    <strong>{milestone.title}</strong>
+                  </div>
+                </li>
+              ))}
+            </ol>
+            {milestones.length > 1 && (
+              <details className="remaining-outcomes">
+                <summary>
+                  {completed}/{milestones.length} done
+                  {active ? ` · ${active} active` : ""}
+                </summary>
+                <ol className="inspector-milestones">
+                  {milestones.map((milestone) => (
+                    <li
+                      className={`inspector-milestone ${milestone.status}`}
+                      key={`all-${milestone.id}`}
+                    >
+                      <StatusBadge value={milestone.status} />
+                      <div>
+                        <strong>{milestone.title}</strong>
+                      </div>
+                    </li>
+                  ))}
+                </ol>
+              </details>
+            )}
+          </>
         ) : (
-          <div className="plan-progress-empty">
-            The governor will publish its bounded milestones when work begins.
-          </div>
+          <div className="plan-progress-empty">No milestones yet.</div>
         )}
       </div>
       {assignedAgents.length > 0 && (
@@ -4203,8 +4247,8 @@ function WorkStatusCard({
           run.publication_mode === "draft_pr_after_approval"
         ? "Ready to create a draft pull request"
         : prScope === "No pull request linked"
-          ? "No remote pull request action recorded"
-          : "Remote merge state is not yet confirmed by Harness";
+          ? "No PR"
+          : prScope;
   return (
     <InspectorCard label="Work status">
       <div className="work-status-head">
@@ -4256,7 +4300,7 @@ function MessageHistoryPreview({
   messages: LatestAgentMessage[];
   onOpen: () => void;
 }) {
-  const { scrollRef, onScroll } = useLatestMessageScroll(messages.length);
+  const latest = messages.at(-1);
   return (
     <section className="inspector-card message-history-card">
       <div
@@ -4273,20 +4317,12 @@ function MessageHistoryPreview({
         aria-label={`Open ${label.toLowerCase()}`}
       >
         <span className="inspector-label">{label}</span>
-        <span className="message-open-hint">Open full history ↗</span>
-        <div
-          className="message-history-preview"
-          ref={scrollRef}
-          onScroll={onScroll}
-        >
-          {messages.length ? (
-            messages.map((item) => (
-              <MessageEntry message={item} compact key={item.id} />
-            ))
+        <span className="message-open-hint">Full history</span>
+        <div className="message-history-preview clamped">
+          {latest ? (
+            <MessageEntry message={latest} compact />
           ) : (
-            <div className="message-history-empty">
-              No completed messages yet.
-            </div>
+            <div className="message-history-empty">None yet.</div>
           )}
         </div>
       </div>
@@ -5108,14 +5144,18 @@ function AccountLoginModal({
   );
 }
 
-function RegisterModal({
+export function RegisterModal({
+  initialPath = "",
+  allowNativeBrowse = false,
   onClose,
   onDone,
 }: {
+  initialPath?: string;
+  allowNativeBrowse?: boolean;
   onClose: () => void;
   onDone: () => Promise<void>;
 }) {
-  const [path, setPath] = useState("");
+  const [path, setPath] = useState(initialPath);
   const [query, setQuery] = useState("");
   const [discoveries, setDiscoveries] = useState<RepositoryDiscovery[]>([]);
   const [scanning, setScanning] = useState(true);
@@ -5236,15 +5276,23 @@ function RegisterModal({
         </div>
         <label className="field">
           <span>Repository root</span>
-          <input
-            value={path}
-            onChange={(event) => setPath(event.target.value)}
-            placeholder="/home/you/Documents/project"
-            required
-          />
+          <span className="field-row">
+            <input
+              value={path}
+              onChange={(event) => setPath(event.target.value)}
+              placeholder="/home/you/Documents/project"
+              required
+            />
+            {allowNativeBrowse && (
+              <a className="button" href="bildr://pick-folder">
+                Browse…
+              </a>
+            )}
+          </span>
           <small>
-            Harness checks the active branch, origin, Git identity, cleanliness,
-            and repository instructions.
+            {allowNativeBrowse
+              ? "Use Browse to pick a local Git checkout. Harness still checks the active branch, origin, Git identity, cleanliness, and repository instructions."
+              : "Harness checks the active branch, origin, Git identity, cleanliness, and repository instructions."}
           </small>
         </label>
         {error && <div className="form-error">{error}</div>}
@@ -5977,19 +6025,17 @@ function planningRunState(state: string) {
 }
 
 function planningStateTitle(state: string) {
-  if (state === "PLAN_ADVERSARIAL_REVIEW")
-    return "Independent reviewer is stress-testing the plan";
-  if (state === "PLAN_REVISION_REQUIRED")
-    return "Architect is correcting blocking plan findings";
-  return "Architect is researching and building the plan";
+  if (state === "PLAN_ADVERSARIAL_REVIEW") return "Reviewing the plan";
+  if (state === "PLAN_REVISION_REQUIRED") return "Revising the plan";
+  return "Planning";
 }
 
 function planningStateDetail(state: string) {
   if (state === "PLAN_ADVERSARIAL_REVIEW")
-    return "Checking feasibility, critical-path liveness, behavior-first milestones, test timing, and recovery authority.";
+    return "Independent review of feasibility and recovery.";
   if (state === "PLAN_REVISION_REQUIRED")
-    return "Turning the review findings into a complete replacement plan; approval remains unavailable until it is certified.";
-  return "Reading repository authority, decomposing the goal, and producing reviewable milestones.";
+    return "Replacing the blocked plan. Approval waits on certification.";
+  return "Reading the repo and writing the task graph.";
 }
 
 function terminal(state: string) {
@@ -6117,74 +6163,36 @@ function workStatusSummary(
   diff?: WorktreeDiffSummary,
 ) {
   if (!worktree)
-    return {
-      label: "NO WORKSPACE YET",
-      detail: "Harness has not created a mutable workspace for this work yet.",
-    };
+    return { label: "NO WORKSPACE YET", detail: "No mutable workspace yet." };
   if (
     task &&
     ["INTEGRATED", "CI_PROVEN", "LIVE_PROVEN", "CLOSED"].includes(task.state)
   )
-    return {
-      label: "INTEGRATED",
-      detail:
-        "The controller-committed change is integrated into this run. This does not by itself claim that a remote pull request was merged.",
-    };
+    return { label: "INTEGRATED", detail: "In this run. Not a merged PR." };
   if (task?.state === "VERIFIED")
-    return {
-      label: "VERIFIED COMMIT",
-      detail:
-        "An independent reviewer accepted the controller-owned commit; it is waiting for integration.",
-    };
+    return { label: "VERIFIED COMMIT", detail: "Accepted. Waiting to integrate." };
   if (diff?.state === "committed_and_uncommitted")
     return {
       label: "COMMITTED + UNCOMMITTED",
-      detail:
-        "The workspace has controller-visible commits plus additional uncommitted changes.",
+      detail: "Commits plus extra uncommitted files.",
     };
   if (diff?.state === "uncommitted")
-    return {
-      label: "UNCOMMITTED",
-      detail:
-        "The workspace contains local changes that have not yet passed controller commit and review.",
-    };
+    return { label: "UNCOMMITTED", detail: "Uncommitted local changes." };
   if (diff?.state === "committed")
-    return {
-      label: "COMMITTED",
-      detail:
-        "The workspace head contains commits relative to the run base and has no additional uncommitted changes.",
-    };
+    return { label: "COMMITTED", detail: "Clean vs the run base." };
   if (
     worktree.state === "REVIEW_READY" ||
     task?.state === "REVIEW_READY" ||
     task?.state === "VERIFYING"
   )
-    return {
-      label: "COMMITTED",
-      detail:
-        "Harness committed the custody-checked change and retained it for review.",
-    };
+    return { label: "COMMITTED", detail: "Committed and held for review." };
   if (worktree.state === "CONFLICTED")
-    return {
-      label: "CONFLICT",
-      detail: "The workspace has an integration conflict that needs attention.",
-    };
+    return { label: "CONFLICT", detail: "Integration conflict." };
   if (worktree.dirty || worktree.files_changed > 0)
-    return {
-      label: "UNCOMMITTED",
-      detail:
-        "The workspace contains local changes that have not yet passed controller commit and review.",
-    };
+    return { label: "UNCOMMITTED", detail: "Uncommitted local changes." };
   if (worktree.state === "PRESERVED")
-    return {
-      label: "NO LOCAL CHANGES",
-      detail: "This attempt was preserved without a projected local diff.",
-    };
-  return {
-    label: "CLEAN WORKSPACE",
-    detail:
-      "The managed workspace is clean and no local diff is currently projected.",
-  };
+    return { label: "NO LOCAL CHANGES", detail: "Preserved; no local diff." };
+  return { label: "CLEAN WORKSPACE", detail: "Clean. No local diff." };
 }
 function pullRequestScope(run: Run, task?: Task) {
   const text = [run.title, run.objective, task?.title, task?.objective]
@@ -6347,6 +6355,20 @@ function isTyping(target: EventTarget | null) {
     target instanceof HTMLTextAreaElement ||
     target instanceof HTMLSelectElement
   );
+}
+
+export function registerPathFromSearch(search: string): string {
+  const params = new URLSearchParams(
+    search.startsWith("?") ? search.slice(1) : search,
+  );
+  return (params.get("register") || "").trim();
+}
+
+export function isDesktopShell(search: string): boolean {
+  const params = new URLSearchParams(
+    search.startsWith("?") ? search.slice(1) : search,
+  );
+  return params.get("shell") === "desktop";
 }
 
 export {

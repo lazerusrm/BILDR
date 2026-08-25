@@ -47,11 +47,14 @@ fails closed and reports the expected installed path.
 ```bash
 npm --prefix ui ci
 npm --prefix ui run build
-cargo build --release -p harnessd -p harnessctl -p harness-probe
+cargo build --release -p harnessd -p harnessctl -p harness-probe -p harness-desktop
 
 install -Dm755 target/release/harnessd "$HOME/.local/bin/harnessd"
 install -Dm755 target/release/harnessctl "$HOME/.local/bin/harnessctl"
 install -Dm755 target/release/harness-probe "$HOME/.local/bin/harness-probe"
+install -Dm755 target/release/harness-desktop "$HOME/.local/bin/harness-desktop"
+install -Dm644 packaging/desktop/bildr.desktop \
+  "$HOME/.local/share/applications/bildr.desktop"
 install -Dm644 packaging/systemd/harnessd.service \
   "$HOME/.config/systemd/user/harnessd.service"
 mkdir -p "$HOME/.config/harness-console"
@@ -61,9 +64,10 @@ systemctl --user daemon-reload
 systemctl --user enable --now harnessd.service
 ```
 
-Alternatively, `cargo xtask dist` creates a checksummed tarball with the three
-release binaries, systemd unit, config/profile, Codex agent and skill files,
-schemas, compatibility metadata, API contract, README, version, and license.
+Alternatively, `cargo xtask dist` creates a checksummed tarball with the
+release binaries including `harness-desktop`, systemd unit, desktop launcher,
+config/profile, Codex agent and skill files, schemas, compatibility metadata,
+API contract, README, version, and license.
 
 ## Preflight and local startup
 

@@ -3,6 +3,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   LiveTurnTelemetry,
+  RegisterModal,
   agentEffort,
   agentModel,
   delegatedThreadDisplayState,
@@ -11,10 +12,12 @@ import {
   formatTurnElapsed,
   formatTokens,
   humanTaskState,
+  isDesktopShell,
   primaryTaskAgent,
   pullRequestScope,
   rateLimitForecast,
   recordRateLimitHistory,
+  registerPathFromSearch,
   roleLabel,
   shortModel,
   shortSha,
@@ -22,7 +25,7 @@ import {
   tone,
   workStatusSummary,
 } from "./App";
-import type { Agent, Run, Task, Worktree } from "./types";
+import type { Agent, Run, Task, Worktree, WorktreeDiffSummary } from "./types";
 
 describe("workspace presentation helpers", () => {
   it("keeps terminal and active run states distinct", () => {
@@ -122,7 +125,23 @@ describe("workspace presentation helpers", () => {
     expect(humanTaskState(task.state)).toBe("Waiting on you");
     expect(delegatedThreadDisplayState(child, false)).toBe("FINISHING");
     expect(workStatusSummary(task, worktree).label).toBe("UNCOMMITTED");
+    expect(workStatusSummary(task, worktree).detail.split(" ").length).toBeLessThan(8);
     expect(pullRequestScope(run, task)).toBe("PR #3108");
+  });
+
+  it("keeps work-status copy to a short sentence", () => {
+    const committed = workStatusSummary(
+      { state: "IMPLEMENTING" } as Task,
+      { state: "ACTIVE", dirty: false, files_changed: 0 } as Worktree,
+      { state: "committed" } as WorktreeDiffSummary,
+    );
+    expect(committed.label).toBe("COMMITTED");
+    expect(committed.detail.length).toBeLessThan(40);
+    const integrated = workStatusSummary(
+      { state: "INTEGRATED" } as Task,
+      { state: "ACTIVE" } as Worktree,
+    );
+    expect(integrated.detail.toLowerCase()).toContain("not a merged pr");
   });
 
   it("shows the effective run posture instead of only its lifecycle state", () => {
@@ -245,5 +264,33 @@ describe("workspace presentation helpers", () => {
       now,
     );
     expect(paced[key]).toHaveLength(1);
+  });
+});
+
+describe("desktop register helpers", () => {
+  it("reads the folder-picker query used by the native shell", () => {
+    expect(registerPathFromSearch("?register=%2Fhome%2Fsrc%2Fapp")).toBe(
+      "/home/src/app",
+    );
+    expect(registerPathFromSearch("register=/tmp/repo&shell=desktop")).toBe(
+      "/tmp/repo",
+    );
+    expect(registerPathFromSearch("")).toBe("");
+    expect(isDesktopShell("?shell=desktop")).toBe(true);
+    expect(isDesktopShell("")).toBe(false);
+  });
+
+  it("offers a native browse control when the desktop shell is active", () => {
+    const markup = renderToStaticMarkup(
+      createElement(RegisterModal, {
+        initialPath: "/home/src/app",
+        allowNativeBrowse: true,
+        onClose: () => undefined,
+        onDone: async () => undefined,
+      }),
+    );
+    expect(markup).toContain("Browse");
+    expect(markup).toContain("/home/src/app");
+    expect(markup).toContain("bildr://pick-folder");
   });
 });

@@ -1,0 +1,34 @@
+[package]
+name = "harness-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tauri 2 / wry OS-webview shell for the BILDR operator console"
+default-run = "harness-desktop"
+
+[lib]
+name = "harness_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "harness-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", default-features = true, features = ["tray-icon", "image-png"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+thiserror.workspace = true
+url.workspace = true
+
+[features]
+default = []
+custom-protocol = ["tauri/custom-protocol"]
