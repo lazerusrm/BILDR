@@ -1339,6 +1339,10 @@ kbd {
 .blocked-run-recovery p {
   margin: 0;
   color: var(--muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .blocked-run-recovery-icon {
@@ -1874,7 +1878,7 @@ kbd {
   line-height: 1.4;
 }
 .goal-plan-scroll {
-  max-height: 170px;
+  max-height: 120px;
   overflow: auto;
   padding: 10px 12px;
   scrollbar-gutter: stable;
@@ -1887,9 +1891,13 @@ kbd {
   white-space: pre-wrap;
 }
 .goal-plan-scroll .plan-summary {
-  margin-bottom: 12px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin-bottom: 10px;
   border-bottom: 1px solid var(--line);
-  padding-bottom: 10px;
+  padding-bottom: 8px;
 }
 .goal-plan-scroll ol {
   display: grid;
@@ -2248,7 +2256,7 @@ kbd {
   color: var(--violet);
 }
 .handoff-message {
-  max-height: 175px;
+  max-height: 7.2em;
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -2777,7 +2785,7 @@ kbd {
   margin: 6px 0 0;
   color: var(--soft);
   font-size: 12px;
-  line-height: 1.62;
+  line-height: 1.4;
 }
 .inspector-card small {
   display: block;
@@ -2985,6 +2993,27 @@ kbd {
   margin-top: 9px;
   padding-right: 4px;
   scrollbar-color: var(--line-strong) transparent;
+}
+.message-history-preview.clamped {
+  max-height: 7.5em;
+}
+.message-history-preview.clamped .message-entry {
+  padding: 8px;
+}
+.message-history-preview.clamped .message-entry > div {
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: normal;
+}
+.remaining-outcomes {
+  margin-top: 8px;
+}
+.remaining-outcomes > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 10px;
 }
 .message-history-empty {
   padding: 22px 8px;
@@ -4031,6 +4060,22 @@ kbd {
   color: var(--soft);
   font-size: 10px;
   font-weight: 700;
+}
+.field-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.field-row input {
+  flex: 1;
+  width: auto;
+}
+.field-row .button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+html[data-shell="desktop"] .topbar {
+  padding-right: 12px;
 }
 .field input,
 .field textarea,
