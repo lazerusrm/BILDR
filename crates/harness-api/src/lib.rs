@@ -19,11 +19,12 @@ use harness_domain::{
     is_safe_operator_control_identifier, is_safe_outcome_identifier, is_safe_outcome_reason_code,
 };
 use harness_orchestrator::{
-    ApprovalDecisionRequest, ApproveSignoffRequest, AttestAcceptanceRequest, CreateRunRequest,
-    OperatorSettings, Orchestrator, OrchestratorError, PlanReviewFinding,
-    PrepareCoordinationCheckoutRequest, PublishDraftPrRequest, RegisterRepositoryRequest,
-    RenameCodexAccountRequest, RepositoryDiscovery, RequestSignoffChanges, RetryTaskRequest,
-    StartCodexAccountLoginRequest, UpdateOperatorSettingsRequest,
+    ApprovalDecisionRequest, ApproveSignoffRequest, AttestAcceptanceRequest,
+    CreateLocalProjectRequest, CreateRunRequest, OperatorSettings, Orchestrator, OrchestratorError,
+    PlanReviewFinding, PrepareCoordinationCheckoutRequest, PublishDraftPrRequest,
+    RegisterRepositoryRequest, RenameCodexAccountRequest, RepositoryDiscovery,
+    RequestSignoffChanges, RetryTaskRequest, StartCodexAccountLoginRequest,
+    UpdateOperatorSettingsRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -87,6 +88,7 @@ pub fn router(orchestrator: Arc<Orchestrator>) -> Router {
             "/api/v1/repositories",
             get(list_repositories).post(register_repository),
         )
+        .route("/api/v1/repositories/new-local", post(create_local_project))
         .route("/api/v1/repositories/discover", get(discover_repositories))
         .route("/api/v1/repositories/{repository_id}", get(get_repository))
         .route(
@@ -429,6 +431,16 @@ async fn register_repository(
 ) -> Result<impl IntoResponse, ApiError> {
     authenticate(&state, &headers, true)?;
     let repository = state.orchestrator.register_repository(request).await?;
+    Ok((StatusCode::CREATED, Json(repository)))
+}
+
+async fn create_local_project(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateLocalProjectRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    let repository = state.orchestrator.create_local_project(request).await?;
     Ok((StatusCode::CREATED, Json(repository)))
 }
 

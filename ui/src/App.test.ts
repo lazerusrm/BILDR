@@ -18,6 +18,7 @@ import {
   formatTokens,
   humanTaskState,
   isDesktopShell,
+  newProjectParentFromSearch,
   primaryTaskAgent,
   pullRequestScope,
   rateLimitForecast,
@@ -470,7 +471,13 @@ describe("desktop register helpers", () => {
     expect(registerPathFromSearch("register=/tmp/repo&shell=desktop")).toBe(
       "/tmp/repo",
     );
+    expect(
+      newProjectParentFromSearch(
+        "?new_project_parent=%2Fhome%2Fsrc&shell=desktop",
+      ),
+    ).toBe("/home/src");
     expect(registerPathFromSearch("")).toBe("");
+    expect(newProjectParentFromSearch("")).toBe("");
     expect(isDesktopShell("?shell=desktop")).toBe(true);
     expect(isDesktopShell("")).toBe(false);
   });
@@ -487,5 +494,6 @@ describe("desktop register helpers", () => {
     expect(markup).toContain("Browse");
     expect(markup).toContain("/home/src/app");
     expect(markup).toContain("bildr://pick-folder");
+    expect(markup).toContain("Create new local project");
   });
 });

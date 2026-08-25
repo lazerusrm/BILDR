@@ -194,6 +194,13 @@ class HarnessApi {
     });
   }
 
+  createLocalProject(parentPath: string, projectName: string) {
+    return this.post<Repository>("/repositories/new-local", {
+      parent_path: parentPath,
+      project_name: projectName,
+    });
+  }
+
   prepareCoordinationCheckout(repositoryId: string, destinationPath: string) {
     return this.post<Repository>(
       `/repositories/${repositoryId}/prepare-clean-checkout`,

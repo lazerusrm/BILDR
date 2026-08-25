@@ -76,6 +76,7 @@ type Modal =
   | "palette"
   | "messages"
   | null;
+type ProjectMode = "existing" | "new";
 
 const nav: Array<{ view: View; label: string; icon: typeof Home }> = [
   { view: "home", label: "Home", icon: Home },
@@ -161,6 +162,14 @@ export default function App() {
       typeof window === "undefined" ? "" : window.location.search,
     ),
   );
+  const [newProjectParentPrefill, setNewProjectParentPrefill] = useState(() =>
+    newProjectParentFromSearch(
+      typeof window === "undefined" ? "" : window.location.search,
+    ),
+  );
+  const [registerMode, setRegisterMode] = useState<ProjectMode>("existing");
+  const [openRunAfterProject, setOpenRunAfterProject] = useState(false);
+  const [newRunRepositoryId, setNewRunRepositoryId] = useState<string>();
   const reloadTimer = useRef<number | undefined>(undefined);
   const refreshInFlight = useRef(false);
   const requestedRunRef = useRef<string | undefined>(undefined);
@@ -290,8 +299,16 @@ export default function App() {
   useEffect(() => {
     if (!registerPrefill) return;
     setView("repositories");
+    setRegisterMode("existing");
     setModal("register");
   }, [registerPrefill]);
+
+  useEffect(() => {
+    if (!newProjectParentPrefill) return;
+    setView("repositories");
+    setRegisterMode("new");
+    setModal("register");
+  }, [newProjectParentPrefill]);
 
   useEffect(() => {
     let alive = true;
@@ -624,7 +641,15 @@ export default function App() {
                 }
               }}
               onSelect={chooseRun}
-              onNew={() => setModal("new-run")}
+              onNew={() => {
+                if (repositories.length) {
+                  setModal("new-run");
+                } else {
+                  setRegisterMode("new");
+                  setOpenRunAfterProject(true);
+                  setModal("register");
+                }
+              }}
             />
           )}
           {view === "home" && (
@@ -633,17 +658,29 @@ export default function App() {
               runs={runs}
               postures={visibleRunPostures}
               runtime={runtime}
-              onNewRun={() =>
-                setModal(repositories.length ? "new-run" : "register")
-              }
+              onNewRun={() => {
+                if (repositories.length) {
+                  setModal("new-run");
+                } else {
+                  setRegisterMode("new");
+                  setOpenRunAfterProject(true);
+                  setModal("register");
+                }
+              }}
               onRun={chooseRun}
-              onRegister={() => setModal("register")}
+              onRegister={() => {
+                setRegisterMode("existing");
+                setModal("register");
+              }}
             />
           )}
           {view === "repositories" && (
             <RepositoriesView
               repositories={repositories}
-              onRegister={() => setModal("register")}
+              onRegister={() => {
+                setRegisterMode("existing");
+                setModal("register");
+              }}
               onInspect={(id) =>
                 runAction(
                   "inspect",
@@ -658,7 +695,17 @@ export default function App() {
             />
           )}
           {view === "runs" && !currentRun && (
-            <EmptyRuns onNew={() => setModal("new-run")} />
+            <EmptyRuns
+              onNew={() => {
+                if (repositories.length) {
+                  setModal("new-run");
+                } else {
+                  setRegisterMode("new");
+                  setOpenRunAfterProject(true);
+                  setModal("register");
+                }
+              }}
+            />
           )}
           {view === "runs" && currentRun && !currentDetail && (
             <RunLoading run={currentRun} />
@@ -1020,16 +1067,30 @@ export default function App() {
       />
       {modal === "register" && (
         <RegisterModal
-          initialPath={registerPrefill}
+          initialPath={
+            registerMode === "new" ? newProjectParentPrefill : registerPrefill
+          }
+          initialMode={registerMode}
           allowNativeBrowse={desktopShell}
           onClose={() => {
             setModal(null);
             setRegisterPrefill("");
+            setNewProjectParentPrefill("");
+            setOpenRunAfterProject(false);
           }}
-          onDone={async () => {
-            setModal(null);
+          onDone={async (repository) => {
             setRegisterPrefill("");
+            setNewProjectParentPrefill("");
             await loadGlobal();
+            setToast(`${repository.display_name} is ready in BILDR`);
+            window.setTimeout(() => setToast(""), 3200);
+            if (openRunAfterProject) {
+              setNewRunRepositoryId(repository.id);
+              setOpenRunAfterProject(false);
+              setModal("new-run");
+            } else {
+              setModal(null);
+            }
           }}
         />
       )}
@@ -1050,11 +1111,21 @@ export default function App() {
       {modal === "new-run" && (
         <NewRunModal
           repositories={repositories}
+          initialRepositoryId={newRunRepositoryId}
           accounts={codexAccounts}
           modelCatalog={runModelCatalog}
           settings={operatorSettings}
-          onClose={() => setModal(null)}
+          onClose={() => {
+            setNewRunRepositoryId(undefined);
+            setModal(null);
+          }}
+          onCreateProject={() => {
+            setRegisterMode("new");
+            setOpenRunAfterProject(true);
+            setModal("register");
+          }}
           onDone={async (run, startError) => {
+            setNewRunRepositoryId(undefined);
             setModal(null);
             await loadGlobal();
             chooseRun(run.id);
@@ -1083,8 +1154,19 @@ export default function App() {
             setView(next);
             setModal(null);
           }}
-          onNewRun={() => setModal("new-run")}
-          onRegister={() => setModal("register")}
+          onNewRun={() => {
+            if (repositories.length) {
+              setModal("new-run");
+            } else {
+              setRegisterMode("new");
+              setOpenRunAfterProject(true);
+              setModal("register");
+            }
+          }}
+          onRegister={() => {
+            setRegisterMode("existing");
+            setModal("register");
+          }}
         />
       )}
       {modal === "messages" && (
@@ -1821,11 +1903,11 @@ function HomeView({
         ) : (
           <EmptyCard
             icon={<FolderGit2 />}
-            title="Register a repository"
-            text="Choose any clean local Git checkout. Harness keeps its managed work separate from your primary checkout."
+            title="Add your first project"
+            text="Register a clean local Git checkout, or create a new local project. BILDR keeps managed work separate from your primary checkout."
             action={
               <button className="button" onClick={onRegister}>
-                Register repository
+                Add project
               </button>
             }
           />
@@ -1872,13 +1954,13 @@ function RepositoriesView({
   return (
     <div className="page">
       <PageTitle
-        eyebrow="Local checkouts"
+        eyebrow="Local projects"
         title="Repositories"
-        description="Registered coordination checkouts and anything that needs attention."
+        description="Registered checkouts, local-only projects, and anything that needs attention."
         action={
           <button className="button primary" onClick={onRegister}>
             <Plus size={14} />
-            Register
+            Add project
           </button>
         }
       />
@@ -1905,12 +1987,12 @@ function RepositoriesView({
               className={`truncate ${repository.blockers.length ? "danger" : ""}`}
               title={repository.blockers.join("; ")}
             >
-              {repository.blockers[0] || repository.origin_url || "missing"}
+              {repository.blockers[0] || repository.origin_url || "Local-only"}
             </span>
             <span>{repository.managed_worktree_count}</span>
             <StatusBadge value={repository.health} />
             <div className="repo-actions">
-              {repository.blockers.includes("primary checkout is dirty") && (
+              {repository.origin_url && repository.blockers.includes("primary checkout is dirty") && (
                 <button
                   className="button primary"
                   onClick={() => onPrepare(repository.id)}
@@ -5630,19 +5712,26 @@ function AccountLoginModal({
 
 export function RegisterModal({
   initialPath = "",
+  initialMode = "existing",
   allowNativeBrowse = false,
   onClose,
   onDone,
 }: {
   initialPath?: string;
+  initialMode?: ProjectMode;
   allowNativeBrowse?: boolean;
   onClose: () => void;
-  onDone: () => Promise<void>;
+  onDone: (repository: Repository) => Promise<void>;
 }) {
+  const [mode, setMode] = useState<ProjectMode>(initialMode);
   const [path, setPath] = useState(initialPath);
+  const [parentPath, setParentPath] = useState(
+    initialMode === "new" ? initialPath : "",
+  );
+  const [projectName, setProjectName] = useState("");
   const [query, setQuery] = useState("");
   const [discoveries, setDiscoveries] = useState<RepositoryDiscovery[]>([]);
-  const [scanning, setScanning] = useState(true);
+  const [scanning, setScanning] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const scan = useCallback(async () => {
@@ -5662,15 +5751,21 @@ export function RegisterModal({
     }
   }, []);
   useEffect(() => {
-    scan();
-  }, [scan]);
+    if (mode === "existing") {
+      scan();
+    } else {
+      setScanning(false);
+    }
+  }, [mode, scan]);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setBusy(true);
     setError("");
     try {
-      await api.registerRepository(path);
-      await onDone();
+      const repository = mode === "existing"
+        ? await api.registerRepository(path)
+        : await api.createLocalProject(parentPath, projectName);
+      await onDone(repository);
     } catch (caught) {
       setError(message(caught));
     } finally {
@@ -5687,105 +5782,196 @@ export function RegisterModal({
     : discoveries;
   return (
     <ModalFrame
-      title="Register a repository"
-      eyebrow="Local Git checkout"
+      title="Add a project"
+      eyebrow="Existing checkout or new local folder"
       onClose={onClose}
       wide
     >
       <form onSubmit={submit}>
-        <div className="discovery-header">
-          <div>
-            <strong>Discovered checkouts</strong>
-            <span>
-              {discoveries.length
-                ? `${discoveries.length} local Git checkouts found`
-                : "Choose a GitHub checkout or enter a local path."}
-            </span>
-          </div>
-          <button
-            type="button"
-            className="button subtle"
-            onClick={scan}
-            disabled={scanning}
-          >
-            <RefreshCw size={13} className={scanning ? "spin" : ""} />
-            {scanning ? "Scanning…" : "Scan again"}
-          </button>
-        </div>
-        {discoveries.length > 8 && (
-          <label className="discovery-search">
-            <Search size={14} />
+        <div className="compact-choice">
+          <label>
             <input
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Filter by repository, path, or origin…"
-              autoFocus
+              type="radio"
+              checked={mode === "existing"}
+              onChange={() => {
+                setMode("existing");
+                setError("");
+              }}
             />
+            <span>
+              <b>Use existing Git checkout</b>
+              <small>Register a project already on disk</small>
+            </span>
           </label>
-        )}
-        <div className="discovery-list">
-          {scanning && !discoveries.length ? (
-            <div className="discovery-empty">
-              Looking for local Git checkouts…
-            </div>
-          ) : visibleDiscoveries.length ? (
-            visibleDiscoveries.map((item) => (
+          <label>
+            <input
+              type="radio"
+              checked={mode === "new"}
+              onChange={() => {
+                setMode("new");
+                setError("");
+              }}
+            />
+            <span>
+              <b>Create new local project</b>
+              <small>Make a folder and initialise its Git history</small>
+            </span>
+          </label>
+        </div>
+        {mode === "existing" ? (
+          <>
+            <div className="discovery-header">
+              <div>
+                <strong>Discovered checkouts</strong>
+                <span>
+                  {discoveries.length
+                    ? `${discoveries.length} local Git checkouts found`
+                    : "Choose a Git checkout or enter a local path."}
+                </span>
+              </div>
               <button
                 type="button"
-                className={`discovery-row ${path === item.root_path ? "selected" : ""}`}
-                key={item.root_path}
-                onClick={() => setPath(item.root_path)}
-                disabled={item.registered}
+                className="button subtle"
+                onClick={scan}
+                disabled={scanning}
               >
-                <FolderGit2 size={16} />
-                <span>
-                  <strong>{item.display_name}</strong>
-                  <small className="mono">{item.root_path}</small>
-                  <small>{item.origin_url || "No origin remote"}</small>
-                </span>
-                <span className="discovery-badges">
-                  {item.compatible && <em>Ready</em>}
-                  {item.is_github && <em>GitHub</em>}
-                  {item.registered && <em>Registered</em>}
-                </span>
+                <RefreshCw size={13} className={scanning ? "spin" : ""} />
+                {scanning ? "Scanning…" : "Scan again"}
               </button>
-            ))
-          ) : (
-            <div className="discovery-empty">
-              {normalizedQuery
-                ? "No checkout matches this filter."
-                : "No checkouts found in common folders. Enter a path below."}
             </div>
-          )}
-        </div>
-        <label className="field">
-          <span>Repository root</span>
-          <span className="field-row">
-            <input
-              value={path}
-              onChange={(event) => setPath(event.target.value)}
-              placeholder="/home/you/Documents/project"
-              required
-            />
-            {allowNativeBrowse && (
-              <a className="button" href="bildr://pick-folder">
-                Browse…
-              </a>
+            {discoveries.length > 8 && (
+              <label className="discovery-search">
+                <Search size={14} />
+                <input
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder="Filter by repository, path, or origin…"
+                  autoFocus
+                />
+              </label>
             )}
-          </span>
-          <small>
-            {allowNativeBrowse
-              ? "Use Browse to pick a local Git checkout. Harness still checks the active branch, origin, Git identity, cleanliness, and repository instructions."
-              : "Harness checks the active branch, origin, Git identity, cleanliness, and repository instructions."}
-          </small>
-        </label>
+            <div className="discovery-list">
+              {scanning && !discoveries.length ? (
+                <div className="discovery-empty">
+                  Looking for local Git checkouts…
+                </div>
+              ) : visibleDiscoveries.length ? (
+                visibleDiscoveries.map((item) => (
+                  <button
+                    type="button"
+                    className={`discovery-row ${path === item.root_path ? "selected" : ""}`}
+                    key={item.root_path}
+                    onClick={() => setPath(item.root_path)}
+                    disabled={item.registered}
+                  >
+                    <FolderGit2 size={16} />
+                    <span>
+                      <strong>{item.display_name}</strong>
+                      <small className="mono">{item.root_path}</small>
+                      <small>{item.origin_url || "Local-only (no origin)"}</small>
+                    </span>
+                    <span className="discovery-badges">
+                      {item.compatible && <em>Ready</em>}
+                      {item.is_github && <em>GitHub</em>}
+                      {item.registered && <em>Registered</em>}
+                    </span>
+                  </button>
+                ))
+              ) : (
+                <div className="discovery-empty">
+                  {normalizedQuery
+                    ? "No checkout matches this filter."
+                    : "No checkouts found in common folders. Enter a path below."}
+                </div>
+              )}
+            </div>
+            <label className="field">
+              <span>Repository root</span>
+              <span className="field-row">
+                <input
+                  value={path}
+                  onChange={(event) => setPath(event.target.value)}
+                  placeholder="/home/you/Documents/project"
+                  required={mode === "existing"}
+                />
+                {allowNativeBrowse && (
+                  <a className="button" href="bildr://pick-folder">
+                    Browse…
+                  </a>
+                )}
+              </span>
+              <small>
+                {allowNativeBrowse
+                  ? "Use Browse to pick a local checkout. BILDR checks the active branch, Git identity, cleanliness, and repository instructions. A remote is optional for local-only work."
+                  : "BILDR checks the active branch, Git identity, cleanliness, and repository instructions. A remote is optional for local-only work."}
+              </small>
+            </label>
+          </>
+        ) : (
+          <div className="form-grid">
+            <label className="field">
+              <span>Parent folder</span>
+              <span className="field-row">
+                <input
+                  autoFocus
+                  value={parentPath}
+                  onChange={(event) => setParentPath(event.target.value)}
+                  placeholder="/home/you/Documents"
+                  required={mode === "new"}
+                />
+                {allowNativeBrowse && (
+                  <a
+                    className="button"
+                    href="bildr://pick-folder?purpose=new-project"
+                  >
+                    Browse…
+                  </a>
+                )}
+              </span>
+              <small>
+                An existing absolute folder. BILDR creates one new child folder inside it.
+              </small>
+            </label>
+            <label className="field">
+              <span>Project folder name</span>
+              <input
+                value={projectName}
+                onChange={(event) => setProjectName(event.target.value)}
+                placeholder="my-new-project"
+                required={mode === "new"}
+                maxLength={128}
+              />
+              <small>
+                BILDR creates <span className="mono">{parentPath || "/parent"}/{projectName || "project"}</span>.
+              </small>
+            </label>
+            <div className="pin-note">
+              <ShieldCheck size={15} />
+              <span>
+                The new folder receives a local <span className="mono">main</span> branch, README, and initial commit so managed worktrees have an exact base. No remote is added and nothing is published.
+              </span>
+            </div>
+          </div>
+        )}
         {error && <div className="form-error">{error}</div>}
         <div className="modal-actions">
           <button type="button" className="button" onClick={onClose}>
             Cancel
           </button>
-          <button className="button primary" disabled={!path.trim() || busy}>
-            {busy ? "Inspecting…" : "Register repository"}
+          <button
+            className="button primary"
+            disabled={
+              busy ||
+              (mode === "existing" ? !path.trim() : !parentPath.trim() || !projectName.trim())
+            }
+          >
+            {busy
+              ? mode === "existing"
+                ? "Inspecting…"
+                : "Creating…"
+              : mode === "existing"
+                ? "Register project"
+                : "Create local project"}
           </button>
         </div>
       </form>
@@ -5893,20 +6079,26 @@ function suggestedCoordinationPath(root?: string) {
 
 function NewRunModal({
   repositories,
+  initialRepositoryId,
   accounts,
   modelCatalog,
   settings,
   onClose,
+  onCreateProject,
   onDone,
 }: {
   repositories: Repository[];
+  initialRepositoryId?: string;
   accounts: CodexAccountsSnapshot;
   modelCatalog: RunModelCatalog;
   settings?: OperatorSettings;
   onClose: () => void;
+  onCreateProject: () => void;
   onDone: (run: Run, startError?: string) => Promise<void>;
 }) {
-  const [repository, setRepository] = useState(repositories[0]?.id || "");
+  const [repository, setRepository] = useState(
+    initialRepositoryId || repositories[0]?.id || "",
+  );
   const [objective, setObjective] = useState("");
   const [automaticPlanApproval, setAutomaticPlanApproval] = useState(false);
   const [deepInterview, setDeepInterview] = useState(false);
@@ -5933,6 +6125,15 @@ function NewRunModal({
         : (modelCatalog.models[0]?.id || ""),
     );
   }, [modelCatalog]);
+  useEffect(() => {
+    setRepository((current) =>
+      repositories.some((item) => item.id === current)
+        ? current
+        : (initialRepositoryId && repositories.some((item) => item.id === initialRepositoryId)
+          ? initialRepositoryId
+          : (repositories[0]?.id || "")),
+    );
+  }, [initialRepositoryId, repositories]);
   const selectedModel = modelCatalog.models.find((model) => model.id === runModel);
   const selectedModelEfforts = selectedModel?.reasoning_efforts ?? EMPTY_STRING_ARRAY;
   useEffect(() => {
@@ -6047,7 +6248,7 @@ function NewRunModal({
         </label>
         <div className="form-grid">
           <label className="field">
-            <span>Repository</span>
+            <span>Project</span>
             <select
               value={repository}
               onChange={(event) => setRepository(event.target.value)}
@@ -6058,11 +6259,19 @@ function NewRunModal({
                 </option>
               ))}
             </select>
+            <button
+              type="button"
+              className="button subtle"
+              onClick={onCreateProject}
+              disabled={busy}
+            >
+              Create new local project…
+            </button>
           </label>
           <label className="field">
             <span>Base</span>
             <input
-              value={`origin/${selectedRepository?.default_branch || "main"}`}
+              value={`${selectedRepository?.origin_url ? "origin/" : ""}${selectedRepository?.default_branch || "main"}`}
               readOnly
             />
           </label>
@@ -6184,8 +6393,9 @@ function NewRunModal({
               type="radio"
               checked={publication === "draft_pr_after_approval"}
               onChange={() => setPublication("draft_pr_after_approval")}
+              disabled={!selectedRepository?.origin_url}
             />
-            Draft PR after approval
+            Draft PR after approval{!selectedRepository?.origin_url ? " · remote required" : ""}
           </label>
         </div>
         <div className="pin-note">
@@ -6983,6 +7193,13 @@ export function registerPathFromSearch(search: string): string {
     search.startsWith("?") ? search.slice(1) : search,
   );
   return (params.get("register") || "").trim();
+}
+
+export function newProjectParentFromSearch(search: string): string {
+  const params = new URLSearchParams(
+    search.startsWith("?") ? search.slice(1) : search,
+  );
+  return (params.get("new_project_parent") || "").trim();
 }
 
 export function isDesktopShell(search: string): boolean {

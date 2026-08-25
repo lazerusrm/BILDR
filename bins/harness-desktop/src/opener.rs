@@ -7,8 +7,9 @@ use crate::origin::{OriginError, accept_webview_url, query_value};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenerAction {
     ShowWindow,
-    PickFolder,
+    PickFolder { new_project: bool },
     Register { path: PathBuf },
+    NewProject { parent_path: PathBuf },
 }
 
 pub const PROTOCOL_SCHEMES: &[&str] = &["bildr", "harness"];
@@ -24,6 +25,13 @@ pub fn parse_opener(argument: &str) -> Result<OpenerAction, OriginError> {
     }
     if url.scheme() == "http" {
         let accepted = accept_webview_url(value)?;
+        if let Some(parent_path) = query_value(&accepted, "new_project_parent")
+            && !parent_path.is_empty()
+        {
+            return Ok(OpenerAction::NewProject {
+                parent_path: PathBuf::from(parent_path),
+            });
+        }
         if let Some(path) = query_value(&accepted, "register")
             && !path.is_empty()
         {
@@ -46,11 +54,21 @@ fn parse_app_scheme(url: &Url) -> Result<OpenerAction, OriginError> {
     let command = if command.is_empty() { "open" } else { command };
     match command {
         "open" | "show" => Ok(OpenerAction::ShowWindow),
-        "pick-folder" | "pick_folder" | "browse" => Ok(OpenerAction::PickFolder),
+        "pick-folder" | "pick_folder" | "browse" => Ok(OpenerAction::PickFolder {
+            new_project: match query_value(url, "purpose").as_deref() {
+                None | Some("repository") => false,
+                Some("new-project") => true,
+                Some(other) => {
+                    return Err(OriginError(format!(
+                        "unknown folder-picker purpose {other}"
+                    )));
+                }
+            },
+        }),
         "register" => {
             let path = query_value(url, "path").or_else(|| query_value(url, "register"));
             let Some(path) = path.filter(|value| !value.is_empty()) else {
-                return Ok(OpenerAction::PickFolder);
+                return Ok(OpenerAction::PickFolder { new_project: false });
             };
             Ok(OpenerAction::Register {
                 path: PathBuf::from(path),
@@ -66,6 +84,18 @@ pub fn register_query_url(origin: &Url, folder: &Path) -> Result<Url, OriginErro
         .to_str()
         .ok_or_else(|| OriginError("repository folder path is not valid UTF-8".to_owned()))?;
     Ok(crate::origin::with_query(&origin, "register", path))
+}
+
+pub fn new_project_query_url(origin: &Url, folder: &Path) -> Result<Url, OriginError> {
+    let origin = accept_webview_url(origin.as_str())?;
+    let path = folder
+        .to_str()
+        .ok_or_else(|| OriginError("new project folder path is not valid UTF-8".to_owned()))?;
+    Ok(crate::origin::with_query(
+        &origin,
+        "new_project_parent",
+        path,
+    ))
 }
 
 #[cfg(test)]
@@ -92,7 +122,11 @@ mod tests {
     fn protocol_opener_picks_a_folder_or_registers() {
         assert_eq!(
             parse_opener("bildr://pick-folder").expect("pick"),
-            OpenerAction::PickFolder
+            OpenerAction::PickFolder { new_project: false }
+        );
+        assert_eq!(
+            parse_opener("bildr://pick-folder?purpose=new-project").expect("new project pick"),
+            OpenerAction::PickFolder { new_project: true }
         );
         assert_eq!(
             parse_opener("bildr://register?path=/home/src/app").expect("register"),
@@ -109,6 +143,11 @@ mod tests {
         assert_eq!(query_value(&url, "shell").as_deref(), Some("desktop"));
         assert_eq!(url.scheme(), "http");
         assert_eq!(url.host_str(), Some("127.0.0.1"));
+        let project_url = new_project_query_url(&origin, Path::new("/home/src")).expect("project");
+        assert_eq!(
+            query_value(&project_url, "new_project_parent").as_deref(),
+            Some("/home/src")
+        );
     }
 
     #[test]

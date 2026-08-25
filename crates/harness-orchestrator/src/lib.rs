@@ -1501,6 +1501,16 @@ pub struct RegisterRepositoryRequest {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct CreateLocalProjectRequest {
+    /// Existing absolute directory that will contain the newly created project.
+    pub parent_path: PathBuf,
+    /// A single new directory name; paths and hidden staging-style names are
+    /// rejected by the Git custody layer.
+    pub project_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrepareCoordinationCheckoutRequest {
     pub destination_path: PathBuf,
 }
@@ -2900,6 +2910,61 @@ impl Orchestrator {
             repository_id.as_str(),
             "repository.registered",
             &serde_json::to_value(&inspection)?,
+            None,
+        )?;
+        self.store.repository(&repository_id).map_err(Into::into)
+    }
+
+    /// Provisions a new, local-only general project. This deliberately does
+    /// not accept a remote or perform any external write: the first Git commit
+    /// merely gives BILDR an immutable base for managed worktrees.
+    pub async fn create_local_project(
+        &self,
+        request: CreateLocalProjectRequest,
+    ) -> Result<RepositorySummary, OrchestratorError> {
+        let profile = self.profile_by_id("general")?;
+        let root = self
+            .git
+            .create_local_project(&request.parent_path, &request.project_name)
+            .await?;
+        let inspection = self.git.inspect(&root, &profile.profile).await?;
+        let repository_id = RepositoryId::new();
+        let default_branch = inspection.current_branch.clone().ok_or_else(|| {
+            OrchestratorError::Blocked(
+                "new local project was initialized on a detached HEAD".to_owned(),
+            )
+        })?;
+        let display_name = inspection
+            .root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| request.project_name.trim().to_owned());
+        self.store.create_repository(&NewRepository {
+            id: repository_id.clone(),
+            profile_id: profile.profile.profile_id.clone(),
+            profile_version: profile.profile.schema_version,
+            display_name,
+            root_path: inspection.root.clone(),
+            origin_url: None,
+            default_branch: default_branch.clone(),
+            expected_coordination_branch: Some(default_branch),
+            state: if inspection.blockers.is_empty() {
+                "READY".to_owned()
+            } else {
+                "BLOCKED".to_owned()
+            },
+        })?;
+        self.record_inspection(&repository_id, &inspection, None)?;
+        self.store.emit_domain_event(
+            None,
+            "repository",
+            repository_id.as_str(),
+            "repository.local_project_created",
+            &json!({
+                "inspection": inspection,
+                "local_only": true,
+                "remote_configured": false,
+            }),
             None,
         )?;
         self.store.repository(&repository_id).map_err(Into::into)
@@ -4362,6 +4427,11 @@ impl Orchestrator {
             )));
         }
         let repository = self.store.repository(&request.repository_id)?;
+        if request.publication == "draft_pr_after_approval" && repository.origin_url.is_none() {
+            return Err(OrchestratorError::Blocked(
+                "draft PR publication requires a repository origin remote".to_owned(),
+            ));
+        }
         let profile = self.profile_for_repository(&repository)?;
         let run_model = request.run_model.clone();
         let selected_run_model = self.validate_run_model_route(&run_model)?;
@@ -4393,7 +4463,9 @@ impl Orchestrator {
             return Err(OrchestratorError::Blocked(fresh.blockers.join("; ")));
         }
         let base_ref = request.base_ref.clone().unwrap_or_else(|| {
-            if profile.profile.base_ref == "auto" {
+            if repository.origin_url.is_none() {
+                repository.default_branch.clone()
+            } else if profile.profile.base_ref == "auto" {
                 format!("origin/{}", repository.default_branch)
             } else {
                 profile.profile.base_ref.clone()
@@ -4404,7 +4476,7 @@ impl Orchestrator {
             .fetch_and_pin(
                 Path::new(&repository.root_path),
                 &base_ref,
-                self.config.git.fetch_before_run,
+                self.config.git.fetch_before_run && repository.origin_url.is_some(),
             )
             .await?;
         let run_id = RunId::new();
@@ -26327,7 +26399,7 @@ mod tests {
         assert!(instructions.contains("do not plan or implement"));
         assert!(INTENT_INTERVIEW_CONTRACT.contains("one highest-leverage question at a time"));
         assert!(INTENT_INTERVIEW_CONTRACT.contains("raw conversation is not planner input"));
-        assert!(INTENT_INTERVIEW_RESPONSE_FORMAT.contains("For a question, `brief` must be null"));
+        assert!(INTENT_INTERVIEW_RESPONSE_FORMAT.contains("`brief` must be null"));
         assert!(INTENT_INTERVIEW_RESPONSE_FORMAT.contains("Include every key shown"));
     }
 

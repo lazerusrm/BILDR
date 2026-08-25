@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::capabilities::{IPC_COMMANDS, WEBVIEW_ENGINE};
 use crate::notify::{fetch_pending_approval_count, pending_approval_notification};
-use crate::opener::{OpenerAction, parse_opener, register_query_url};
+use crate::opener::{OpenerAction, new_project_query_url, parse_opener, register_query_url};
 use crate::options::DesktopOptions;
 use crate::origin::{accept_webview_url, desktop_shell_url};
 use crate::sidecar::{
@@ -50,13 +50,16 @@ pub fn run() -> Result<()> {
     }
 
     let mut url = desktop_shell_url(plan.url());
-    let mut pick_on_open = false;
+    let mut pick_on_open = None;
     if let Some(opener) = &options.opener {
         match parse_opener(opener).context("opener")? {
             OpenerAction::ShowWindow => {}
-            OpenerAction::PickFolder => pick_on_open = true,
+            OpenerAction::PickFolder { new_project } => pick_on_open = Some(new_project),
             OpenerAction::Register { path } => {
                 url = register_query_url(&url, &path).context("register opener")?;
+            }
+            OpenerAction::NewProject { parent_path } => {
+                url = new_project_query_url(&url, &parent_path).context("new project opener")?;
             }
         }
     }
@@ -79,8 +82,8 @@ pub fn run() -> Result<()> {
             let _ = IPC_COMMANDS;
             install_tray(app.handle())?;
             open_operator_window(app.handle(), url.clone())?;
-            if pick_on_open {
-                pick_folder_and_navigate(app.handle());
+            if let Some(new_project) = pick_on_open {
+                pick_folder_and_navigate(app.handle(), new_project);
             }
             start_approval_poller(app.handle().clone());
             Ok(())
@@ -129,8 +132,11 @@ fn navigation_allowed(app: &AppHandle, url: &Url) -> bool {
             Ok(OpenerAction::ShowWindow) => {
                 let _ = reveal_window(app);
             }
-            Ok(OpenerAction::PickFolder) => pick_folder_and_navigate(app),
+            Ok(OpenerAction::PickFolder { new_project }) => {
+                pick_folder_and_navigate(app, new_project)
+            }
             Ok(OpenerAction::Register { path }) => navigate_register(app, &path),
+            Ok(OpenerAction::NewProject { parent_path }) => navigate_new_project(app, &parent_path),
             Err(error) => eprintln!("opener rejected: {error}"),
         }
         return false;
@@ -151,8 +157,10 @@ fn navigation_allowed(app: &AppHandle, url: &Url) -> bool {
 fn install_tray(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Show BILDR", true, None::<&str>)?;
     let register = MenuItem::with_id(app, "register", "Register repository…", true, None::<&str>)?;
+    let new_project =
+        MenuItem::with_id(app, "new-project", "New local project…", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &register, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &register, &new_project, &quit])?;
     let mut tray = TrayIconBuilder::with_id("bildr")
         .menu(&menu)
         .tooltip("BILDR")
@@ -161,7 +169,8 @@ fn install_tray(app: &AppHandle) -> tauri::Result<()> {
             "show" => {
                 let _ = reveal_window(app);
             }
-            "register" => pick_folder_and_navigate(app),
+            "register" => pick_folder_and_navigate(app, false),
+            "new-project" => pick_folder_and_navigate(app, true),
             "quit" => app.exit(0),
             _ => {}
         })
@@ -220,19 +229,24 @@ fn show_approval_notification(app: &AppHandle, body: &str) {
     }
 }
 
-fn pick_folder_and_navigate(app: &AppHandle) {
-    match pick_folder_path(app) {
+fn pick_folder_and_navigate(app: &AppHandle, new_project: bool) {
+    match pick_folder_path(app, new_project) {
+        Ok(Some(path)) if new_project => navigate_new_project(app, &PathBuf::from(path)),
         Ok(Some(path)) => navigate_register(app, &PathBuf::from(path)),
         Ok(None) => {}
         Err(error) => eprintln!("folder picker failed: {error}"),
     }
 }
 
-fn pick_folder_path(app: &AppHandle) -> Result<Option<String>, String> {
+fn pick_folder_path(app: &AppHandle, new_project: bool) -> Result<Option<String>, String> {
     let picked = app
         .dialog()
         .file()
-        .set_title("Register a repository")
+        .set_title(if new_project {
+            "Choose parent folder for new project"
+        } else {
+            "Register a repository"
+        })
         .blocking_pick_folder();
     Ok(picked.map(|path| path.to_string()))
 }
@@ -251,6 +265,23 @@ fn navigate_register(app: &AppHandle, folder: &std::path::Path) {
             let _ = reveal_window(app);
         }
         Err(error) => eprintln!("register URL rejected: {error}"),
+    }
+}
+
+fn navigate_new_project(app: &AppHandle, parent: &std::path::Path) {
+    let Some(state) = app.try_state::<ShellState>() else {
+        return;
+    };
+    match new_project_query_url(&state.origin, parent) {
+        Ok(url) => {
+            if let Some(window) = app.get_webview_window(WINDOW_LABEL)
+                && let Err(error) = window.navigate(url.clone())
+            {
+                eprintln!("failed to open new-project flow: {error}");
+            }
+            let _ = reveal_window(app);
+        }
+        Err(error) => eprintln!("new-project URL rejected: {error}"),
     }
 }
 
@@ -285,5 +316,5 @@ fn show_window(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn pick_repository_folder(app: AppHandle) -> Result<Option<String>, String> {
-    pick_folder_path(&app)
+    pick_folder_path(&app, false)
 }

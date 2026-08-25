@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     fs::{self, File, OpenOptions},
-    io::Read,
+    io::{Read, Write},
     os::unix::{
         ffi::OsStrExt,
         fs::{OpenOptionsExt, PermissionsExt},
@@ -163,9 +163,10 @@ impl GitManager {
         if identity_name.is_none() || identity_email.is_none() {
             blockers.push("Git user.name and user.email must both be configured".to_owned());
         }
-        if origin_url.is_none() {
-            blockers.push("origin remote is missing".to_owned());
-        }
+        // A remote is not a custody requirement for a local-only project. The
+        // controller pins the exact local HEAD before it creates any managed
+        // worktree, and publication still has to prove that an appropriate
+        // remote exists before it can create a pull request.
         for authority in profile
             .instruction_sources
             .iter()
@@ -185,6 +186,69 @@ impl GitManager {
             git_identity_email_present: identity_email.is_some(),
             blockers,
         })
+    }
+
+    /// Creates a new local-only project without ever touching an existing
+    /// directory or configuring a remote. A first commit is required because
+    /// managed worktrees are always created from an exact Git object.
+    pub async fn create_local_project(
+        &self,
+        parent_path: &Path,
+        project_name: &str,
+    ) -> Result<PathBuf, GitError> {
+        if !parent_path.is_absolute() {
+            return Err(GitError::Policy(
+                "new project parent_path must be an absolute directory".to_owned(),
+            ));
+        }
+        validate_new_project_name(project_name)?;
+        let parent = fs::canonicalize(parent_path)?;
+        if !parent.is_dir() {
+            return Err(GitError::Policy(format!(
+                "new project parent_path is not a directory: {}",
+                parent.display()
+            )));
+        }
+        let destination = parent.join(project_name);
+        if destination.exists() {
+            return Err(GitError::Conflict(format!(
+                "new project directory already exists: {}",
+                destination.display()
+            )));
+        }
+
+        let staging = create_project_staging_directory(&parent, project_name)?;
+        let initialize = async {
+            fs::set_permissions(&staging, fs::Permissions::from_mode(0o755))?;
+            git_ok(&staging, ["init", "--initial-branch=main"]).await?;
+            let readme_path = staging.join("README.md");
+            let mut readme = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o644)
+                .open(&readme_path)?;
+            writeln!(readme, "# {project_name}")?;
+            writeln!(readme)?;
+            writeln!(readme, "Local project created with BILDR.")?;
+            readme.sync_all()?;
+            git_ok(&staging, ["add", "--", "README.md"]).await?;
+            git_ok(
+                &staging,
+                ["commit", "--no-gpg-sign", "-m", "chore: initialize project"],
+            )
+            .await?;
+            fs::rename(&staging, &destination)?;
+            canonical_repo_root(&destination).await
+        }
+        .await;
+
+        if initialize.is_err() {
+            // The staging directory was created by this operation and has not
+            // been exposed at the requested project path. Best-effort cleanup
+            // prevents a failed identity or Git setup from blocking a retry.
+            let _ = fs::remove_dir_all(&staging);
+        }
+        initialize
     }
 
     pub async fn discover_repositories(
@@ -1201,6 +1265,53 @@ async fn canonical_repo_root(repository: &Path) -> Result<PathBuf, GitError> {
     Ok(root)
 }
 
+fn validate_new_project_name(name: &str) -> Result<(), GitError> {
+    if name.is_empty()
+        || name != name.trim()
+        || name.chars().count() > 128
+        || name.starts_with('.')
+        || name.contains(['/', '\\', '\0', '\n', '\r'])
+        || !matches!(
+            Path::new(name).components().next(),
+            Some(Component::Normal(_))
+        )
+        || Path::new(name).components().count() != 1
+    {
+        return Err(GitError::Policy(
+            "new project name must be one non-hidden folder name (up to 128 characters)".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn create_project_staging_directory(
+    parent: &Path,
+    project_name: &str,
+) -> Result<PathBuf, GitError> {
+    let safe_name = project_name
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        .collect::<String>();
+    let safe_name = (!safe_name.is_empty())
+        .then_some(safe_name)
+        .unwrap_or_else(|| "project".to_owned());
+    for attempt in 0..32_u8 {
+        let staging = parent.join(format!(
+            ".bildr-new-{safe_name}-{}-{}-{attempt}",
+            now_ms(),
+            std::process::id(),
+        ));
+        match fs::create_dir(&staging) {
+            Ok(()) => return Ok(staging),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(GitError::Conflict(
+        "could not reserve a private staging directory for the new project".to_owned(),
+    ))
+}
+
 fn validate_reference(reference: &str) -> Result<(), GitError> {
     if reference.is_empty()
         || reference.starts_with('-')
@@ -1633,6 +1744,14 @@ mod tests {
     fn rejects_path_escape() {
         assert!(validate_relative_repo_path("../secret").is_err());
         assert!(validate_relative_repo_path("central/src/lib.rs").is_ok());
+    }
+
+    #[test]
+    fn new_project_name_is_one_safe_child_directory() {
+        assert!(validate_new_project_name("my-project_2").is_ok());
+        for invalid in ["", " project", "project ", ".project", "..", "a/b", "a\\b"] {
+            assert!(validate_new_project_name(invalid).is_err(), "{invalid:?}");
+        }
     }
 
     #[test]
