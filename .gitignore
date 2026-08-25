@@ -20,6 +20,7 @@
 # These are bulk-backed symlinks on development hosts.
 /target
 /ui/node_modules
+/bins/harness-desktop/gen/
 
 # Local Harness state belongs under XDG directories, never in the repo.
 /.harness-runtime/

@@ -15,6 +15,7 @@ members = [
     "bins/harnessd",
     "bins/harnessctl",
     "bins/harness-probe",
+    "bins/harness-desktop",
     "bins/fake-app-server",
     "xtask",
 ]

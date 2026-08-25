@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=BILDR
+Comment=Local Codex control plane
+Exec=harness-desktop %u
+Icon=bildr
+Terminal=false
+Categories=Development;IDE;
+MimeType=x-scheme-handler/bildr;x-scheme-handler/harness;
+StartupWMClass=BILDR
