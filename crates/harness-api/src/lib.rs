@@ -143,6 +143,10 @@ pub fn router(orchestrator: Arc<Orchestrator>) -> Router {
             post(request_supervisor_review),
         )
         .route(
+            "/api/v1/runs/{run_id}/ponytail/audit",
+            post(request_ponytail_audit),
+        )
+        .route(
             "/api/v1/supervisor-actions/{action_id}/apply",
             post(apply_supervisor_action),
         )
@@ -792,6 +796,23 @@ async fn request_supervisor_review(
             state
                 .orchestrator
                 .request_supervisor_review(&RunId::from(run_id), "local-user")
+                .await?,
+        ),
+    ))
+}
+
+async fn request_ponytail_audit(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            state
+                .orchestrator
+                .request_ponytail_audit(&RunId::from(run_id), "local-user")
                 .await?,
         ),
     ))

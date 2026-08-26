@@ -234,6 +234,10 @@ class HarnessApi {
     return this.post(`/runs/${encodeURIComponent(runId)}/supervision/review`);
   }
 
+  requestPonytailAudit(runId: string) {
+    return this.post(`/runs/${encodeURIComponent(runId)}/ponytail/audit`);
+  }
+
   applySupervisorAction(actionId: string) {
     return this.post<SupervisorAction>(
       `/supervisor-actions/${encodeURIComponent(actionId)}/apply`,
@@ -378,7 +382,7 @@ class HarnessApi {
     automaticPlanApproval: boolean,
     runTokenBudget: number,
     deepInterview: boolean,
-    minimalImplementation: boolean,
+    ponytailMode: "off" | "lite" | "full" | "ultra",
     compactHandoffs: boolean,
     codexAccountId?: string,
   ) {
@@ -394,7 +398,7 @@ class HarnessApi {
       automatic_plan_approval: automaticPlanApproval,
       run_token_budget: runTokenBudget,
       deep_interview: deepInterview,
-      minimal_implementation: minimalImplementation,
+      ponytail_mode: ponytailMode,
       compact_handoffs: compactHandoffs,
       codex_account_id: codexAccountId || null,
     });

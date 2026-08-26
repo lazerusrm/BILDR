@@ -155,9 +155,50 @@ const FINAL_AUDITOR_SESSION_TOKEN_BUDGET: u64 = 120_000;
 const WORKER_PROTOCOL_CONTEXT_ALLOWANCE: u64 = 20_000;
 const WORKER_COMPLETION_RESERVE: u64 = 16_000;
 const WORKER_EXECUTION_CONTRACT: &str = "Begin from the task packet and compiled context; do not batch broad discovery. After reading repository-required guidance, inspect only the narrowest change seam needed, then create a candidate diff before any further exploration. Once a diff exists, run focused checks and iterate from concrete failures. If bounded prior-attempt continuity already contains a candidate, inspect that diff first and improve or test it instead of restarting discovery. Stop only if required work is outside leased custody or conflicts with active authority.";
-const MINIMAL_IMPLEMENTATION_DISCIPLINE: &str = r#"Minimal implementation discipline is enabled for this run (Ponytail-inspired).
+/// BILDR carries a reviewed, fixed Ponytail ruleset rather than downloading or
+/// executing third-party hooks in a run.  This keeps prompt behavior
+/// reproducible and preserves BILDR's controller-owned safety boundary.
+const PONYTAIL_ADAPTER_SCHEMA: &str = "harness.ponytail-adapter.v1";
+const PONYTAIL_UPSTREAM_REPOSITORY: &str = "https://github.com/dietrichgebert/ponytail";
+const PONYTAIL_UPSTREAM_VERSION: &str = "4.9.0";
 
-Use this decision order before adding code or dependencies: first determine whether the requested behavior needs a change; then reuse existing code; then use the standard library; then native platform capability; then an already-installed dependency; and only then add the smallest clear implementation. Prefer deletion and simplification when they preserve the required behavior. Do not use minimalism to weaken validation, error handling, security, accessibility, evidence, tests, or an explicit requirement. When a more complex solution is necessary, state the concrete constraint that makes it necessary."#;
+/// The controller-owned rendition of Ponytail's coding policy. Controller
+/// contracts, exact JSON, custody, evidence, and safety requirements retain
+/// priority over its presentation preferences.
+const PONYTAIL_DELIVERY_DISCIPLINE: &str = r#"Ponytail implementation discipline is active for this run.
+
+This is a controller-owned, version-pinned rendition of Ponytail. It governs what you build, not controller wire formats, exact evidence, source patches, or an explicitly requested explanation. Controller contracts and all repository-required guidance take priority.
+
+Before changing code, understand the task and trace the real flow end-to-end. Then stop at the first rung that holds:
+1. Does this need to exist at all? Speculative need means skip it (YAGNI).
+2. Does the codebase already have the helper, utility, type, or pattern? Reuse it; do not re-write it.
+3. Does the standard library solve it? Use it.
+4. Does the native platform feature solve it? Use it.
+5. Does an already-installed dependency solve it? Use it; do not add a dependency for what a few lines can do.
+6. Can the correct change be one line? Make it one line.
+7. Only then write the minimum code that works.
+
+For a bug fix, find the root cause rather than patching one symptom: inspect sibling callers of the touched shared behavior, then make one correct fix at the narrowest common seam when that is truly the cause.
+
+No unrequested abstractions, one-implementation interfaces, speculative factories, configuration nobody changes, boilerplate, scaffolding "for later", or avoidable dependencies. Prefer deletion to addition, boring to clever, and the fewest files that preserve the required behavior. Between same-size standard-library alternatives, choose the one that is correct at edge cases. If a deliberate simplification has a real ceiling, mark only that actual corner with a `ponytail:` source comment naming both the ceiling and its concrete upgrade trigger.
+
+Do not use minimalism to cut comprehension, input validation at trust boundaries, data-loss error handling, security, accessibility, calibration a real system needs, explicit requirements, controller evidence, or required tests. Non-trivial new logic needs one smallest runnable regression check; trivial one-liners do not need test ceremony. When complexity is necessary, state the concrete constraint in the final task handoff if its response contract permits prose."#;
+
+const PONYTAIL_LITE_DISCIPLINE: &str = r#"Mode: lite. Build the requested outcome, but when a materially lazier safe alternative exists, name it concisely in the permitted final handoff. Do not block delivery on that alternative."#;
+const PONYTAIL_FULL_DISCIPLINE: &str = r#"Mode: full. Enforce the ladder. Prefer the shortest correct diff and concise handoff once the real flow is understood."#;
+const PONYTAIL_ULTRA_DISCIPLINE: &str = r#"Mode: ultra. Treat speculative additions as rejected until a concrete requirement or evidence makes them necessary. Prefer deletion before addition, then ship the smallest correct behavior and name the condition that would justify the larger design."#;
+
+/// Ponytail's diff review is advisory only. Correctness, security, evidence,
+/// accessibility, and explicit requirements never become optional because a
+/// smaller alternative was suggested.
+const PONYTAIL_EXECUTION_REVIEW_DISCIPLINE: &str = r#"Ponytail minimality review is active for this candidate. Independently look for a *concrete, semantically equivalent* simplification that preserves every stated requirement, evidence obligation, security property, accessibility behavior, error path, and supported edge case. Do not flag a check, validation, error path, security control, accessibility behavior, or explicit requirement merely because deleting it makes the diff shorter.
+
+For each proven opportunity, use an advisory finding only. Prefix its description with exactly one of `PONYTAIL delete:`, `PONYTAIL stdlib:`, `PONYTAIL native:`, `PONYTAIL yagni:`, or `PONYTAIL shrink:`; name the exact replacement or `nothing`. Minimality alone is never a blocking finding and never changes an otherwise-correct verdict. If no safe concrete reduction is proven, emit no Ponytail finding."#;
+
+const PONYTAIL_AUDIT_TOKEN_BUDGET: u64 = 80_000;
+const PONYTAIL_AUDIT_PROMPT: &str = r#"Perform a one-shot Ponytail whole-repository audit on the exact checked-out source revision. Read source and declared dependency manifests only; do not edit, run commands that mutate state, use the network, audit correctness/security/performance, or propose a rewrite. Hunt concrete, evidence-backed overengineering only: dead code, hand-rolled standard-library behavior, dependencies or code a native platform feature replaces, a one-implementation abstraction, dead configuration, or semantically equivalent shorter code.
+
+Every finding must be safe to apply without weakening a required behavior, input validation, data-loss handling, security, accessibility, an explicit requirement, or a runnable regression check. Omit speculative possibilities. Rank largest safe cuts first. Return only the supplied JSON object. If no safe concrete reduction is proven, return `findings: []` and say `Lean already. Ship.` in `summary`."#;
 const COMPACT_HANDOFF_DISCIPLINE: &str = r#"Compact handoff discipline is enabled for this run (Caveman-inspired).
 
 Keep planning narration, discoveries, and handoffs concise and evidence-led: state the decision, the smallest supporting facts, and what remains unproved. Do not restate the task, enumerate unrelated files, or pad with alternatives already ruled out. This is never permission to summarize, rewrite, drop, or lossy-compress required JSON, source patches, command output, errors, evidence receipts, digests, security details, accessibility constraints, or a user requirement. When exact material is required, return it exactly."#;
@@ -287,8 +328,8 @@ fn agent_prompt_layers(
     }
 }
 
-fn minimal_implementation_prompt(role: AgentRole, enabled: bool, prompt: String) -> String {
-    if enabled
+fn ponytail_delivery_prompt(role: AgentRole, config: &PonytailRunConfig, prompt: String) -> String {
+    if config.mode.is_active()
         && matches!(
             role,
             AgentRole::Architect
@@ -298,7 +339,10 @@ fn minimal_implementation_prompt(role: AgentRole, enabled: bool, prompt: String)
                 | AgentRole::Integrator
         )
     {
-        format!("{MINIMAL_IMPLEMENTATION_DISCIPLINE}\n\n{prompt}")
+        format!(
+            "{PONYTAIL_DELIVERY_DISCIPLINE}\n\n{}\n\n{prompt}",
+            config.mode.delivery_mode_discipline()
+        )
     } else {
         prompt
     }
@@ -1582,10 +1626,51 @@ pub struct CreateRunRequest {
     pub codex_account_id: Option<String>,
     #[serde(default)]
     pub deep_interview: bool,
-    #[serde(default = "default_minimal_implementation")]
-    pub minimal_implementation: bool,
+    /// The version-pinned Ponytail policy for this run. Its mode is immutable
+    /// once the run begins so a reviewed result always carries its exact
+    /// decision policy. `minimal_implementation` remains accepted only for
+    /// older desktop clients during the rollout; new clients send this field.
+    #[serde(default)]
+    pub ponytail_mode: Option<PonytailMode>,
+    #[serde(default)]
+    pub minimal_implementation: Option<bool>,
     #[serde(default = "default_compact_handoffs")]
     pub compact_handoffs: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PonytailMode {
+    Off,
+    Lite,
+    #[default]
+    Full,
+    Ultra,
+}
+
+impl PonytailMode {
+    const fn is_active(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    const fn delivery_mode_discipline(self) -> &'static str {
+        match self {
+            Self::Off => "Mode: off.",
+            Self::Lite => PONYTAIL_LITE_DISCIPLINE,
+            Self::Full => PONYTAIL_FULL_DISCIPLINE,
+            Self::Ultra => PONYTAIL_ULTRA_DISCIPLINE,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PonytailRunConfig {
+    pub schema: String,
+    pub upstream_repository: String,
+    pub upstream_version: String,
+    pub mode: PonytailMode,
+    pub rules_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1789,6 +1874,10 @@ pub struct RunDetail {
     pub signoff_packet: Option<SignoffPacket>,
     pub draft_pr_ci: Option<Value>,
     pub automatic_plan_approval: bool,
+    pub ponytail: PonytailRunConfig,
+    pub ponytail_reviews: Vec<PonytailReviewRecord>,
+    pub ponytail_debt: PonytailDebtReport,
+    pub ponytail_audit: Option<PonytailAuditReport>,
     pub preferred_codex_account_id: Option<String>,
     pub governor_progress: BTreeMap<String, Value>,
     pub supervision_mode: SupervisorMode,
@@ -1801,6 +1890,58 @@ pub struct RunDetail {
     /// Immutable, read-only Sol consultation lifecycle records. Their output
     /// is advisory evidence for a later Terra review, never executable input.
     pub expert_requests: Vec<ExpertRequestRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PonytailReviewRecord {
+    pub task_id: String,
+    pub attempt_id: String,
+    pub source_sha: Option<String>,
+    pub mode: PonytailMode,
+    pub findings: Vec<PlanReviewFinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PonytailDebtEntry {
+    pub path: String,
+    pub line: u64,
+    pub marker: String,
+    pub has_upgrade_trigger: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PonytailDebtReport {
+    pub schema: String,
+    pub source_sha: String,
+    pub available: bool,
+    pub unavailable_reason: Option<String>,
+    pub entries: Vec<PonytailDebtEntry>,
+    pub entries_without_upgrade_trigger: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PonytailAuditFinding {
+    pub tag: String,
+    pub path: String,
+    pub line: u64,
+    pub description: String,
+    pub replacement: String,
+    pub estimated_lines_removed: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PonytailAuditReport {
+    pub schema: String,
+    pub source_sha: String,
+    pub summary: String,
+    pub findings: Vec<PonytailAuditFinding>,
+    pub estimated_lines_removed: u64,
+    pub estimated_dependencies_removed: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -3253,14 +3394,29 @@ impl Orchestrator {
             .unwrap_or(default)
     }
 
-    fn minimal_implementation_enabled(&self, run_id: &RunId) -> Result<bool, OrchestratorError> {
-        Ok(self
+    fn ponytail_config(&self, run_id: &RunId) -> Result<PonytailRunConfig, OrchestratorError> {
+        if let Some(config) = self
+            .store
+            .runtime_metadata(&ponytail_metadata_key(run_id))?
+            .map(serde_json::from_value)
+            .transpose()?
+        {
+            return Ok(config);
+        }
+
+        // Runs created by the former checkbox rollout retain their documented
+        // effective behavior. This read path is only migration for already
+        // durable runs; all new runs bind a complete versioned config below.
+        let legacy_enabled = self
             .store
             .runtime_metadata(&minimal_implementation_metadata_key(run_id))?
             .and_then(|value| value.as_bool())
-            // Runs created before this feature retain the safe, default-on
-            // policy. There is deliberately no mid-run operator toggle.
-            .unwrap_or_else(default_minimal_implementation))
+            .unwrap_or_else(default_minimal_implementation);
+        Ok(new_ponytail_run_config(if legacy_enabled {
+            PonytailMode::Full
+        } else {
+            PonytailMode::Off
+        }))
     }
 
     fn compact_handoffs_enabled(&self, run_id: &RunId) -> Result<bool, OrchestratorError> {
@@ -3366,6 +3522,139 @@ impl Orchestrator {
         };
         self.launch_supervisor_review(run_id, &snapshot).await?;
         Ok(operation("request_supervisor_review", run_id.as_str()))
+    }
+
+    /// Starts a bounded, read-only whole-repository Ponytail audit. Its output
+    /// is an advisory report only: it cannot apply a deletion, change a task,
+    /// or weaken BILDR's correctness and evidence gates.
+    pub async fn request_ponytail_audit(
+        &self,
+        run_id: &RunId,
+        actor: &str,
+    ) -> Result<OperationAccepted, OrchestratorError> {
+        let _guard = self.operation_lock.lock().await;
+        let run = self.store.run(run_id)?;
+        let ponytail = self.ponytail_config(run_id)?;
+        if !ponytail.mode.is_active() {
+            return Err(OrchestratorError::Conflict(
+                "Ponytail is off for this immutable run configuration".to_owned(),
+            ));
+        }
+        if self.store.list_agents(run_id)?.iter().any(|agent| {
+            agent.role == AgentRole::Explorer
+                && agent.nickname.as_deref() == Some("ponytail-audit")
+                && agent_state_consumes_capacity(&agent.state)
+        }) {
+            return Err(OrchestratorError::Conflict(
+                "a Ponytail repository audit is already running".to_owned(),
+            ));
+        }
+        let (active_total, _, _) = self.active_agent_counts()?;
+        if active_total >= self.config.orchestration.max_total_agent_threads {
+            return Err(OrchestratorError::Blocked(format!(
+                "all {} Codex thread slots are active; Ponytail audit remains queued",
+                self.config.orchestration.max_total_agent_threads
+            )));
+        }
+        let inspection = self
+            .store
+            .list_worktrees(Some(run_id))?
+            .into_iter()
+            .find(|worktree| worktree.kind == "inspection" && worktree.state == "READY")
+            .ok_or_else(|| {
+                OrchestratorError::Blocked(
+                    "Ponytail audit cannot start because the pinned inspection worktree is unavailable"
+                        .to_owned(),
+                )
+            })?;
+        let profile = self.profile_for_run(&run)?;
+        let route = self.run_model_route(&run, &profile.profile.models.verifier)?;
+        self.require_runtime_ready().await?;
+        self.select_preferred_codex_account_for_run(run_id).await?;
+        self.store.record_human_action(
+            Some(run_id),
+            None,
+            actor,
+            "request_ponytail_audit",
+            "run",
+            run_id.as_str(),
+            &json!({
+                "source_sha": run.base_sha,
+                "mode": ponytail.mode,
+                "automatic_action": false,
+            }),
+        )?;
+        let agent_id = AgentSessionId::new();
+        self.store.create_agent_session(&NewAgentSession {
+            id: agent_id.clone(),
+            run_id: run_id.clone(),
+            task_attempt_id: None,
+            parent_agent_session_id: None,
+            runtime_kind: "codex_controller".to_owned(),
+            codex_account_id: self.controller_codex_account_id(),
+            role: AgentRole::Explorer,
+            nickname: Some("ponytail-audit".to_owned()),
+            requested_model: route.model.clone(),
+            requested_reasoning_effort: route.reasoning_effort.clone(),
+            sandbox_mode: SandboxMode::ReadOnly,
+            approval_policy: "never".to_owned(),
+            cwd: PathBuf::from(&inspection.path),
+            state: "STARTING".to_owned(),
+            current_goal: Some("Read-only Ponytail whole-repository complexity audit".to_owned()),
+            token_budget: Some(PONYTAIL_AUDIT_TOKEN_BUDGET),
+        })?;
+        let prompt = format!(
+            "{PONYTAIL_AUDIT_PROMPT}\n\nRun objective:\n{}\n\nExact audit source SHA: {}\n\n{}",
+            run.objective,
+            run.base_sha,
+            ponytail_audit_response_contract(),
+        );
+        if let Err(error) = self
+            .start_agent(
+                &agent_id,
+                run_id,
+                None,
+                Path::new(&inspection.path),
+                &route,
+                SandboxMode::ReadOnly,
+                false,
+                None,
+                "Read-only Ponytail whole-repository complexity audit",
+                Some(PONYTAIL_AUDIT_TOKEN_BUDGET),
+                prompt,
+                // Qwodex cannot combine a strict response schema with an
+                // interactive read-only source turn. Its controller intake is
+                // still strict below, but it receives a normal tool turn so
+                // the one run-bound local model can inspect the pinned tree.
+                if provider_uses_evidence_only_reviews(&self.config.codex.model_provider) {
+                    None
+                } else {
+                    Some(model_output_schema(ponytail_audit_output_schema()))
+                },
+            )
+            .await
+        {
+            self.store.update_agent_state(
+                &agent_id,
+                "FAILED",
+                Some("Ponytail audit could not start"),
+                None,
+                None,
+                Some(("infrastructure_unavailable", &error.to_string())),
+            )?;
+            return Err(error);
+        }
+        self.emit_run_event(
+            &run,
+            "run.ponytail.audit_started",
+            json!({
+                "agent_id": agent_id,
+                "source_sha": run.base_sha,
+                "mode": ponytail.mode,
+                "automatic_action": false,
+            }),
+        )?;
+        Ok(operation("request_ponytail_audit", run_id.as_str()))
     }
 
     /// Applies one stored supervisor proposal only after re-reading the exact
@@ -4384,7 +4673,18 @@ impl Orchestrator {
         request: CreateRunRequest,
     ) -> Result<RunSummary, OrchestratorError> {
         let deep_interview = request.deep_interview;
-        let minimal_implementation = request.minimal_implementation;
+        let ponytail_mode = match (request.ponytail_mode, request.minimal_implementation) {
+            (Some(mode), Some(enabled)) if mode.is_active() != enabled => {
+                return Err(OrchestratorError::Validation(
+                    "ponytail_mode conflicts with legacy minimal_implementation".to_owned(),
+                ));
+            }
+            (Some(mode), _) => mode,
+            (None, Some(true)) => PonytailMode::Full,
+            (None, Some(false)) => PonytailMode::Off,
+            (None, None) => default_ponytail_mode(),
+        };
+        let ponytail = new_ponytail_run_config(ponytail_mode);
         let compact_handoffs = request.compact_handoffs;
         if request.objective.trim().is_empty() {
             return Err(OrchestratorError::Validation(
@@ -4562,8 +4862,8 @@ impl Orchestrator {
             &json!(automatic_plan_approval),
         )?;
         self.store.put_runtime_metadata(
-            &minimal_implementation_metadata_key(&run_id),
-            &json!(minimal_implementation),
+            &ponytail_metadata_key(&run_id),
+            &serde_json::to_value(&ponytail)?,
         )?;
         self.store.put_runtime_metadata(
             &compact_handoffs_metadata_key(&run_id),
@@ -4616,7 +4916,7 @@ impl Orchestrator {
             json!({
                 "base_sha": run.base_sha,
                 "deep_interview": deep_interview,
-                "minimal_implementation": minimal_implementation,
+                "ponytail": ponytail,
             }),
         )?;
         Ok(run)
@@ -4625,6 +4925,7 @@ impl Orchestrator {
     pub fn run_detail(&self, run_id: &RunId) -> Result<RunDetail, OrchestratorError> {
         let run = self.store.run(run_id)?;
         let intent_interview = self.intent_interview_snapshot(run_id)?;
+        let ponytail = self.ponytail_config(run_id)?;
         let latest_plan = self.store.latest_plan(run_id)?;
         let plan = latest_plan.as_ref().map(|(_, plan, _, _)| plan.clone());
         let plan_digest = plan.as_ref().map(packet_digest).transpose()?;
@@ -4686,12 +4987,21 @@ impl Orchestrator {
         let draft_pr_ci = self
             .store
             .runtime_metadata(&format!("draft-pr-ci:{run_id}"))?;
+        let tasks = self.store.list_tasks(run_id)?;
+        let worktrees = self.store.list_worktrees(Some(run_id))?;
+        let ponytail_reviews = self.ponytail_reviews(&tasks, &ponytail)?;
+        let ponytail_debt = self.ponytail_debt_report(&run, &worktrees);
+        let ponytail_audit = self
+            .store
+            .runtime_metadata(&ponytail_audit_metadata_key(run_id))?
+            .map(serde_json::from_value)
+            .transpose()?;
         Ok(RunDetail {
             run,
             intent_interview,
-            tasks: self.store.list_tasks(run_id)?,
+            tasks,
             agents,
-            worktrees: self.store.list_worktrees(Some(run_id))?,
+            worktrees,
             approvals: self.store.list_approvals(Some(run_id), None)?,
             plan,
             plan_digest,
@@ -4701,6 +5011,10 @@ impl Orchestrator {
             signoff_packet,
             draft_pr_ci,
             automatic_plan_approval,
+            ponytail,
+            ponytail_reviews,
+            ponytail_debt,
+            ponytail_audit,
             preferred_codex_account_id,
             governor_progress,
             supervision_mode: self.effective_supervision_config().mode,
@@ -4710,6 +5024,61 @@ impl Orchestrator {
             supervisor_actions: self.store.supervisor_actions_for_run(run_id)?,
             expert_requests: self.store.expert_requests_for_run(run_id, 100)?,
         })
+    }
+
+    fn ponytail_reviews(
+        &self,
+        tasks: &[TaskSummary],
+        config: &PonytailRunConfig,
+    ) -> Result<Vec<PonytailReviewRecord>, OrchestratorError> {
+        let mut reviews = Vec::new();
+        for task in tasks {
+            if let Some(review) = self
+                .store
+                .runtime_metadata(&ponytail_review_metadata_key(&task.id))?
+                .map(serde_json::from_value)
+                .transpose()?
+            {
+                reviews.push(review);
+            }
+        }
+        // An off run cannot acquire new review findings, but a migration or a
+        // malformed legacy record must never display stale findings as active.
+        if !config.mode.is_active() {
+            reviews.clear();
+        }
+        Ok(reviews)
+    }
+
+    fn ponytail_debt_report(
+        &self,
+        run: &RunSummary,
+        worktrees: &[WorktreeSummary],
+    ) -> PonytailDebtReport {
+        let Some(inspection) = worktrees
+            .iter()
+            .find(|worktree| worktree.kind == "inspection")
+        else {
+            return PonytailDebtReport {
+                schema: "harness.ponytail-debt.v1".to_owned(),
+                source_sha: run.base_sha.clone(),
+                available: false,
+                unavailable_reason: Some("the run inspection worktree is unavailable".to_owned()),
+                entries: Vec::new(),
+                entries_without_upgrade_trigger: 0,
+            };
+        };
+        match scan_ponytail_debt(Path::new(&inspection.path), &run.base_sha) {
+            Ok(report) => report,
+            Err(error) => PonytailDebtReport {
+                schema: "harness.ponytail-debt.v1".to_owned(),
+                source_sha: run.base_sha.clone(),
+                available: false,
+                unavailable_reason: Some(error.to_string()),
+                entries: Vec::new(),
+                entries_without_upgrade_trigger: 0,
+            },
+        }
     }
 
     fn intent_interview_snapshot(
@@ -9253,11 +9622,8 @@ impl Orchestrator {
         let run = self.store.run(run_id)?;
         self.bind_normal_agent_to_run_model_route(&run, &agent, route)?;
         let role = agent.role;
-        let prompt = minimal_implementation_prompt(
-            role,
-            self.minimal_implementation_enabled(run_id)?,
-            prompt,
-        );
+        let ponytail = self.ponytail_config(run_id)?;
+        let prompt = ponytail_delivery_prompt(role, &ponytail, prompt);
         let prompt = compact_handoff_prompt(self.compact_handoffs_enabled(run_id)?, prompt);
         let runtime = self.runtime().await?;
         let AgentPromptLayers {
@@ -10881,6 +11247,9 @@ impl Orchestrator {
         }
         let (run_id, attempt_id) = self.store.agent_context(agent_id)?;
         match agent.role {
+            AgentRole::Explorer if agent.nickname.as_deref() == Some("ponytail-audit") => {
+                self.accept_ponytail_audit(agent_id, text).await?
+            }
             AgentRole::Interviewer => {
                 if self.store.run(&run_id)?.state == RunState::Interviewing {
                     match parse_intent_interview_turn(text) {
@@ -10997,6 +11366,70 @@ impl Orchestrator {
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    async fn accept_ponytail_audit(
+        &self,
+        agent_id: &AgentSessionId,
+        text: &str,
+    ) -> Result<(), OrchestratorError> {
+        let agent = self.store.agent(agent_id)?;
+        if agent.role != AgentRole::Explorer
+            || agent.nickname.as_deref() != Some("ponytail-audit")
+            || agent.sandbox_mode != SandboxMode::ReadOnly
+        {
+            return Err(OrchestratorError::Protocol(
+                "Ponytail audit response does not come from its read-only audit agent".to_owned(),
+            ));
+        }
+        let (run_id, attempt_id) = self.store.agent_context(agent_id)?;
+        if attempt_id.is_some() {
+            return Err(OrchestratorError::Protocol(
+                "Ponytail audit agent unexpectedly has mutable task-attempt custody".to_owned(),
+            ));
+        }
+        let run = self.store.run(&run_id)?;
+        let ponytail = self.ponytail_config(&run_id)?;
+        if !ponytail.mode.is_active() {
+            return Err(OrchestratorError::Conflict(
+                "Ponytail audit cannot be accepted for an off run".to_owned(),
+            ));
+        }
+        let report = parse_json_text::<PonytailAuditReport>(text)?;
+        validate_ponytail_audit_report(&report, &run)?;
+        let key = ponytail_audit_metadata_key(&run_id);
+        if let Some(existing) = self.store.runtime_metadata(&key)? {
+            let existing: PonytailAuditReport = serde_json::from_value(existing)?;
+            if serde_json::to_value(&existing)? != serde_json::to_value(&report)? {
+                return Err(OrchestratorError::Conflict(
+                    "Ponytail audit replay differs from the immutable stored report".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+        self.store
+            .put_runtime_metadata(&key, &serde_json::to_value(&report)?)?;
+        self.store.update_agent_state(
+            agent_id,
+            "COMPLETED",
+            Some(&report.summary),
+            None,
+            None,
+            None,
+        )?;
+        self.emit_agent_event(
+            &run_id,
+            agent_id,
+            "agent.ponytail.audit_completed",
+            json!({
+                "source_sha": report.source_sha,
+                "finding_count": report.findings.len(),
+                "estimated_lines_removed": report.estimated_lines_removed,
+                "estimated_dependencies_removed": report.estimated_dependencies_removed,
+                "automatic_action": false,
+            }),
+        )?;
         Ok(())
     }
 
@@ -12662,6 +13095,21 @@ impl Orchestrator {
                     Some(("inconclusive", "missing final audit verdict")),
                 )?;
             }
+        } else if agent.role == AgentRole::Explorer
+            && agent.nickname.as_deref() == Some("ponytail-audit")
+            && self
+                .store
+                .runtime_metadata(&ponytail_audit_metadata_key(&run_id))?
+                .is_none()
+        {
+            self.store.update_agent_state(
+                agent_id,
+                "FAILED",
+                Some("Ponytail auditor returned no schema-valid report"),
+                None,
+                None,
+                Some(("inconclusive", "missing Ponytail audit report")),
+            )?;
         }
         Ok(())
     }
@@ -14423,6 +14871,7 @@ impl Orchestrator {
         let run = self.store.run(run_id)?;
         let profile = self.profile_for_run(&run)?;
         let route = self.run_model_route(&run, &profile.profile.models.verifier)?;
+        let ponytail = self.ponytail_config(run_id)?;
         let evidence_snapshot = self.store.evidence_snapshot(run_id)?;
         let source_evidence = exact_source_evidence(&evidence_snapshot, commit);
         let agent_id = AgentSessionId::new();
@@ -14498,6 +14947,11 @@ impl Orchestrator {
                 review_base
             )
         };
+        let prompt = if ponytail.mode.is_active() {
+            format!("{prompt}\n\n{PONYTAIL_EXECUTION_REVIEW_DISCIPLINE}")
+        } else {
+            prompt
+        };
         if let Err(error) = self
             .start_agent(
                 &agent_id,
@@ -14565,6 +15019,27 @@ impl Orchestrator {
             &format!("verifier-verdict:{task_id}"),
             &serde_json::to_value(&verdict)?,
         )?;
+        let ponytail = self.ponytail_config(run_id)?;
+        if ponytail.mode.is_active() {
+            let findings = verdict
+                .findings
+                .iter()
+                .filter(|finding| finding.description.starts_with("PONYTAIL "))
+                .cloned()
+                .collect::<Vec<_>>();
+            let (_, _, _, source_sha) = self.store.worktree_for_attempt(attempt_id)?;
+            let record = PonytailReviewRecord {
+                task_id: task_id.to_string(),
+                attempt_id: attempt_id.to_string(),
+                source_sha,
+                mode: ponytail.mode,
+                findings,
+            };
+            self.store.put_runtime_metadata(
+                &ponytail_review_metadata_key(&task_id),
+                &serde_json::to_value(&record)?,
+            )?;
+        }
         let blocking = verdict
             .findings
             .iter()
@@ -20721,12 +21196,232 @@ const fn default_minimal_implementation() -> bool {
     true
 }
 
+const fn default_ponytail_mode() -> PonytailMode {
+    PonytailMode::Full
+}
+
+fn ponytail_rules_sha256(mode: PonytailMode) -> String {
+    let material = format!(
+        "{PONYTAIL_ADAPTER_SCHEMA}\n{PONYTAIL_UPSTREAM_REPOSITORY}\n{PONYTAIL_UPSTREAM_VERSION}\n{PONYTAIL_DELIVERY_DISCIPLINE}\n{}\n{PONYTAIL_EXECUTION_REVIEW_DISCIPLINE}",
+        mode.delivery_mode_discipline(),
+    );
+    hex::encode(Sha256::digest(material.as_bytes()))
+}
+
+fn new_ponytail_run_config(mode: PonytailMode) -> PonytailRunConfig {
+    PonytailRunConfig {
+        schema: PONYTAIL_ADAPTER_SCHEMA.to_owned(),
+        upstream_repository: PONYTAIL_UPSTREAM_REPOSITORY.to_owned(),
+        upstream_version: PONYTAIL_UPSTREAM_VERSION.to_owned(),
+        mode,
+        rules_sha256: ponytail_rules_sha256(mode),
+    }
+}
+
 const fn default_compact_handoffs() -> bool {
     true
 }
 
 fn minimal_implementation_metadata_key(run_id: &RunId) -> String {
     format!("run-minimal-implementation:{run_id}")
+}
+
+fn ponytail_metadata_key(run_id: &RunId) -> String {
+    format!("run-ponytail:{run_id}")
+}
+
+fn ponytail_review_metadata_key(task_id: &TaskId) -> String {
+    format!("ponytail-review:{task_id}")
+}
+
+fn ponytail_audit_metadata_key(run_id: &RunId) -> String {
+    format!("ponytail-audit:{run_id}")
+}
+
+fn ponytail_audit_response_contract() -> &'static str {
+    "Return exactly one JSON object with these root keys: `schema`, `source_sha`, `summary`, `findings`, `estimated_lines_removed`, and `estimated_dependencies_removed`. `schema` is exactly `harness.ponytail-audit.v1`; `source_sha` must exactly equal the controller-provided SHA. Every finding has exactly `tag`, `path`, `line`, `description`, `replacement`, and `estimated_lines_removed`. `tag` is exactly `delete`, `stdlib`, `native`, `yagni`, or `shrink`; `path` is an exact repository-relative regular file path; `line` and all estimates are non-negative integers; `description` and `replacement` are concise non-empty text. Findings are advisory-only and never apply a change."
+}
+
+fn ponytail_audit_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "schema",
+            "source_sha",
+            "summary",
+            "findings",
+            "estimated_lines_removed",
+            "estimated_dependencies_removed"
+        ],
+        "properties": {
+            "schema": {"const": "harness.ponytail-audit.v1"},
+            "source_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "summary": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "findings": {
+                "type": "array",
+                "maxItems": 100,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["tag", "path", "line", "description", "replacement", "estimated_lines_removed"],
+                    "properties": {
+                        "tag": {"enum": ["delete", "stdlib", "native", "yagni", "shrink"]},
+                        "path": {"type": "string", "minLength": 1, "maxLength": 4096},
+                        "line": {"type": "integer", "minimum": 1},
+                        "description": {"type": "string", "minLength": 1, "maxLength": 4096},
+                        "replacement": {"type": "string", "minLength": 1, "maxLength": 4096},
+                        "estimated_lines_removed": {"type": "integer", "minimum": 0}
+                    }
+                }
+            },
+            "estimated_lines_removed": {"type": "integer", "minimum": 0},
+            "estimated_dependencies_removed": {"type": "integer", "minimum": 0}
+        }
+    })
+}
+
+fn audit_path_is_safe_relative_file(path: &str) -> bool {
+    let path = Path::new(path);
+    !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn validate_ponytail_audit_report(
+    report: &PonytailAuditReport,
+    run: &RunSummary,
+) -> Result<(), OrchestratorError> {
+    if report.schema != "harness.ponytail-audit.v1" || report.source_sha != run.base_sha {
+        return Err(OrchestratorError::Validation(
+            "Ponytail audit is not bound to the exact run source revision".to_owned(),
+        ));
+    }
+    if report.summary.trim().is_empty()
+        || report.findings.iter().any(|finding| {
+            !matches!(
+                finding.tag.as_str(),
+                "delete" | "stdlib" | "native" | "yagni" | "shrink"
+            ) || !audit_path_is_safe_relative_file(&finding.path)
+                || finding.line == 0
+                || finding.description.trim().is_empty()
+                || finding.replacement.trim().is_empty()
+        })
+    {
+        return Err(OrchestratorError::Validation(
+            "Ponytail audit must contain only concrete tagged repository findings".to_owned(),
+        ));
+    }
+    let actual_estimate = report.findings.iter().fold(0_u64, |total, finding| {
+        total.saturating_add(finding.estimated_lines_removed)
+    });
+    if actual_estimate != report.estimated_lines_removed {
+        return Err(OrchestratorError::Validation(
+            "Ponytail audit total does not equal the sum of its findings".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn scan_ponytail_debt(root: &Path, source_sha: &str) -> Result<PonytailDebtReport, std::io::Error> {
+    const SKIPPED_DIRECTORIES: &[&str] = &[
+        ".git",
+        ".next",
+        ".turbo",
+        "__pycache__",
+        "build",
+        "coverage",
+        "dist",
+        "node_modules",
+        "target",
+    ];
+    const MAX_SCANNED_FILE_BYTES: u64 = 1_048_576;
+    const MAX_DEBT_ENTRIES: usize = 10_000;
+
+    let mut pending = vec![root.to_path_buf()];
+    let mut entries = Vec::new();
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                if !SKIPPED_DIRECTORIES
+                    .iter()
+                    .any(|name| path.file_name().is_some_and(|value| value == *name))
+                {
+                    pending.push(path);
+                }
+                continue;
+            }
+            if !file_type.is_file() || fs::metadata(&path)?.len() > MAX_SCANNED_FILE_BYTES {
+                continue;
+            }
+            let Ok(contents) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let relative_path = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            for (index, line) in contents.lines().enumerate() {
+                let trimmed = line.trim_start();
+                let is_comment = trimmed.starts_with("//")
+                    || trimmed.starts_with('#')
+                    || trimmed.starts_with("/*")
+                    || trimmed.starts_with('*');
+                let Some(marker_index) = trimmed.to_ascii_lowercase().find("ponytail:") else {
+                    continue;
+                };
+                if !is_comment {
+                    continue;
+                }
+                let marker = trimmed[marker_index + "ponytail:".len()..]
+                    .trim()
+                    .to_owned();
+                let lowered = marker.to_ascii_lowercase();
+                let has_upgrade_trigger =
+                    [" when ", " if ", " upgrade", " revisit", " replace", " -> "]
+                        .iter()
+                        .any(|needle| lowered.contains(needle));
+                entries.push(PonytailDebtEntry {
+                    path: relative_path.clone(),
+                    line: u64::try_from(index + 1).unwrap_or(u64::MAX),
+                    marker,
+                    has_upgrade_trigger,
+                });
+                if entries.len() >= MAX_DEBT_ENTRIES {
+                    break;
+                }
+            }
+            if entries.len() >= MAX_DEBT_ENTRIES {
+                break;
+            }
+        }
+        if entries.len() >= MAX_DEBT_ENTRIES {
+            break;
+        }
+    }
+    entries.sort_by(|left, right| (&left.path, left.line).cmp(&(&right.path, right.line)));
+    let entries_without_upgrade_trigger = entries
+        .iter()
+        .filter(|entry| !entry.has_upgrade_trigger)
+        .count()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    Ok(PonytailDebtReport {
+        schema: "harness.ponytail-debt.v1".to_owned(),
+        source_sha: source_sha.to_owned(),
+        available: true,
+        unavailable_reason: None,
+        entries,
+        entries_without_upgrade_trigger,
+    })
 }
 
 fn compact_handoffs_metadata_key(run_id: &RunId) -> String {
@@ -25833,8 +26528,32 @@ mod tests {
     }
 
     #[test]
-    fn minimal_implementation_discipline_is_default_on_and_limited_to_delivery_roles() {
-        assert!(default_minimal_implementation());
+    fn ponytail_rules_are_versioned_complete_and_limited_to_delivery_roles() {
+        assert_eq!(default_ponytail_mode(), PonytailMode::Full);
+        let full = new_ponytail_run_config(PonytailMode::Full);
+        assert_eq!(full.schema, PONYTAIL_ADAPTER_SCHEMA);
+        assert_eq!(full.upstream_repository, PONYTAIL_UPSTREAM_REPOSITORY);
+        assert_eq!(full.upstream_version, PONYTAIL_UPSTREAM_VERSION);
+        assert_eq!(full.rules_sha256, ponytail_rules_sha256(PonytailMode::Full));
+        assert_ne!(
+            full.rules_sha256,
+            ponytail_rules_sha256(PonytailMode::Ultra)
+        );
+        for required_rule in [
+            "understand the task and trace the real flow end-to-end",
+            "Does this need to exist at all?",
+            "Does the codebase already have",
+            "Does the standard library solve it?",
+            "Does the native platform feature solve it?",
+            "Does an already-installed dependency solve it?",
+            "Can the correct change be one line?",
+            "find the root cause rather than patching one symptom",
+            "No unrequested abstractions",
+            "ponytail:` source comment",
+            "Non-trivial new logic needs one smallest runnable regression check",
+        ] {
+            assert!(PONYTAIL_DELIVERY_DISCIPLINE.contains(required_rule));
+        }
         for role in [
             AgentRole::Architect,
             AgentRole::Governor,
@@ -25842,8 +26561,9 @@ mod tests {
             AgentRole::HighRiskWorker,
             AgentRole::Integrator,
         ] {
-            let prompt = minimal_implementation_prompt(role, true, "task packet".to_owned());
-            assert!(prompt.starts_with(MINIMAL_IMPLEMENTATION_DISCIPLINE));
+            let prompt = ponytail_delivery_prompt(role, &full, "task packet".to_owned());
+            assert!(prompt.starts_with(PONYTAIL_DELIVERY_DISCIPLINE));
+            assert!(prompt.contains(PONYTAIL_FULL_DISCIPLINE));
             assert!(prompt.ends_with("task packet"));
         }
         for role in [
@@ -25858,14 +26578,50 @@ mod tests {
             AgentRole::Investigator,
         ] {
             assert_eq!(
-                minimal_implementation_prompt(role, true, "review packet".to_owned()),
+                ponytail_delivery_prompt(role, &full, "review packet".to_owned()),
                 "review packet"
             );
         }
         assert_eq!(
-            minimal_implementation_prompt(AgentRole::Worker, false, "task packet".to_owned()),
+            ponytail_delivery_prompt(
+                AgentRole::Worker,
+                &new_ponytail_run_config(PonytailMode::Off),
+                "task packet".to_owned(),
+            ),
             "task packet"
         );
+        assert!(PONYTAIL_EXECUTION_REVIEW_DISCIPLINE.contains("advisory finding only"));
+    }
+
+    #[test]
+    fn ponytail_debt_scanner_ignores_prose_and_requires_an_upgrade_trigger() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("lib.rs"),
+            "// ponytail: global lock, upgrade when contention is measured\nlet note = \"ponytail: prose\";\n# ponytail: naive scan\n",
+        )
+        .unwrap();
+        let report = scan_ponytail_debt(temp.path(), "a".repeat(40).as_str()).unwrap();
+        assert!(report.available);
+        assert_eq!(report.entries.len(), 2);
+        assert!(report.entries[0].has_upgrade_trigger);
+        assert!(!report.entries[1].has_upgrade_trigger);
+        assert_eq!(report.entries_without_upgrade_trigger, 1);
+    }
+
+    #[test]
+    fn ponytail_audit_contract_is_bounded_and_accepts_only_safe_relative_paths() {
+        let schema = ponytail_audit_output_schema();
+        assert_eq!(
+            schema["properties"]["schema"]["const"],
+            "harness.ponytail-audit.v1"
+        );
+        assert_eq!(schema["properties"]["findings"]["maxItems"], 100);
+        assert!(ponytail_audit_response_contract().contains("advisory-only"));
+        assert!(audit_path_is_safe_relative_file("src/lib.rs"));
+        assert!(!audit_path_is_safe_relative_file("../outside.rs"));
+        assert!(!audit_path_is_safe_relative_file("/etc/passwd"));
+        assert!(!audit_path_is_safe_relative_file(""));
     }
 
     #[test]

@@ -1289,6 +1289,10 @@ export interface RunDetail {
     error?: string;
   };
   automatic_plan_approval: boolean;
+  ponytail: PonytailRunConfig;
+  ponytail_reviews: PonytailReviewRecord[];
+  ponytail_debt: PonytailDebtReport;
+  ponytail_audit?: PonytailAuditReport | null;
   preferred_codex_account_id?: string;
   governor_progress?: Record<string, GovernorCheckpoint>;
   supervision_mode?: "disabled" | "observe_only" | "shadow" | "advisory" | "active_low_risk" | "active";
@@ -1297,6 +1301,66 @@ export interface RunDetail {
   supervisor_decision?: SupervisorDecision | null;
   supervisor_actions?: SupervisorAction[];
   expert_requests?: ExpertRequest[];
+}
+
+export type PonytailMode = "off" | "lite" | "full" | "ultra";
+
+export interface PonytailRunConfig {
+  schema: string;
+  upstream_repository: string;
+  upstream_version: string;
+  mode: PonytailMode;
+  rules_sha256: string;
+}
+
+export interface PonytailReviewFinding {
+  severity: "blocking" | "advisory" | string;
+  file?: string | null;
+  line?: number | null;
+  description: string;
+  required_correction: string;
+}
+
+export interface PonytailReviewRecord {
+  task_id: string;
+  attempt_id: string;
+  source_sha?: string | null;
+  mode: PonytailMode;
+  findings: PonytailReviewFinding[];
+}
+
+export interface PonytailDebtEntry {
+  path: string;
+  line: number;
+  marker: string;
+  has_upgrade_trigger: boolean;
+}
+
+export interface PonytailDebtReport {
+  schema: string;
+  source_sha: string;
+  available: boolean;
+  unavailable_reason?: string | null;
+  entries: PonytailDebtEntry[];
+  entries_without_upgrade_trigger: number;
+}
+
+export interface PonytailAuditFinding {
+  tag: "delete" | "stdlib" | "native" | "yagni" | "shrink" | string;
+  path: string;
+  line: number;
+  description: string;
+  replacement: string;
+  estimated_lines_removed: number;
+}
+
+export interface PonytailAuditReport {
+  schema: string;
+  source_sha: string;
+  summary: string;
+  findings: PonytailAuditFinding[];
+  estimated_lines_removed: number;
+  estimated_dependencies_removed: number;
 }
 
 export interface ExpertRequest {

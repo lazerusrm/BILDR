@@ -3,6 +3,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   LiveTurnTelemetry,
+  PonytailPanel,
   RegisterModal,
   SettingsView,
   SupervisorObservationPanel,
@@ -113,6 +114,68 @@ describe("workspace presentation helpers", () => {
     expect(observing).toContain("Terra, Sol, and automatic actions remain off");
     expect(observing).toContain("Latest snapshot r3");
     expect(observing).toContain("Event 42");
+  });
+
+  it("shows the pinned Ponytail mode, audit, review, and debt receipts without implying automatic edits", () => {
+    const panel = renderToStaticMarkup(
+      createElement(PonytailPanel, {
+        detail: {
+          ponytail: {
+            schema: "harness.ponytail-adapter.v1",
+            upstream_repository: "https://github.com/dietrichgebert/ponytail",
+            upstream_version: "4.9.0",
+            mode: "ultra",
+            rules_sha256: "a".repeat(64),
+          },
+          ponytail_reviews: [{
+            task_id: "task-1",
+            attempt_id: "attempt-1",
+            source_sha: "b".repeat(40),
+            mode: "ultra",
+            findings: [{
+              severity: "advisory",
+              file: "src/lib.rs",
+              line: 12,
+              description: "PONYTAIL delete: unused wrapper. nothing",
+              required_correction: "Delete the unused wrapper.",
+            }],
+          }],
+          ponytail_debt: {
+            schema: "harness.ponytail-debt.v1",
+            source_sha: "b".repeat(40),
+            available: true,
+            unavailable_reason: null,
+            entries: [{
+              path: "src/lib.rs",
+              line: 22,
+              marker: "global lock, upgrade when contention is measured",
+              has_upgrade_trigger: true,
+            }],
+            entries_without_upgrade_trigger: 0,
+          },
+          ponytail_audit: {
+            schema: "harness.ponytail-audit.v1",
+            source_sha: "b".repeat(40),
+            summary: "One concrete simplification is available.",
+            findings: [{
+              tag: "delete",
+              path: "src/lib.rs",
+              line: 12,
+              description: "unused wrapper",
+              replacement: "nothing",
+              estimated_lines_removed: 8,
+            }],
+            estimated_lines_removed: 8,
+            estimated_dependencies_removed: 0,
+          },
+        } as RunDetail,
+      }),
+    );
+    expect(panel).toContain("Ponytail ultra mode");
+    expect(panel).toContain("Pinned Ponytail 4.9.0");
+    expect(panel).toContain("PONYTAIL delete");
+    expect(panel).toContain("Run read-only audit");
+    expect(panel).toContain("Never applies a change");
   });
 
   it("exposes the human-approved supervisory control in settings", () => {
@@ -354,6 +417,22 @@ describe("workspace presentation helpers", () => {
         worktrees: [],
         approvals: [],
         automatic_plan_approval: false,
+        ponytail: {
+          schema: "harness.ponytail-adapter.v1",
+          upstream_repository: "https://github.com/dietrichgebert/ponytail",
+          upstream_version: "4.9.0",
+          mode: "full",
+          rules_sha256: "a".repeat(64),
+        },
+        ponytail_reviews: [],
+        ponytail_debt: {
+          schema: "harness.ponytail-debt.v1",
+          source_sha: "b".repeat(40),
+          available: true,
+          unavailable_reason: null,
+          entries: [],
+          entries_without_upgrade_trigger: 0,
+        },
       }),
     ).toBe("WAITING ON YOU");
     expect(effectiveRunPosture({ ...run, scheduler_paused: true })).toBe(

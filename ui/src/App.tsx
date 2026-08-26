@@ -52,6 +52,7 @@ import type {
   IntentInterviewSnapshot,
   LatestAgentMessage,
   OperatorSettings,
+  PonytailMode,
   Repository,
   RepositoryDiscovery,
   Run,
@@ -830,6 +831,13 @@ export default function App() {
                   "supervisor-review",
                   () => api.requestSupervisorReview(currentRun.id),
                   "Terra started a read-only blocker analysis; recovery still requires your approval",
+                )
+              }
+              onRequestPonytailAudit={() =>
+                runAction(
+                  "ponytail-audit",
+                  () => api.requestPonytailAudit(currentRun.id),
+                  "Read-only Ponytail audit started; it cannot change the run or apply fixes",
                 )
               }
               onApplySupervisorAction={(actionId) =>
@@ -2161,6 +2169,7 @@ function RunWorkspace({
   onRequestPlanChanges,
   onResumePlanReview,
   onRequestSupervisorReview,
+  onRequestPonytailAudit,
   onApplySupervisorAction,
   onApproveIntegration,
   onApproveSignoff,
@@ -2190,6 +2199,7 @@ function RunWorkspace({
   onRequestPlanChanges: (finding: string) => void;
   onResumePlanReview: () => void;
   onRequestSupervisorReview: () => void;
+  onRequestPonytailAudit: () => void;
   onApplySupervisorAction: (actionId: string) => void;
   onApproveIntegration: () => void;
   onApproveSignoff: () => void;
@@ -2426,6 +2436,11 @@ function RunWorkspace({
         busy={busy}
         onRequestReview={onRequestSupervisorReview}
         onApplyAction={onApplySupervisorAction}
+      />
+      <PonytailPanel
+        detail={detail}
+        busy={busy}
+        onRequestAudit={onRequestPonytailAudit}
       />
       <BlockedRunRecoveryPanel
         detail={detail}
@@ -3458,6 +3473,111 @@ export function blockedPlanRecovery(run: Run, planDigest?: string) {
     };
   }
   return undefined;
+}
+
+export function PonytailPanel({
+  detail,
+  busy = "",
+  onRequestAudit = () => undefined,
+}: {
+  detail: RunDetail;
+  busy?: string;
+  onRequestAudit?: () => void;
+}) {
+  const ponytail = detail.ponytail;
+  if (!ponytail) return null;
+  const reviews = detail.ponytail_reviews || [];
+  const findings = reviews.flatMap((review) => review.findings);
+  const debt = detail.ponytail_debt;
+  const audit = detail.ponytail_audit;
+  const active = ponytail.mode !== "off";
+  return (
+    <section className="supervisor-observation" aria-label="Ponytail implementation discipline">
+      <header>
+        <div className="supervisor-observation-icon" aria-hidden="true">
+          <Zap size={17} />
+        </div>
+        <div>
+          <div className="eyebrow">Implementation discipline</div>
+          <h2>{active ? `Ponytail ${ponytail.mode} mode` : "Ponytail is off"}</h2>
+          <p>
+            {active
+              ? "The delivery controller traces the real flow first, then applies the full minimality ladder. Candidate verification also records advisory-only simplification findings; it never weakens correctness or proof."
+              : "This run deliberately has no Ponytail implementation policy or minimality review."}
+          </p>
+        </div>
+        <StatusBadge value={active ? ponytail.mode.toUpperCase() : "OFF"} />
+      </header>
+      <div className="supervisor-observation-receipt">
+        <span>Pinned Ponytail {ponytail.upstream_version}</span>
+        <span title={ponytail.rules_sha256}>Rules SHA-256 {ponytail.rules_sha256.slice(0, 12)}…</span>
+        <span>Immutable for this run</span>
+      </div>
+      {active && (
+        <div className="supervisor-action-receipts" aria-label="Ponytail review and debt receipts">
+          <strong>Measured run receipts</strong>
+          <p className="muted">
+            {reviews.length} candidate reviews · {findings.length} proven simplification opportunities · {debt?.entries.length || 0} marked shortcuts. These are observed receipts, not invented savings against an unrun baseline.
+          </p>
+          <strong>Minimality review</strong>
+          {findings.length ? (
+            findings.slice(0, 6).map((finding, index) => (
+              <div key={`${finding.file || "run"}-${finding.line || index}-${index}`} className="supervisor-action-receipt">
+                <span>{finding.description}</span>
+                <span>{finding.required_correction}</span>
+              </div>
+            ))
+          ) : (
+            <p className="muted">No safe simplification has been proven yet.</p>
+          )}
+          <strong>Ponytail debt ledger</strong>
+          {!debt?.available ? (
+            <p className="muted">{debt?.unavailable_reason || "The pinned inspection tree is not available."}</p>
+          ) : debt.entries.length ? (
+            <>
+              {debt.entries.slice(0, 6).map((entry) => (
+                <div key={`${entry.path}:${entry.line}`} className="supervisor-action-receipt">
+                  <span>{entry.path}:{entry.line} · {entry.marker}</span>
+                  <span>{entry.has_upgrade_trigger ? "upgrade trigger recorded" : "no upgrade trigger"}</span>
+                </div>
+              ))}
+              <p className="muted">
+                {debt.entries.length} shortcuts · {debt.entries_without_upgrade_trigger} without an upgrade trigger · base {shortSha(debt.source_sha)}
+              </p>
+            </>
+          ) : (
+            <p className="muted">No Ponytail shortcuts in the pinned inspection tree.</p>
+          )}
+          <strong>Whole-repository audit</strong>
+          {audit ? (
+            <>
+              <p className="muted">{audit.summary}</p>
+              {audit.findings.slice(0, 6).map((finding) => (
+                <div key={`${finding.path}:${finding.line}:${finding.tag}`} className="supervisor-action-receipt">
+                  <span>{finding.tag} · {finding.path}:{finding.line} · {finding.description}</span>
+                  <span>{finding.replacement}</span>
+                </div>
+              ))}
+              <p className="muted">
+                {audit.findings.length} concrete opportunities · up to {audit.estimated_lines_removed} lines · {audit.estimated_dependencies_removed} dependencies · base {shortSha(audit.source_sha)}
+              </p>
+            </>
+          ) : (
+            <p className="muted">No whole-repository audit has been recorded for this pinned source.</p>
+          )}
+        </div>
+      )}
+      {active && (
+        <div className="supervisor-observation-actions">
+          <button className="button secondary small" onClick={onRequestAudit} disabled={!!busy}>
+            <Search size={14} />
+            Run read-only audit
+          </button>
+          <span>Advisory only. Never applies a change.</span>
+        </div>
+      )}
+    </section>
+  );
 }
 
 export function SupervisorObservationPanel({
@@ -6102,7 +6222,7 @@ function NewRunModal({
   const [objective, setObjective] = useState("");
   const [automaticPlanApproval, setAutomaticPlanApproval] = useState(false);
   const [deepInterview, setDeepInterview] = useState(false);
-  const [minimalImplementation, setMinimalImplementation] = useState(true);
+  const [ponytailMode, setPonytailMode] = useState<PonytailMode>("full");
   const [compactHandoffs, setCompactHandoffs] = useState(true);
   const [codexAccountId, setCodexAccountId] = useState("");
   const [publication, setPublication] = useState("local_only");
@@ -6163,7 +6283,7 @@ function NewRunModal({
         automaticPlanApproval,
         runTokenBudget,
         deepInterview,
-        minimalImplementation,
+        ponytailMode,
         compactHandoffs,
         codexAccountId || undefined,
       );
@@ -6216,20 +6336,24 @@ function NewRunModal({
             </small>
           </span>
         </label>
-        <label className={`interview-option ${minimalImplementation ? "selected" : ""}`}>
-          <input
-            type="checkbox"
-            checked={minimalImplementation}
-            onChange={(event) => setMinimalImplementation(event.target.checked)}
-          />
+        <label className={`field ${ponytailMode !== "off" ? "selected" : ""}`}>
           <span>
-            <strong>Ponytail minimal implementation</strong>
+            <strong>Ponytail implementation discipline</strong>
             <small>
-              On by default · use the Ponytail-inspired decision ladder: avoid
-              unnecessary change, reuse what exists, then make the smallest
-              clear solution without weakening requirements or proof.
+              Version-pinned per run · reads the real flow first, then applies
+              YAGNI, reuse, stdlib, native platform, installed dependency, and
+              smallest-correct-diff rules without weakening proof or safety.
             </small>
           </span>
+          <select
+            value={ponytailMode}
+            onChange={(event) => setPonytailMode(event.target.value as PonytailMode)}
+          >
+            <option value="off">Off</option>
+            <option value="lite">Lite · propose a simpler alternative</option>
+            <option value="full">Full · default</option>
+            <option value="ultra">Ultra · reject speculative complexity</option>
+          </select>
         </label>
         <label className={`interview-option ${compactHandoffs ? "selected" : ""}`}>
           <input
