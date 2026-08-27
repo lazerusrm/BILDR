@@ -805,3 +805,10 @@ pub struct NewEvaluationInvalidation {
     pub holdout_access_log_id: Option<String>,
     pub idempotency_key: String,
 }
+
+/// What one retention sweep removed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetentionSweep {
+    pub raw_events: usize,
+    pub command_runs: usize,
+}

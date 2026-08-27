@@ -111,6 +111,7 @@ class HarnessApi {
       credentials: "same-origin",
     });
     if (!response.ok) throw await this.error(response);
+    if (response.status === 204) return undefined as T;
     return (await response.json()) as T;
   }
 
@@ -124,6 +125,10 @@ class HarnessApi {
       { method: "POST", body: JSON.stringify(body) },
       true,
     );
+  }
+
+  delete<T>(path: string): Promise<T> {
+    return this.request<T>(path, { method: "DELETE" }, true);
   }
 
   runtime = () => this.get<RuntimeStatus>("/runtime");
@@ -432,6 +437,14 @@ class HarnessApi {
 
   archiveRun(runId: string) {
     return this.post<Run>(`/runs/${runId}/archive`);
+  }
+
+  setRunPinned(runId: string, pinned: boolean) {
+    return this.post<Run>(`/runs/${runId}/pin`, { pinned });
+  }
+
+  deleteRun(runId: string) {
+    return this.delete<void>(`/runs/${runId}`);
   }
 
   recordOperatorOutcome(body: {

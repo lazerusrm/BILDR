@@ -10,7 +10,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response, Sse, sse::Event},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use futures::future::BoxFuture;
 use harness_domain::{
@@ -239,6 +239,8 @@ pub fn router(orchestrator: Arc<Orchestrator>, provider_switch: ProviderSwitchCo
         )
         .route("/api/v1/runs/{run_id}/stop", post(stop_run))
         .route("/api/v1/runs/{run_id}/archive", post(archive_run))
+        .route("/api/v1/runs/{run_id}/pin", post(set_run_pin))
+        .route("/api/v1/runs/{run_id}", delete(delete_run))
         .route(
             "/api/v1/runs/{run_id}/approve-integration",
             post(approve_integration),
@@ -994,8 +996,42 @@ async fn archive_run(
     Ok(Json(
         state
             .orchestrator
-            .archive_run(&RunId::from(run_id), "local-user")?,
+            .archive_run(&RunId::from(run_id), "local-user")
+            .await?,
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunPinBody {
+    pinned: bool,
+}
+
+async fn set_run_pin(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Json(body): Json<RunPinBody>,
+) -> Result<Json<harness_domain::RunSummary>, ApiError> {
+    authenticate(&state, &headers, true)?;
+    Ok(Json(state.orchestrator.set_run_pinned(
+        &RunId::from(run_id),
+        body.pinned,
+        "local-user",
+    )?))
+}
+
+async fn delete_run(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    authenticate(&state, &headers, true)?;
+    state
+        .orchestrator
+        .delete_run(&RunId::from(run_id), "local-user")
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

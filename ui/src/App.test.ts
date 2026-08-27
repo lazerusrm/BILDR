@@ -3,11 +3,14 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   LiveTurnTelemetry,
-  AccountBar,
+  AccountPopover,
   PonytailPanel,
   RegisterModal,
   SettingsView,
   SupervisorObservationPanel,
+  clampOperatorCopy,
+  compactAction,
+  supervisorAdviceIsWaitOnly,
   accountOptionLabel,
   agentEffort,
   agentModel,
@@ -80,8 +83,7 @@ describe("workspace presentation helpers", () => {
     expect(threadLifecycleSummary(agent)).toContain("completed");
     expect(blockerStatus(run, task, agent)).toEqual({
       reason: "controller token budget exhausted",
-      nextStep:
-        "Use Continue governor below. You can add a decision or new fact and choose the next attempt budget before continuing.",
+      nextStep: "Continue the governor.",
     });
   });
 
@@ -91,8 +93,7 @@ describe("workspace presentation helpers", () => {
         detail: { supervision_mode: "disabled" } as RunDetail,
       }),
     );
-    expect(disabled).toContain("Supervision is disabled");
-    expect(disabled).toContain("no automatic action is available");
+    expect(disabled).toContain("Supervision off");
 
     const observing = renderToStaticMarkup(
       createElement(SupervisorObservationPanel, {
@@ -111,10 +112,51 @@ describe("workspace presentation helpers", () => {
         } as RunDetail,
       }),
     );
-    expect(observing).toContain("Observe-only custody");
-    expect(observing).toContain("Terra, Sol, and automatic actions remain off");
-    expect(observing).toContain("Latest snapshot r3");
-    expect(observing).toContain("Event 42");
+    expect(observing).toContain("Snapshots only");
+    expect(observing).toContain("r3");
+  });
+
+  it("collapses wait-only Terra advice instead of asking the operator to apply wait", () => {
+    const detail = {
+      supervision_mode: "advisory",
+      run: { state: "EXECUTING" },
+      supervisor_decision: {
+        policy_state: "ADVISORY",
+        payload: {
+          summary:
+            "The immutable snapshot permits only a bounded wait; no intervention is proposed.",
+          actions: [
+            {
+              kind: "wait",
+              summary: "Wait for the next controller-visible event",
+            },
+          ],
+        },
+      },
+      supervisor_actions: [{ id: "act-1", kind: "wait", state: "PROPOSED" }],
+    } as RunDetail;
+    expect(supervisorAdviceIsWaitOnly(detail)).toBe(true);
+    const markup = renderToStaticMarkup(
+      createElement(SupervisorObservationPanel, { detail }),
+    );
+    expect(markup).toContain("Terra");
+    expect(markup).toContain("wait");
+    expect(markup).not.toContain("Revalidate and apply");
+    expect(markup).not.toContain("immutable snapshot");
+    expect(markup).toContain("Ask Terra");
+  });
+
+  it("clamps operator copy and strips custody jargon", () => {
+    expect(clampOperatorCopy("short")).toBe("short");
+    expect(clampOperatorCopy("a ".repeat(120), 40).endsWith("…")).toBe(true);
+    expect(compactAction("Controller committed custody-verified diff")).toBe(
+      "Committed",
+    );
+    expect(
+      compactAction(
+        "The supplied patch is internally coherent and the evidence packet is absent",
+      ),
+    ).toBe("");
   });
 
   it("shows the pinned Ponytail mode, audit, review, and debt receipts without implying automatic edits", () => {
@@ -219,7 +261,7 @@ describe("workspace presentation helpers", () => {
 
   it("places the persisted Qwodex/hosted runtime switch in the account bar", () => {
     const accountBar = renderToStaticMarkup(
-      createElement(AccountBar, {
+      createElement(AccountPopover, {
         snapshot: { accounts: [] },
         modelCatalog: { provider: "qwen-local-switcher", models: [] },
         providerSwitch: {
@@ -259,8 +301,7 @@ describe("workspace presentation helpers", () => {
     });
     expect(blockerStatus(run)).toEqual({
       reason: "session token budget exhausted",
-      nextStep:
-        "Use the recovery panel above to resume the bounded final plan review or give the architect one concrete plan correction.",
+      nextStep: "Resume review or request a plan change.",
     });
   });
 
@@ -410,7 +451,7 @@ describe("workspace presentation helpers", () => {
     const task = { state: "NEEDS_HELP", title: "Repair PR #3108", objective: "Repair PR #3108" } as Task;
     const run = { title: "Repair PR #3108", objective: "Repair PR #3108" } as Run;
     const worktree = { state: "ACTIVE", dirty: true, files_changed: 3, additions: 12, deletions: 4 } as Worktree;
-    expect(humanTaskState(task.state)).toBe("Waiting on you");
+    expect(humanTaskState(task.state)).toBe("Paused");
     expect(delegatedThreadDisplayState(child, false)).toBe("FINISHING");
     expect(workStatusSummary(task, worktree).label).toBe("UNCOMMITTED");
     expect(workStatusSummary(task, worktree).detail.split(" ").length).toBeLessThan(8);

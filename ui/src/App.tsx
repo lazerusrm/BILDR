@@ -21,7 +21,6 @@ import {
   Plus,
   RefreshCw,
   Search,
-  ServerCog,
   Settings,
   ShieldCheck,
   Square,
@@ -30,16 +29,22 @@ import {
   Zap,
 } from "lucide-react";
 import {
+  type CSSProperties,
   type FormEvent,
   type ReactNode,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
 import { api } from "./api";
 import { ImprovementCenter } from "./improvement/ImprovementCenter";
-import { AttentionCenter } from "./operator-control/AttentionCenter";
+import { NeedsYou } from "./operator-control/NeedsYou";
+import { ThreadList, isArchived } from "./operator-control/ThreadList";
+import type { RefLabels } from "./operator-control/refs";
+import { NotificationSettings } from "./operator-control/NotificationSettings";
+import { RunActivity } from "./operator-control/RunActivity";
 import type {
   Agent,
   Approval,
@@ -69,7 +74,7 @@ import type {
 
 const EMPTY_STRING_ARRAY: string[] = [];
 
-type View = "home" | "repositories" | "runs" | "control" | "improvement" | "usage" | "host" | "settings";
+type View = "home" | "runs" | "improvement" | "usage" | "settings";
 type Modal =
   | "register"
   | "prepare-checkout"
@@ -82,14 +87,9 @@ type ProjectMode = "existing" | "new";
 
 const nav: Array<{ view: View; label: string; icon: typeof Home }> = [
   { view: "home", label: "Home", icon: Home },
-  { view: "repositories", label: "Repositories", icon: FolderGit2 },
   { view: "runs", label: "Runs", icon: Activity },
-  { view: "control", label: "Control", icon: AlertTriangle },
-  { view: "improvement", label: "Improvement", icon: Network },
+  { view: "improvement", label: "Learning", icon: Network },
   { view: "usage", label: "Usage", icon: CircleDollarSign },
-];
-const systemNav: Array<{ view: View; label: string; icon: typeof Home }> = [
-  { view: "host", label: "Host", icon: ServerCog },
   { view: "settings", label: "Settings", icon: Settings },
 ];
 
@@ -103,6 +103,89 @@ const ADDITIONAL_BUDGET_OPTIONS = [
   0, 250_000, 500_000, 1_000_000, 2_000_000, 4_000_000, 5_000_000,
   10_000_000, 20_000_000, 50_000_000,
 ];
+const RAIL_WIDTH_KEY = "harness-rail-width-v1";
+const RAIL_MIN = 176;
+const RAIL_MAX = 440;
+const RAIL_DEFAULT = 216;
+const INSPECTOR_WIDTH_KEY = "harness-inspector-width-v1";
+const INSPECTOR_MIN = 360;
+const INSPECTOR_MAX = 900;
+const INSPECTOR_DEFAULT = 520;
+/** The run workspace stays usable no matter how wide the inspector is dragged. */
+const MAIN_MIN = 480;
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, Math.round(value)));
+}
+
+function storedWidth(key: string, fallback: number, min: number, max: number) {
+  const stored = Number(window.localStorage.getItem(key));
+  return Number.isFinite(stored) && stored > 0 ? clamp(stored, min, max) : fallback;
+}
+
+/**
+ * Drag handle on a pane edge. Width is a CSS variable on the shell so the grid
+ * track follows, and it persists per browser profile.
+ */
+function PaneResizer({
+  side,
+  width,
+  min,
+  max,
+  fallback,
+  label,
+  onWidth,
+}: {
+  side: "left" | "right";
+  width: number;
+  min: number;
+  max: number;
+  fallback: number;
+  label: string;
+  onWidth: (width: number) => void;
+}) {
+  const measure = (clientX: number) =>
+    clamp(side === "left" ? clientX : window.innerWidth - clientX, min, max);
+  return (
+    <div
+      className={`pane-resizer pane-resizer-${side}`}
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={label}
+      aria-valuenow={width}
+      aria-valuemin={min}
+      aria-valuemax={max}
+      tabIndex={0}
+      title="Drag to resize · double-click to reset"
+      onDoubleClick={() => onWidth(fallback)}
+      onPointerDown={(event) => {
+        event.preventDefault();
+        const handle = event.currentTarget;
+        handle.setPointerCapture(event.pointerId);
+        document.body.classList.add("resizing-pane");
+        const move = (moved: PointerEvent) => onWidth(measure(moved.clientX));
+        const stop = () => {
+          handle.releasePointerCapture(event.pointerId);
+          handle.removeEventListener("pointermove", move);
+          handle.removeEventListener("pointerup", stop);
+          handle.removeEventListener("pointercancel", stop);
+          document.body.classList.remove("resizing-pane");
+        };
+        handle.addEventListener("pointermove", move);
+        handle.addEventListener("pointerup", stop);
+        handle.addEventListener("pointercancel", stop);
+      }}
+      onKeyDown={(event) => {
+        const step = (event.shiftKey ? 48 : 16) * (side === "left" ? 1 : -1);
+        if (event.key === "ArrowLeft") onWidth(clamp(width - step, min, max));
+        else if (event.key === "ArrowRight") onWidth(clamp(width + step, min, max));
+        else if (event.key === "Home") onWidth(fallback);
+        else return;
+        event.preventDefault();
+      }}
+    />
+  );
+}
 
 export type RateLimitSample = {
   observedAt: number;
@@ -160,6 +243,23 @@ export default function App() {
   const [stream, setStream] = useState<
     "connecting" | "connected" | "disconnected"
   >("connecting");
+  const [railWidth, setRailWidth] = useState(() =>
+    storedWidth(RAIL_WIDTH_KEY, RAIL_DEFAULT, RAIL_MIN, RAIL_MAX),
+  );
+  const [inspectorWidth, setInspectorWidth] = useState(() =>
+    storedWidth(
+      INSPECTOR_WIDTH_KEY,
+      INSPECTOR_DEFAULT,
+      INSPECTOR_MIN,
+      INSPECTOR_MAX,
+    ),
+  );
+  useEffect(() => {
+    window.localStorage.setItem(RAIL_WIDTH_KEY, String(railWidth));
+  }, [railWidth]);
+  useEffect(() => {
+    window.localStorage.setItem(INSPECTOR_WIDTH_KEY, String(inspectorWidth));
+  }, [inspectorWidth]);
   const [light, setLight] = useState(
     () => localStorage.getItem("harness-theme") === "light",
   );
@@ -316,14 +416,14 @@ export default function App() {
 
   useEffect(() => {
     if (!registerPrefill) return;
-    setView("repositories");
+    setView("home");
     setRegisterMode("existing");
     setModal("register");
   }, [registerPrefill]);
 
   useEffect(() => {
     if (!newProjectParentPrefill) return;
-    setView("repositories");
+    setView("home");
     setRegisterMode("new");
     setModal("register");
   }, [newProjectParentPrefill]);
@@ -522,6 +622,25 @@ export default function App() {
       );
   const currentRun =
     currentDetail?.run || runs.find((run) => run.id === selectedRunId);
+  /** Runs an attention item can still refer to; archived work no longer nags. */
+  const liveRunIds = useMemo(
+    () =>
+      new Set(
+        runs
+          .filter((run) => String(run.state).toUpperCase() !== "ARCHIVED")
+          .map((run) => run.id),
+      ),
+    [runs],
+  );
+  /** Identifier -> operator-facing name, so records never render a raw ULID. */
+  const refLabels = useMemo(() => {
+    const labels: Record<string, string> = {};
+    for (const run of runs) labels[run.id] = run.title;
+    for (const task of currentDetail?.tasks || []) {
+      labels[task.id] = `${task.external_task_id} · ${task.title}`;
+    }
+    return labels;
+  }, [runs, currentDetail?.tasks]);
 
   useEffect(() => {
     if (!selectedWorktree) {
@@ -632,22 +751,16 @@ export default function App() {
         repository={repositories.find(
           (repository) => repository.id === currentRun?.repository_id,
         )}
-        runtime={runtime}
-        usage={usage}
         approvals={approvals}
         light={light}
-        onTheme={() => setLight((value) => !value)}
-        onPalette={() => setModal("palette")}
-      />
-      <AccountBar
-        snapshot={codexAccounts}
+        accounts={codexAccounts}
         modelCatalog={runModelCatalog}
         providerSwitch={providerSwitch}
         history={rateHistory}
-        busy={busy === "codex-account"}
+        accountBusy={busy === "codex-account"}
         providerBusy={busy === "provider-switch"}
         onSwitchProvider={switchProvider}
-        onSelect={(accountId) =>
+        onSelectAccount={(accountId) =>
           runAction(
             "codex-account",
             async () =>
@@ -655,14 +768,14 @@ export default function App() {
             "Codex account selected",
           )
         }
-        onRefresh={() =>
+        onRefreshAccounts={() =>
           runAction(
             "codex-account",
             async () => setCodexAccounts(await api.codexAccounts(true)),
             "All detected Codex account limits refreshed",
           )
         }
-        onAdd={() => {
+        onAddAccount={() => {
           setAccountLoginTargetId(undefined);
           setModal("account-login");
         }}
@@ -670,15 +783,76 @@ export default function App() {
           setAccountLoginTargetId(accountId);
           setModal("account-login");
         }}
+        onTheme={() => setLight((value) => !value)}
+        onPalette={() => setModal("palette")}
       />
       <div
         className={`shell ${view === "runs" && currentDetail ? "with-inspector" : ""}`}
+        style={
+          {
+            "--rail-width": `${railWidth}px`,
+            "--inspector-width": `${inspectorWidth}px`,
+          } as CSSProperties
+        }
       >
         <Rail
           view={view}
           approvals={approvals.length}
           activeRuns={runs.filter((run) => !terminal(run.state)).length}
+          runs={runs}
+          selectedRunId={currentRun?.id}
+          busy={busy}
           onChange={setView}
+          onSelectRun={(runId) => {
+            chooseRun(runId);
+            setView("runs");
+          }}
+          onPinRun={(run) =>
+            runAction(
+              run.id,
+              async () => {
+                const next = await api.setRunPinned(run.id, !run.pinned);
+                setRuns((current) =>
+                  current.map((item) => (item.id === next.id ? next : item)),
+                );
+              },
+              run.pinned ? "Thread unpinned" : "Thread pinned",
+            )
+          }
+          onArchiveRun={(run) =>
+            runAction(
+              run.id,
+              async () => {
+                const next = await api.archiveRun(run.id);
+                setRuns((current) =>
+                  current.map((item) => (item.id === next.id ? next : item)),
+                );
+              },
+              "Thread archived",
+            )
+          }
+          onDeleteRun={(run) =>
+            runAction(
+              run.id,
+              async () => {
+                await api.deleteRun(run.id);
+                setRuns((current) =>
+                  current.filter((item) => item.id !== run.id),
+                );
+                if (currentRun?.id === run.id) chooseRun("");
+              },
+              "Thread deleted",
+            )
+          }
+        />
+        <PaneResizer
+          side="left"
+          width={railWidth}
+          min={RAIL_MIN}
+          max={RAIL_MAX}
+          fallback={RAIL_DEFAULT}
+          label="Resize sidebar"
+          onWidth={setRailWidth}
         />
         <main className="main" id="main-content">
           {error && (
@@ -730,6 +904,8 @@ export default function App() {
               runs={runs}
               postures={visibleRunPostures}
               runtime={runtime}
+              labels={refLabels}
+              liveRunIds={liveRunIds}
               onNewRun={() => {
                 if (repositories.length) {
                   setModal("new-run");
@@ -740,15 +916,10 @@ export default function App() {
                 }
               }}
               onRun={chooseRun}
-              onRegister={() => {
-                setRegisterMode("existing");
-                setModal("register");
+              onOpenRun={(runId) => {
+                chooseRun(runId);
+                setView("runs");
               }}
-            />
-          )}
-          {view === "repositories" && (
-            <RepositoriesView
-              repositories={repositories}
               onRegister={() => {
                 setRegisterMode("existing");
                 setModal("register");
@@ -1049,13 +1220,11 @@ export default function App() {
               runtime={runtime}
             />
           )}
-          {view === "control" && <AttentionCenter />}
-          {view === "host" && (
-            <HostView runtime={runtime} repositories={repositories} />
-          )}
           {view === "settings" && (
             <SettingsView
               light={light}
+              runtime={runtime}
+              repositories={repositories}
               accounts={codexAccounts}
               modelCatalog={runModelCatalog}
               onAccounts={setCodexAccounts}
@@ -1073,6 +1242,20 @@ export default function App() {
             />
           )}
         </main>
+        {view === "runs" && currentRun && currentDetail && (
+          <PaneResizer
+            side="right"
+            width={inspectorWidth}
+            min={INSPECTOR_MIN}
+            max={Math.max(
+              INSPECTOR_MIN,
+              Math.min(INSPECTOR_MAX, window.innerWidth - railWidth - MAIN_MIN),
+            )}
+            fallback={INSPECTOR_DEFAULT}
+            label="Resize inspector"
+            onWidth={setInspectorWidth}
+          />
+        )}
         {view === "runs" && currentRun && currentDetail && (
           <Inspector
             task={selectedTask}
@@ -1250,11 +1433,7 @@ export default function App() {
       )}
       {modal === "messages" && (
         <MessageHistoryModal
-          title={
-            selectedAgent?.role === "governor"
-              ? "Governor messages"
-              : "Thread messages"
-          }
+          title="Messages"
           messages={messageHistory}
           onClose={() => setModal(null)}
         />
@@ -1265,18 +1444,36 @@ export default function App() {
 
 function TopBar({
   repository,
-  runtime,
-  usage,
   approvals,
   light,
+  accounts,
+  modelCatalog,
+  providerSwitch,
+  history,
+  accountBusy,
+  providerBusy,
+  onSelectAccount,
+  onSwitchProvider,
+  onRefreshAccounts,
+  onAddAccount,
+  onReauthenticate,
   onTheme,
   onPalette,
 }: {
   repository?: Repository;
-  runtime?: RuntimeStatus;
-  usage?: Usage;
   approvals: Approval[];
   light: boolean;
+  accounts: CodexAccountsSnapshot;
+  modelCatalog: RunModelCatalog;
+  providerSwitch: ProviderSwitchStatus;
+  history: RateLimitHistory;
+  accountBusy: boolean;
+  providerBusy: boolean;
+  onSelectAccount: (accountId: string) => void;
+  onSwitchProvider: (provider: string) => void;
+  onRefreshAccounts: () => void;
+  onAddAccount: () => void;
+  onReauthenticate: (accountId: string) => void;
   onTheme: () => void;
   onPalette: () => void;
 }) {
@@ -1294,27 +1491,19 @@ function TopBar({
         <ChevronDown size={13} />
       </button>
       <div className="top-spacer" />
-      <div
-        className={`top-pill ${runtime?.codex.state === "ready" ? "healthy" : "unhealthy"}`}
-        title={runtime?.codex.detail ?? undefined}
-      >
-        <i className="status-dot" />
-        <span>App Server {runtime?.codex.version || "offline"}</span>
-        <span className="wide-only">
-          ·{" "}
-          {runtime?.codex.schema_match
-            ? "schema matched"
-            : "execution disabled"}
-        </span>
-      </div>
-      <div className="top-pill wide-only">
-        Slots {runtime?.scheduler.active_total || 0} /{" "}
-        {runtime?.scheduler.max_total || 0}
-      </div>
-      <div className="top-pill wide-only">
-        {formatTokens(usage?.total_tokens || 0)} ·{" "}
-        {formatCost(usage?.cost.upper_microusd || 0)}
-      </div>
+      <AccountPopover
+        snapshot={accounts}
+        modelCatalog={modelCatalog}
+        providerSwitch={providerSwitch}
+        history={history}
+        busy={accountBusy}
+        providerBusy={providerBusy}
+        onSelect={onSelectAccount}
+        onSwitchProvider={onSwitchProvider}
+        onRefresh={onRefreshAccounts}
+        onAdd={onAddAccount}
+        onReauthenticate={onReauthenticate}
+      />
       <button
         className={`top-pill interactive ${approvals.length ? "attention" : ""}`}
         onClick={onPalette}
@@ -1344,7 +1533,7 @@ type AccountMeter = {
   historyKey?: string;
 };
 
-export function AccountBar({
+export function AccountPopover({
   snapshot,
   modelCatalog,
   providerSwitch,
@@ -1369,11 +1558,46 @@ export function AccountBar({
   onAdd: () => void;
   onReauthenticate: (accountId: string) => void;
 }) {
+  const ref = useRef<HTMLDetailsElement>(null);
+  useEffect(() => {
+    const dismiss = (event: Event) => {
+      const element = ref.current;
+      if (element?.open && !element.contains(event.target as Node)) {
+        element.open = false;
+      }
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && ref.current?.open) ref.current.open = false;
+    };
+    document.addEventListener("pointerdown", dismiss);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("pointerdown", dismiss);
+      document.removeEventListener("keydown", escape);
+    };
+  }, []);
   const account =
     snapshot.accounts.find(
       (item) => item.id === snapshot.selected_account_id,
     ) || snapshot.accounts.find((item) => item.selected);
   const meters = accountMeters(account);
+  const capacity = account ? accountCapacity(account) : undefined;
+  const capacityMeter = meters
+    .filter(
+      (meter) =>
+        meter.window &&
+        !/spark/i.test(`${meter.key} ${meter.label}`),
+    )
+    .sort(
+      (left, right) =>
+        left.window!.remaining_percent - right.window!.remaining_percent,
+    )[0];
+  const burn = capacityMeter?.window
+    ? rateLimitForecast(
+        capacityMeter.historyKey ? history[capacityMeter.historyKey] || [] : [],
+        capacityMeter.window,
+      )
+    : undefined;
   const live = Boolean(
     account?.state === "ready" &&
     account.observed_at &&
@@ -1384,129 +1608,174 @@ export function AccountBar({
     ? modelCatalog.models.find((model) => model.id === "ornith-1.5-35b-a3b-nvfp4")
         ?.display_name || "Local model catalog ready"
     : "Hosted model catalog ready";
+  const tone = isQwodex
+    ? "healthy"
+    : capacity === undefined
+      ? "unknown"
+      : capacity <= 10
+        ? "unhealthy"
+        : capacity <= 30
+          ? "warning"
+          : "healthy";
   return (
-    <section
-      className="account-bar"
-      aria-label={isQwodex ? "Local model route" : "Codex account and usage limits"}
-    >
-      {isQwodex ? (
-        <div className="account-identity">
-          <label>Execution account</label>
-          <strong>Qwodex · local</strong>
-          <span>No Codex account is used for this local-model run.</span>
-        </div>
-      ) : (
-        <div className="account-identity">
-          <label htmlFor="codex-account-select">Codex account</label>
+    <details className="account-popover" ref={ref}>
+      <summary
+        className={`top-pill interactive ${tone}`}
+        title={
+          isQwodex
+            ? localModelLabel
+            : burn
+              ? `${capacityMeter?.label}: ${burn.label}`
+              : "Codex account and remaining capacity"
+        }
+        aria-label={
+          isQwodex
+            ? "Local model route, no Codex account in use"
+            : `Codex account ${account?.label || "unavailable"}${
+                capacity === undefined ? "" : `, ${capacity}% capacity left`
+              }${burn ? `, burn rate ${burn.short}` : ""}`
+        }
+      >
+        <i className={`status-dot ${isQwodex || live ? "" : "stale"}`} />
+        {isQwodex ? (
+          <>
+            <span>Qwodex</span>
+            <strong>local</strong>
+          </>
+        ) : (
+          <>
+            <span>{account?.label || "No account"}</span>
+            <strong>{capacity === undefined ? "—" : `${capacity}%`}</strong>
+            {burn && <em className="burn-rate">{burn.short}</em>}
+          </>
+        )}
+        <ChevronDown size={12} />
+      </summary>
+      <div
+        className="account-panel"
+        aria-label={
+          isQwodex ? "Local model route" : "Codex account and usage limits"
+        }
+      >
+        {isQwodex ? (
+          <div className="account-identity">
+            <label>Execution account</label>
+            <strong>Qwodex · local</strong>
+            <span>No Codex account is used for this local-model run.</span>
+          </div>
+        ) : (
+          <div className="account-identity">
+            <label htmlFor="codex-account-select">Codex account</label>
+            <div>
+              <select
+                id="codex-account-select"
+                value={snapshot.selected_account_id || ""}
+                disabled={busy}
+                onChange={(event) =>
+                  event.target.value === "__add__"
+                    ? onAdd()
+                    : onSelect(event.target.value)
+                }
+                title={account?.codex_home}
+              >
+                {!snapshot.accounts.length && (
+                  <option value="">No account detected</option>
+                )}
+                {snapshot.accounts.map((item) => (
+                  <option value={item.id} key={item.id}>
+                    {accountOptionLabel(item)}
+                  </option>
+                ))}
+                <option value="__add__">＋ Add Codex account…</option>
+              </select>
+              <ChevronDown size={12} />
+            </div>
+            <span>
+              {account
+                ? `${account.plan_type || account.account_type || account.state}`
+                : "Codex App Server unavailable"}
+            </span>
+          </div>
+        )}
+        <div className={`provider-identity ${isQwodex ? "local" : "hosted"}`}>
+          <label htmlFor="provider-switch-select">Model provider</label>
           <div>
             <select
-              id="codex-account-select"
-              value={snapshot.selected_account_id || ""}
-              disabled={busy}
-              onChange={(event) =>
-                event.target.value === "__add__"
-                  ? onAdd()
-                  : onSelect(event.target.value)
-              }
-              title={account?.codex_home}
+              id="provider-switch-select"
+              value={providerSwitch.active_provider || modelCatalog.provider}
+              disabled={providerBusy || !providerSwitch.switchable}
+              onChange={(event) => onSwitchProvider(event.target.value)}
+              title={providerSwitch.detail}
             >
-              {!snapshot.accounts.length && (
-                <option value="">No account detected</option>
+              {!providerSwitch.available_providers.length && (
+                <option value={modelCatalog.provider || ""}>
+                  {isQwodex ? "Qwodex · local" : "OpenAI · hosted"}
+                </option>
               )}
-              {snapshot.accounts.map((item) => (
-                <option value={item.id} key={item.id}>
-                  {accountOptionLabel(item)}
+              {providerSwitch.available_providers.map((provider) => (
+                <option value={provider} key={provider}>
+                  {provider === "qwen-local-switcher"
+                    ? "Qwodex · local"
+                    : provider === "openai"
+                      ? "OpenAI · hosted"
+                      : provider}
                 </option>
               ))}
-              <option value="__add__">＋ Add Codex account…</option>
             </select>
             <ChevronDown size={12} />
           </div>
-          <span>
-            {account
-              ? `${account.label} · ${account.plan_type || account.account_type || account.state}`
-              : "Codex App Server unavailable"}
+          <span title={providerSwitch.detail || localModelLabel}>
+            {providerBusy
+              ? "Saving selection and restarting BILDR…"
+              : providerSwitch.switchable
+                ? "Switches runtime when no run is active"
+                : providerSwitch.detail || localModelLabel}
           </span>
         </div>
-      )}
-      <div className={`provider-identity ${isQwodex ? "local" : "hosted"}`}>
-        <label htmlFor="provider-switch-select">Model provider</label>
-        <div>
-          <select
-            id="provider-switch-select"
-            value={providerSwitch.active_provider || modelCatalog.provider}
-            disabled={providerBusy || !providerSwitch.switchable}
-            onChange={(event) => onSwitchProvider(event.target.value)}
-            title={providerSwitch.detail}
-          >
-            {!providerSwitch.available_providers.length && (
-              <option value={modelCatalog.provider || ""}>
-                {isQwodex ? "Qwodex · local" : "OpenAI · hosted"}
-              </option>
-            )}
-            {providerSwitch.available_providers.map((provider) => (
-              <option value={provider} key={provider}>
-                {provider === "qwen-local-switcher"
-                  ? "Qwodex · local"
-                  : provider === "openai"
-                    ? "OpenAI · hosted"
-                    : provider}
-              </option>
-            ))}
-          </select>
-          <ChevronDown size={12} />
-        </div>
-        <span title={providerSwitch.detail || localModelLabel}>
-          {providerBusy
-            ? "Saving selection and restarting BILDR…"
-            : providerSwitch.switchable
-              ? "Switches runtime when no run is active"
-              : providerSwitch.detail || localModelLabel}
-        </span>
+        {!isQwodex && (
+          <>
+            <div className="account-meters">
+              {meters.map((meter) => (
+                <LimitMeter
+                  meter={meter}
+                  samples={meter.historyKey ? history[meter.historyKey] || [] : []}
+                  key={meter.key}
+                />
+              ))}
+            </div>
+            <div className={`account-live ${live ? "live" : "stale"}`}>
+              <strong>
+                <i />
+                {live ? "Live" : account?.observed_at ? "Stale" : "Waiting"}
+              </strong>
+              <span>
+                {account?.observed_at
+                  ? `observed ${relativeObserved(account.observed_at)}`
+                  : account?.detail || "no telemetry"}
+              </span>
+              {account?.managed &&
+                ["signed_out", "unavailable"].includes(account.state) && (
+                  <button
+                    className="button subtle"
+                    onClick={() => onReauthenticate(account.id)}
+                  >
+                    Re-authenticate
+                  </button>
+                )}
+              <button
+                className="button subtle"
+                onClick={onRefresh}
+                disabled={busy}
+                title="Refresh limits for every detected Codex account"
+              >
+                <RefreshCw size={12} className={busy ? "spin" : ""} />
+                Refresh
+              </button>
+            </div>
+          </>
+        )}
       </div>
-      {!isQwodex && (
-        <>
-          <div className="account-meters">
-            {meters.map((meter) => (
-              <LimitMeter
-                meter={meter}
-                samples={meter.historyKey ? history[meter.historyKey] || [] : []}
-                key={meter.key}
-              />
-            ))}
-          </div>
-          <div className={`account-live ${live ? "live" : "stale"}`}>
-            {account?.managed &&
-              ["signed_out", "unavailable"].includes(account.state) && (
-                <button
-                  className="button subtle account-reauth"
-                  onClick={() => onReauthenticate(account.id)}
-                >
-                  Re-authenticate
-                </button>
-              )}
-            <button
-              className="account-refresh"
-              onClick={onRefresh}
-              disabled={busy}
-              title="Refresh limits for every detected Codex account"
-              aria-label="Refresh limits for every detected Codex account"
-            >
-              <RefreshCw size={12} className={busy ? "spin" : ""} />
-            </button>
-            <strong>
-              <i />
-              {live ? "Live" : account?.observed_at ? "Stale" : "Waiting"}
-            </strong>
-            <span>
-              {account?.observed_at
-                ? `observed ${relativeObserved(account.observed_at)}`
-                : account?.detail || "no telemetry"}
-            </span>
-          </div>
-        </>
-      )}
-    </section>
+    </details>
   );
 }
 
@@ -1739,6 +2008,7 @@ export function rateLimitForecast(
   if (currentRemaining <= 0)
     return {
       label: "usage depleted",
+      short: "depleted",
       detail: "No capacity remains in this window.",
     };
   const resetAt = window.resets_at ? window.resets_at * 1_000 : undefined;
@@ -1819,6 +2089,7 @@ export function rateLimitForecast(
     return {
       label:
         window.used_percent > 0 ? "learning burn rate" : "no drain observed",
+      short: window.used_percent > 0 ? "learning burn" : "no drain",
       detail:
         "A forecast appears after enough elapsed window time or at least one hour and 1% of observed drawdown.",
     };
@@ -1831,6 +2102,7 @@ export function rateLimitForecast(
       : `empty ${new Date(exhaustionAt).toLocaleString([], { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}`;
   return {
     label: `avg burn ${formatBurnRate(rate)}%/h · ${outcome}`,
+    short: `${formatBurnRate(rate)}%/h`,
     detail: `Smoothed from ${components.map((component) => component.label).join(" plus ")}. Longer observations carry more weight so brief bursts do not dominate. This is a pace estimate, not a provider guarantee.`,
   };
 }
@@ -1871,55 +2143,76 @@ function Rail({
   view,
   approvals,
   activeRuns,
+  runs,
+  selectedRunId,
+  busy,
   onChange,
+  onSelectRun,
+  onPinRun,
+  onArchiveRun,
+  onDeleteRun,
 }: {
   view: View;
   approvals: number;
   activeRuns: number;
+  runs: Run[];
+  selectedRunId?: string;
+  busy: string;
   onChange: (view: View) => void;
+  onSelectRun: (runId: string) => void;
+  onPinRun: (run: Run) => void;
+  onArchiveRun: (run: Run) => void;
+  onDeleteRun: (run: Run) => void;
 }) {
+  const archived = runs.filter(isArchived);
+  const item = (entry: (typeof nav)[number]) => {
+    const Icon = entry.icon;
+    const count = entry.view === "runs" ? activeRuns + approvals : 0;
+    return (
+      <button
+        key={entry.view}
+        className={`nav-item ${view === entry.view ? "active" : ""}`}
+        onClick={() => onChange(entry.view)}
+        title={entry.label}
+      >
+        <Icon size={16} />
+        <span>{entry.label}</span>
+        {count > 0 && <i className="nav-count">{count}</i>}
+      </button>
+    );
+  };
   return (
     <nav className="rail" aria-label="Primary navigation">
-      <div className="rail-section">Workspace</div>
-      {nav.map((item) => {
-        const Icon = item.icon;
-        const count = item.view === "runs" ? activeRuns + approvals : 0;
-        return (
-          <button
-            key={item.view}
-            className={`nav-item ${view === item.view ? "active" : ""}`}
-            onClick={() => onChange(item.view)}
-            title={item.label}
-          >
-            <Icon size={16} />
-            <span>{item.label}</span>
-            {count > 0 && <i className="nav-count">{count}</i>}
-          </button>
-        );
-      })}
-      <div className="rail-section">System</div>
-      {systemNav.map((item) => {
-        const Icon = item.icon;
-        return (
-          <button
-            key={item.view}
-            className={`nav-item ${view === item.view ? "active" : ""}`}
-            onClick={() => onChange(item.view)}
-            title={item.label}
-          >
-            <Icon size={16} />
-            <span>{item.label}</span>
-          </button>
-        );
-      })}
-      <div className="rail-shortcuts">
-        <kbd>G</kbd>
-        <kbd>H</kbd>
-        <span>Home</span>
-        <kbd>G</kbd>
-        <kbd>R</kbd>
-        <span>Runs</span>
+      {nav.map(item)}
+      <div className="rail-threads">
+        <div className="rail-threads-title">Threads</div>
+        <ThreadList
+          runs={runs.filter((run) => !isArchived(run))}
+          selectedRunId={selectedRunId}
+          busy={busy}
+          onSelect={onSelectRun}
+          onPin={onPinRun}
+          onArchive={onArchiveRun}
+          onDelete={onDeleteRun}
+        />
       </div>
+      {archived.length > 0 && (
+        <details className="rail-archived">
+          <summary>
+            <span>Archived</span>
+            <i>{archived.length}</i>
+          </summary>
+          <ThreadList
+            runs={archived}
+            selectedRunId={selectedRunId}
+            busy={busy}
+            onSelect={onSelectRun}
+            onPin={onPinRun}
+            onArchive={onArchiveRun}
+            onDelete={onDeleteRun}
+          />
+        </details>
+      )}
     </nav>
   );
 }
@@ -1929,23 +2222,32 @@ function HomeView({
   runs,
   postures,
   runtime,
+  labels,
+  liveRunIds,
   onNewRun,
   onRun,
+  onOpenRun,
   onRegister,
+  onInspect,
+  onPrepare,
 }: {
   repositories: Repository[];
   runs: Run[];
   postures: Record<string, string>;
   runtime?: RuntimeStatus;
+  labels: RefLabels;
+  liveRunIds: ReadonlySet<string>;
   onNewRun: () => void;
   onRun: (id: string) => void;
+  onOpenRun: (id: string) => void;
   onRegister: () => void;
+  onInspect: (id: string) => void;
+  onPrepare: (id: string) => void;
 }) {
   const active = runs.filter((run) => !terminal(run.state));
   return (
     <div className="page home-page">
       <PageTitle
-        eyebrow="Local orchestration"
         title="Good afternoon"
         description="Exact repository truth, active work, and runtime health in one place."
         action={
@@ -1955,6 +2257,8 @@ function HomeView({
           </button>
         }
       />
+      <SectionHeader title="Needs you" />
+      <NeedsYou labels={labels} liveRunIds={liveRunIds} onOpenRun={onOpenRun} />
       <SectionHeader title="Active" count={active.length} />
       <div className="stack">
         {active.length ? (
@@ -1994,7 +2298,18 @@ function HomeView({
           />
         )}
       </div>
-      <SectionHeader title="Repositories" count={repositories.length} />
+      <SectionHeader
+        title="Repositories"
+        count={repositories.length}
+        action={
+          repositories.length ? (
+            <button className="button subtle" onClick={onRegister}>
+              <Plus size={13} />
+              Register
+            </button>
+          ) : undefined
+        }
+      />
       <div className="stack">
         {repositories.length ? (
           repositories.map((repository) => (
@@ -2002,11 +2317,32 @@ function HomeView({
               <FolderGit2 size={17} />
               <div>
                 <strong>{repository.display_name}</strong>
-                <span>
+                <span
+                  className={repository.blockers.length ? "danger" : ""}
+                  title={repository.origin_url || repository.root_path}
+                >
                   {repository.blockers.length
                     ? repository.blockers.join(" · ")
                     : `${repository.primary_branch || repository.default_branch} · clean · ${repository.managed_worktree_count} managed workspaces`}
                 </span>
+              </div>
+              <div className="home-row-actions">
+                {repository.blockers.includes("primary checkout is dirty") && (
+                  <button
+                    className="button primary"
+                    onClick={() => onPrepare(repository.id)}
+                  >
+                    Create clean checkout
+                  </button>
+                )}
+                <button
+                  className="button subtle"
+                  onClick={() => onInspect(repository.id)}
+                  title={repository.root_path}
+                >
+                  <RefreshCw size={13} />
+                  Inspect
+                </button>
               </div>
               <StatusBadge value={repository.health} />
             </div>
@@ -2046,82 +2382,6 @@ function HomeView({
           state={runtime?.scheduler.paused ? "paused" : "ready"}
           detail={`${runtime?.scheduler.active_total || 0}/${runtime?.scheduler.max_total || 0} agent slots · ${runtime?.scheduler.queued_tasks || 0} queued`}
         />
-      </div>
-    </div>
-  );
-}
-
-function RepositoriesView({
-  repositories,
-  onRegister,
-  onInspect,
-  onPrepare,
-}: {
-  repositories: Repository[];
-  onRegister: () => void;
-  onInspect: (id: string) => void;
-  onPrepare: (id: string) => void;
-}) {
-  return (
-    <div className="page">
-      <PageTitle
-        eyebrow="Local projects"
-        title="Repositories"
-        description="Registered checkouts, local-only projects, and anything that needs attention."
-        action={
-          <button className="button primary" onClick={onRegister}>
-            <Plus size={14} />
-            Add project
-          </button>
-        }
-      />
-      <div className="table-card">
-        <div className="table-head repo-grid">
-          <span>Repository</span>
-          <span>Branch</span>
-          <span>Origin / attention</span>
-          <span>Workspaces</span>
-          <span>Health</span>
-          <span />
-        </div>
-        {repositories.map((repository) => (
-          <div className="table-row repo-grid" key={repository.id}>
-            <div className="cell-main">
-              <FolderGit2 size={16} />
-              <span>
-                <strong>{repository.display_name}</strong>
-                <small className="mono">{repository.root_path}</small>
-              </span>
-            </div>
-            <span>{repository.primary_branch || "—"}</span>
-            <span
-              className={`truncate ${repository.blockers.length ? "danger" : ""}`}
-              title={repository.blockers.join("; ")}
-            >
-              {repository.blockers[0] || repository.origin_url || "Local-only"}
-            </span>
-            <span>{repository.managed_worktree_count}</span>
-            <StatusBadge value={repository.health} />
-            <div className="repo-actions">
-              {repository.origin_url && repository.blockers.includes("primary checkout is dirty") && (
-                <button
-                  className="button primary"
-                  onClick={() => onPrepare(repository.id)}
-                >
-                  <FolderGit2 size={13} />
-                  Create clean checkout
-                </button>
-              )}
-              <button
-                className="button subtle"
-                onClick={() => onInspect(repository.id)}
-              >
-                <RefreshCw size={13} />
-                Inspect
-              </button>
-            </div>
-          </div>
-        ))}
       </div>
     </div>
   );
@@ -2234,14 +2494,13 @@ function EmptyRuns({ onNew }: { onNew: () => void }) {
   return (
     <div className="page">
       <PageTitle
-        eyebrow="Orchestration"
         title="Runs"
         description="No task is selected."
       />
       <EmptyCard
         icon={<Activity />}
         title="Create the first task"
-        text="Harness pins origin/main, compiles active authority, and starts with read-only architecture."
+        text="Create a task to start planning."
         action={
           <button className="button primary" onClick={onNew}>
             <Plus size={14} />
@@ -2412,21 +2671,24 @@ function RunWorkspace({
       <div className="run-heading">
         <div>
           <h1>{run.title}</h1>
-          <p>
-            {posture} · {verified} of {tasks.length}{" "}
-            tasks verified ·{" "}
-            {run.integration_sha
-              ? "integration ready"
-              : "integration not created"}
+          <p
+            className="run-lifecycle"
+            title="Run lifecycle times use this browser's local time zone"
+          >
+            {verified}/{tasks.length} done ·{" "}
+            {elapsed(run.started_at || run.created_at)}
+            {usage ? ` · ${formatCost(usage.cost.upper_microusd || 0)}` : ""}
+            {activeTurns ? ` · ${activeTurns} working` : ""}
+            {starting ? ` · ${starting} starting` : ""}
           </p>
         </div>
         <div className="actions">
           {!terminal(run.state) && resumeNeedsBudget && (
             <label className="resume-budget-picker">
               <span>
-                Next work window
+                Next budget
                 {projectedRunBudget
-                  ? ` · total cap ${formatTokens(projectedRunBudget)}`
+                  ? ` · cap ${formatTokens(projectedRunBudget)}`
                   : ""}
               </span>
               <select
@@ -2465,7 +2727,7 @@ function RunWorkspace({
                 ) : (
                   <Pause size={13} />
                 )}
-                {run.scheduler_paused ? "Resume work" : "Pause scheduling"}
+                {run.scheduler_paused ? "Resume" : "Pause"}
               </button>
               <RunPrimaryAction
                 run={run}
@@ -2501,39 +2763,6 @@ function RunWorkspace({
       <div className="progress" aria-label={`${progress}% of tasks verified`}>
         <i style={{ width: `${progress}%` }} />
       </div>
-      <div className="metrics">
-        <Metric
-          label="Active turns"
-          value={String(activeTurns)}
-          note={
-            starting
-              ? `${starting} attempt starting`
-              : `${agents.length} sessions total`
-          }
-        />
-        <Metric
-          label="Verified tasks"
-          value={`${verified} / ${tasks.length}`}
-          note={`${tasks.filter((task) => task.state === "WAITING_DEPENDENCY").length} waiting`}
-        />
-        <Metric
-          label="API-equivalent"
-          value={formatCost(usage?.cost.upper_microusd || 0)}
-          note={usage?.cost.confidence || "no usage yet"}
-        />
-        <Metric
-          label="Elapsed"
-          value={elapsed(run.started_at || run.created_at)}
-          note={run.scheduler_paused ? "scheduler paused" : "active wall time"}
-        />
-      </div>
-      <div
-        className="run-lifecycle"
-        title="Run lifecycle times use this browser's local time zone"
-      >
-        <strong>Run lifecycle</strong>
-        <span>{runLifecycleSummary(run)}</span>
-      </div>
       <SupervisorObservationPanel
         detail={detail}
         busy={busy}
@@ -2545,14 +2774,31 @@ function RunWorkspace({
         busy={busy}
         onRequestAudit={onRequestPonytailAudit}
       />
-      <BlockedRunRecoveryPanel
-        detail={detail}
-        busy={busy}
-        onResumeReview={onResumePlanReview}
-        onRequestChanges={onRequestPlanChanges}
-        onResumeWork={() => onPause(0)}
-        onRetry={(taskId) => onRetry(taskId, "", 0)}
-      />
+      {focusTask && (
+        <NeedsHelpPanel
+          key={focusTask.id}
+          task={focusTask}
+          governor={selectedTaskAgent}
+          children={selectedTaskChildren}
+          latestMessage={governorLatestMessage}
+          settings={settings}
+          busy={busy}
+          onRetry={(guidance, additionalTokenBudget) =>
+            onRetry(focusTask.id, guidance, additionalTokenBudget)
+          }
+        />
+      )}
+      {(!focusTask ||
+        Boolean(blockedPlanRecovery(run, detail.plan_digest))) && (
+        <BlockedRunRecoveryPanel
+          detail={detail}
+          busy={busy}
+          onResumeReview={onResumePlanReview}
+          onRequestChanges={onRequestPlanChanges}
+          onResumeWork={() => onPause(0)}
+          onRetry={(taskId) => onRetry(taskId, "", 0)}
+        />
+      )}
       {detail.intent_interview && (
         <IntentInterviewPanel
           interview={detail.intent_interview}
@@ -2587,20 +2833,6 @@ function RunWorkspace({
         onRequestChanges={onRequestSignoffChanges}
         onAttest={onAttestAcceptance}
       />
-      {focusTask && (
-        <NeedsHelpPanel
-          key={focusTask.id}
-          task={focusTask}
-          governor={selectedTaskAgent}
-          children={selectedTaskChildren}
-          latestMessage={governorLatestMessage}
-          settings={settings}
-          busy={busy}
-          onRetry={(guidance, additionalTokenBudget) =>
-            onRetry(focusTask.id, guidance, additionalTokenBudget)
-          }
-        />
-      )}
       {selectedTask &&
         !focusTask &&
         [
@@ -2617,38 +2849,37 @@ function RunWorkspace({
           />
         )}
       {architectAgents.length > 0 && (
-        <>
-          <SectionHeader title="Architecture and review" />
-          {visibleArchitectureAgents.map((agent) => (
-            <AgentRow
-              key={agent.id}
-              run={run}
-              agent={agent}
-              selected={selectedAgentId === agent.id}
-              onClick={() => onSelect(undefined, agent.id)}
-            />
-          ))}
-          {previousArchitectureAttempts.length > 0 && (
-            <details className="attempt-history">
-              <summary>
-                Previous architecture attempts{" "}
-                <span>{previousArchitectureAttempts.length}</span>
-              </summary>
-              <div>
-                {previousArchitectureAttempts.map((agent) => (
-                  <AgentRow
-                    key={agent.id}
-                    run={run}
-                    agent={agent}
-                    selected={selectedAgentId === agent.id}
-                    onClick={() => onSelect(undefined, agent.id)}
-                  />
-                ))}
-              </div>
-            </details>
-          )}
-        </>
+        <details
+          className="attempt-history"
+          open={!tasks.length || planningRunState(run.state)}
+        >
+          <summary>
+            Architecture
+            <span>{architectAgents.length}</span>
+          </summary>
+          <div>
+            {visibleArchitectureAgents.map((agent) => (
+              <AgentRow
+                key={agent.id}
+                run={run}
+                agent={agent}
+                selected={selectedAgentId === agent.id}
+                onClick={() => onSelect(undefined, agent.id)}
+              />
+            ))}
+            {previousArchitectureAttempts.map((agent) => (
+              <AgentRow
+                key={agent.id}
+                run={run}
+                agent={agent}
+                selected={selectedAgentId === agent.id}
+                onClick={() => onSelect(undefined, agent.id)}
+              />
+            ))}
+          </div>
+        </details>
       )}
+      <RunActivity runId={run.id} />
       <SectionHeader
         title="Implementation tasks"
         count={tasks.length}
@@ -2693,10 +2924,10 @@ function RunWorkspace({
               </strong>
               <span>
                 {run.state === "INTERVIEWING"
-                  ? "Answer the current question, confirm the resulting brief, or skip the interview to continue from the original request."
+                  ? "Answer, confirm, or skip the interview."
                   : planningRunState(run.state)
-                  ? "Implementation begins only after independent plan certification and the configured approval policy."
-                  : "Select Start architecture to begin repository research."}
+                  ? "Implementation waits on a certified plan."
+                  : "Start architecture to plan."}
               </span>
             </div>
           </div>
@@ -2939,11 +3170,11 @@ function ArchitectureStatusPanel({
       ? planningStateTitle(run.state)
       : "Planning has not started yet";
   const detail = starting
-    ? "Harness is opening the read-only Sol planning thread now."
+    ? "Opening the planning thread."
     : planning
-      ? architect?.current_action ||
+      ? compactAction(architect?.current_action) ||
         planningStateDetail(run.state)
-      : "This task is prepared and waiting. Select Start architecture to begin repository research and planning.";
+      : "Start architecture when you're ready.";
   return (
     <section
       className={`architecture-status-panel ${planning ? "working" : "ready"}`}
@@ -3002,46 +3233,19 @@ function GoalPlanPanel({
   const canRequestChanges =
     detail.run.state === "PLAN_REVIEW_REQUIRED" || reviewDeadlocked;
   const budgetOverrideRequired = certificate?.budget.feasible === false;
+  const currentPlanTitle =
+    detail.plan?.tasks[0]?.title ||
+    (busy === "start"
+      ? "Starting the architect"
+      : planningRunState(detail.run.state)
+        ? planningStateTitle(detail.run.state)
+        : "No plan yet");
   return (
-    <section className="goal-plan-grid" aria-label="Goal and plan">
-      <article className="goal-plan-card">
-        <header>
-          <div>
-            <span>Goal</span>
-          </div>
-          <StatusBadge
-            value={
-              detail.run.state === "PLAN_REVIEW_REQUIRED"
-                ? "PLAN CERTIFIED"
-                : detail.run.state === "PLAN_ADVERSARIAL_REVIEW"
-                  ? "REVIEWING PLAN"
-                  : detail.run.state === "PLAN_REVISION_REQUIRED"
-                    ? "REVISING PLAN"
-                : effectiveRunPosture(detail.run, detail)
-            }
-          />
-        </header>
-        <div className="goal-plan-scroll">
-          <p>{goal}</p>
-        </div>
-      </article>
-      <article className="goal-plan-card">
+    <section className="goal-plan-card" aria-label="Goal and plan">
         <header>
           <div>
             <span>Plan</span>
-            <strong>
-              {detail.plan
-                ? detail.run.state === "PLAN_ADVERSARIAL_REVIEW"
-                  ? "Plan under adversarial review"
-                  : detail.run.state === "PLAN_REVISION_REQUIRED"
-                    ? "Plan rejected; revision is underway"
-                    : "Current implementation plan"
-                : busy === "start"
-                  ? "Starting the architect"
-                  : planningRunState(detail.run.state)
-                    ? planningStateTitle(detail.run.state)
-                    : "Planning has not started"}
-            </strong>
+            <strong>{currentPlanTitle}</strong>
           </div>
           {detail.run.state === "PLAN_REVIEW_REQUIRED" ? (
             <StatusBadge value="YOUR APPROVAL" />
@@ -3049,14 +3253,14 @@ function GoalPlanPanel({
             <StatusBadge value="CERTIFYING" />
           ) : detail.run.state === "PLAN_REVISION_REQUIRED" ? (
             <StatusBadge value="REVISING" />
-          ) : (
-            <span className="plan-policy">
-              {detail.automatic_plan_approval
-                ? "Auto approve after certification"
-                : "Manual approval"}
-            </span>
-          )}
+          ) : null}
         </header>
+        <details className="goal-plan-fold" open={canRequestChanges}>
+          <summary>
+            {detail.plan
+              ? `${detail.plan.tasks.length} step${detail.plan.tasks.length === 1 ? "" : "s"}`
+              : "Plan details"}
+          </summary>
         <div className="goal-plan-scroll">
           {detail.plan ? (
             <>
@@ -3110,12 +3314,9 @@ function GoalPlanPanel({
                 })}
               </ol>
               {certificate && (
-                <section
-                  className="plan-certificate"
-                  aria-label="Plan certificate"
-                >
-                  <div className="plan-certificate-heading">
-                    <b>Certification evidence · revision {certificate.revision}</b>
+                <details className="plan-certificate" aria-label="Plan certificate">
+                  <summary>
+                    Certificate r{certificate.revision}
                     <StatusBadge
                       value={
                         certificate.automatic_approval_eligible
@@ -3123,8 +3324,8 @@ function GoalPlanPanel({
                           : "HUMAN DECISION"
                       }
                     />
-                  </div>
-                  <p>{certificate.summary}</p>
+                  </summary>
+                  <p>{clampOperatorCopy(certificate.summary, 180)}</p>
                   <div className="plan-certificate-facts">
                     <span>
                       Planning spend {formatTokens(detail.planning_tokens_used || certificate.budget.planning_tokens_used)}
@@ -3164,7 +3365,7 @@ function GoalPlanPanel({
                       ))}
                     </div>
                   )}
-                </section>
+                </details>
               )}
               {reviewHistory.length > 0 && (
                 <details className="plan-review-history">
@@ -3189,13 +3390,14 @@ function GoalPlanPanel({
           ) : (
             <p>
               {busy === "start"
-                ? "Harness is opening the read-only planning thread now."
+                ? "Starting planning."
                 : planningRunState(detail.run.state)
                   ? planningStateDetail(detail.run.state)
-                  : "Select Start architecture to begin repository research and build the implementation plan."}
+                  : "Start architecture to build the plan."}
             </p>
           )}
         </div>
+        </details>
         {canRequestChanges && (
           <footer className="plan-decision-footer">
             {showChangeRequest ? (
@@ -3235,8 +3437,8 @@ function GoalPlanPanel({
               <>
                 <span>
                   {reviewDeadlocked
-                    ? "Automated review stopped after repeated or non-shrinking blockers. Give the architect one concrete direction."
-                    : "The plan is certified. Approve it or send a blocking finding through the same revision loop."}
+                    ? "Review stalled. Give one concrete correction."
+                    : "Approve the plan or request a change."}
                 </span>
                 <button
                   className="button subtle"
@@ -3261,7 +3463,12 @@ function GoalPlanPanel({
             )}
           </footer>
         )}
-      </article>
+        <details className="goal-plan-fold">
+          <summary>Goal</summary>
+          <div className="goal-plan-scroll">
+            <p>{goal}</p>
+          </div>
+        </details>
     </section>
   );
 }
@@ -3545,7 +3752,7 @@ function BudgetControl({
         onChange={(event) => onChange(values[Number(event.target.value)])}
         aria-label={`${label} token budget`}
       />
-      <small>{hint}</small>
+      {hint ? <small>{hint}</small> : null}
     </label>
   );
 }
@@ -3683,6 +3890,31 @@ export function PonytailPanel({
   );
 }
 
+function isWaitKind(kind?: string) {
+  return (kind || "").replaceAll("-", "_").toLowerCase() === "wait";
+}
+
+function isGenericWaitCopy(text?: string) {
+  if (!text) return true;
+  return /bounded wait|no intervention is proposed|immutable snapshot|controller-visible/i.test(
+    text,
+  );
+}
+
+export function supervisorAdviceIsWaitOnly(detail: {
+  supervisor_decision?: RunDetail["supervisor_decision"];
+  supervisor_actions?: RunDetail["supervisor_actions"];
+}) {
+  const kinds = [
+    ...(detail.supervisor_decision?.payload.actions || []).map(
+      (action) => action.kind,
+    ),
+    ...(detail.supervisor_actions || []).map((action) => action.kind),
+  ].filter((kind): kind is string => Boolean(kind));
+  if (kinds.length) return kinds.every((kind) => isWaitKind(kind));
+  return isGenericWaitCopy(detail.supervisor_decision?.payload.summary);
+}
+
 export function SupervisorObservationPanel({
   detail,
   busy = "",
@@ -3698,133 +3930,131 @@ export function SupervisorObservationPanel({
   const snapshot = detail.supervisor_snapshot;
   const review = detail.supervisor_review;
   const decision = detail.supervisor_decision;
-  const actionReceipts = detail.supervisor_actions || [];
+  const actionReceipts = (detail.supervisor_actions || []).filter(
+    (action) => !isWaitKind(action.kind),
+  );
   const expertRequests = detail.expert_requests || [];
   const observing = mode === "observe_only";
   const advisory = mode === "advisory";
   const reviewRunning = ["STARTING", "RUNNING"].includes(review?.state || "");
   const canRequest = advisory && !reviewRunning && !terminal(detail.run.state);
+  const waitOnly = supervisorAdviceIsWaitOnly(detail);
+  const usefulSummary =
+    decision?.payload.summary && !isGenericWaitCopy(decision.payload.summary)
+      ? clampOperatorCopy(decision.payload.summary, 140)
+      : undefined;
+  const usefulProposals = (decision?.payload.actions || []).filter(
+    (action) => !isWaitKind(action.kind),
+  );
+
+  if (!advisory && !observing) {
+    return (
+      <section
+        className="supervisor-observation compact"
+        aria-label="Supervisory observation"
+      >
+        <span>Supervision off</span>
+      </section>
+    );
+  }
+
+  if (observing) {
+    return (
+      <section
+        className="supervisor-observation compact"
+        aria-label="Supervisory observation"
+      >
+        <span>Snapshots only</span>
+        {snapshot && <span>r{snapshot.revision}</span>}
+      </section>
+    );
+  }
+
+  if (waitOnly && !reviewRunning && actionReceipts.length === 0) {
+    return (
+      <section
+        className="supervisor-observation compact"
+        aria-label="Supervisory observation"
+      >
+        <span>Terra</span>
+        <span>{reviewRunning ? "reviewing" : "wait"}</span>
+        {review?.completed_at && (
+          <span>{formatLocalClock(review.completed_at)}</span>
+        )}
+        {canRequest && (
+          <button
+            className="button subtle"
+            onClick={onRequestReview}
+            disabled={!!busy}
+          >
+            Ask Terra
+          </button>
+        )}
+      </section>
+    );
+  }
+
   return (
     <section className="supervisor-observation" aria-label="Supervisory observation">
       <header>
-        <div className="supervisor-observation-icon" aria-hidden="true">
-          {advisory ? <Bot size={17} /> : <Database size={17} />}
-        </div>
         <div>
-          <div className="eyebrow">Thread supervision</div>
-          <h2>
-            {advisory
-              ? "Human-approved recovery advisor"
-              : observing
-                ? "Observe-only custody"
-                : "Supervision is disabled"}
-          </h2>
-          <p>
-            {advisory
-              ? "Terra can analyze a fresh immutable blocker snapshot, read-only. It cannot resume, retry, replan, edit, approve proof, or take any action; those remain your choices below."
-              : observing
-              ? "Immutable controller snapshots are being recorded. Terra, Sol, and automatic actions remain off."
-              : "No supervisory model is running, no snapshot is being recorded, and no automatic action is available."}
-          </p>
+          <strong>{decision?.policy_state === "STALE" ? "Terra stale" : "Terra"}</strong>
+          {usefulSummary && <p>{usefulSummary}</p>}
+          {reviewRunning && <p>Review running</p>}
         </div>
-        <StatusBadge value={advisory ? "ADVISORY" : observing ? "OBSERVE ONLY" : "DISABLED"} />
+        {canRequest && (
+          <button
+            className="button subtle"
+            onClick={onRequestReview}
+            disabled={!!busy}
+          >
+            Ask Terra
+          </button>
+        )}
       </header>
-      {snapshot && (
-        <div className="supervisor-observation-receipt">
-          <span>
-            Latest snapshot r{snapshot.revision} · {formatLocalTimestamp(snapshot.created_at)}
-          </span>
-          <span>Trigger: {humanizeSupervisorTrigger(snapshot.trigger_kind)}</span>
-          <span title={snapshot.payload_sha256}>
-            Event {snapshot.event_cursor} · SHA-256 {snapshot.payload_sha256.slice(0, 12)}…
-          </span>
-        </div>
-      )}
-      {review && (
-        <div className="supervisor-observation-receipt">
-          <span>
-            Terra review · {humanAgentState(review.state)} · started {formatLocalTimestamp(review.created_at)}
-          </span>
-          <span>
-            {review.completed_at
-              ? `Completed ${formatLocalTimestamp(review.completed_at)}`
-              : review.failure_reason || "Read-only analysis in progress"}
-          </span>
-        </div>
-      )}
-      {decision && (
-        <div className="supervisor-decision">
-          <strong>{decision.policy_state === "STALE" ? "Superseded analysis" : "Terra’s read-only assessment"}</strong>
-          <p>{decision.payload.summary || "A bounded assessment was recorded without a displayable summary."}</p>
-          {decision.policy_state !== "STALE" && decision.payload.actions?.length ? (
-            <div className="supervisor-proposals" aria-label="Advisory recovery proposals">
-              {decision.payload.actions.slice(0, 3).map((action, index) => (
-                <span key={action.action_id || index}>
-                  {action.kind?.replaceAll("_", " ") || "proposal"}: {action.summary || action.expected_observable_outcome || "Review the recorded evidence before acting."}
-                </span>
-              ))}
-            </div>
-          ) : null}
-          {decision.payload.uncertainties?.length ? (
-            <p className="muted">Uncertainty: {decision.payload.uncertainties[0]}</p>
-          ) : null}
+      {usefulProposals.length > 0 && decision?.policy_state !== "STALE" && (
+        <div className="supervisor-proposals" aria-label="Advisory recovery proposals">
+          {usefulProposals.slice(0, 3).map((action, index) => (
+            <span key={action.action_id || index}>
+              {action.kind?.replaceAll("_", " ") || "proposal"}
+              {action.summary ? `: ${clampOperatorCopy(action.summary, 100)}` : ""}
+            </span>
+          ))}
         </div>
       )}
       {actionReceipts.length > 0 && (
         <div className="supervisor-action-receipts" aria-label="Supervisor action receipts">
-          <strong>Proposed actions</strong>
-          {actionReceipts.slice(0, 6).map((action) => (
-            <div key={action.id} className="supervisor-action-receipt" title={action.proposal_sha256}>
+          {actionReceipts.slice(0, 4).map((action) => (
+            <div key={action.id} className="supervisor-action-receipt">
               <span>
                 {action.kind.replaceAll("_", " ")} · {humanAgentState(action.state)}
-                {action.policy_reason ? ` — ${action.policy_reason}` : " — waiting"}
               </span>
               {action.state === "PROPOSED" && (
                 <button
-                  className="button secondary small"
+                  className="button subtle"
                   onClick={() => onApplyAction(action.id)}
                   disabled={!!busy}
                 >
-                  Revalidate and apply
+                  Apply
                 </button>
               )}
             </div>
           ))}
-          <p className="muted">Advisory only until you apply.</p>
         </div>
       )}
       {expertRequests.length > 0 && (
         <div className="supervisor-action-receipts" aria-label="Expert consultation receipts">
-          <strong>Read-only expert consultations</strong>
-          {expertRequests.slice(0, 3).map((request) => (
-            <div key={request.id} className="supervisor-action-receipt" title={request.payload_sha256}>
+          {expertRequests.slice(0, 2).map((request) => (
+            <div key={request.id} className="supervisor-action-receipt">
               <span>
-                Sol xhigh · {humanAgentState(request.state)}
-                {request.failure_reason ? ` — ${request.failure_reason}` : " — advisory"}
-              </span>
-              <span>
-                Started {formatLocalTimestamp(request.started_at || request.created_at)}
-                {request.completed_at ? ` · completed ${formatLocalTimestamp(request.completed_at)}` : ""}
+                Expert · {humanAgentState(request.state)}
               </span>
             </div>
           ))}
         </div>
       )}
-      {canRequest && (
-        <div className="supervisor-observation-actions">
-          <button className="button" onClick={onRequestReview} disabled={!!busy}>
-            <Search size={14} />
-            {snapshot ? "Analyze current blocker" : "Analyze this run"}
-          </button>
-          <span>Read-only. Does not change the run.</span>
-        </div>
-      )}
     </section>
   );
-}
-
-function humanizeSupervisorTrigger(trigger: string) {
-  return trigger.replaceAll("_", " ");
 }
 
 function BlockedRunRecoveryPanel({
@@ -3859,41 +4089,27 @@ function BlockedRunRecoveryPanel({
   return (
     <section className="blocked-run-recovery" aria-label="Blocked run recovery">
       <header>
-        <div className="blocked-run-recovery-icon" aria-hidden="true">
-          <AlertTriangle size={18} />
-        </div>
         <div>
-          <div className="eyebrow">Blocked, action available</div>
           <h2>
-            {recovery?.kind === "resume_review"
-              ? "Resume review"
-              : "Blocked"}
+            {recovery?.kind === "resume_review" ? "Resume review" : "Blocked"}
           </h2>
           <p>
-            <strong>Why:</strong> {recovery?.reason || blocked?.reason || "Harness recorded a blocked condition."}
+            {plainOperatorReason(
+              recovery?.reason || blocked?.reason || "",
+            )}
           </p>
         </div>
-        <StatusBadge value="RECOVERY AVAILABLE" />
       </header>
-      {recovery?.kind === "resume_review" && (
-        <p className="blocked-run-recovery-explainer">
-          Read-only review of the same plan. Does not approve or implement.
-        </p>
-      )}
       {!detail.plan_digest ? (
-        <p className="blocked-run-recovery-unavailable">
-          No retained plan. Open a follow-up instead of guessing.
-        </p>
+        <p className="blocked-run-recovery-unavailable">No plan saved.</p>
       ) : showRevision ? (
         <div className="blocked-run-revision">
-          <label htmlFor="blocked-plan-revision">
-            Concrete correction for the architect
-          </label>
+          <label htmlFor="blocked-plan-revision">What should change?</label>
           <textarea
             id="blocked-plan-revision"
             value={revisionRequest}
             onChange={(event) => setRevisionRequest(event.target.value)}
-            placeholder="Describe the plan defect and the specific correction the next revision must make."
+            placeholder="What should change?"
             rows={3}
             maxLength={8000}
           />
@@ -3914,7 +4130,7 @@ function BlockedRunRecoveryPanel({
               }}
               disabled={!!busy || !canSubmitRevision}
             >
-              Request plan revision
+              Revise plan
             </button>
           </div>
         </div>
@@ -3927,23 +4143,23 @@ function BlockedRunRecoveryPanel({
               disabled={!!busy}
             >
               <Play size={13} />
-              Resume final review
+              Resume review
             </button>
           )}
           {recovery?.kind !== "resume_review" && detail.run.scheduler_paused && (
             <button className="button primary" onClick={onResumeWork} disabled={!!busy}>
               <Play size={13} />
-              Resume work
+              Resume
             </button>
           )}
           {recovery?.kind !== "resume_review" && !detail.run.scheduler_paused && retryTask && (
             <button className="button primary" onClick={() => onRetry(retryTask.id)} disabled={!!busy}>
               <Play size={13} />
-              Retry affected task
+              Retry
             </button>
           )}
           <button className="button subtle" onClick={() => setShowRevision(true)} disabled={!!busy}>
-            Request plan revision
+            Revise plan
           </button>
         </div>
       )}
@@ -3952,11 +4168,8 @@ function BlockedRunRecoveryPanel({
 }
 
 function NeedsHelpPanel({
-  task,
   governor,
-  children,
   latestMessage,
-  settings,
   busy,
   onRetry,
 }: {
@@ -3970,77 +4183,33 @@ function NeedsHelpPanel({
 }) {
   const [guidance, setGuidance] = useState("");
   const [additionalTokenBudget, setAdditionalTokenBudget] = useState(0);
-  const governing = governor?.role === "governor";
-  const completedChildren = children.filter((child) =>
-    ["TURN_COMPLETE", "COMPLETED", "FAILED", "INTERRUPTED"].includes(
-      child.state,
-    ),
-  ).length;
   const budgetPaused =
     governor?.state === "PAUSED" &&
     /budget|turn slice|reconcil/i.test(governor.current_action || "");
   const noProgressPaused = /no-progress/i.test(governor?.current_action || "");
+  const title = budgetPaused
+    ? "Budget hit"
+    : noProgressPaused
+      ? "No progress"
+      : "Paused";
+  const update = latestMessage
+    ? compactAction(humanAgentMessage(latestMessage.text), 180)
+    : "";
   return (
     <section className="needs-help-panel">
       <header>
-        <div className="needs-help-icon">
-          <AlertTriangle size={17} />
-        </div>
         <div>
-          <div className="eyebrow">
-            Governor control · {humanTaskState(task.state)}
-          </div>
-          <h2>
-            {budgetPaused
-              ? "Turn budget hit"
-              : noProgressPaused
-                ? "No progress — paused"
-                : governing
-                  ? "Governor paused"
-                  : "Needs your direction"}
-          </h2>
-          <p>
-            {latestMessage
-              ? timeAgo(latestMessage.occurred_at)
-              : "Waiting for the last governor update"}
-          </p>
+          <h2>{title}</h2>
+          {update ? <p className="handoff-message">{update}</p> : null}
         </div>
       </header>
-      <div className="needs-help-facts">
-        <span>
-          <b>{shortModel(agentModel(governor))}</b> ·{" "}
-          {roleLabel(governor?.role)} · {agentEffort(governor)}
-        </span>
-        <span>
-          {governor ? humanAgentState(governor.state) : "Not launched"} ·{" "}
-          {governor?.current_action || "handoff available"}
-        </span>
-        <span>
-          {children.length} delegated · {completedChildren} finished
-        </span>
-        <span>
-          {formatTokens(agentBudgetUsage(governor))}
-          {governor?.token_budget
-            ? ` / ${formatTokens(governor.token_budget)}`
-            : ""}{" "}
-          tokens
-        </span>
-      </div>
-      <div>
-        <div className="inspector-label">Governor update</div>
-        <div className="handoff-message">
-          {latestMessage
-            ? humanAgentMessage(latestMessage.text)
-            : "No update yet. You can still continue from controller history."}
-        </div>
-      </div>
       <div className="help-compose">
         <textarea
           value={guidance}
           onChange={(event) => setGuidance(event.target.value)}
           maxLength={1000}
-          rows={3}
-          placeholder="Decision or fact (optional)"
+          rows={2}
+          placeholder="Optional note"
         />
         <BudgetControl
           label="Next attempt"
@@ -4049,23 +4218,20 @@ function NeedsHelpPanel({
           onChange={setAdditionalTokenBudget}
           valueLabel={
             additionalTokenBudget
-              ? `Adaptive + ${formatTokens(additionalTokenBudget)} tokens`
+              ? `+ ${formatTokens(additionalTokenBudget)}`
               : "Adaptive"
           }
-          hint={`${formatTokens(settings?.recommended_governor_attempt_tokens || 650_000)} recommended for the next governor turn.`}
+          hint=""
           compact
         />
         <div>
-          <span>
-            {guidance.length}/1000
-          </span>
           <button
             className="button primary"
             onClick={() => onRetry(guidance.trim(), additionalTokenBudget)}
             disabled={!!busy}
           >
             <Play size={13} />
-            Continue governor
+            Continue
           </button>
         </div>
       </div>
@@ -4094,41 +4260,31 @@ function TaskRuntimePanel({
   const title = preparing
     ? `Preparing attempt ${task.attempt}`
     : connecting
-      ? `Connecting ${shortModel(agentModel(agent))} agent`
+      ? "Connecting"
       : activeTurn
         ? governing
-          ? `${shortModel(agentModel(agent))} governor is overseeing ${children.length} delegated thread${children.length === 1 ? "" : "s"}`
-          : `${shortModel(agentModel(agent))} is actively working`
+          ? `Governor · ${children.length} thread${children.length === 1 ? "" : "s"}`
+          : "Working"
         : task.state === "WAITING_APPROVAL"
-          ? "Agent is waiting for your approval"
-          : "Processing the agent handoff";
+          ? "Waiting for approval"
+          : "Handoff";
   const detail = preparing
-    ? "Creating and validating a fresh isolated workspace. No Codex turn is active yet."
+    ? "Creating a workspace."
     : connecting
-      ? "The agent session exists and Harness is waiting for the App Server turn to begin."
+      ? "Waiting for the turn to start."
       : activeTurn
-        ? `${agent?.current_action || "The turn is active; commands and messages will appear in Recent activity."}${agent?.context_strategy === "bounded_handoff" ? " Prior attempt handoff is loaded." : ""}`
-        : "No turn is active right now. Harness is projecting the completed response and deciding the next task state.";
+        ? compactAction(agent?.current_action) || "Turn active"
+        : "No active turn.";
   return (
     <section
       className={`task-runtime-panel ${activeTurn || preparing || connecting ? "working" : ""}`}
     >
       <div className="runtime-spinner" aria-hidden="true" />
       <div>
-        <div className="eyebrow">
-          Selected task · {humanTaskState(task.state)}
-        </div>
         <h2>{title}</h2>
         <p>{detail}</p>
       </div>
-      <div className="runtime-facts">
-        <strong>{activeTurn ? "Turn active" : "No active turn"}</strong>
-        <span>
-          {agent?.heartbeat_at
-            ? `Last activity ${timeAgo(agent.heartbeat_at)}`
-            : "Waiting for first agent heartbeat"}
-        </span>
-      </div>
+      <StatusBadge value={humanTaskState(task.state)} />
       {activeTurn && (
         <LiveTurnTelemetry
           agent={agent}
@@ -4166,35 +4322,43 @@ export function LiveTurnTelemetry({
       <div className="live-turn-heading">
         <i aria-hidden="true" />
         <strong aria-live="polite">
-          {agent?.current_action || fallbackAction}
+          {compactAction(agent?.current_action) || fallbackAction}
         </strong>
         <span>
           {startedAt ? formatTurnElapsed(startedAt, clock) : "Starting turn"}
           {agent?.heartbeat_at ? ` · activity ${timeAgo(agent.heartbeat_at)}` : ""}
         </span>
       </div>
-      <dl className="live-turn-metrics" aria-label="Current turn token usage">
-        <div>
-          <dt>Input</dt>
-          <dd>{value(usage?.input_tokens)}</dd>
-        </div>
-        <div>
-          <dt>Cached input</dt>
-          <dd>{value(usage?.cached_input_tokens)}</dd>
-        </div>
-        <div>
-          <dt>Output</dt>
-          <dd>{value(usage?.output_tokens)}</dd>
-        </div>
-        <div title="Reasoning tokens are included in output">
-          <dt>Reasoning in output</dt>
-          <dd>{value(usage?.reasoning_output_tokens)}</dd>
-        </div>
-        <div>
-          <dt>Turn total</dt>
-          <dd>{value(usage?.total_tokens)}</dd>
-        </div>
-      </dl>
+      {usage && (
+        <details className="live-turn-fold">
+          <summary>
+            {value(usage.total_tokens)} this turn ·{" "}
+            {value(usage.cached_input_tokens)} cached
+          </summary>
+          <dl className="live-turn-metrics" aria-label="Current turn token usage">
+            <div>
+              <dt>Input</dt>
+              <dd>{value(usage.input_tokens)}</dd>
+            </div>
+            <div>
+              <dt>Cached input</dt>
+              <dd>{value(usage.cached_input_tokens)}</dd>
+            </div>
+            <div>
+              <dt>Output</dt>
+              <dd>{value(usage.output_tokens)}</dd>
+            </div>
+            <div title="Reasoning tokens are included in output">
+              <dt>Reasoning in output</dt>
+              <dd>{value(usage.reasoning_output_tokens)}</dd>
+            </div>
+            <div>
+              <dt>Turn total</dt>
+              <dd>{value(usage.total_tokens)}</dd>
+            </div>
+          </dl>
+        </details>
+      )}
       {!usage && (
         <span className="live-turn-awaiting">
           Waiting for the first model-usage update
@@ -4207,7 +4371,6 @@ export function LiveTurnTelemetry({
 function RunPrimaryAction({
   run,
   detail,
-  posture,
   busy,
   onStart,
   onApprove,
@@ -4290,12 +4453,7 @@ function RunPrimaryAction({
           : "Refresh required CI"}
       </button>
     );
-  return (
-    <button className="button primary muted" disabled>
-      <Activity size={14} />
-      {posture}
-    </button>
-  );
+  return null;
 }
 
 function AgentRow({
@@ -4336,20 +4494,21 @@ function AgentRow({
         ? humanTaskState(state).toUpperCase()
         : state;
   const blocker = blockerStatus(run, task, displayAgent);
-  const currentActivity =
+  const currentActivity = compactAction(
     task?.state === "LEASED"
-      ? `Preparing attempt ${task.attempt} · creating isolated workspace`
+      ? `Preparing attempt ${task.attempt}`
       : task?.state === "STARTING"
-        ? "Agent session is connecting · waiting for turn start"
+        ? "Connecting"
         : activeTurn
-          ? `${displayAgent?.current_action || "Agent turn is active"}${displayAgent?.role === "governor" ? ` · ${children.length} delegated thread${children.length === 1 ? "" : "s"}` : ""}${displayAgent?.context_strategy === "bounded_handoff" ? " · prior handoff loaded" : displayAgent?.context_strategy === "native_thread_reuse" ? " · governor context retained" : ""}`
+          ? displayAgent?.current_action || "Working"
           : blocker?.reason ||
             displayAgent?.current_action ||
             displayAgent?.current_goal ||
             (task?.dependencies.length
               ? `Waiting on ${task.dependencies.join(", ")}`
               : task?.objective) ||
-            "Waiting for runtime activity";
+            "",
+  );
   const standalonePurpose =
     agent?.role === "final_auditor"
       ? "final quality review"
@@ -4390,16 +4549,8 @@ function AgentRow({
           </span>
         </div>
         <div className="agent-usage">
-          <strong>Thread usage / budget · {usage}</strong>
-          <span>API cost · {cost}</span>
-          {displayAgent && (
-            <span
-              className="agent-lifecycle"
-              title="Thread lifecycle times use this browser's local time zone"
-            >
-              {threadLifecycleRowSummary(displayAgent)}
-            </span>
-          )}
+          <strong>{usage}</strong>
+          <span>{cost}</span>
         </div>
         <div className="agent-state-cell">
           {selected && <span className="selected-marker">Selected</span>}
@@ -4423,15 +4574,14 @@ function AgentRow({
                 <span>
                   ↳ <b>{childDisplayName(child)}</b>
                   <small>
-                    {childState === "FINISHING"
-                      ? "Finishing background work while the governor waits for you"
-                      : blockerStatus(run, task, child)?.reason ||
-                        child.current_action ||
-                        child.current_goal ||
-                        "Waiting for activity"}
-                  </small>
-                  <small title="Thread lifecycle times use this browser's local time zone">
-                    {threadLifecycleRowSummary(child)}
+                    {compactAction(
+                      childState === "FINISHING"
+                        ? "Finishing"
+                        : blockerStatus(run, task, child)?.reason ||
+                          child.current_action ||
+                          child.current_goal ||
+                          "",
+                    )}
                   </small>
                 </span>
                 <span>
@@ -4503,12 +4653,6 @@ function Inspector({
   const viewingChild = Boolean(currentAgent?.parent_agent_id);
   const currentWorktree =
     preparing && worktree?.state === "PRESERVED" ? undefined : worktree;
-  const taskState =
-    task?.state === "LEASED"
-      ? "STARTING"
-      : task
-        ? humanTaskState(task.state).toUpperCase()
-        : undefined;
   const pendingApprovals = detail.approvals.filter(
     (approval) => approval.state === "pending",
   );
@@ -4519,7 +4663,7 @@ function Inspector({
           <div>
             <div className="eyebrow">
               {task
-                ? `${viewingChild ? "Child thread" : roleLabel(currentAgent?.role)} · task ${task.external_task_id} · attempt ${task.attempt} · ${taskState?.replaceAll("_", " ")}`
+                ? `${task.external_task_id} · attempt ${task.attempt}`
                 : roleLabel(agent?.role)}
             </div>
             <h2>
@@ -4541,16 +4685,60 @@ function Inspector({
             </button>
           )}
         </div>
+        {compactAction(currentAgent?.current_action) ||
+        currentAgent?.active_turn_id ||
+        planningRunState(detail.run.state) ||
+        detail.run.state === "READY_FOR_ARCHITECTURE" ? (
         <p>
-          {currentAgent?.current_action ||
+          {compactAction(currentAgent?.current_action) ||
             (currentAgent?.active_turn_id
-              ? "Working now"
+              ? "Working"
               : detail.run.state === "READY_FOR_ARCHITECTURE"
-                ? "Select Start architecture to begin"
-                : planningRunState(detail.run.state)
-                  ? planningStateDetail(detail.run.state)
-                  : "No active turn")}
+                ? "Start architecture"
+                : planningStateDetail(detail.run.state))}
         </p>
+        ) : null}
+        {(currentAgent || task) && (
+          <div className="inspector-status">
+            <StatusBadge
+              value={
+                currentAgent
+                  ? humanAgentState(currentAgent.state)
+                  : humanTaskState(task!.state)
+              }
+            />
+            <small>
+              {shortModel(agentModel(currentAgent))}{" "}
+              {agentEffort(currentAgent)} ·{" "}
+              {formatTokens(agentBudgetUsage(currentAgent))}/
+              {formatTokens(currentAgent?.token_budget || 0)} ·{" "}
+              {currentAgent?.estimated_cost_upper || "$0.00"}
+            </small>
+            <div className="mini-progress">
+              <i
+                style={{
+                  width: `${currentAgent?.token_budget ? Math.min(100, (agentBudgetUsage(currentAgent) / currentAgent.token_budget) * 100) : 0}%`,
+                }}
+              />
+            </div>
+            <details className="thread-details">
+              <summary>Runtime</summary>
+              <p>
+                {clampOperatorCopy(
+                  currentAgent?.current_goal ||
+                    task?.objective ||
+                    "No active goal",
+                  160,
+                )}
+              </p>
+              {currentAgent && (
+                <small title="Thread lifecycle times use this browser's local time zone">
+                  {threadLifecycleSummary(currentAgent)}
+                </small>
+              )}
+            </details>
+          </div>
+        )}
       </div>
       {pendingApprovals.length > 0 && (
         <div className="inline-approvals">
@@ -4601,21 +4789,17 @@ function Inspector({
             disabled={!!busy}
           >
             <ShieldCheck size={13} />
-            Request independent review
+            Request review
           </button>
         </div>
       )}
       {controlAgent?.active_turn_id && (
         <div className="steer-box">
-          <label>Message the {controlName}</label>
+          <label>Message</label>
           <textarea
             value={steer}
             onChange={(event) => setSteer(event.target.value)}
-            placeholder={
-              task
-                ? "Give the governor direction; it will manage the child threads…"
-                : `Give the ${controlName} direction…`
-            }
+            placeholder="Add a note…"
             rows={3}
           />
           <div>
@@ -4680,19 +4864,17 @@ function InspectorContent({
     <>
       {viewingChild && (
         <InspectorCard label="Child thread">
-          <p>Steer still goes to the governor.</p>
+          <p>Steer the governor, not this thread.</p>
         </InspectorCard>
       )}
-      {blocker && (
+      {blocker && !(task && retryableState(task.state)) && (
         <InspectorCard label="Next">
           <p>{blocker.nextStep}</p>
         </InspectorCard>
       )}
       <PlanProgressPanel task={task} governor={governor} detail={detail} />
       <MessageHistoryPreview
-        label={
-          agent?.role === "governor" ? "Governor messages" : "Thread messages"
-        }
+        label="Messages"
         messages={visibleMessages}
         onOpen={onOpenMessages}
       />
@@ -4702,48 +4884,6 @@ function InspectorContent({
         diff={worktreeDiff}
         run={detail.run}
       />
-      <InspectorCard
-        label={agent?.role === "governor" ? "Governor status" : "Thread status"}
-      >
-        <p>
-          <strong>
-            {agent
-              ? humanAgentState(agent.state)
-              : task
-                ? humanTaskState(task.state)
-                : "Unknown"}
-          </strong>
-          {agent?.current_action ? ` · ${agent.current_action}` : ""}
-        </p>
-        <div className="mini-progress">
-          <i
-            style={{
-              width: `${agent?.token_budget ? Math.min(100, (agentBudgetUsage(agent) / agent.token_budget) * 100) : 0}%`,
-            }}
-          />
-        </div>
-        <small>
-          {shortModel(agentModel(agent))} {agentEffort(agent)} ·{" "}
-          {formatTokens(agentBudgetUsage(agent))}/
-          {formatTokens(agent?.token_budget || 0)} ·{" "}
-          {agent?.estimated_cost_upper || "$0.00"}
-        </small>
-        <details className="thread-details">
-          <summary>Goal and runtime</summary>
-          <p>{agent?.current_goal || task?.objective || "No active goal"}</p>
-          <small>
-            {contextStrategyLabel(agent?.context_strategy)} ·{" "}
-            {agent?.heartbeat_at
-              ? `heartbeat ${timeAgo(agent.heartbeat_at)}`
-              : "no heartbeat"}
-          </small>
-          {agent && (
-            <small title="Thread lifecycle times use this browser's local time zone">
-              {threadLifecycleSummary(agent)}
-            </small>
-          )}
-        </details>
-      </InspectorCard>
     </>
   );
 }
@@ -4942,7 +5082,7 @@ function PlanProgressPanel({
       </div>
       {assignedAgents.length > 0 && (
         <div className="plan-assignments">
-          <div className="inspector-label">Agents on this work</div>
+          <div className="inspector-label">Agents</div>
           {assignedAgents.map((assigned) => {
             const working = Boolean(
               assigned.active_turn_id && activeAgentState(assigned.state),
@@ -4957,9 +5097,11 @@ function PlanProgressPanel({
                       : childDisplayName(assigned)}
                   </strong>
                   <span>
-                    {assigned.current_action ||
-                      assigned.current_goal ||
-                      "Waiting for the next assignment"}
+                    {compactAction(
+                      assigned.current_action ||
+                        assigned.current_goal ||
+                        "Waiting",
+                    )}
                   </span>
                 </div>
                 <StatusBadge
@@ -5000,27 +5142,16 @@ function WorkStatusCard({
           ? "No PR"
           : prScope;
   return (
-    <InspectorCard label="Work status">
+    <InspectorCard label="Work">
       <div className="work-status-head">
         <StatusBadge value={status.label} />
-        <span>{prScope}</span>
+        <span>{remote}</span>
       </div>
-      <div className="work-diff">
-        <div>
-          <strong>{files}</strong>
-          <span>files changed</span>
-        </div>
-        <div className="success">
-          <strong>+{additions}</strong>
-          <span>added</span>
-        </div>
-        <div className="danger">
-          <strong>−{deletions}</strong>
-          <span>removed</span>
-        </div>
-      </div>
-      <p>{status.detail}</p>
-      <small>{remote}</small>
+      <p className="work-diff">
+        <strong>{files}</strong> {files === 1 ? "file" : "files"}{" "}
+        <span className="success">+{additions}</span>{" "}
+        <span className="danger">−{deletions}</span>
+      </p>
       {files > 0 && (
         <details className="work-files">
           <summary>Changed files ({files})</summary>
@@ -5093,7 +5224,6 @@ function MessageHistoryModal({
   return (
     <ModalFrame
       title={title}
-      eyebrow="Timestamped local scrollback"
       onClose={onClose}
       wide
     >
@@ -5199,7 +5329,6 @@ function UsageView({
   return (
     <div className="page usage-page">
       <PageTitle
-        eyebrow="Where the work goes"
         title="Usage"
         description="Token and time spend grouped by account, repository, and agent. API cost is an equivalent estimate, not an invoice."
       />
@@ -5295,7 +5424,7 @@ function UsageGroupList({
   );
 }
 
-function HostView({
+function RuntimeSection({
   runtime,
   repositories,
 }: {
@@ -5303,13 +5432,13 @@ function HostView({
   repositories: Repository[];
 }) {
   return (
-    <div className="page">
-      <PageTitle
-        eyebrow="Runtime health"
-        title="Host and App Server"
-        description="Runs stay disabled unless the installed Codex version and app protocol are compatible."
-      />
-      <div className="health-grid large">
+    <>
+      <div className="settings-section-title">Runtime</div>
+      <p className="settings-note">
+        Runs stay disabled unless the installed Codex version and app protocol
+        are compatible.
+      </p>
+      <div className="health-grid">
         <HealthCard
           icon={<Bot />}
           label="Codex App Server"
@@ -5365,7 +5494,7 @@ function HostView({
           </dl>
         </InspectorCard>
       </div>
-    </div>
+    </>
   );
 }
 
@@ -5373,6 +5502,8 @@ export function SettingsView({
   light,
   accounts,
   modelCatalog,
+  runtime,
+  repositories = [],
   onAccounts,
   onSettings,
   onRefresh,
@@ -5383,6 +5514,8 @@ export function SettingsView({
   light: boolean;
   accounts: CodexAccountsSnapshot;
   modelCatalog: RunModelCatalog;
+  runtime?: RuntimeStatus;
+  repositories?: Repository[];
   onAccounts: (snapshot: CodexAccountsSnapshot) => void;
   onSettings: (settings: OperatorSettings) => void;
   onRefresh: () => Promise<void>;
@@ -5431,7 +5564,6 @@ export function SettingsView({
   return (
     <div className="page narrow-page">
       <PageTitle
-        eyebrow="Local preferences"
         title="Settings"
         description="Preferences are stored on this computer. Publishing and other external changes still require approval."
       />
@@ -5615,6 +5747,8 @@ export function SettingsView({
           </span>
         </div>
       </div>
+      <NotificationSettings />
+      <RuntimeSection runtime={runtime} repositories={repositories} />
     </div>
   );
 }
@@ -5854,7 +5988,6 @@ function AccountLoginModal({
   return (
     <ModalFrame
       title={account ? "Re-authenticate account" : "Add Codex account"}
-      eyebrow="Sign in with ChatGPT"
       onClose={close}
       wide
     >
@@ -6004,12 +6137,7 @@ export function RegisterModal({
       )
     : discoveries;
   return (
-    <ModalFrame
-      title="Add a project"
-      eyebrow="Existing checkout or new local folder"
-      onClose={onClose}
-      wide
-    >
+    <ModalFrame title="Add a project" onClose={onClose} wide>
       <form onSubmit={submit}>
         <div className="compact-choice">
           <label>
@@ -6233,7 +6361,6 @@ function PrepareCheckoutModal({
   return (
     <ModalFrame
       title="Create clean coordination checkout"
-      eyebrow="Non-destructive onboarding"
       onClose={onClose}
       wide
     >
@@ -6406,13 +6533,23 @@ function NewRunModal({
       setBusy(false);
     }
   };
+  const advancedSummary = [
+    `${selectedRepository?.origin_url ? "origin/" : ""}${selectedRepository?.default_branch || "main"}`,
+    `${formatTokens(runTokenBudget)} ceiling`,
+    [selectedModel?.display_name || runModel, runEffort]
+      .filter(Boolean)
+      .join(" "),
+    automaticPlanApproval ? "auto-approve plan" : "review before work",
+    publication === "local_only" ? "keep local" : "draft PR after approval",
+    isQwodex ? "local provider" : codexAccountId ? "pinned account" : "automatic account",
+    ...(deepInterview ? ["deep interview"] : []),
+    `Ponytail ${ponytailMode}`,
+    ...(compactHandoffs ? [] : ["compact handoffs off"]),
+  ]
+    .filter(Boolean)
+    .join(" · ");
   return (
-    <ModalFrame
-      title="New task"
-      eyebrow="Goal and oversight"
-      onClose={onClose}
-      wide
-    >
+    <ModalFrame title="New task" onClose={onClose} wide>
       <form onSubmit={submit}>
         <label className="field">
           <span>What should the governor accomplish?</span>
@@ -6425,55 +6562,7 @@ function NewRunModal({
             required
           />
         </label>
-        <label className={`interview-option ${deepInterview ? "selected" : ""}`}>
-          <input
-            type="checkbox"
-            checked={deepInterview}
-            onChange={(event) => setDeepInterview(event.target.checked)}
-          />
-          <span>
-            <strong>Deep interview before planning</strong>
-            <small>
-              Optional · clarify the intended final shape one material decision
-              at a time, then confirm a concise brief before the architect starts.
-            </small>
-          </span>
-        </label>
-        <label className={`field ${ponytailMode !== "off" ? "selected" : ""}`}>
-          <span>
-            <strong>Ponytail implementation discipline</strong>
-            <small>
-              Version-pinned per run · reads the real flow first, then applies
-              YAGNI, reuse, stdlib, native platform, installed dependency, and
-              smallest-correct-diff rules without weakening proof or safety.
-            </small>
-          </span>
-          <select
-            value={ponytailMode}
-            onChange={(event) => setPonytailMode(event.target.value as PonytailMode)}
-          >
-            <option value="off">Off</option>
-            <option value="lite">Lite · propose a simpler alternative</option>
-            <option value="full">Full · default</option>
-            <option value="ultra">Ultra · reject speculative complexity</option>
-          </select>
-        </label>
-        <label className={`interview-option ${compactHandoffs ? "selected" : ""}`}>
-          <input
-            type="checkbox"
-            checked={compactHandoffs}
-            onChange={(event) => setCompactHandoffs(event.target.checked)}
-          />
-          <span>
-            <strong>Caveman compact handoffs</strong>
-            <small>
-              On by default · keeps narration and handoffs concise, while exact
-              evidence, JSON, patches, command output, and safety requirements
-              remain uncompressed.
-            </small>
-          </span>
-        </label>
-        <div className="form-grid">
+        {repositories.length > 1 && (
           <label className="field">
             <span>Project</span>
             <select
@@ -6486,6 +6575,90 @@ function NewRunModal({
                 </option>
               ))}
             </select>
+          </label>
+        )}
+        <details className="advanced-fields">
+          <summary>
+            <span>Advanced</span>
+            <small>{advancedSummary}</small>
+          </summary>
+          <label
+            className={`interview-option ${deepInterview ? "selected" : ""}`}
+          >
+            <input
+              type="checkbox"
+              checked={deepInterview}
+              onChange={(event) => setDeepInterview(event.target.checked)}
+            />
+            <span>
+              <strong>Deep interview before planning</strong>
+              <small>
+                Clarify the intended final shape one material decision at a
+                time, then confirm a concise brief before the architect starts.
+              </small>
+            </span>
+          </label>
+          <label className={`field ${ponytailMode !== "off" ? "selected" : ""}`}>
+            <span>
+              <strong>Ponytail implementation discipline</strong>
+              <small>
+                Version-pinned per run · reads the real flow first, then applies
+                YAGNI, reuse, stdlib, native platform, installed dependency, and
+                smallest-correct-diff rules without weakening proof or safety.
+              </small>
+            </span>
+            <select
+              value={ponytailMode}
+              onChange={(event) =>
+                setPonytailMode(event.target.value as PonytailMode)
+              }
+            >
+              <option value="off">Off</option>
+              <option value="lite">Lite · propose a simpler alternative</option>
+              <option value="full">Full · default</option>
+              <option value="ultra">Ultra · reject speculative complexity</option>
+            </select>
+          </label>
+          <label
+            className={`interview-option ${compactHandoffs ? "selected" : ""}`}
+          >
+            <input
+              type="checkbox"
+              checked={compactHandoffs}
+              onChange={(event) => setCompactHandoffs(event.target.checked)}
+            />
+            <span>
+              <strong>Caveman compact handoffs</strong>
+              <small>
+                On by default · keeps narration and handoffs concise, while
+                exact evidence, JSON, patches, command output, and safety
+                requirements remain uncompressed.
+              </small>
+            </span>
+          </label>
+          <div className="form-grid">
+            {repositories.length <= 1 && (
+              <label className="field">
+                <span>Project</span>
+                <select
+                  value={repository}
+                  onChange={(event) => setRepository(event.target.value)}
+                >
+                  {repositories.map((item) => (
+                    <option value={item.id} key={item.id}>
+                      {item.display_name} · {item.health}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+            <label className="field">
+              <span>Base</span>
+              <input
+                value={`${selectedRepository?.origin_url ? "origin/" : ""}${selectedRepository?.default_branch || "main"}`}
+                readOnly
+              />
+            </label>
             <button
               type="button"
               className="button subtle"
@@ -6494,137 +6667,131 @@ function NewRunModal({
             >
               Create new local project…
             </button>
-          </label>
-          <label className="field">
-            <span>Base</span>
-            <input
-              value={`${selectedRepository?.origin_url ? "origin/" : ""}${selectedRepository?.default_branch || "main"}`}
-              readOnly
-            />
-          </label>
-        </div>
-        <BudgetControl
-          label="Total run ceiling"
-          value={runTokenBudget}
-          valueLabel={`${formatTokens(runTokenBudget)} tokens`}
-          options={RUN_BUDGET_OPTIONS}
-          onChange={setRunTokenBudget}
-          hint={`This is the aggregate ceiling for planning, governor work, children, and review. Harness automatically opens bounded governor turns and retries productive work within it; the current turn recommendation is ${formatTokens(settings?.recommended_governor_attempt_tokens || 650_000)} tokens.`}
-        />
-        <div className="form-grid">
-          <label className="field">
-            <span>Run model</span>
-            <select
-              value={runModel}
-              onChange={(event) => setRunModel(event.target.value)}
-            >
-              {modelCatalog.models.map((model) => (
-                <option value={model.id} key={model.id}>
-                  {model.display_name || model.id}
-                </option>
-              ))}
-            </select>
-            <small>
-              {modelCatalog.provider || "Configured"} · immutable for this
-              run and used by every BILDR task role. Qwodex runs refuse native
-              child agents whose model route cannot be controller-bound.
-            </small>
-          </label>
-          <label className="field">
-            <span>Thinking level</span>
-            <select
-              value={runEffort}
-              onChange={(event) => setRunEffort(event.target.value)}
-            >
-              {selectedModelEfforts.map((effort) => (
-                <option value={effort} key={effort}>
-                  {effort === "xhigh"
-                    ? "XHigh"
-                    : effort[0].toUpperCase() + effort.slice(1)}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
-        <div className="form-grid">
-          {!isQwodex && (
-          <label className="field">
-            <span>Codex account</span>
-            <select
-              value={codexAccountId}
-              onChange={(event) => setCodexAccountId(event.target.value)}
-            >
-              <option value="">Automatic · best available</option>
-              {accounts.accounts.map((account) => (
-                <option value={account.id} key={account.id}>
-                  {accountOptionLabel(account)}
-                </option>
-              ))}
-            </select>
-            <small>
-              A specific account is selected at the next safe attempt boundary.
-              Automatic mode can hand off when capacity is low.
-            </small>
-          </label>
-          )}
-          {isQwodex && (
-            <div className="field local-provider-note">
-              <span>Local provider</span>
-              <strong>Qwodex uses no Codex account</strong>
+          </div>
+          <BudgetControl
+            label="Total run ceiling"
+            value={runTokenBudget}
+            valueLabel={`${formatTokens(runTokenBudget)} tokens`}
+            options={RUN_BUDGET_OPTIONS}
+            onChange={setRunTokenBudget}
+            hint={`Aggregate ceiling for planning, governor work, children, and review. The current turn recommendation is ${formatTokens(settings?.recommended_governor_attempt_tokens || 650_000)} tokens.`}
+          />
+          <div className="form-grid">
+            <label className="field">
+              <span>Run model</span>
+              <select
+                value={runModel}
+                onChange={(event) => setRunModel(event.target.value)}
+              >
+                {modelCatalog.models.map((model) => (
+                  <option value={model.id} key={model.id}>
+                    {model.display_name || model.id}
+                  </option>
+                ))}
+              </select>
               <small>
-                The selected local model is used by every BILDR role, including
-                its read-only supervisor.
+                {modelCatalog.provider || "Configured"} · immutable for this run
+                and used by every BILDR task role. Qwodex runs refuse native
+                child agents whose model route cannot be controller-bound.
               </small>
-            </div>
-          )}
-          <div className="field">
-            <span>Plan approval</span>
-            <div className="compact-choice">
-              <label>
-                <input
-                  type="radio"
-                  checked={!automaticPlanApproval}
-                  onChange={() => setAutomaticPlanApproval(false)}
-                />
-                <span>
-                  <b>Review before work</b>
-                  <small>Recommended · pause after planning</small>
-                </span>
+            </label>
+            <label className="field">
+              <span>Thinking level</span>
+              <select
+                value={runEffort}
+                onChange={(event) => setRunEffort(event.target.value)}
+              >
+                {selectedModelEfforts.map((effort) => (
+                  <option value={effort} key={effort}>
+                    {effort === "xhigh"
+                      ? "XHigh"
+                      : effort[0].toUpperCase() + effort.slice(1)}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <div className="form-grid">
+            {!isQwodex && (
+              <label className="field">
+                <span>Codex account</span>
+                <select
+                  value={codexAccountId}
+                  onChange={(event) => setCodexAccountId(event.target.value)}
+                >
+                  <option value="">Automatic · best available</option>
+                  {accounts.accounts.map((account) => (
+                    <option value={account.id} key={account.id}>
+                      {accountOptionLabel(account)}
+                    </option>
+                  ))}
+                </select>
+                <small>
+                  A specific account is selected at the next safe attempt
+                  boundary. Automatic mode can hand off when capacity is low.
+                </small>
               </label>
-              <label>
-                <input
-                  type="radio"
-                  checked={automaticPlanApproval}
-                  onChange={() => setAutomaticPlanApproval(true)}
-                />
-                <span>
-                  <b>Approve certified plan</b>
-                  <small>Begin automatically after adversarial review</small>
-                </span>
-              </label>
+            )}
+            {isQwodex && (
+              <div className="field local-provider-note">
+                <span>Local provider</span>
+                <strong>Qwodex uses no Codex account</strong>
+                <small>
+                  The selected local model is used by every BILDR role,
+                  including its read-only supervisor.
+                </small>
+              </div>
+            )}
+            <div className="field">
+              <span>Plan approval</span>
+              <div className="compact-choice">
+                <label>
+                  <input
+                    type="radio"
+                    checked={!automaticPlanApproval}
+                    onChange={() => setAutomaticPlanApproval(false)}
+                  />
+                  <span>
+                    <b>Review before work</b>
+                    <small>Recommended · pause after planning</small>
+                  </span>
+                </label>
+                <label>
+                  <input
+                    type="radio"
+                    checked={automaticPlanApproval}
+                    onChange={() => setAutomaticPlanApproval(true)}
+                  />
+                  <span>
+                    <b>Approve certified plan</b>
+                    <small>Begin automatically after adversarial review</small>
+                  </span>
+                </label>
+              </div>
             </div>
           </div>
-        </div>
-        <div className="choice-group">
-          <span>Publication</span>
-          <label>
-            <input
-              type="radio"
-              checked={publication === "local_only"}
-              onChange={() => setPublication("local_only")}
-            />
-            Keep local
-          </label>
-          <label>
-            <input
-              type="radio"
-              checked={publication === "draft_pr_after_approval"}
-              onChange={() => setPublication("draft_pr_after_approval")}
-              disabled={!selectedRepository?.origin_url}
-            />
-            Draft PR after approval{!selectedRepository?.origin_url ? " · remote required" : ""}
-          </label>
-        </div>
+          <div className="choice-group">
+            <span>Publication</span>
+            <label>
+              <input
+                type="radio"
+                checked={publication === "local_only"}
+                onChange={() => setPublication("local_only")}
+              />
+              Keep local
+            </label>
+            <label>
+              <input
+                type="radio"
+                checked={publication === "draft_pr_after_approval"}
+                onChange={() => setPublication("draft_pr_after_approval")}
+                disabled={!selectedRepository?.origin_url}
+              />
+              Draft PR after approval
+              {!selectedRepository?.origin_url ? " · remote required" : ""}
+            </label>
+          </div>
+        </details>
         <div className="pin-note">
           <ShieldCheck size={15} />
           <span>
@@ -6670,11 +6837,6 @@ function CommandPalette({
       icon: item.icon,
       action: () => onNavigate(item.view),
     })),
-    ...systemNav.map((item) => ({
-      label: `Go to ${item.label}`,
-      icon: item.icon,
-      action: () => onNavigate(item.view),
-    })),
   ].filter((item) => item.label.toLowerCase().includes(query.toLowerCase()));
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
@@ -6708,13 +6870,11 @@ function CommandPalette({
 
 function ModalFrame({
   title,
-  eyebrow,
   onClose,
   wide,
   children,
 }: {
   title: string;
-  eyebrow: string;
   onClose: () => void;
   wide?: boolean;
   children: ReactNode;
@@ -6730,7 +6890,6 @@ function ModalFrame({
       >
         <header>
           <div>
-            <span className="eyebrow">{eyebrow}</span>
             <h2>{title}</h2>
           </div>
           <button className="icon-button" onClick={onClose} aria-label="Close">
@@ -6744,12 +6903,10 @@ function ModalFrame({
 }
 
 function PageTitle({
-  eyebrow,
   title,
   description,
   action,
 }: {
-  eyebrow: string;
   title: string;
   description: string;
   action?: ReactNode;
@@ -6757,7 +6914,6 @@ function PageTitle({
   return (
     <div className="page-title">
       <div>
-        <span className="eyebrow">{eyebrow}</span>
         <h1>{title}</h1>
         <p>{description}</p>
       </div>
@@ -6769,16 +6925,19 @@ function SectionHeader({
   title,
   count,
   aside,
+  action,
 }: {
   title: string;
   count?: number;
   aside?: string;
+  action?: ReactNode;
 }) {
   return (
     <div className="section-header">
       <span>{title}</span>
       {count !== undefined && <i>{count}</i>}
       {aside && <small>{aside}</small>}
+      {action}
     </div>
   );
 }
@@ -6873,6 +7032,7 @@ function EmptyInspector({
   );
 }
 function StatusBadge({ value }: { value: string }) {
+  const key = value.replaceAll(" ", "_").toUpperCase();
   const animated = [
     "WORKING",
     "RUNNING",
@@ -6884,12 +7044,12 @@ function StatusBadge({ value }: { value: string }) {
     "PLAN_REVISION_REQUIRED",
     "INTEGRATING",
     "VERIFYING",
-  ].includes(value);
+  ].includes(key);
   return (
     <span
-      className={`status-badge tone-${tone(value)} ${animated ? "animated" : ""}`}
+      className={`status-badge tone-${tone(key)} ${animated ? "animated" : ""}`}
     >
-      {value.replaceAll("_", " ")}
+      {shortStatusLabel(key)}
     </span>
   );
 }
@@ -6937,9 +7097,14 @@ function StatusBar({
         <i />
         {streamLabel}
       </span>
-      <span>
+      <span
+        className={runtime?.codex.state === "ready" ? "" : "danger"}
+        title={runtime?.codex.detail ?? undefined}
+      >
         {runtime?.codex.state === "ready"
-          ? "App Server ready"
+          ? `App Server ${runtime.codex.version || "ready"}${
+              runtime.codex.schema_match ? "" : " · execution disabled"
+            }`
           : "App Server unavailable"}
       </span>
       <span>
@@ -7026,11 +7191,9 @@ function planningStateTitle(state: string) {
 }
 
 function planningStateDetail(state: string) {
-  if (state === "PLAN_ADVERSARIAL_REVIEW")
-    return "Independent review of feasibility and recovery.";
-  if (state === "PLAN_REVISION_REQUIRED")
-    return "Replacing the blocked plan. Approval waits on certification.";
-  return "Reading the repo and writing the task graph.";
+  if (state === "PLAN_ADVERSARIAL_REVIEW") return "Reviewing the plan.";
+  if (state === "PLAN_REVISION_REQUIRED") return "Revising the plan.";
+  return "Writing the task graph.";
 }
 
 function terminal(state: string) {
@@ -7130,27 +7293,21 @@ function activeAgentState(state: string) {
     "FINISHING",
   ].includes(state);
 }
-function contextStrategyLabel(strategy?: string) {
-  if (strategy === "native_thread_reuse")
-    return "Existing governor context retained";
-  if (strategy === "bounded_handoff") return "Bounded handoff context";
-  return "Fresh independent context";
-}
 function delegatedThreadDisplayState(child: Agent, governorActive: boolean) {
   return !governorActive && activeAgentState(child.state)
     ? "FINISHING"
     : child.state;
 }
 function humanTaskState(state: string) {
-  if (state === "NEEDS_HELP") return "Waiting on you";
-  if (state === "WAITING_APPROVAL") return "Waiting for approval";
-  return roleLabel(state);
+  if (state === "NEEDS_HELP" || state === "CHANGES_REQUESTED") return "Paused";
+  if (state === "WAITING_APPROVAL") return "Approve";
+  return shortStatusLabel(state);
 }
 function humanAgentState(state: string) {
-  if (state === "TURN_COMPLETE") return "Turn complete";
+  if (state === "TURN_COMPLETE" || state === "COMPLETED") return "Done";
   if (state === "FINISHING") return "Finishing";
   if (state === "PAUSED") return "Paused";
-  return roleLabel(state);
+  return shortStatusLabel(state);
 }
 export function runLifecycleSummary(run: Run) {
   if (!run.started_at) {
@@ -7162,10 +7319,69 @@ export function threadLifecycleSummary(agent: Agent) {
   if (!agent.started_at) return "Local time · start not recorded";
   return `Local time · started ${formatLocalTimestamp(agent.started_at)} · ${agent.completed_at ? `completed ${formatLocalTimestamp(agent.completed_at)}` : "completion pending"}`;
 }
-function threadLifecycleRowSummary(agent: Agent) {
-  if (!agent.started_at) return "Local · start not recorded";
-  return `Local · start ${formatLocalClock(agent.started_at)} → ${agent.completed_at ? `done ${formatLocalClock(agent.completed_at)}` : "pending"}`;
+export function clampOperatorCopy(text: string, max = 160) {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (compact.length <= max) return compact;
+  const cut = compact.slice(0, max);
+  const at = cut.lastIndexOf(" ");
+  return `${(at > Math.min(72, max - 24) ? cut.slice(0, at) : cut).trimEnd()}…`;
 }
+
+const OPERATOR_SLOP =
+  /custody[- ]verified|controller committed|immutable snapshot|bounded wait|controller-visible|evidence packet|internally coherent|no intervention is proposed|advisory only|durable handoff|read-only assessment/i;
+
+export function looksLikeSlopCopy(text: string) {
+  return OPERATOR_SLOP.test(text);
+}
+
+export function plainOperatorReason(text: string, max = 140) {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (!compact || looksLikeSlopCopy(compact)) return "";
+  return clampOperatorCopy(compact, max);
+}
+
+export function compactAction(text?: string, max = 88) {
+  if (!text) return "";
+  const raw = text.replace(/\s+/g, " ").trim();
+  if (looksLikeSlopCopy(raw)) {
+    if (/commit/i.test(raw)) return "Committed";
+    if (/wait/i.test(raw)) return "Waiting";
+    return "";
+  }
+  return clampOperatorCopy(raw, max);
+}
+
+function shortStatusLabel(value: string) {
+  const key = value.replaceAll(" ", "_").toUpperCase();
+  switch (key) {
+    case "CHANGES_REQUESTED":
+    case "NEEDS_HELP":
+      return "Paused";
+    case "WAITING_ON_YOU":
+      return "Needs you";
+    case "WAITING_FOR_APPROVAL":
+    case "WAITING_APPROVAL":
+      return "Approve";
+    case "TURN_COMPLETE":
+    case "COMPLETED":
+      return "Done";
+    case "PLAN_ADVERSARIAL_REVIEW":
+      return "Reviewing";
+    case "PLAN_REVISION_REQUIRED":
+      return "Revising";
+    case "READY_FOR_ARCHITECTURE":
+      return "Ready";
+    case "CLARIFYING_INTENT":
+      return "Interview";
+    case "INFRASTRUCTURE_UNAVAILABLE":
+      return "Unavailable";
+    case "RECOVERY_AVAILABLE":
+      return "Blocked";
+    default:
+      return value.replaceAll("_", " ");
+  }
+}
+
 export function blockerStatus(
   run: Run | undefined,
   task?: Task,
@@ -7190,18 +7406,18 @@ export function blockerStatus(
     task?.failure_reason ||
     run?.failure_reason ||
     agent?.current_action ||
-    "Harness recorded a blocked state without a more specific runtime reason.";
+    "Blocked without a recorded reason.";
   const nextStep = agent?.parent_agent_id
-    ? "This delegated thread is read-only. Return to the governor; only the governor can continue or retry its owning task."
+    ? "Return to the governor."
     : task && retryableState(task.state)
-      ? "Use Continue governor below. You can add a decision or new fact and choose the next attempt budget before continuing."
+      ? "Continue the governor."
       : run?.state === "BLOCKED" && run.phase === "plan_review_deadlocked"
-        ? "Describe one concrete plan defect in Request changes below; Harness will send that bounded correction through the revision loop."
+        ? "Request a plan change."
         : run?.state === "BLOCKED" && run.phase === "plan_review_budget_exhausted"
-          ? "Use the recovery panel above to resume the bounded final plan review or give the architect one concrete plan correction."
+          ? "Resume review or request a plan change."
         : run?.scheduler_paused
-          ? "Select Resume work after confirming the recorded condition is resolved."
-          : "No safe automatic continuation is available at this run phase. Resolve the recorded condition, preserve the current evidence, then start a scoped follow-up if needed.";
+          ? "Resume work."
+          : "Fix the blocker, then continue.";
   return { reason, nextStep };
 }
 function workStatusSummary(
@@ -7324,6 +7540,7 @@ function tone(value: string) {
       "high",
       "inconclusive",
       "needs_help",
+      "changes_requested",
       "stalled",
     ].some((item) => state.includes(item))
   )

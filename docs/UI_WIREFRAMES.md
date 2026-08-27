@@ -31,36 +31,38 @@
 ```text
 BILDR
 ├── Home
-│   ├── repositories
+│   ├── needs you: source-owned attention, newest first
 │   ├── active runs
-│   ├── recent runs
-│   └── host/runtime health
-├── Repositories
-│   ├── discovered local checkouts
-│   ├── registration and health
-│   └── new run
+│   ├── repositories: registration, health, inspect, clean checkout
+│   └── host/runtime health summary
 ├── Runs
 │   ├── governor and task rows
 │   ├── latest governor update and meaningful activity
 │   ├── inspectable delegated child threads
 │   ├── governor steering/continuation
-│   └── inline approvals
+│   ├── inline approvals
+│   └── activity: material changes, connection, waiting on, investigations
 ├── Usage
 │   ├── by Codex account
 │   ├── by repository
 │   └── by agent
-├── Host/runtime
-│   ├── Codex App Server
-│   ├── process/resource usage
-│   ├── local runners/hardware
-│   └── logs
-└── Settings
-    ├── plan approval, governor autonomy, and budgets
-    ├── Codex account names and authentication
-    ├── account handoff
-    ├── retention
-    ├── security
-    └── appearance/accessibility
+├── Threads (rail list, all runs)
+│   ├── posture icon: working / waiting / stopped / completed / failed
+│   ├── pin (ordering only, never changes run authority)
+│   ├── archive (stopped or completed runs)
+│   └── delete (archived runs only, purges dependent records)
+├── Learning
+│   ├── governed knowledge review
+│   └── failure occurrences and traces
+├── Settings
+│   ├── plan approval, governor autonomy, and budgets
+│   ├── Codex account names and authentication
+│   ├── account handoff
+│   ├── retention
+│   ├── security
+    ├── appearance/accessibility
+    ├── notifications: presence preference and delivery health
+    └── runtime: Codex App Server, local history, scheduler, compatibility
 ```
 
 ## 3. Desktop shell
@@ -104,19 +106,19 @@ Left to right:
 - product/repository selector;
 - run selector and immutable base SHA;
 - App Server health and version/schema badge;
-- agent slots and local resource slots;
-- run-level input/output/reasoning tokens and API-equivalent cost;
+- Codex account and remaining capacity, opening the account and limits panel;
 - pending approval count, highest risk first;
 - global command palette;
 - user/local-session menu.
 
 Clicking the base SHA opens a compact provenance card: requested ref, resolved SHA, fetch timestamp, authority digest, Codex version, protocol-schema digest, profile version, and pricing snapshot IDs.
 
-### Codex account and limits strip
+### Codex account and limits panel
 
-Directly below the top bar, show the selected local Codex account, its plan,
-and each backend-exposed rate-limit window as remaining percentage plus reset
-time. The selector switches between detected and Harness-managed `CODEX_HOME`
+The top bar shows one capacity pill: the selected account and its lowest
+remaining general window. Opening it reveals the selected local Codex account,
+its plan, and each backend-exposed rate-limit window as remaining percentage
+plus reset time. The selector switches between detected and Harness-managed `CODEX_HOME`
 profiles only when no agent session is active and includes **Add Codex
 account**. Device authorization is initiated by the installed Codex binary;
 Harness shows only the OpenAI verification URL and one-time code. Missing
@@ -129,7 +131,16 @@ Credentials stay inside private Codex homes and are never rendered by Harness.
 
 ### Left rail
 
-The left rail stays narrow. It is navigation, not a second status dashboard. Counts appear only when actionable: running agents, approvals, failed validations, retained worktrees.
+The left rail stays narrow. It is navigation, not a second status dashboard.
+Counts appear only when actionable: running agents, approvals, failed
+validations, retained worktrees. Every destination is flat.
+
+Below the destinations the rail lists **Threads**: every run, pinned first and
+then most recently started. Each row shows one posture icon — working, waiting,
+stopped, completed, or failed — and reveals pin, archive, and delete on hover.
+Archive is offered only for a stopped or completed run; delete only for an
+archived one, behind an inline confirmation. Pinning is presentation state and
+changes no run authority.
 
 ## 4. Home screen
 
@@ -555,9 +566,9 @@ The run-level view contains:
 
 Avoid gamifying low token use. The objective is predictable cost per accepted result, not minimum tokens at the expense of proof.
 
-## 13. Host/runtime view
+## 13. Runtime section
 
-Shows:
+Shown at the foot of **Settings**, with a health summary also on Home:
 
 - `harnessd` version, uptime, event-loop lag, memory, open file count;
 - Codex binary version, App Server PID, protocol schema digest, restart count;

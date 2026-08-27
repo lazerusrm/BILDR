@@ -466,6 +466,8 @@ export interface Run {
   failure_reason?: string | null;
   scheduler_paused: boolean;
   run_token_budget?: number;
+  /** Operator-owned ordering only; it never changes run authority. */
+  pinned?: boolean;
   version: number;
 }
 

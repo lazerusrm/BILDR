@@ -112,7 +112,28 @@ const run = {
   started_at: now,
   scheduler_paused: false,
   run_token_budget: 240000,
+  pinned: true,
   version: 5,
+};
+const archivedRun = {
+  id: "run-04JHARNESS",
+  repository_id: "repo-1",
+  title: "Retired probe latency sweep",
+  objective: "Superseded by the ledger benchmark.",
+  mode: "plan_and_implement",
+  publication_mode: "local_only",
+  state: "ARCHIVED",
+  phase: "archived",
+  base_ref: "origin/main",
+  base_sha: sha,
+  authority_digest: "c".repeat(64),
+  created_at: now,
+  started_at: now,
+  completed_at: now,
+  scheduler_paused: true,
+  run_token_budget: 120000,
+  pinned: false,
+  version: 9,
 };
 const preparedRun = {
   ...run,
@@ -353,6 +374,38 @@ const json = (response, value, status = 200) => {
   response.end(JSON.stringify(value));
 };
 
+const providerSwitchStatus = {
+  active_provider: "openai",
+  available_providers: ["openai", "qwen-local-switcher"],
+  switchable: true,
+  restart_required: true,
+  detail: "Switch only when every run is terminal.",
+};
+
+const runModelCatalog = {
+  provider: "openai-codex",
+  models: [
+    {
+      id: "gpt-5.6-sol",
+      display_name: "SOL · strongest",
+      reasoning_efforts: ["low", "medium", "high", "xhigh", "max"],
+      profile_sha256: "e".repeat(64),
+    },
+    {
+      id: "gpt-5.6-terra",
+      display_name: "Terra · balanced",
+      reasoning_efforts: ["low", "medium", "high", "xhigh"],
+      profile_sha256: "f".repeat(64),
+    },
+    {
+      id: "gpt-5.6-luna",
+      display_name: "Luna · economical",
+      reasoning_efforts: ["low", "medium", "high"],
+      profile_sha256: "a".repeat(64),
+    },
+  ],
+};
+
 const apiResponse = (pathname) => {
   if (pathname === "/api/v1/runtime") {
     return {
@@ -399,7 +452,12 @@ const apiResponse = (pathname) => {
   if (pathname === "/api/v1/settings") return settings;
   if (pathname === "/api/v1/runs")
     return {
-      items: [preparedRun, run, ...(interviewRun ? [interviewRun] : [])],
+      items: [
+        preparedRun,
+        run,
+        archivedRun,
+        ...(interviewRun ? [interviewRun] : []),
+      ],
       next_cursor: null,
     };
   if (pathname === "/api/v1/approvals") return [approval];
@@ -425,6 +483,8 @@ const apiResponse = (pathname) => {
     return usage;
   if (pathname === "/api/v1/usage") return usageBreakdown;
   if (pathname === "/api/v1/improvement/avo-episodes") return [];
+  if (pathname === "/api/v1/models") return runModelCatalog;
+  if (pathname === "/api/v1/provider") return providerSwitchStatus;
   if (pathname === `/api/v1/runs/${run.id}/evidence`) {
     return {
       schema: "harness.evidence.snapshot.v1",
@@ -468,6 +528,14 @@ const apiResponse = (pathname) => {
 };
 
 const mutationResponse = (pathname) => {
+  const pinned = [run, preparedRun, archivedRun].find(
+    (item) => pathname === `/api/v1/runs/${item.id}/pin`,
+  );
+  if (pinned) return { ...pinned, pinned: !pinned.pinned };
+  const archiving = [run, preparedRun, archivedRun].find(
+    (item) => pathname === `/api/v1/runs/${item.id}/archive`,
+  );
+  if (archiving) return { ...archiving, state: "ARCHIVED", phase: "archived" };
   if (pathname === "/api/v1/runs") {
     interviewRun = {
       ...preparedRun,
@@ -589,6 +657,468 @@ const contentTypes = {
   ".svg": "image/svg+xml",
 };
 
+
+// Operator control plane fixtures. Shapes follow ui/src/types.ts and the routes
+// registered in crates/harness-api/src/operator_control.rs.
+const ms = (minutesAgo) => Date.now() - minutesAgo * 60_000;
+const digest = (seed) => seed.padEnd(64, "0").slice(0, 64);
+
+const attentionItems = [
+  {
+    schema: "harness.attention-item.v1",
+    attention_id: "att-001",
+    repository_id: repository.id,
+    run_id: run.id,
+    task_id: "task-core-001",
+    source: {
+      source_type: "approval",
+      source_id: approval.id,
+      source_revision: 1,
+    },
+    category: "command_approval",
+    severity: "high",
+    state: "open",
+    title: "Command approval needed",
+    summary:
+      "The governor wants to run cargo test -p validator -- negative_case in the managed worktree.",
+    option_refs: ["approve", "deny"],
+    evidence_refs: [],
+    blocked_refs: ["task-core-001"],
+    dedupe_key: "approval:command:core-001",
+    opened_event_id: "evt-4411",
+    opened_at_ms: ms(6),
+    acknowledged_at_ms: null,
+    due_at_ms: null,
+    resurfacing: { policy: "until_resolved", maximum_defer_ms: 900_000 },
+    resolution: null,
+    version: 1,
+  },
+  {
+    schema: "harness.attention-item.v1",
+    attention_id: "att-002",
+    repository_id: repository.id,
+    run_id: preparedRun.id,
+    task_id: null,
+    source: {
+      source_type: "external_condition",
+      source_id: "cond-ci-001",
+      source_revision: 3,
+    },
+    category: "waiting_external",
+    severity: "normal",
+    state: "waiting_external",
+    title: "Waiting on required CI checks",
+    summary:
+      "The draft pull request head has two required checks still queued at the exact integration SHA.",
+    option_refs: [],
+    evidence_refs: ["cond-ci-001"],
+    blocked_refs: [preparedRun.id],
+    dedupe_key: "condition:ci_check:pr-118",
+    opened_event_id: "evt-4380",
+    opened_at_ms: ms(41),
+    acknowledged_at_ms: ms(30),
+    due_at_ms: null,
+    resurfacing: { policy: "on_state_change", maximum_defer_ms: 1_800_000 },
+    resolution: null,
+    version: 3,
+  },
+];
+
+const materialProgress = [
+  {
+    schema: "harness.material-progress.v1",
+    event_id: "mp-003",
+    run_id: run.id,
+    task_id: "task-core-001",
+    attempt_id: "attempt-1",
+    kind: "candidate_changed",
+    source_event_id: "evt-4402",
+    occurred_at_ms: ms(8),
+    classifier_version: "2026.08.1",
+    summary: "Candidate advanced to 3 changed files (+84 / -19).",
+    evidence_refs: [],
+    candidate_sha: sha,
+    milestone_refs: ["CORE-001"],
+    sha256: digest("mp003"),
+  },
+  {
+    schema: "harness.material-progress.v1",
+    event_id: "mp-002",
+    run_id: run.id,
+    task_id: "task-core-001",
+    attempt_id: "attempt-1",
+    kind: "validation_advanced",
+    source_event_id: "evt-4390",
+    occurred_at_ms: ms(19),
+    classifier_version: "2026.08.1",
+    summary: "Focused negative proof reached the validator stage.",
+    evidence_refs: ["ev-221"],
+    candidate_sha: sha,
+    milestone_refs: ["CORE-001"],
+    sha256: digest("mp002"),
+  },
+  {
+    schema: "harness.material-progress.v1",
+    event_id: "mp-001",
+    run_id: run.id,
+    task_id: null,
+    attempt_id: null,
+    kind: "attention_changed",
+    source_event_id: "evt-4370",
+    occurred_at_ms: ms(52),
+    classifier_version: "2026.08.1",
+    summary: "Plan certified with zero blocking findings.",
+    evidence_refs: ["ev-210"],
+    candidate_sha: null,
+    milestone_refs: [],
+    sha256: digest("mp001"),
+  },
+];
+
+const livenessEpisodes = [
+  {
+    schema: "harness.liveness-episode.v1",
+    episode_id: "live-002",
+    run_id: run.id,
+    task_id: "task-core-001",
+    attempt_id: "attempt-1",
+    state: "healthy",
+    version: 4,
+    opened_at_ms: ms(58),
+    updated_at_ms: ms(1),
+    state_reason_codes: ["turn_active", "recent_material_progress"],
+    last_material_progress_at_ms: ms(8),
+    next_review_at_ms: ms(-4),
+    intervention_count: 0,
+    outcome: null,
+    sha256: digest("live002"),
+  },
+  {
+    schema: "harness.liveness-episode.v1",
+    episode_id: "live-001",
+    run_id: preparedRun.id,
+    task_id: null,
+    attempt_id: null,
+    state: "waiting_external",
+    version: 2,
+    opened_at_ms: ms(41),
+    updated_at_ms: ms(11),
+    state_reason_codes: ["external_condition_open"],
+    last_material_progress_at_ms: ms(41),
+    next_review_at_ms: ms(-9),
+    intervention_count: 1,
+    outcome: null,
+    sha256: digest("live001"),
+  },
+];
+
+const interventionReceipts = {
+  "live-001": [
+    {
+      schema: "harness.intervention-receipt.v1",
+      intervention_id: "int-001",
+      episode_id: "live-001",
+      kind: "wait",
+      source_event_id: "evt-4381",
+      target_version: 2,
+      policy_version: "2026.08.1",
+      requested_by: "controller",
+      created_at_ms: ms(11),
+      sha256: digest("int001"),
+    },
+  ],
+  "live-002": [],
+};
+
+const externalConditions = [
+  {
+    schema: "harness.external-condition-summary.v1",
+    condition_id: "cond-ci-001",
+    owner_type: "run",
+    owner_id: preparedRun.id,
+    adapter: "ci_check",
+    source_id: "pr-118",
+    state: "open",
+    sequence: 3,
+    poll_policy: { initial_ms: 30_000, maximum_ms: 300_000, deadline_ms: null },
+    last_observation_state: "open",
+    last_observed_at_ms: ms(2),
+    version: 3,
+    opened_at_ms: ms(41),
+    updated_at_ms: ms(2),
+  },
+];
+
+const conditionObservations = {
+  "cond-ci-001": [
+    {
+      observation_id: "obs-003",
+      condition_id: "cond-ci-001",
+      state: "open",
+      source_event_id: "check:event:3",
+      observed_at_ms: ms(2),
+      detail: "2 required checks queued",
+      sha256: digest("obs003"),
+    },
+    {
+      observation_id: "obs-002",
+      condition_id: "cond-ci-001",
+      state: "unknown",
+      source_event_id: "check:event:2",
+      observed_at_ms: ms(22),
+      detail: "Checks not yet reported for the exact head",
+      sha256: digest("obs002"),
+    },
+  ],
+};
+
+const investigations = [
+  {
+    schema: "harness.investigation-artifact-summary.v1",
+    artifact_id: "inv-001",
+    run_id: run.id,
+    task_id: "task-core-001",
+    attempt_id: "attempt-1",
+    question: "Why did the validator accept a weakened negative case?",
+    sensitivity: "internal",
+    base_sha: sha,
+    finding_count: 2,
+    recommendation_count: 1,
+    decision_count: 1,
+    created_at_ms: ms(27),
+    artifact_sha256: digest("inv001"),
+  },
+];
+
+const operatorPresence = {
+  schema: "harness.operator-presence.v1",
+  operator_id: "local",
+  mode: "interactive",
+  version: 2,
+  updated_at_ms: ms(120),
+  sha256: digest("presence"),
+};
+
+const notificationDeliveries = [
+  {
+    schema: "harness.notification-delivery.v1",
+    delivery_id: "del-001",
+    attention_id: "att-001",
+    class: "action_required",
+    state: "pending",
+    channel: "in_product_mirror",
+    source_event_id: "evt-4411",
+    created_at_ms: ms(6),
+    payload_sha256: digest("del001p"),
+    sha256: digest("del001"),
+  },
+];
+
+const notificationDeliveryHealth = {
+  schema: "harness.notification-delivery-health.v1",
+  channel: "in_product_mirror",
+  current_attention_revisions: 2,
+  examined_current_revisions: 2,
+  presented_examined_revisions: 1,
+  unpresented_examined_revisions: 1,
+  unpresented_critical_examined_revisions: 0,
+  unpresented_action_required_examined_revisions: 1,
+  unverified_claim_examined_revisions: 0,
+  oldest_unpresented_opened_at_ms: ms(6),
+  latest_presentation_receipt_at_ms: ms(30),
+  truncated: false,
+  desktop_delivery_enabled: false,
+  batching_enabled: false,
+  suppression_enabled: false,
+};
+
+const section = (rows, state = "current", cursor = 4411) => ({
+  state,
+  rows,
+  source_cursor: cursor,
+  truncated: false,
+  detail: null,
+});
+
+const controlPlaneSnapshot = {
+  schema: "harness.control-plane-snapshot.v1",
+  snapshot_id: "snap-0007",
+  revision: 7,
+  compiled_at_ms: ms(1),
+  event_cursor: 4411,
+  consistency: "current",
+  system: section([{ component: "app_server", state: "ready" }]),
+  accounts: section([{ account: "codex-main", remaining_percent: 96 }]),
+  scheduler: section([{ active_total: 1, max_total: 6, queued_tasks: 0 }]),
+  runs: section([
+    { run_id: run.id, state: run.state, title: run.title },
+    { run_id: preparedRun.id, state: preparedRun.state, title: preparedRun.title },
+  ]),
+  attention: section(attentionItems),
+  attempts: section([{ task_id: "task-core-001", attempt: 1, owner: "governor" }]),
+  investigations: section(investigations),
+  progress: section(materialProgress),
+  liveness: section(livenessEpisodes),
+  reconciliation: section([], "current"),
+  external_conditions: section(externalConditions),
+  cost: section([{ total_tokens: 46_000, upper_microusd: 3_600_000 }]),
+  notifications: section(notificationDeliveries),
+  limits: section([{ limit_id: "codex", remaining_percent: 96 }]),
+  truncation: [],
+  source_cursors: { attention: 4411, progress: 4402, liveness: 4400 },
+  sha256: digest("snap0007"),
+};
+
+const controllerEvents = [
+  {
+    event_id: "evt-4411",
+    occurred_at_ms: ms(6),
+    event_type: "attention.opened",
+    aggregate_type: "attention",
+    aggregate_id: "att-001",
+  },
+  {
+    event_id: "evt-4402",
+    occurred_at_ms: ms(8),
+    event_type: "progress.candidate_changed",
+    aggregate_type: "task",
+    aggregate_id: "task-core-001",
+  },
+  {
+    event_id: "evt-4390",
+    occurred_at_ms: ms(19),
+    event_type: "progress.validation_advanced",
+    aggregate_type: "task",
+    aggregate_id: "task-core-001",
+  },
+  {
+    event_id: "evt-4381",
+    occurred_at_ms: ms(11),
+    event_type: "liveness.intervention_recorded",
+    aggregate_type: "liveness",
+    aggregate_id: "live-001",
+  },
+];
+
+const returnView = {
+  schema: "harness.return-view.v1",
+  return_view_id: "rv-0007",
+  snapshot_id: controlPlaneSnapshot.snapshot_id,
+  snapshot_revision: controlPlaneSnapshot.revision,
+  event_cursor: 4411,
+  acknowledged_cursor: 4362,
+  sections: {
+    material_changes: section(controllerEvents),
+    attention: section(attentionItems),
+    runs: controlPlaneSnapshot.runs,
+    attempts: controlPlaneSnapshot.attempts,
+    investigations: section(investigations),
+    reconciliation: section([]),
+    liveness: section(livenessEpisodes),
+    external_conditions: section(externalConditions),
+    accounts: controlPlaneSnapshot.accounts,
+    cost: controlPlaneSnapshot.cost,
+    limits: controlPlaneSnapshot.limits,
+  },
+  sha256: digest("rv0007"),
+};
+
+const runTopology = {
+  schema: "harness.run-topology.v1",
+  snapshot_id: controlPlaneSnapshot.snapshot_id,
+  run_id: run.id,
+  nodes: [
+    { id: run.id, kind: "run", source_ref: `run:${run.id}` },
+    { id: "task-core-001", kind: "task", source_ref: "task:CORE-001" },
+    { id: worker.id, kind: "agent", source_ref: `agent:${worker.id}` },
+  ],
+  edges: [
+    { from: run.id, to: "task-core-001", kind: "plans", source_ref: "plan:1" },
+    { from: "task-core-001", to: worker.id, kind: "assigned", source_ref: "lease:1" },
+  ],
+  source_cursor: 4411,
+  sha256: digest("topo"),
+};
+
+const operatorControlResponse = (pathname, search) => {
+  if (pathname === "/api/v1/control-plane/snapshot") return controlPlaneSnapshot;
+  if (pathname === "/api/v1/control-plane/return-view") return returnView;
+  if (pathname === "/api/v1/attention")
+    return {
+      items: attentionItems,
+      includes_terminal: search.get("include_terminal") === "true",
+      next_cursor: null,
+    };
+  if (pathname === "/api/v1/material-progress") return materialProgress;
+  if (pathname === "/api/v1/liveness") return livenessEpisodes;
+  const runLiveness = pathname.match(/^\/api\/v1\/runs\/([^/]+)\/liveness$/);
+  if (runLiveness)
+    return livenessEpisodes.filter(
+      (episode) => episode.run_id === runLiveness[1],
+    );
+  if (pathname === "/api/v1/investigations") return investigations;
+  if (pathname === "/api/v1/external-conditions") return externalConditions;
+  if (pathname === "/api/v1/operator-presence") return operatorPresence;
+  if (pathname === "/api/v1/notification-deliveries") return notificationDeliveries;
+  if (pathname === "/api/v1/notification-delivery-health")
+    return notificationDeliveryHealth;
+  if (pathname === "/api/v1/notification-shadow-batches") return [];
+  if (pathname === "/api/v1/reconciliations") return [];
+  const presented = notificationDeliveries.find(
+    (item) =>
+      pathname === `/api/v1/notification-deliveries/${item.delivery_id}/presentations`,
+  );
+  if (presented)
+    return {
+      schema: "harness.notification-presentation-receipt.v1",
+      receipt_id: "rcpt-001",
+      delivery_id: presented.delivery_id,
+      operator_id: "local",
+      delivery_sha256: presented.sha256,
+      presented_at_ms: Date.now(),
+      sha256: digest("rcpt001"),
+    };
+  if (pathname === "/api/v1/improvement/knowledge") return [];
+  if (pathname === `/api/v1/runs/${run.id}/topology`) return runTopology;
+  if (pathname === `/api/v1/runs/${preparedRun.id}/topology`)
+    return { ...runTopology, run_id: preparedRun.id, nodes: [], edges: [] };
+  const condition = externalConditions.find(
+    (item) => pathname === `/api/v1/external-conditions/${item.condition_id}`,
+  );
+  if (condition) return condition;
+  const observed = Object.keys(conditionObservations).find(
+    (id) => pathname === `/api/v1/external-conditions/${id}/observations`,
+  );
+  if (observed) return conditionObservations[observed];
+  const receipts = Object.keys(interventionReceipts).find(
+    (id) => pathname === `/api/v1/liveness/${id}/interventions`,
+  );
+  if (receipts) return interventionReceipts[receipts];
+  const artifact = investigations.find(
+    (item) => pathname === `/api/v1/investigations/${item.artifact_id}`,
+  );
+  if (artifact)
+    return {
+      schema: "harness.investigation-artifact.v1",
+      ...artifact,
+      findings: [
+        {
+          finding_id: "f-1",
+          severity: "blocking",
+          summary: "The negative case was satisfied by a broadened matcher.",
+          evidence_ref: "ev-221",
+        },
+      ],
+      recommendations: [
+        { recommendation_id: "r-1", summary: "Pin the matcher to the exact failure string." },
+      ],
+      decisions: [
+        { decision_id: "d-1", summary: "Blocks independent work", accepted: true },
+      ],
+    };
+  return undefined;
+};
+
 const server = createServer((request, response) => {
   const url = new URL(request.url || "/", "http://127.0.0.1:4173");
   if (url.pathname === "/api/v1/session") {
@@ -610,13 +1140,23 @@ const server = createServer((request, response) => {
     response.end("event: heartbeat\ndata: 1\n\n");
     return;
   }
+  if (request.method === "DELETE" && /^\/api\/v1\/runs\/[^/]+$/.test(url.pathname)) {
+    response.writeHead(204).end();
+    return;
+  }
   if (url.pathname.startsWith("/api/v1/")) {
     const mutation =
       request.method === "POST" ? mutationResponse(url.pathname) : undefined;
-    const value = mutation === undefined ? apiResponse(url.pathname) : mutation;
-    return value === undefined
-      ? json(response, { error: { message: "mock route not found" } }, 404)
-      : json(response, value);
+    const value =
+      mutation === undefined
+        ? (apiResponse(url.pathname) ??
+          operatorControlResponse(url.pathname, url.searchParams))
+        : mutation;
+    if (value === undefined) {
+      console.error(`mock: no fixture for ${request.method} ${url.pathname}`);
+      return json(response, { error: { message: "mock route not found" } }, 404);
+    }
+    return json(response, value);
   }
 
   const relative = url.pathname === "/" ? "index.html" : url.pathname.slice(1);

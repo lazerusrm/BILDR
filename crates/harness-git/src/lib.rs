@@ -117,6 +117,12 @@ impl VerifiedDiff {
 }
 
 impl GitManager {
+    /// Root that every managed worktree must live under. Callers use it to
+    /// prove a path is harness-owned before touching the filesystem directly.
+    pub fn managed_worktree_root(&self) -> PathBuf {
+        self.worktree_root.as_ref().clone()
+    }
+
     pub fn new(worktree_root: &Path) -> Result<Self, GitError> {
         fs::create_dir_all(worktree_root)?;
         fs::set_permissions(worktree_root, fs::Permissions::from_mode(0o700))?;

@@ -201,6 +201,9 @@ async fn serve(
     let observation_enabled = config.self_improvement_runtime_status().observation_enabled;
     let active_provider = config.codex.model_provider.clone();
     let provisioned_providers = config.provider_switch_options();
+    // Captured before the config moves into the orchestrator.
+    let raw_event_retention_days = config.storage.raw_event_retention_days;
+    let command_log_retention_days = config.storage.command_log_retention_days;
     let orchestrator = Arc::new(
         Orchestrator::new(config, paths, profile, store, runtime)
             .await
@@ -271,11 +274,25 @@ async fn serve(
     });
     let maintenance_orchestrator = Arc::clone(&orchestrator);
     let maintenance_seconds = orchestrator.maintenance_interval_seconds().max(1);
+    // Protocol transcript dominates database growth, so age it out on the same
+    // cadence as the rest of maintenance. Nothing else prunes it.
     let maintenance_task: JoinHandle<()> = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(maintenance_seconds));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
+            match maintenance_orchestrator
+                .store()
+                .sweep_retention(raw_event_retention_days, command_log_retention_days)
+            {
+                Ok(swept) if swept.raw_events > 0 || swept.command_runs > 0 => info!(
+                    raw_events = swept.raw_events,
+                    command_runs = swept.command_runs,
+                    "retention sweep removed aged records"
+                ),
+                Ok(_) => {}
+                Err(error) => warn!(%error, "retention sweep failed"),
+            }
             if let Err(error) = maintenance_orchestrator.maintenance_tick().await {
                 warn!(%error, "orchestration maintenance tick failed");
             }

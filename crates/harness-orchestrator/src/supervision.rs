@@ -905,6 +905,7 @@ mod tests {
             failure_reason: Some("The integration contract remains disputed.".to_owned()),
             scheduler_paused: false,
             run_token_budget: Some(1_000_000),
+            pinned: false,
             version: 1,
         };
         let plan = RunPlan {
