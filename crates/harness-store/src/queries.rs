@@ -40,10 +40,9 @@ use crate::{
     NewImmutableRunModelRoute, NewImprovementRevision, NewOperatorOutcome, NewPairedStatVerdict,
     NewPolicyChampionBinding, NewRepository, NewRun, NewTaskAttempt, NewTasksetMembership,
     NewValidationRecord, NewWorktree, PairedStatVerdictReceipt, PolicyChampionBinding,
-    RetentionSweep,
-    PriorAttemptContext, RawEventInput, RepositoryHealthInput, Store, StoreError, StoredSession,
-    TraceProjectionDomainReceipt, TraceProjectionRawReceipt, TraceProjectionSnapshot,
-    TraceProjectionStructuralReceipt, TraceProjectionWatermark,
+    PriorAttemptContext, RawEventInput, RepositoryHealthInput, RetentionSweep, Store, StoreError,
+    StoredSession, TraceProjectionDomainReceipt, TraceProjectionRawReceipt,
+    TraceProjectionSnapshot, TraceProjectionStructuralReceipt, TraceProjectionWatermark,
 };
 
 const TRACE_SNAPSHOT_MAX_RAW_RECEIPTS: i64 = 10_000;
@@ -3155,8 +3154,10 @@ impl Store {
             ] {
                 transaction.execute(statement, params![cutoff])?;
             }
-            swept.raw_events =
-                transaction.execute("DELETE FROM raw_events WHERE received_at<?1", params![cutoff])?;
+            swept.raw_events = transaction.execute(
+                "DELETE FROM raw_events WHERE received_at<?1",
+                params![cutoff],
+            )?;
         }
         if command_log_days > 0 {
             let cutoff = now - i64::from(command_log_days) * 86_400_000;
@@ -3241,7 +3242,10 @@ impl Store {
         if changed != 1 {
             return Err(StoreError::NotFound(format!("run {id}")));
         }
-        transaction.execute("DELETE FROM run_purges WHERE run_id=?1", params![id.as_str()])?;
+        transaction.execute(
+            "DELETE FROM run_purges WHERE run_id=?1",
+            params![id.as_str()],
+        )?;
         transaction.commit()?;
         Ok(())
     }
