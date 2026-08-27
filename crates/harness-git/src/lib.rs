@@ -340,6 +340,13 @@ impl GitManager {
     ) -> Result<RepositoryInspection, GitError> {
         let source = canonical_repo_root(source).await?;
         validate_branch(branch)?;
+        // Git clone does not carry repository-local identity configuration. A
+        // source checkout that is eligible for BILDR therefore has its author
+        // identity copied to the new, BILDR-owned checkout before inspection.
+        // We deliberately require the pair: a partial identity must still be
+        // rejected by the normal checkout policy.
+        let source_identity_name = optional_git_text(&source, ["config", "user.name"]).await?;
+        let source_identity_email = optional_git_text(&source, ["config", "user.email"]).await?;
         if !destination.is_absolute()
             || destination
                 .components()
@@ -416,6 +423,20 @@ impl GitManager {
                 });
             }
             Err(error) => {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error);
+            }
+        }
+        if let (Some(name), Some(email)) = (&source_identity_name, &source_identity_email) {
+            if let Err(error) =
+                git_ok(&staging, ["config", "--local", "--", "user.name", name]).await
+            {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error);
+            }
+            if let Err(error) =
+                git_ok(&staging, ["config", "--local", "--", "user.email", email]).await
+            {
                 let _ = fs::remove_dir_all(&staging);
                 return Err(error);
             }
@@ -1765,6 +1786,20 @@ mod tests {
         );
     }
 
+    fn fixture_git_text(repository: &Path, args: &[&str]) -> String {
+        let output = StdCommand::new("git")
+            .current_dir(repository)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
     #[test]
     fn rejects_path_escape() {
         assert!(validate_relative_repo_path("../secret").is_err());
@@ -1862,6 +1897,14 @@ mod tests {
         assert_eq!(inspection.root, fs::canonicalize(&destination).unwrap());
         assert!(inspection.clean);
         assert_eq!(inspection.current_branch.as_deref(), Some("main"));
+        assert_eq!(
+            fixture_git_text(&destination, &["config", "user.name"]),
+            "Harness Test"
+        );
+        assert_eq!(
+            fixture_git_text(&destination, &["config", "user.email"]),
+            "harness@example.invalid"
+        );
         assert_eq!(
             fs::read_to_string(destination.join("tracked.txt")).unwrap(),
             "remote base\n"
