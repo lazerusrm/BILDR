@@ -1731,15 +1731,17 @@ mod tests {
                 )
                 .unwrap();
             crate::queries::canonical_validation_receipt_sha256(
-                "validation-record-1",
-                Some("candidate-1"),
-                "validator-gate",
-                "T1",
-                "success",
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                None,
-                Some(1),
-                2,
+                crate::queries::CanonicalValidationReceipt {
+                    id: "validation-record-1",
+                    task_attempt_id: Some("candidate-1"),
+                    validator_id: "validator-gate",
+                    proof_tier: "T1",
+                    result_class: "success",
+                    source_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    command_run_id: None,
+                    started_at: Some(1),
+                    completed_at: 2,
+                },
             )
             .unwrap()
         }
