@@ -1549,6 +1549,9 @@ pub struct RunSummary {
     pub failure_reason: Option<String>,
     pub scheduler_paused: bool,
     pub run_token_budget: Option<u64>,
+    /// Operator-owned ordering only. Pinning never changes run authority.
+    #[serde(default)]
+    pub pinned: bool,
     pub version: u64,
 }
 

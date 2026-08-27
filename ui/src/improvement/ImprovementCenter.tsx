@@ -214,7 +214,7 @@ export function ImprovementCenter({
   return (
     <div className="page improvement-page">
       <header className="page-title">
-        <div><span className="eyebrow">{mode.label}</span><h1>Improvement Center</h1></div>
+        <div><span className="eyebrow">{mode.label}</span><h1>Learning</h1></div>
         <p>{mode.detail}</p>
       </header>
       {mode.alert && <p role="alert" className="form-error">{mode.detail}</p>}

@@ -40,9 +40,9 @@ use crate::{
     NewImmutableRunModelRoute, NewImprovementRevision, NewOperatorOutcome, NewPairedStatVerdict,
     NewPolicyChampionBinding, NewRepository, NewRun, NewTaskAttempt, NewTasksetMembership,
     NewValidationRecord, NewWorktree, PairedStatVerdictReceipt, PolicyChampionBinding,
-    PriorAttemptContext, RawEventInput, RepositoryHealthInput, Store, StoreError, StoredSession,
-    TraceProjectionDomainReceipt, TraceProjectionRawReceipt, TraceProjectionSnapshot,
-    TraceProjectionStructuralReceipt, TraceProjectionWatermark,
+    PriorAttemptContext, RawEventInput, RepositoryHealthInput, RetentionSweep, Store, StoreError,
+    StoredSession, TraceProjectionDomainReceipt, TraceProjectionRawReceipt,
+    TraceProjectionSnapshot, TraceProjectionStructuralReceipt, TraceProjectionWatermark,
 };
 
 const TRACE_SNAPSHOT_MAX_RAW_RECEIPTS: i64 = 10_000;
@@ -3107,6 +3107,149 @@ impl Store {
         self.run(id)
     }
 
+    /// Set operator pin state. Presentation only; it does not bump run version
+    /// because it never invalidates a concurrent authority decision.
+    pub fn set_run_pinned(&self, id: &RunId, pinned: bool) -> Result<RunSummary, StoreError> {
+        let changed = self.connection()?.execute(
+            "UPDATE runs SET pinned=?2,updated_at=?3 WHERE id=?1",
+            params![id.as_str(), i64::from(pinned), now_ms()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::NotFound(format!("run {id}")));
+        }
+        self.run(id)
+    }
+
+    /// Delete protocol transcript and command history older than the configured
+    /// retention window.
+    ///
+    /// `raw_events` dominates database growth, and the records that point at it
+    /// keep nullable provenance columns, so an aged-out event is removed and its
+    /// referents simply lose the pointer. A retention marker is held for the
+    /// transaction so the append-only learning guards permit exactly that
+    /// pointer clearing and nothing else. Returns what it removed.
+    pub fn sweep_retention(
+        &self,
+        raw_event_days: u32,
+        command_log_days: u32,
+    ) -> Result<RetentionSweep, StoreError> {
+        let mut swept = RetentionSweep::default();
+        if raw_event_days == 0 && command_log_days == 0 {
+            return Ok(swept);
+        }
+        let now = now_ms();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO run_purges(run_id,started_at) VALUES('__retention__',?1)",
+            params![now],
+        )?;
+        if raw_event_days > 0 {
+            let cutoff = now - i64::from(raw_event_days) * 86_400_000;
+            for statement in [
+                "UPDATE improvement_events SET source_raw_event_id=NULL WHERE source_raw_event_id IN (SELECT id FROM raw_events WHERE received_at<?1)",
+                "UPDATE domain_events SET source_raw_event_id=NULL WHERE source_raw_event_id IN (SELECT id FROM raw_events WHERE received_at<?1)",
+                "UPDATE projected_items SET source_raw_event_id=NULL WHERE source_raw_event_id IN (SELECT id FROM raw_events WHERE received_at<?1)",
+                "UPDATE token_samples SET source_event_id=NULL WHERE source_event_id IN (SELECT id FROM raw_events WHERE received_at<?1)",
+            ] {
+                transaction.execute(statement, params![cutoff])?;
+            }
+            swept.raw_events = transaction.execute(
+                "DELETE FROM raw_events WHERE received_at<?1",
+                params![cutoff],
+            )?;
+        }
+        if command_log_days > 0 {
+            let cutoff = now - i64::from(command_log_days) * 86_400_000;
+            swept.command_runs = transaction.execute(
+                "DELETE FROM command_runs WHERE completed_at IS NOT NULL AND completed_at<?1",
+                params![cutoff],
+            )?;
+        }
+        transaction.execute("DELETE FROM run_purges WHERE run_id='__retention__'", [])?;
+        transaction.commit()?;
+        Ok(swept)
+    }
+
+    /// Purge one run and every dependent record.
+    ///
+    /// A row in run_purges announces the purge; each run-scoped immutability
+    /// trigger aborts unless its run is the one being purged, so a record can
+    /// never be removed on its own. Children are cleared before the run row so
+    /// ordinary foreign keys stay enforced throughout.
+    /// Twenty tables clear by ON DELETE CASCADE; the rest are listed here
+    /// because they reference the run without one, or by value.
+    pub fn delete_run(&self, id: &RunId) -> Result<(), StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO run_purges(run_id,started_at) VALUES(?1,?2)",
+            params![id.as_str(), now_ms()],
+        )?;
+        // Learning records are global and append-only. They keep a nullable
+        // pointer at the raw/domain event that produced them; the record
+        // survives a run purge, the dangling provenance pointer does not.
+        for statement in [
+            "UPDATE improvement_events SET source_raw_event_id=NULL WHERE source_raw_event_id IN (SELECT id FROM raw_events WHERE run_id=?1)",
+            "UPDATE improvement_revisions SET source_domain_event_id=NULL WHERE source_domain_event_id IN (SELECT id FROM domain_events WHERE run_id=?1)",
+            "UPDATE failure_occurrences SET source_domain_event_id=NULL WHERE source_domain_event_id IN (SELECT id FROM domain_events WHERE run_id=?1)",
+        ] {
+            transaction.execute(statement, params![id.as_str()])?;
+        }
+        for statement in [
+            // leaf rows that hang off this run's cascaded children
+            "DELETE FROM evaluation_stat_verdicts WHERE champion_evaluation_run_id IN (SELECT id FROM evaluation_runs WHERE controller_run_id=?1) OR challenger_evaluation_run_id IN (SELECT id FROM evaluation_runs WHERE controller_run_id=?1)",
+            "DELETE FROM evaluation_samples WHERE evaluation_run_id IN (SELECT id FROM evaluation_runs WHERE controller_run_id=?1)",
+            "DELETE FROM evaluation_run_status_revisions WHERE evaluation_run_id IN (SELECT id FROM evaluation_runs WHERE controller_run_id=?1)",
+            "DELETE FROM reconciliation_proof_consumptions WHERE task_id IN (SELECT id FROM tasks WHERE run_id=?1) OR proof_id IN (SELECT proof_id FROM ownership_proofs WHERE run_id=?1)",
+            "DELETE FROM evidence_artifacts WHERE artifact_id IN (SELECT id FROM artifacts WHERE run_id=?1)",
+            "DELETE FROM projected_items WHERE source_raw_event_id IN (SELECT id FROM raw_events WHERE run_id=?1)",
+            "DELETE FROM token_samples WHERE source_event_id IN (SELECT id FROM raw_events WHERE run_id=?1)",
+            "DELETE FROM handoffs WHERE agent_session_id IN (SELECT id FROM agent_sessions WHERE run_id=?1)",
+            "DELETE FROM expert_responses WHERE run_id=?1",
+            "DELETE FROM expert_requests WHERE run_id=?1",
+            "DELETE FROM supervisor_actions WHERE run_id=?1",
+            "DELETE FROM supervisor_decisions WHERE run_id=?1",
+            "DELETE FROM supervisor_reviews WHERE run_id=?1",
+            "DELETE FROM supervisor_observation_cursors WHERE run_id=?1",
+            "DELETE FROM supervisor_snapshots WHERE run_id=?1",
+            "DELETE FROM agent_model_route_bindings WHERE run_id=?1",
+            "DELETE FROM run_model_routes WHERE run_id=?1",
+            "DELETE FROM artifact_run_bindings WHERE run_id=?1",
+            "DELETE FROM evaluation_runs WHERE controller_run_id=?1",
+            "DELETE FROM investigation_artifacts WHERE run_id=?1",
+            "DELETE FROM material_progress_events WHERE run_id=?1",
+            "DELETE FROM ownership_proofs WHERE run_id=?1",
+            "DELETE FROM topology_snapshots WHERE run_id=?1",
+            // Operator-control records reference the run by value, not by
+            // foreign key. Orphaned attention keeps asking for action on work
+            // that no longer exists, so it goes with the run.
+            "DELETE FROM notification_presentation_receipts WHERE delivery_id IN (SELECT delivery_id FROM notification_deliveries WHERE attention_id IN (SELECT id FROM attention_items WHERE run_id=?1))",
+            "DELETE FROM notification_deliveries WHERE attention_id IN (SELECT id FROM attention_items WHERE run_id=?1)",
+            "DELETE FROM attention_events WHERE attention_id IN (SELECT id FROM attention_items WHERE run_id=?1)",
+            "DELETE FROM attention_items WHERE run_id=?1",
+            "DELETE FROM liveness_observations WHERE episode_id IN (SELECT episode_id FROM liveness_episodes WHERE run_id=?1)",
+            "DELETE FROM intervention_receipts WHERE episode_id IN (SELECT episode_id FROM liveness_episodes WHERE run_id=?1)",
+            "DELETE FROM liveness_episodes WHERE run_id=?1",
+            "DELETE FROM reconciliation_findings WHERE episode_id IN (SELECT episode_id FROM reconciliation_episodes WHERE run_id=?1)",
+            "DELETE FROM reconciliation_actions WHERE episode_id IN (SELECT episode_id FROM reconciliation_episodes WHERE run_id=?1)",
+            "DELETE FROM reconciliation_proof_consumptions WHERE episode_id IN (SELECT episode_id FROM reconciliation_episodes WHERE run_id=?1)",
+            "DELETE FROM reconciliation_episodes WHERE run_id=?1",
+        ] {
+            transaction.execute(statement, params![id.as_str()])?;
+        }
+        let changed = transaction.execute("DELETE FROM runs WHERE id=?1", params![id.as_str()])?;
+        if changed != 1 {
+            return Err(StoreError::NotFound(format!("run {id}")));
+        }
+        transaction.execute(
+            "DELETE FROM run_purges WHERE run_id=?1",
+            params![id.as_str()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn set_run_integration(
         &self,
         id: &RunId,
@@ -5968,7 +6111,7 @@ fn map_repository(row: &Row<'_>) -> rusqlite::Result<RepositorySummary> {
 }
 
 pub(crate) fn run_select() -> &'static str {
-    "SELECT r.id,r.repository_id,r.title,r.requested_objective,r.mode,r.publication_mode,r.state,r.phase,r.base_ref,r.base_sha,r.integration_branch,r.integration_sha,r.authority_digest,r.created_at,r.started_at,r.completed_at,r.scheduler_paused,r.run_token_budget,r.version,r.failure_reason FROM runs r"
+    "SELECT r.id,r.repository_id,r.title,r.requested_objective,r.mode,r.publication_mode,r.state,r.phase,r.base_ref,r.base_sha,r.integration_branch,r.integration_sha,r.authority_digest,r.created_at,r.started_at,r.completed_at,r.scheduler_paused,r.run_token_budget,r.version,r.failure_reason,r.pinned FROM runs r"
 }
 
 pub(crate) fn map_run(row: &Row<'_>) -> rusqlite::Result<RunSummary> {
@@ -6001,6 +6144,7 @@ pub(crate) fn map_run(row: &Row<'_>) -> rusqlite::Result<RunSummary> {
         failure_reason: row.get(19)?,
         scheduler_paused: row.get(16)?,
         run_token_budget: row.get::<_, Option<i64>>(17)?.map(|value| value as u64),
+        pinned: row.get::<_, i64>(20)? != 0,
         version: row.get::<_, i64>(18)? as u64,
     })
 }

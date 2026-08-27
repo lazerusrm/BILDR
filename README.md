@@ -106,7 +106,7 @@ path field as a fallback. Set `HARNESS_REPOSITORY_SEARCH_ROOTS` to a
 colon-separated path list to replace the default search roots.
 
 If a discovered checkout is blocked only because it is dirty, choose **Create
-clean checkout** on the Repositories page. Pick a new sibling directory and the
+clean checkout** beside it on Home. Pick a new sibling directory and the
 Harness will clone the repository's active default branch, reuse the source checkout's Git objects, verify the
 new checkout, and move the unused registration to it. The original checkout and
 its untracked files are not changed. Keep that source checkout in place while

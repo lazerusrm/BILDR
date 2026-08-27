@@ -62,6 +62,11 @@ const NOTIFICATION_SHADOW_BATCHES_MIGRATION: &str =
     include_str!("../../../migrations/0019_notification_shadow_batches.sql");
 const IMMUTABLE_MODEL_ROUTES_MIGRATION: &str =
     include_str!("../../../migrations/0020_immutable_model_routes.sql");
+const RUN_PINNING_MIGRATION: &str = include_str!("../../../migrations/0021_run_pinning.sql");
+const RUN_SCOPED_PURGE_MIGRATION: &str =
+    include_str!("../../../migrations/0022_run_scoped_purge.sql");
+const PURGE_OPERATOR_CONTROL_MIGRATION: &str =
+    include_str!("../../../migrations/0023_purge_operator_control.sql");
 
 #[derive(Clone)]
 pub struct Store {
@@ -515,6 +520,103 @@ fn apply_runtime_migrations(connection: &mut Connection) -> Result<(), StoreErro
     } else {
         set_runtime_schema_version(connection, "19")?;
     }
+    if !run_pinning_schema_current(connection)? {
+        apply_run_pinning_migration(connection, || Ok(()))?;
+    } else {
+        set_runtime_schema_version(connection, "20")?;
+    }
+    if !run_scoped_purge_schema_current(connection)? {
+        apply_run_scoped_purge_migration(connection, || Ok(()))?;
+    } else {
+        set_runtime_schema_version(connection, "21")?;
+    }
+    if !purge_operator_control_schema_current(connection)? {
+        apply_purge_operator_control_migration(connection, || Ok(()))?;
+    } else {
+        set_runtime_schema_version(connection, "22")?;
+    }
+    Ok(())
+}
+
+/// Operator-control guards gain the purge condition in v22.
+fn purge_operator_control_schema_current(connection: &Connection) -> Result<bool, StoreError> {
+    let guarded: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='attention_events_no_delete' AND sql LIKE '%run_purges%')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(guarded)
+}
+
+/// Re-scope operator-control immutability guards and clear records already
+/// orphaned by a purge that predated them.
+fn apply_purge_operator_control_migration<F>(
+    connection: &mut Connection,
+    after_schema: F,
+) -> Result<(), StoreError>
+where
+    F: FnOnce() -> Result<(), StoreError>,
+{
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(PURGE_OPERATOR_CONTROL_MIGRATION)?;
+    after_schema()?;
+    set_runtime_schema_version(&transaction, "22")?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// The guarded triggers carry a WHEN clause; the original unconditional ones do
+/// not. Presence of the guard is the marker that v21 is installed.
+fn run_scoped_purge_schema_current(connection: &Connection) -> Result<bool, StoreError> {
+    let guarded: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='run_model_routes_no_delete' AND sql LIKE '%run_purges%')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(guarded)
+}
+
+/// Re-scope run-owned immutability triggers so a whole-run purge is possible
+/// while an individual record stays immutable for the life of its run.
+fn apply_run_scoped_purge_migration<F>(
+    connection: &mut Connection,
+    after_schema: F,
+) -> Result<(), StoreError>
+where
+    F: FnOnce() -> Result<(), StoreError>,
+{
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(RUN_SCOPED_PURGE_MIGRATION)?;
+    after_schema()?;
+    set_runtime_schema_version(&transaction, "21")?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Pinning is additive presentation state, so this migration is safe to apply
+/// to a populated database. The column check keeps it idempotent.
+fn run_pinning_schema_current(connection: &Connection) -> Result<bool, StoreError> {
+    let present: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('runs') WHERE name='pinned')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(present)
+}
+
+/// Install the operator pin column and its v20 marker as one transaction.
+fn apply_run_pinning_migration<F>(
+    connection: &mut Connection,
+    after_schema: F,
+) -> Result<(), StoreError>
+where
+    F: FnOnce() -> Result<(), StoreError>,
+{
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(RUN_PINNING_MIGRATION)?;
+    after_schema()?;
+    set_runtime_schema_version(&transaction, "20")?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -906,7 +1008,7 @@ mod tests {
         assert!(store.check().unwrap().ready);
         drop(store);
         let reopened = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(reopened.migration_version().unwrap(), "19");
+        assert_eq!(reopened.migration_version().unwrap(), "22");
         let has_worktree_fingerprint: bool = reopened
             .connection()
             .unwrap()
@@ -1852,7 +1954,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let store = Store::open(&database, &temp.path().join("artifacts")).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "19");
+        assert_eq!(store.migration_version().unwrap(), "22");
         for name in [
             "improvement_revisions",
             "improvement_events",
@@ -1922,7 +2024,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "19");
+        assert_eq!(store.migration_version().unwrap(), "22");
         for name in [
             "failure_occurrences",
             "failure_clusters",
@@ -1982,7 +2084,7 @@ mod tests {
         );
         drop(store);
         let reopened = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(reopened.migration_version().unwrap(), "19");
+        assert_eq!(reopened.migration_version().unwrap(), "22");
         assert!(
             reopened
                 .backup(&temp.path().join("v6-backup.sqlite3"))
@@ -2021,7 +2123,7 @@ mod tests {
         drop(connection);
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "19");
+        assert_eq!(store.migration_version().unwrap(), "22");
         for name in [
             "taskset_revision_memberships",
             "evaluation_runs",
@@ -2055,7 +2157,7 @@ mod tests {
                 .unwrap()
                 .migration_version()
                 .unwrap(),
-            "19"
+            "22"
         );
         assert!(
             Store::open(&backup, &temp.path().join("backup-artifacts"))
@@ -2101,7 +2203,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "19");
+        assert_eq!(store.migration_version().unwrap(), "22");
         for name in [
             "policy_champion_bindings",
             "policy_current_champions",
@@ -2250,7 +2352,7 @@ mod tests {
                 .unwrap()
                 .migration_version()
                 .unwrap(),
-            "19"
+            "22"
         );
     }
 
@@ -2339,7 +2441,7 @@ mod tests {
 
         let artifacts = temp.path().join("artifacts");
         let store = Store::open(&database, &artifacts).unwrap();
-        assert_eq!(store.migration_version().unwrap(), "19");
+        assert_eq!(store.migration_version().unwrap(), "22");
         for (table, column) in [
             ("evaluation_runs", "controller_run_id"),
             ("evaluation_samples", "controller_evidence_id"),

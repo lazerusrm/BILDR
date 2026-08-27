@@ -65,26 +65,13 @@ A run view contains:
 
 ## UI module layout
 
-Implement under `ui/src/operator-control/`:
+Implement under `ui/src/operator-control/`. These records do not get their own
+destination: each renders inside the view that already owns its context.
 
 ```text
-api.ts
-types.ts
-OperatorStatusPage.tsx
-ReturnView.tsx
-AttentionCenter.tsx
-AttentionDetail.tsx
-RunStatus.tsx
-RunTopologyTable.tsx
-RunTopologyGraph.tsx          # optional/gated
-LivenessPanel.tsx
-RecoveryPanel.tsx
-InvestigationPanel.tsx
-ExternalConditionsPanel.tsx
-PresenceControl.tsx
-NotificationHealth.tsx
-SourceEvidenceLink.tsx
-operator-control.css
+NeedsYou.tsx              # attention items, rendered on Home
+RunActivity.tsx           # per-run material progress, liveness, waits, investigations
+NotificationSettings.tsx  # presence preference and delivery health, in Settings
 *.test.tsx
 ```
 

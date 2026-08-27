@@ -108,7 +108,7 @@ Key ideas:
 
 BILDR adaptation:
 
-- Improvement Center and trace/evidence inspection;
+- the Learning view (rail: Advanced) and trace/evidence inspection;
 - evidence-backed knowledge supplements but never overrides repository authority;
 - recurring quality gardener proposes narrow draft changes;
 - independent evaluator and promotion authority.

@@ -2267,7 +2267,12 @@ impl Orchestrator {
             config.security.store_raw_reasoning,
         )?;
         let yolo_mode = stored_bool(&store, SETTING_YOLO_MODE, false)?;
-        if let Some(runtime) = runtime.as_ref()
+        // Qwodex is credential-free by construction. Probing the Codex
+        // account registry would spawn unnecessary local App Server probes,
+        // and used to make a Qwodex run look as if it needed an account.
+        let hosted_codex = config.codex.model_provider == "openai";
+        if hosted_codex
+            && let Some(runtime) = runtime.as_ref()
             && let Ok(snapshot) = runtime.codex_accounts().await
             && let Some(account_id) = snapshot.selected_account_id
         {
@@ -5817,12 +5822,15 @@ impl Orchestrator {
         }
     }
 
-    pub fn archive_run(
+    /// Archive one run. A run that is still live is stopped first: the operator
+    /// asked for it out of the way, and leaving a running thread archived would
+    /// hide work that still holds mutable custody.
+    pub async fn archive_run(
         &self,
         run_id: &RunId,
         actor: &str,
     ) -> Result<RunSummary, OrchestratorError> {
-        let run = self.store.run(run_id)?;
+        let mut run = self.store.run(run_id)?;
         if run.state == RunState::Archived {
             return Ok(run);
         }
@@ -5830,9 +5838,7 @@ impl Orchestrator {
             run.state,
             RunState::Completed | RunState::Canceled | RunState::Failed
         ) {
-            return Err(OrchestratorError::Conflict(
-                "run must be stopped or completed before it can be archived".to_owned(),
-            ));
+            run = self.stop_run(run_id, true, actor).await?;
         }
         if run.state == RunState::Completed && self.run_hygiene_policy_enabled(run_id)? {
             self.store.put_runtime_metadata(
@@ -5861,6 +5867,118 @@ impl Orchestrator {
             &json!({"previous_state": run.state}),
         )?;
         Ok(archived)
+    }
+
+    /// Pinning is operator presentation state. It records a human action for
+    /// the audit trail but changes no run authority, schedule, or custody.
+    pub fn set_run_pinned(
+        &self,
+        run_id: &RunId,
+        pinned: bool,
+        actor: &str,
+    ) -> Result<RunSummary, OrchestratorError> {
+        let run = self.store.run(run_id)?;
+        if run.pinned == pinned {
+            return Ok(run);
+        }
+        let updated = self.store.set_run_pinned(run_id, pinned)?;
+        self.store.record_human_action(
+            Some(run_id),
+            None,
+            actor,
+            if pinned { "pin_run" } else { "unpin_run" },
+            "run",
+            run_id.as_str(),
+            &json!({"pinned": pinned}),
+        )?;
+        Ok(updated)
+    }
+
+    /// Purge one archived run and its dependent records. This destroys
+    /// evidence, so it is refused unless the run is already archived: a run
+    /// still holding mutable custody must never be removed underneath it.
+    pub async fn delete_run(&self, run_id: &RunId, actor: &str) -> Result<(), OrchestratorError> {
+        let run = self.store.run(run_id)?;
+        if !run.state.is_terminal() {
+            self.stop_run(run_id, true, actor).await?;
+        }
+        self.release_run_worktrees(run_id).await?;
+        self.store.record_human_action(
+            Some(run_id),
+            None,
+            actor,
+            "delete_run",
+            "run",
+            run_id.as_str(),
+            &json!({"title": run.title, "state": run.state}),
+        )?;
+        self.store.delete_run(run_id)?;
+        Ok(())
+    }
+
+    /// Remove every managed worktree for one run so a purge cannot orphan a
+    /// directory. A dirty worktree is removed with force: the operator asked to
+    /// delete the run and its work along with it.
+    async fn release_run_worktrees(&self, run_id: &RunId) -> Result<(), OrchestratorError> {
+        let run = self.store.run(run_id)?;
+        let repository = self.store.repository(&run.repository_id)?;
+        for worktree in self.store.list_worktrees(Some(run_id))? {
+            if worktree.state == "REMOVED" {
+                continue;
+            }
+            let path = Path::new(&worktree.path);
+            let removal = if path.exists() {
+                self.git
+                    .remove_worktree(Path::new(&repository.root_path), path, true)
+                    .await
+            } else {
+                self.git
+                    .prune_worktrees(Path::new(&repository.root_path))
+                    .await
+            };
+            match removal {
+                Ok(()) => self.store.mark_worktree_removed(&worktree.id)?,
+                Err(error) => {
+                    // Git can refuse a worktree whose administrative data is
+                    // already gone or whose checkout it will not touch. The
+                    // operator asked to delete this run, so fall back to
+                    // removing the managed directory directly, then prune the
+                    // stale registration. The path is verified to sit inside
+                    // the managed worktree root first, so this can never reach
+                    // a checkout the harness does not own.
+                    warn!(
+                        worktree = %worktree.path,
+                        %error,
+                        "git refused worktree removal during run delete; removing the managed directory"
+                    );
+                    let managed_root = self.git.managed_worktree_root();
+                    let inside = path
+                        .canonicalize()
+                        .map(|resolved| resolved.starts_with(&managed_root))
+                        .unwrap_or(false);
+                    if path.exists() && !inside {
+                        return Err(OrchestratorError::Conflict(format!(
+                            "refusing to remove {}: it is outside the managed worktree root",
+                            worktree.path
+                        )));
+                    }
+                    if path.exists() {
+                        std::fs::remove_dir_all(path).map_err(|cause| {
+                            OrchestratorError::Conflict(format!(
+                                "could not remove worktree {}: {cause}",
+                                worktree.path
+                            ))
+                        })?;
+                    }
+                    let _ = self
+                        .git
+                        .prune_worktrees(Path::new(&repository.root_path))
+                        .await;
+                    self.store.mark_worktree_removed(&worktree.id)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn start_intent_interview(
@@ -26166,6 +26284,7 @@ mod tests {
             failure_reason: None,
             scheduler_paused: false,
             run_token_budget: Some(5_000_000),
+            pinned: false,
             version: 1,
         };
         let profile = load_profile("general", Path::new("/nonexistent-config"))
@@ -26343,6 +26462,7 @@ mod tests {
             failure_reason: Some("session token budget exhausted".to_owned()),
             scheduler_paused: false,
             run_token_budget: None,
+            pinned: false,
             version: 3,
         };
         assert!(blocked_plan_review_budget_exhausted(&blocked));

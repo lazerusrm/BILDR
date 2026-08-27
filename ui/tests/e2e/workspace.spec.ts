@@ -23,26 +23,29 @@ test("renders the governor-first run workspace and usage breakdown", async ({
   await expect(
     page.getByRole("heading", { name: "CI credibility remediation" }),
   ).toBeVisible();
-  await expect(page.getByText("Architecture and review")).toBeVisible();
+  await expect(page.locator(".attempt-history summary")).toContainText(
+    "Architecture",
+  );
   await expect(
     page.getByRole("region", { name: "Goal and plan" }),
   ).toBeVisible();
-  await expect(page.getByText("What the governor is pursuing")).toBeVisible();
   await expect(
     page.getByRole("button", { name: /CORE-001/ }).first(),
   ).toBeVisible();
   await expect(
-    page.getByText("Governor messages", { exact: true }),
+    page.getByText("Messages", { exact: true }),
   ).toBeVisible();
   await expect(page.getByText("Plan progress", { exact: true })).toBeVisible();
   await expect(page.getByText(/completed$/).first()).toBeVisible();
-  await expect(page.getByText("Agents on this work", { exact: true })).toBeVisible();
+  await expect(page.getByText("Agents", { exact: true })).toBeVisible();
   await expect(page.getByText("Recent activity", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Needs your approval")).toBeVisible();
-  await expect(page.getByText("Message the governor")).toBeVisible();
+  await expect(page.getByText("Message", { exact: true })).toBeVisible();
   const liveTurn = page.getByRole("group", {
     name: "Live turn telemetry",
   });
+  await expect(liveTurn).toContainText("27.6k this turn");
+  await liveTurn.locator(".live-turn-fold > summary").click();
   await expect(liveTurn).toContainText("Input");
   await expect(liveTurn).toContainText("25.0k");
   await expect(liveTurn).toContainText("Reasoning in output");
@@ -61,11 +64,8 @@ test("renders the governor-first run workspace and usage breakdown", async ({
   await main.evaluate((element) => {
     element.scrollTop = 0;
   });
-  await page.getByRole("button", { name: "Open governor messages" }).click();
-  await expect(page.getByText("Timestamped local scrollback")).toBeVisible();
-  await expect(
-    page.getByRole("heading", { name: "Governor messages" }),
-  ).toBeVisible();
+  await page.getByRole("button", { name: "Open messages" }).click();
+  await expect(page.getByRole("heading", { name: "Messages" })).toBeVisible();
   await page.getByRole("button", { name: "Close" }).click();
 
   await page
@@ -113,6 +113,10 @@ test("makes a prepared task's idle architecture state explicit", async ({
   ).toBeVisible();
 
   await page.getByRole("button", { name: "New task" }).click();
+  await expect(page.locator(".advanced-fields > summary")).toContainText(
+    "5.0m ceiling",
+  );
+  await page.locator(".advanced-fields > summary").click();
   await expect(
     page.getByRole("slider", { name: "Total run ceiling token budget" }),
   ).toBeVisible();
@@ -161,19 +165,10 @@ test("shows a blocked thread's durable reason, recovery step, and local lifecycl
   await page
     .getByRole("combobox", { name: "Governor session" })
     .selectOption("run-01JHARNESS");
+  await expect(page.locator(".needs-help-panel")).toBeVisible();
+  await expect(page.locator(".run-lifecycle")).toContainText("done");
   await expect(
-    page.getByText("Blocker and next available step", { exact: true }),
-  ).toBeVisible();
-  await expect(
-    page.getByText("Why · session token budget exhausted", { exact: true }),
-  ).toBeVisible();
-  await expect(page.getByText("Use Continue governor below.")).toBeVisible();
-  await expect(page.locator(".run-lifecycle")).toContainText(
-    "Local time · started",
-  );
-  await expect(page.getByText(/Local · start .* → done/).first()).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: "Continue governor" }),
+    page.getByRole("button", { name: "Continue" }),
   ).toBeVisible();
 });
 
@@ -212,21 +207,18 @@ test("offers run-level recovery when final plan review stopped before task creat
     .selectOption("run-01JHARNESS");
 
   const recovery = page.getByRole("region", { name: "Blocked run recovery" });
-  await expect(recovery).toContainText("The final plan review can resume");
+  await expect(recovery).toContainText("Resume review");
   await expect(recovery).toContainText("session token budget exhausted");
-  await expect(recovery).toContainText(
-    "does not approve the plan or begin implementation",
-  );
-  await page.getByRole("button", { name: "Resume final review" }).click();
+  await page.getByRole("button", { name: "Resume review" }).click();
   await expect.poll(() => resumeRequested).toBe(true);
 
-  await page.getByRole("button", { name: "Request plan revision" }).click();
+  await page.getByRole("button", { name: "Revise plan" }).click();
   const correction = page.getByRole("textbox", {
-    name: "Concrete correction for the architect",
+    name: "What should change?",
   });
   await correction.fill("Keep the existing evidence but shorten the final review.");
   await expect(
-    page.getByRole("button", { name: "Request plan revision" }),
+    page.getByRole("button", { name: "Revise plan" }),
   ).toBeEnabled();
 });
 
@@ -238,6 +230,7 @@ test("completes a deep interview and hands the confirmed brief to planning", asy
   await page
     .getByRole("textbox", { name: "What should the governor accomplish?" })
     .fill("Prove the requested behavior through the authoritative workflow.");
+  await page.locator(".advanced-fields > summary").click();
   await page
     .getByRole("checkbox", { name: /Deep interview before planning/ })
     .check();
@@ -344,6 +337,7 @@ test("shows live token progress while the deep interviewer is working", async ({
   await page
     .getByRole("textbox", { name: "What should the governor accomplish?" })
     .fill("Clarify the authoritative workflow before planning.");
+  await page.locator(".advanced-fields > summary").click();
   await page
     .getByRole("checkbox", { name: /Deep interview before planning/ })
     .check();
