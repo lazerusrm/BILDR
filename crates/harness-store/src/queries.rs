@@ -50,6 +50,34 @@ const TRACE_SNAPSHOT_MAX_DOMAIN_RECEIPTS: i64 = 10_000;
 const TRACE_SNAPSHOT_MAX_PAYLOAD_BYTES: i64 = 32 * 1024 * 1024;
 const MAX_KNOWLEDGE_PAGE_SIZE: u32 = 200;
 type InvestigationWorktreeBinding = (WorktreeId, Option<AttemptId>, Option<String>);
+type CodexTurnRequestedRoute = (Option<String>, Option<String>);
+type CompletedValidationRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    i64,
+);
+
+/// Exact fields whose canonical JSON digest proves a completed validation.
+///
+/// Keeping these together makes every caller state the immutable receipt it
+/// is hashing, rather than relying on positional arguments that can drift.
+pub(crate) struct CanonicalValidationReceipt<'a> {
+    pub id: &'a str,
+    pub task_attempt_id: Option<&'a str>,
+    pub validator_id: &'a str,
+    pub proof_tier: &'a str,
+    pub result_class: &'a str,
+    pub source_sha: &'a str,
+    pub command_run_id: Option<&'a str>,
+    pub started_at: Option<i64>,
+    pub completed_at: i64,
+}
 
 impl Store {
     pub fn bind_champion_policy(
@@ -1599,17 +1627,17 @@ impl Store {
             } else {
                 (harness_domain::OutcomeDimension::Validation, code)
             };
-            let receipt_sha256 = canonical_validation_receipt_sha256(
-                &id,
-                task_attempt_id.as_deref(),
-                &validator_id,
-                &proof_tier,
-                &result,
-                &source_sha,
-                command_run_id.as_deref(),
+            let receipt_sha256 = canonical_validation_receipt_sha256(CanonicalValidationReceipt {
+                id: &id,
+                task_attempt_id: task_attempt_id.as_deref(),
+                validator_id: &validator_id,
+                proof_tier: &proof_tier,
+                result_class: &result,
+                source_sha: &source_sha,
+                command_run_id: command_run_id.as_deref(),
                 started_at,
-                observed_at,
-            )?;
+                completed_at: observed_at,
+            })?;
             inputs.push(AuthoritativeOutcomeInput {
                 run_id: run_id.clone(),
                 subject: outcome_subject(run_id, task_attempt_id),
@@ -3540,7 +3568,7 @@ impl Store {
         &self,
         thread_id: &str,
         turn_id: &str,
-    ) -> Result<Option<(Option<String>, Option<String>)>, StoreError> {
+    ) -> Result<Option<CodexTurnRequestedRoute>, StoreError> {
         self.connection()?
             .query_row(
                 "SELECT requested_model,requested_reasoning_effort FROM codex_turns WHERE thread_id=?1 AND turn_id=?2",
@@ -7491,17 +7519,7 @@ fn validate_learning_references_tx(
                         (OutcomeClassification::Unknown, "unavailable")
                     }
                 };
-                let validation: (
-                    String,
-                    String,
-                    String,
-                    String,
-                    String,
-                    Option<String>,
-                    Option<String>,
-                    Option<i64>,
-                    i64,
-                ) = tx
+                let validation: CompletedValidationRow = tx
                     .query_row(
                         "SELECT run_id,task_attempt_id,validator_id,proof_tier,result_class,source_sha,command_run_id,started_at,completed_at FROM validations WHERE id=?1 AND state='completed' AND result_class IS NOT NULL AND invalidated_at IS NULL",
                         [&outcome.source.record_id],
@@ -7541,17 +7559,18 @@ fn validate_learning_references_tx(
                         "AVO hard-gate validation has no canonical source revision".into(),
                     )
                 })?;
-                let validation_receipt_sha256 = canonical_validation_receipt_sha256(
-                    &outcome.source.record_id,
-                    Some(&validation_attempt_id),
-                    &validator_id,
-                    &proof_tier,
-                    &validation_result,
-                    &validation_source_sha,
-                    command_run_id.as_deref(),
-                    started_at,
-                    completed_at,
-                )?;
+                let validation_receipt_sha256 =
+                    canonical_validation_receipt_sha256(CanonicalValidationReceipt {
+                        id: &outcome.source.record_id,
+                        task_attempt_id: Some(&validation_attempt_id),
+                        validator_id: &validator_id,
+                        proof_tier: &proof_tier,
+                        result_class: &validation_result,
+                        source_sha: &validation_source_sha,
+                        command_run_id: command_run_id.as_deref(),
+                        started_at,
+                        completed_at,
+                    })?;
                 let (validation_classification, validation_code) =
                     authoritative_result_label(&validation_result);
                 let validation_attempt_is_owned: bool = tx.query_row(
@@ -8892,26 +8911,18 @@ fn authoritative_result_label(
 /// prevents an AVO gate from accepting a hash that describes a subtly
 /// different validation row.
 pub(crate) fn canonical_validation_receipt_sha256(
-    id: &str,
-    task_attempt_id: Option<&str>,
-    validator_id: &str,
-    proof_tier: &str,
-    result_class: &str,
-    source_sha: &str,
-    command_run_id: Option<&str>,
-    started_at: Option<i64>,
-    completed_at: i64,
+    receipt: CanonicalValidationReceipt<'_>,
 ) -> Result<String, StoreError> {
     let receipt = json!({
-        "id": id,
-        "task_attempt_id": task_attempt_id,
-        "validator_id": validator_id,
-        "proof_tier": proof_tier,
-        "result_class": result_class,
-        "source_sha": source_sha,
-        "command_run_id": command_run_id,
-        "started_at": started_at,
-        "completed_at": completed_at,
+        "id": receipt.id,
+        "task_attempt_id": receipt.task_attempt_id,
+        "validator_id": receipt.validator_id,
+        "proof_tier": receipt.proof_tier,
+        "result_class": receipt.result_class,
+        "source_sha": receipt.source_sha,
+        "command_run_id": receipt.command_run_id,
+        "started_at": receipt.started_at,
+        "completed_at": receipt.completed_at,
     });
     Ok(sha256(serde_json::to_string(&receipt)?.as_bytes()))
 }

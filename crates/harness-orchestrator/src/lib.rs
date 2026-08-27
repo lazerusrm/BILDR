@@ -2875,7 +2875,6 @@ impl Orchestrator {
         }
     }
 
-    #[must_use]
     pub fn run_model_catalog(&self) -> Result<RunModelCatalog, OrchestratorError> {
         let provider = self.config.codex.model_provider.clone();
         let models = match provider.as_str() {

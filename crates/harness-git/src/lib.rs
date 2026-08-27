@@ -1298,9 +1298,11 @@ fn create_project_staging_directory(
         .chars()
         .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
         .collect::<String>();
-    let safe_name = (!safe_name.is_empty())
-        .then_some(safe_name)
-        .unwrap_or_else(|| "project".to_owned());
+    let safe_name = if safe_name.is_empty() {
+        "project".to_owned()
+    } else {
+        safe_name
+    };
     for attempt in 0..32_u8 {
         let staging = parent.join(format!(
             ".bildr-new-{safe_name}-{}-{}-{attempt}",

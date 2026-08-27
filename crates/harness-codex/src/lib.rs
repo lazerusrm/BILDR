@@ -2469,10 +2469,10 @@ async fn reader_loop(
             request_id: id.clone(),
             message: message.clone(),
         };
-        if kind == EventKind::ServerRequest {
-            if let Some(id) = id.as_ref() {
-                server_requests.lock().await.insert(request_key(id));
-            }
+        if kind == EventKind::ServerRequest
+            && let Some(id) = id.as_ref()
+        {
+            server_requests.lock().await.insert(request_key(id));
         }
         let _ = events.send(event.clone());
         let _ = durable_sink.send(event).await;
