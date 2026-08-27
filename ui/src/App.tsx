@@ -83,7 +83,7 @@ type Modal =
   | "palette"
   | "messages"
   | null;
-type ProjectMode = "existing" | "new";
+type ProjectMode = "existing" | "managed" | "new";
 
 const nav: Array<{ view: View; label: string; icon: typeof Home }> = [
   { view: "home", label: "Home", icon: Home },
@@ -6115,6 +6115,8 @@ export function RegisterModal({
     initialMode === "new" ? initialPath : "",
   );
   const [projectName, setProjectName] = useState("");
+  const [checkoutDestination, setCheckoutDestination] = useState("");
+  const [checkoutBranch, setCheckoutBranch] = useState("main");
   const [query, setQuery] = useState("");
   const [discoveries, setDiscoveries] = useState<RepositoryDiscovery[]>([]);
   const [scanning, setScanning] = useState(false);
@@ -6137,7 +6139,7 @@ export function RegisterModal({
     }
   }, []);
   useEffect(() => {
-    if (mode === "existing") {
+    if (mode !== "new") {
       scan();
     } else {
       setScanning(false);
@@ -6150,7 +6152,9 @@ export function RegisterModal({
     try {
       const repository = mode === "existing"
         ? await api.registerRepository(path)
-        : await api.createLocalProject(parentPath, projectName);
+        : mode === "managed"
+          ? await api.createManagedCheckout(path, checkoutDestination, checkoutBranch)
+          : await api.createLocalProject(parentPath, projectName);
       await onDone(repository);
     } catch (caught) {
       setError(message(caught));
@@ -6167,47 +6171,35 @@ export function RegisterModal({
       )
     : discoveries;
   return (
-    <ModalFrame title="Add a project" onClose={onClose} wide>
+    <ModalFrame title="Set up a project" onClose={onClose} wide>
       <form onSubmit={submit}>
-        <div className="compact-choice">
-          <label>
-            <input
-              type="radio"
-              checked={mode === "existing"}
-              onChange={() => {
-                setMode("existing");
-                setError("");
-              }}
-            />
-            <span>
-              <b>Use existing Git checkout</b>
-              <small>Register a project already on disk</small>
-            </span>
-          </label>
-          <label>
-            <input
-              type="radio"
-              checked={mode === "new"}
-              onChange={() => {
-                setMode("new");
-                setError("");
-              }}
-            />
-            <span>
-              <b>Create new local project</b>
-              <small>Make a folder and initialise its Git history</small>
-            </span>
-          </label>
-        </div>
-        {mode === "existing" ? (
+        <label className="field project-setup">
+          <span>Project setup</span>
+          <select
+            value={mode}
+            onChange={(event) => {
+              setMode(event.target.value as ProjectMode);
+              setError("");
+            }}
+          >
+            <option value="existing">Use a clean checkout already on disk</option>
+            <option value="managed">Create a clean checkout from origin/main</option>
+            <option value="new">Create a new local Git project</option>
+          </select>
+          <small>
+            BILDR runs only from a clean coordination checkout. Your existing
+            source folder is never changed.
+          </small>
+        </label>
+        {mode !== "new" ? (
           <>
             <div className="discovery-header">
               <div>
-                <strong>Discovered checkouts</strong>
+                <strong>{mode === "managed" ? "Source checkout" : "Local checkout"}</strong>
                 <span>
                   {discoveries.length
-                    ? `${discoveries.length} local Git checkouts found`
-                    : "Choose a Git checkout or enter a local path."}
+                    ? `${discoveries.length} Git checkouts found`
+                    : "Choose a Git checkout or enter its local path."}
                 </span>
               </div>
               <button
@@ -6242,8 +6234,13 @@ export function RegisterModal({
                     type="button"
                     className={`discovery-row ${path === item.root_path ? "selected" : ""}`}
                     key={item.root_path}
-                    onClick={() => setPath(item.root_path)}
-                    disabled={item.registered}
+                    onClick={() => {
+                      setPath(item.root_path);
+                      setCheckoutDestination((current) =>
+                        current || suggestedCoordinationPath(item.root_path),
+                      );
+                    }}
+                    disabled={item.registered && mode === "existing"}
                   >
                     <FolderGit2 size={16} />
                     <span>
@@ -6267,7 +6264,7 @@ export function RegisterModal({
               )}
             </div>
             <label className="field">
-              <span>Repository root</span>
+              <span>{mode === "managed" ? "Source repository root" : "Repository root"}</span>
               <span className="field-row">
                 <input
                   value={path}
@@ -6282,11 +6279,54 @@ export function RegisterModal({
                 )}
               </span>
               <small>
-                {allowNativeBrowse
-                  ? "Use Browse to pick a local checkout. BILDR checks the active branch, Git identity, cleanliness, and repository instructions. A remote is optional for local-only work."
-                  : "BILDR checks the active branch, Git identity, cleanliness, and repository instructions. A remote is optional for local-only work."}
+                {mode === "managed"
+                  ? "BILDR reads this checkout only to obtain its origin remote. Local edits and untracked files are not copied."
+                  : allowNativeBrowse
+                    ? "Use Browse to pick a clean local checkout. BILDR checks the active branch, Git identity, and repository instructions. A remote is optional for local-only work."
+                    : "BILDR checks the active branch, Git identity, and repository instructions. A remote is optional for local-only work."}
               </small>
             </label>
+            {mode === "managed" && (
+              <div className="form-grid">
+                <label className="field">
+                  <span>Origin branch</span>
+                  <div className="input-prefix">
+                    <span>origin/</span>
+                    <input
+                      value={checkoutBranch}
+                      onChange={(event) => setCheckoutBranch(event.target.value)}
+                      placeholder="main"
+                      required
+                      maxLength={240}
+                    />
+                  </div>
+                  <small>
+                    BILDR clones this exact remote branch into a new clean checkout.
+                  </small>
+                </label>
+                <label className="field">
+                  <span>New checkout folder</span>
+                  <input
+                    value={checkoutDestination}
+                    onChange={(event) => setCheckoutDestination(event.target.value)}
+                    placeholder={suggestedCoordinationPath(path) || "/home/you/Documents/project-bildr"}
+                    required
+                  />
+                  <small>
+                    Must not exist. This becomes BILDR's registered project root.
+                  </small>
+                </label>
+              </div>
+            )}
+            {mode === "managed" && (
+              <div className="pin-note">
+                <ShieldCheck size={15} />
+                <span>
+                  Your source checkout can stay dirty. BILDR creates a separate,
+                  clean checkout from <span className="mono">origin/{checkoutBranch || "main"}</span> and runs from that copy.
+                </span>
+              </div>
+            )}
           </>
         ) : (
           <div className="form-grid">
@@ -6320,7 +6360,7 @@ export function RegisterModal({
                 onChange={(event) => setProjectName(event.target.value)}
                 placeholder="my-new-project"
                 required={mode === "new"}
-                maxLength={128}
+                maxLength={120}
               />
               <small>
                 BILDR creates <span className="mono">{parentPath || "/parent"}/{projectName || "project"}</span>.
@@ -6343,16 +6383,24 @@ export function RegisterModal({
             className="button primary"
             disabled={
               busy ||
-              (mode === "existing" ? !path.trim() : !parentPath.trim() || !projectName.trim())
+              (mode === "existing"
+                ? !path.trim()
+                : mode === "managed"
+                  ? !path.trim() || !checkoutDestination.trim() || !checkoutBranch.trim()
+                  : !parentPath.trim() || !projectName.trim())
             }
           >
             {busy
               ? mode === "existing"
                 ? "Inspecting…"
-                : "Creating…"
+                : mode === "managed"
+                  ? "Cloning and verifying…"
+                  : "Creating…"
               : mode === "existing"
-                ? "Register project"
-                : "Create local project"}
+                ? "Register clean checkout"
+                : mode === "managed"
+                  ? "Create clean checkout"
+                  : "Create local project"}
           </button>
         </div>
       </form>

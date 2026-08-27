@@ -210,6 +210,19 @@ class HarnessApi {
     });
   }
 
+  createManagedCheckout(
+    sourcePath: string,
+    destinationPath: string,
+    baseBranch: string,
+  ) {
+    return this.post<Repository>("/repositories/managed-checkout", {
+      profile_id: "general",
+      source_path: sourcePath,
+      destination_path: destinationPath,
+      base_branch: baseBranch,
+    });
+  }
+
   prepareCoordinationCheckout(repositoryId: string, destinationPath: string) {
     return this.post<Repository>(
       `/repositories/${repositoryId}/prepare-clean-checkout`,

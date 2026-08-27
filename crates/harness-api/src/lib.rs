@@ -21,10 +21,10 @@ use harness_domain::{
 };
 use harness_orchestrator::{
     ApprovalDecisionRequest, ApproveSignoffRequest, AttestAcceptanceRequest,
-    CreateLocalProjectRequest, CreateRunRequest, OperatorSettings, Orchestrator, OrchestratorError,
-    PlanReviewFinding, PrepareCoordinationCheckoutRequest, PublishDraftPrRequest,
-    RegisterRepositoryRequest, RenameCodexAccountRequest, RepositoryDiscovery,
-    RequestSignoffChanges, RetryTaskRequest, StartCodexAccountLoginRequest,
+    CreateLocalProjectRequest, CreateManagedCheckoutRequest, CreateRunRequest, OperatorSettings,
+    Orchestrator, OrchestratorError, PlanReviewFinding, PrepareCoordinationCheckoutRequest,
+    PublishDraftPrRequest, RegisterRepositoryRequest, RenameCodexAccountRequest,
+    RepositoryDiscovery, RequestSignoffChanges, RetryTaskRequest, StartCodexAccountLoginRequest,
     UpdateOperatorSettingsRequest,
 };
 use serde::{Deserialize, Serialize};
@@ -176,6 +176,10 @@ pub fn router(orchestrator: Arc<Orchestrator>, provider_switch: ProviderSwitchCo
             get(list_repositories).post(register_repository),
         )
         .route("/api/v1/repositories/new-local", post(create_local_project))
+        .route(
+            "/api/v1/repositories/managed-checkout",
+            post(create_managed_checkout),
+        )
         .route("/api/v1/repositories/discover", get(discover_repositories))
         .route("/api/v1/repositories/{repository_id}", get(get_repository))
         .route(
@@ -559,6 +563,16 @@ async fn create_local_project(
 ) -> Result<impl IntoResponse, ApiError> {
     authenticate(&state, &headers, true)?;
     let repository = state.orchestrator.create_local_project(request).await?;
+    Ok((StatusCode::CREATED, Json(repository)))
+}
+
+async fn create_managed_checkout(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateManagedCheckoutRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers, true)?;
+    let repository = state.orchestrator.create_managed_checkout(request).await?;
     Ok((StatusCode::CREATED, Json(repository)))
 }
 

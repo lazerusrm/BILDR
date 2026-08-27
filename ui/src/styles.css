@@ -4290,6 +4290,32 @@ kbd {
   flex: 0 0 auto;
   white-space: nowrap;
 }
+.input-prefix {
+  display: flex;
+  align-items: stretch;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.input-prefix:focus-within {
+  border-color: var(--accent);
+}
+.input-prefix > span {
+  display: grid;
+  place-items: center;
+  padding: 0 9px;
+  border-right: 1px solid var(--line);
+  color: var(--muted);
+  font: 10px var(--mono);
+}
+.field .input-prefix input {
+  border: 0;
+  border-radius: 0;
+}
+.field .input-prefix input:focus {
+  border-color: transparent;
+}
 html[data-shell="desktop"] .topbar {
   padding-right: 12px;
 }

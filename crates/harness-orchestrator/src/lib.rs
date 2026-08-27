@@ -1553,6 +1553,18 @@ pub struct CreateLocalProjectRequest {
     pub project_name: String,
 }
 
+/// Create a managed, clean project checkout directly from a source checkout's
+/// `origin/<base_branch>`. This is an onboarding operation: it never registers
+/// or modifies the source checkout, which may contain user-owned changes.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateManagedCheckoutRequest {
+    pub profile_id: Option<String>,
+    pub source_path: PathBuf,
+    pub destination_path: PathBuf,
+    pub base_branch: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrepareCoordinationCheckoutRequest {
@@ -3165,6 +3177,82 @@ impl Orchestrator {
                 "inspection": inspection,
                 "local_only": true,
                 "remote_configured": false,
+            }),
+            None,
+        )?;
+        self.store.repository(&repository_id).map_err(Into::into)
+    }
+
+    /// Registers a newly created clean checkout without first admitting the
+    /// user-selected source checkout. A dirty source is therefore never an
+    /// execution root and cannot block normal project onboarding.
+    pub async fn create_managed_checkout(
+        &self,
+        request: CreateManagedCheckoutRequest,
+    ) -> Result<RepositorySummary, OrchestratorError> {
+        let _guard = self.operation_lock.lock().await;
+        let profile_id = request.profile_id.as_deref().unwrap_or("general");
+        let profile = self.profile_by_id(profile_id)?;
+        let branch = request.base_branch.trim();
+        if branch.is_empty() || branch.len() > 240 {
+            return Err(OrchestratorError::Validation(
+                "base_branch must be a non-empty bounded branch name".to_owned(),
+            ));
+        }
+        if self.store.list_repositories()?.iter().any(|registered| {
+            Path::new(&registered.root_path) == request.destination_path.as_path()
+        }) {
+            return Err(OrchestratorError::Conflict(format!(
+                "destination is already registered: {}",
+                request.destination_path.display()
+            )));
+        }
+        let inspection = self
+            .git
+            .create_coordination_clone_from_origin_branch(
+                &request.source_path,
+                &request.destination_path,
+                &profile.profile,
+                branch,
+            )
+            .await?;
+        let default_branch = inspection.current_branch.clone().ok_or_else(|| {
+            OrchestratorError::Blocked(
+                "new managed checkout was initialized on a detached HEAD".to_owned(),
+            )
+        })?;
+        let display_name = inspection
+            .root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| profile.profile.display_name.clone());
+        let repository_id = RepositoryId::new();
+        self.store.create_repository(&NewRepository {
+            id: repository_id.clone(),
+            profile_id: profile.profile.profile_id.clone(),
+            profile_version: profile.profile.schema_version,
+            display_name,
+            root_path: inspection.root.clone(),
+            origin_url: inspection.origin_url.clone(),
+            default_branch: default_branch.clone(),
+            expected_coordination_branch: Some(default_branch),
+            state: if inspection.blockers.is_empty() {
+                "READY".to_owned()
+            } else {
+                "BLOCKED".to_owned()
+            },
+        })?;
+        self.record_inspection(&repository_id, &inspection, None)?;
+        self.store.emit_domain_event(
+            None,
+            "repository",
+            repository_id.as_str(),
+            "repository.managed_checkout_created",
+            &json!({
+                "source_root": request.source_path,
+                "coordination_root": inspection.root,
+                "base_ref": format!("origin/{branch}"),
+                "head_sha": inspection.head_sha,
             }),
             None,
         )?;
