@@ -74,6 +74,16 @@ export interface RunModelCatalog {
   models: RunModelDescriptor[];
 }
 
+/** Daemon-owned provider selection status. Switching replaces the complete
+ * local runtime after the daemon has refused any non-terminal run. */
+export interface ProviderSwitchStatus {
+  active_provider: string;
+  available_providers: string[];
+  switchable: boolean;
+  restart_required: boolean;
+  detail: string;
+}
+
 export interface RunModelDescriptor {
   id: string;
   display_name: string | null;

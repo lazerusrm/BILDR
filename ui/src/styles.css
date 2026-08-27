@@ -568,6 +568,34 @@ select:focus-visible {
   color: var(--text);
   font: 700 11px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
+.provider-identity > div {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.provider-identity select {
+  width: 100%;
+  appearance: none;
+  overflow: hidden;
+  border: 0;
+  outline: 0;
+  padding: 0 20px 0 0;
+  background: transparent;
+  color: var(--text);
+  font: 700 11px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.provider-identity select:disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+.provider-identity > div svg {
+  position: absolute;
+  right: 1px;
+  color: var(--muted);
+  pointer-events: none;
+}
 .provider-identity.local > strong {
   color: var(--ok);
 }

@@ -12,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
 };
+use futures::future::BoxFuture;
 use harness_domain::{
     AgentRole, AgentSessionId, ApprovalId, ArtifactId, ImprovementRecordKind, ImprovementSchema,
     ImprovementState, OutcomeClassification, OutcomeDimension, OutcomeId, OutcomeSubject,
@@ -41,17 +42,99 @@ const SESSION_TTL_SECONDS: u64 = 12 * 60 * 60;
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const EVENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
+/// The currently active daemon provider and the complete, operator-provisioned
+/// alternatives. A provider changes only by restarting the daemon; normal
+/// runs remain bound to the provider/model receipt recorded at admission.
+#[derive(Clone, Debug, Serialize)]
+pub struct ProviderSwitchStatus {
+    pub active_provider: String,
+    pub available_providers: Vec<String>,
+    pub switchable: bool,
+    pub restart_required: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderSwitchRequest {
+    provider: String,
+}
+
+pub type ProviderSwitchHandler =
+    Arc<dyn Fn(String) -> BoxFuture<'static, Result<ProviderSwitchStatus, String>> + Send + Sync>;
+
+/// Daemon-owned provider mutation. The API knows only the bounded status and
+/// callback; configuration paths and App Server process ownership stay in
+/// `harnessd`.
+#[derive(Clone)]
+pub struct ProviderSwitchControl {
+    status: ProviderSwitchStatus,
+    switch: Option<ProviderSwitchHandler>,
+}
+
+impl ProviderSwitchControl {
+    #[must_use]
+    pub fn unavailable(active_provider: String, detail: String) -> Self {
+        Self {
+            status: ProviderSwitchStatus {
+                active_provider,
+                available_providers: Vec::new(),
+                switchable: false,
+                restart_required: false,
+                detail,
+            },
+            switch: None,
+        }
+    }
+
+    #[must_use]
+    pub fn configured(
+        active_provider: String,
+        available_providers: Vec<String>,
+        switch: ProviderSwitchHandler,
+    ) -> Self {
+        Self {
+            status: ProviderSwitchStatus {
+                active_provider,
+                available_providers,
+                switchable: true,
+                restart_required: true,
+                detail: "Switch only when every run is terminal. BILDR persists the complete provider preset, then restarts before any new task can start.".to_owned(),
+            },
+            switch: Some(switch),
+        }
+    }
+
+    #[must_use]
+    pub fn status(&self) -> ProviderSwitchStatus {
+        self.status.clone()
+    }
+
+    async fn switch(&self, provider: String) -> Result<ProviderSwitchStatus, ApiError> {
+        let switch = self.switch.as_ref().ok_or_else(|| {
+            ApiError::conflict(
+                "provider switching is not provisioned for this local BILDR instance",
+            )
+        })?;
+        switch(provider)
+            .await
+            .map_err(|message| ApiError::conflict(&message))
+    }
+}
+
 #[derive(Clone)]
 pub struct ApiState {
     orchestrator: Arc<Orchestrator>,
+    provider_switch: ProviderSwitchControl,
     started: Instant,
     event_replay_limit: u32,
 }
 
-pub fn router(orchestrator: Arc<Orchestrator>) -> Router {
+pub fn router(orchestrator: Arc<Orchestrator>, provider_switch: ProviderSwitchControl) -> Router {
     let state = ApiState {
         event_replay_limit: orchestrator.ui_event_replay_limit(),
         orchestrator,
+        provider_switch,
         started: Instant::now(),
     };
     Router::new()
@@ -59,6 +142,10 @@ pub fn router(orchestrator: Arc<Orchestrator>) -> Router {
         .route("/api/v1/session", post(create_session))
         .route("/api/v1/runtime", get(runtime))
         .route("/api/v1/models", get(run_model_catalog))
+        .route(
+            "/api/v1/provider",
+            get(provider_switch_status).post(switch_provider),
+        )
         .route("/api/v1/codex/accounts", get(codex_accounts))
         .route(
             "/api/v1/codex/accounts/{account_id}/select",
@@ -319,6 +406,31 @@ async fn run_model_catalog(
 ) -> Result<Json<harness_orchestrator::RunModelCatalog>, ApiError> {
     authenticate(&state, &headers, false)?;
     Ok(Json(state.orchestrator.run_model_catalog()?))
+}
+
+async fn provider_switch_status(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<ProviderSwitchStatus>, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(state.provider_switch.status()))
+}
+
+async fn switch_provider(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<ProviderSwitchRequest>,
+) -> Result<Json<ProviderSwitchStatus>, ApiError> {
+    authenticate(&state, &headers, true)?;
+    let provider = request.provider.trim();
+    if provider.is_empty() || provider.len() > 64 {
+        return Err(ApiError::conflict(
+            "provider must be a non-empty bounded identifier",
+        ));
+    }
+    Ok(Json(
+        state.provider_switch.switch(provider.to_owned()).await?,
+    ))
 }
 
 #[derive(Default, Deserialize)]
@@ -2493,6 +2605,14 @@ impl ApiError {
             message: message.to_owned(),
         }
     }
+
+    fn conflict(message: &str) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "conflict",
+            message: message.to_owned(),
+        }
+    }
 }
 
 impl From<OrchestratorError> for ApiError {
@@ -2545,6 +2665,29 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn provider_switch_control_exposes_only_the_provisioned_async_callback() {
+        let control = ProviderSwitchControl::configured(
+            "qwen-local-switcher".to_owned(),
+            vec!["openai".to_owned(), "qwen-local-switcher".to_owned()],
+            Arc::new(|provider| {
+                Box::pin(async move {
+                    Ok(ProviderSwitchStatus {
+                        active_provider: provider,
+                        available_providers: vec!["openai".to_owned()],
+                        switchable: false,
+                        restart_required: true,
+                        detail: "restart queued".to_owned(),
+                    })
+                })
+            }),
+        );
+        assert!(control.status().switchable);
+        let switched = control.switch("openai".to_owned()).await.unwrap();
+        assert_eq!(switched.active_provider, "openai");
+        assert!(switched.restart_required);
+    }
 
     #[test]
     fn cookie_parser_uses_exact_name() {

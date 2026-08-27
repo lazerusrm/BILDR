@@ -2219,6 +2219,11 @@ pub struct Orchestrator {
     // linearizes it after the already-issued model start.
     supervision_lifecycle_lock: Arc<RwLock<()>>,
     operation_lock: Arc<Mutex<()>>,
+    // Persisting a new provider and restarting the daemon must not race a
+    // newly admitted run. The operation lock linearizes the idle check with
+    // run creation; this flag keeps subsequent admission closed until the
+    // current daemon is replaced.
+    provider_switch_pending: Arc<AtomicBool>,
     hygiene_lock: Arc<Mutex<()>>,
     account_logins: Arc<Mutex<BTreeMap<String, CodexAccountLoginEntry>>>,
     #[cfg(test)]
@@ -2289,6 +2294,7 @@ impl Orchestrator {
             settings_lock: Arc::new(StdMutex::new(())),
             supervision_lifecycle_lock: Arc::new(RwLock::new(())),
             operation_lock: Arc::new(Mutex::new(())),
+            provider_switch_pending: Arc::new(AtomicBool::new(false)),
             hygiene_lock: Arc::new(Mutex::new(())),
             account_logins: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(test)]
@@ -2901,6 +2907,56 @@ impl Orchestrator {
             }
         };
         Ok(RunModelCatalog { provider, models })
+    }
+
+    /// A daemon provider is a startup boundary: the App Server executable,
+    /// its account/home semantics, and its model catalog all change together.
+    /// Existing runs carry immutable provider/model receipts, so even a paused
+    /// run cannot be silently resumed after a provider flip.
+    fn require_provider_switch_idle(&self) -> Result<(), OrchestratorError> {
+        let active = self.store.list_runs(None, false)?;
+        if active.is_empty() {
+            return Ok(());
+        }
+        let ids = active
+            .iter()
+            .take(4)
+            .map(|run| run.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let remainder = active.len().saturating_sub(4);
+        let suffix = if remainder == 0 {
+            String::new()
+        } else {
+            format!(" (+{remainder} more)")
+        };
+        Err(OrchestratorError::Conflict(format!(
+            "provider switch requires every run to be terminal; stop, complete, or archive active runs first: {ids}{suffix}"
+        )))
+    }
+
+    /// Begin an operator-requested provider replacement. The pending gate
+    /// remains set until the daemon restarts or its caller explicitly aborts
+    /// the configuration write, so no run can receive an old runtime after a
+    /// new provider has been selected.
+    pub async fn begin_provider_switch(&self) -> Result<(), OrchestratorError> {
+        let _guard = self.operation_lock.lock().await;
+        if self.provider_switch_pending.swap(true, Ordering::AcqRel) {
+            return Err(OrchestratorError::Conflict(
+                "a provider switch is already in progress".to_owned(),
+            ));
+        }
+        if let Err(error) = self.require_provider_switch_idle() {
+            self.provider_switch_pending.store(false, Ordering::Release);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Undo a switch gate when persisting the selected provider fails. This
+    /// must never be called after the daemon has been asked to restart.
+    pub fn cancel_provider_switch(&self) {
+        self.provider_switch_pending.store(false, Ordering::Release);
     }
 
     fn scheduler_totals(&self) -> (u32, u32, u32, u32, bool) {
@@ -4672,6 +4728,15 @@ impl Orchestrator {
         &self,
         request: CreateRunRequest,
     ) -> Result<RunSummary, OrchestratorError> {
+        // See `begin_provider_switch`: this guard makes the active-run check
+        // and run admission one linearizable operation.
+        let _guard = self.operation_lock.lock().await;
+        if self.provider_switch_pending.load(Ordering::Acquire) {
+            return Err(OrchestratorError::Conflict(
+                "provider switch is in progress; wait for BILDR to restart before creating a run"
+                    .to_owned(),
+            ));
+        }
         let deep_interview = request.deep_interview;
         let ponytail_mode = match (request.ponytail_mode, request.minimal_implementation) {
             (Some(mode), Some(enabled)) if mode.is_active() != enabled => {

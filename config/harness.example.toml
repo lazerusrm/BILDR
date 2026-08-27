@@ -15,6 +15,9 @@ artifact_root = ""
 
 [codex]
 binary = "codex"
+# Leave unset to use the operator environment's normal Codex home. A local
+# Qwodex preset should instead set its own isolated home.
+# codex_home = "/absolute/path/to/codex-home"
 model_provider = "openai"
 allowed_models = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
 # Qwodex uses its own mutable local catalog instead of source-coded model
@@ -29,6 +32,25 @@ experimental_api = false
 required_version = "0.149.1"
 # SHA-256 over the parsed, canonical JSON generated with:
 # codex app-server generate-json-schema --out <dir>
+required_protocol_schema_sha256 = "a09caf2ab07d69a3ef48384b40793d32718efe953134efd28d7276be9282cfe7"
+execution_on_schema_mismatch = "disabled"
+reasoning_summary = "concise"
+
+# Optional, daemon-owned runtime selector. Each profile is complete so a
+# provider change never mixes a Qwodex catalog/binary with a hosted App Server
+# (or vice versa). The console accepts a switch only with no non-terminal run,
+# persists the selected preset atomically, then restarts the daemon.
+[provider_switch]
+active_provider = "openai"
+
+[provider_switch.providers.openai]
+binary = "codex"
+model_provider = "openai"
+allowed_models = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+transport = "stdio"
+service_name = "harness_console"
+experimental_api = false
+required_version = "0.149.1"
 required_protocol_schema_sha256 = "a09caf2ab07d69a3ef48384b40793d32718efe953134efd28d7276be9282cfe7"
 execution_on_schema_mismatch = "disabled"
 reasoning_summary = "concise"

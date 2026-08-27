@@ -53,6 +53,7 @@ import type {
   LatestAgentMessage,
   OperatorSettings,
   PonytailMode,
+  ProviderSwitchStatus,
   Repository,
   RepositoryDiscovery,
   Run,
@@ -117,6 +118,13 @@ export default function App() {
   const [runModelCatalog, setRunModelCatalog] = useState<RunModelCatalog>({
     provider: "",
     models: [],
+  });
+  const [providerSwitch, setProviderSwitch] = useState<ProviderSwitchStatus>({
+    active_provider: "",
+    available_providers: [],
+    switchable: false,
+    restart_required: false,
+    detail: "Checking local provider configuration…",
   });
   const [codexAccounts, setCodexAccounts] = useState<CodexAccountsSnapshot>({
     accounts: [],
@@ -200,6 +208,7 @@ export default function App() {
     const [
       nextRuntime,
       nextRunModelCatalog,
+      nextProviderSwitch,
       nextAccounts,
       nextRepositories,
       nextRuns,
@@ -209,6 +218,13 @@ export default function App() {
     ] = await Promise.all([
       api.runtime(),
       api.runModelCatalog(),
+      api.providerSwitchStatus().catch(() => ({
+        active_provider: "",
+        available_providers: [],
+        switchable: false,
+        restart_required: false,
+        detail: "Provider switching is unavailable.",
+      })),
       api.codexAccounts().catch(() => ({ accounts: [] })),
       api.repositories(),
       api.runs(),
@@ -218,6 +234,7 @@ export default function App() {
     ]);
     setRuntime(nextRuntime);
     setRunModelCatalog(nextRunModelCatalog);
+    setProviderSwitch(nextProviderSwitch);
     setCodexAccounts(nextAccounts);
     setRepositories(nextRepositories);
     setRuns(nextRuns);
@@ -544,6 +561,57 @@ export default function App() {
     }
   };
 
+  const switchProvider = async (provider: string) => {
+    setBusy("provider-switch");
+    setError("");
+    try {
+      const status = await api.switchProvider(provider);
+      setProviderSwitch(status);
+      setToast(status.detail);
+      if (!status.restart_required) {
+        window.setTimeout(() => setToast(""), 3200);
+        return;
+      }
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline) {
+        try {
+          // A fresh session distinguishes the restarted daemon from the old
+          // process even when browser cookies survive the controlled restart.
+          const session = await fetch("/api/v1/session", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { Accept: "application/json" },
+          });
+          if (session.ok) {
+            const csrf = (await session.json() as { csrf_token: string }).csrf_token;
+            const response = await fetch("/api/v1/provider", {
+              credentials: "same-origin",
+              headers: {
+                Accept: "application/json",
+                "X-Harness-CSRF": csrf,
+              },
+            });
+            if (response.ok) {
+              const observed = await response.json() as ProviderSwitchStatus;
+              if (observed.active_provider === provider) {
+                window.location.reload();
+                return;
+              }
+            }
+          }
+        } catch {
+          // Expected while the managed daemon is between processes.
+        }
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 500));
+      }
+      setError("Provider selection was saved, but BILDR did not reconnect within 30 seconds. Check the local service status.");
+    } catch (caught) {
+      setError(message(caught));
+    } finally {
+      setBusy("");
+    }
+  };
+
   const chooseRun = (id: string) => {
     if (id === selectedRunId) {
       setView("runs");
@@ -574,8 +642,11 @@ export default function App() {
       <AccountBar
         snapshot={codexAccounts}
         modelCatalog={runModelCatalog}
+        providerSwitch={providerSwitch}
         history={rateHistory}
         busy={busy === "codex-account"}
+        providerBusy={busy === "provider-switch"}
+        onSwitchProvider={switchProvider}
         onSelect={(accountId) =>
           runAction(
             "codex-account",
@@ -1273,21 +1344,27 @@ type AccountMeter = {
   historyKey?: string;
 };
 
-function AccountBar({
+export function AccountBar({
   snapshot,
   modelCatalog,
+  providerSwitch,
   history,
   busy,
+  providerBusy,
   onSelect,
+  onSwitchProvider,
   onRefresh,
   onAdd,
   onReauthenticate,
 }: {
   snapshot: CodexAccountsSnapshot;
   modelCatalog: RunModelCatalog;
+  providerSwitch: ProviderSwitchStatus;
   history: RateLimitHistory;
   busy: boolean;
+  providerBusy: boolean;
   onSelect: (accountId: string) => void;
+  onSwitchProvider: (provider: string) => void;
   onRefresh: () => void;
   onAdd: () => void;
   onReauthenticate: (accountId: string) => void;
@@ -1353,12 +1430,38 @@ function AccountBar({
         </div>
       )}
       <div className={`provider-identity ${isQwodex ? "local" : "hosted"}`}>
-        <label>Model provider</label>
-        <strong>{isQwodex ? "Qwodex · local" : "OpenAI · hosted"}</strong>
-        <span title={localModelLabel}>
-          {isQwodex
-            ? `Ornith available · select it in New run`
-            : `${modelCatalog.models.length} approved models · select one in New run`}
+        <label htmlFor="provider-switch-select">Model provider</label>
+        <div>
+          <select
+            id="provider-switch-select"
+            value={providerSwitch.active_provider || modelCatalog.provider}
+            disabled={providerBusy || !providerSwitch.switchable}
+            onChange={(event) => onSwitchProvider(event.target.value)}
+            title={providerSwitch.detail}
+          >
+            {!providerSwitch.available_providers.length && (
+              <option value={modelCatalog.provider || ""}>
+                {isQwodex ? "Qwodex · local" : "OpenAI · hosted"}
+              </option>
+            )}
+            {providerSwitch.available_providers.map((provider) => (
+              <option value={provider} key={provider}>
+                {provider === "qwen-local-switcher"
+                  ? "Qwodex · local"
+                  : provider === "openai"
+                    ? "OpenAI · hosted"
+                    : provider}
+              </option>
+            ))}
+          </select>
+          <ChevronDown size={12} />
+        </div>
+        <span title={providerSwitch.detail || localModelLabel}>
+          {providerBusy
+            ? "Saving selection and restarting BILDR…"
+            : providerSwitch.switchable
+              ? "Switches runtime when no run is active"
+              : providerSwitch.detail || localModelLabel}
         </span>
       </div>
       {!isQwodex && (

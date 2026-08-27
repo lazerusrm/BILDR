@@ -19,6 +19,7 @@ use axum::{
 };
 use clap::{Parser, Subcommand};
 use evaluation::EvaluationService;
+use harness_api::{ProviderSwitchControl, ProviderSwitchHandler, ProviderSwitchStatus};
 use harness_codex::{
     CodexRuntime, CodexRuntimeManager, CodexSettings, EventKind, probe_compatibility,
 };
@@ -90,7 +91,8 @@ struct UiAssets;
 async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
-    let mut config = load_config(cli.config.as_deref())?;
+    let config_path = resolve_config_path(cli.config.as_deref());
+    let mut config = load_config(config_path.as_deref())?;
     match cli.command {
         Command::Serve {
             bind,
@@ -101,7 +103,7 @@ async fn main() -> Result<()> {
                 config.server.bind = bind;
                 config.validate()?;
             }
-            serve(config, &cli.profile, no_browser, without_codex).await
+            serve(config, &cli.profile, no_browser, without_codex, config_path).await
         }
         Command::Doctor {
             json,
@@ -139,11 +141,14 @@ fn init_tracing() {
         .init();
 }
 
-fn load_config(explicit: Option<&Path>) -> Result<HarnessConfig> {
-    let selected = explicit
+fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
+    explicit
         .map(PathBuf::from)
-        .or_else(default_config_path_if_present);
-    HarnessConfig::load(selected.as_deref()).map_err(Into::into)
+        .or_else(default_config_path_if_present)
+}
+
+fn load_config(config_path: Option<&Path>) -> Result<HarnessConfig> {
+    HarnessConfig::load(config_path).map_err(Into::into)
 }
 
 fn default_config_path_if_present() -> Option<PathBuf> {
@@ -159,6 +164,7 @@ async fn serve(
     profile_id: &str,
     no_browser: bool,
     without_codex: bool,
+    config_path: Option<PathBuf>,
 ) -> Result<()> {
     let bind = resolve_bind(&config.server.bind).await?;
     let should_open_browser = config.server.open_browser_on_start && !no_browser;
@@ -193,6 +199,8 @@ async fn serve(
         .as_ref()
         .map(|runtime| Arc::clone(runtime) as Arc<dyn CodexRuntime>);
     let observation_enabled = config.self_improvement_runtime_status().observation_enabled;
+    let active_provider = config.codex.model_provider.clone();
+    let provisioned_providers = config.provider_switch_options();
     let orchestrator = Arc::new(
         Orchestrator::new(config, paths, profile, store, runtime)
             .await
@@ -285,7 +293,17 @@ async fn serve(
         })
     });
 
-    let app = harness_api::router(Arc::clone(&orchestrator))
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let restart_requested = Arc::new(AtomicBool::new(false));
+    let provider_switch = provider_switch_control(
+        active_provider,
+        provisioned_providers,
+        config_path,
+        Arc::clone(&orchestrator),
+        shutdown_tx.clone(),
+        Arc::clone(&restart_requested),
+    );
+    let app = harness_api::router(Arc::clone(&orchestrator), provider_switch)
         .fallback(static_asset)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http());
@@ -298,7 +316,6 @@ async fn serve(
     if should_open_browser {
         open_browser(&url);
     }
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let signal_shutting_down = Arc::clone(&shutting_down);
     let signal_task = tokio::spawn(async move {
         shutdown_signal().await;
@@ -338,7 +355,91 @@ async fn serve(
     {
         warn!(%error, "App Server shutdown reported an error");
     }
-    result.context("HTTP server failed")
+    result.context("HTTP server failed")?;
+    if restart_requested.load(Ordering::Acquire) {
+        bail!("provider selection was persisted; restarting managed BILDR daemon")
+    }
+    Ok(())
+}
+
+fn provider_switch_control(
+    active_provider: String,
+    provisioned_providers: Option<Vec<String>>,
+    config_path: Option<PathBuf>,
+    orchestrator: Arc<Orchestrator>,
+    shutdown_tx: watch::Sender<bool>,
+    restart_requested: Arc<AtomicBool>,
+) -> ProviderSwitchControl {
+    let Some(path) = config_path.filter(|path| path.is_file()) else {
+        return ProviderSwitchControl::unavailable(
+            active_provider,
+            "Provider switching needs a writable local BILDR configuration file; this daemon is using built-in defaults.".to_owned(),
+        );
+    };
+    let Some(available_providers) = provisioned_providers else {
+        return ProviderSwitchControl::unavailable(
+            active_provider,
+            "Provider switching is not enabled in this local BILDR configuration.".to_owned(),
+        );
+    };
+    let handler: ProviderSwitchHandler = Arc::new(move |provider: String| {
+        let config_path = path.clone();
+        let orchestrator = Arc::clone(&orchestrator);
+        let shutdown_tx = shutdown_tx.clone();
+        let restart_requested = Arc::clone(&restart_requested);
+        Box::pin(async move {
+            let loaded = HarnessConfig::load(Some(&config_path))
+                .map_err(|error| format!("could not load provider configuration: {error}"))?;
+            let Some(available_providers) = loaded.provider_switch_options() else {
+                return Err("provider switching is no longer configured".to_owned());
+            };
+            if !available_providers
+                .iter()
+                .any(|candidate| candidate == &provider)
+            {
+                return Err(format!(
+                    "provider {provider} is not provisioned for this BILDR instance"
+                ));
+            }
+            if loaded.codex.model_provider == provider {
+                return Ok(ProviderSwitchStatus {
+                    active_provider: provider,
+                    available_providers,
+                    switchable: true,
+                    restart_required: false,
+                    detail: "That provider is already active.".to_owned(),
+                });
+            }
+            orchestrator
+                .begin_provider_switch()
+                .await
+                .map_err(|error| error.to_string())?;
+            let persisted = loaded
+                .with_provider_selected(&provider)
+                .and_then(|selected| selected.write_atomically(&config_path));
+            if let Err(error) = persisted {
+                orchestrator.cancel_provider_switch();
+                return Err(format!("could not persist provider selection: {error}"));
+            }
+            restart_requested.store(true, Ordering::Release);
+            tokio::spawn(async move {
+                // Let the successful POST response leave the loopback socket
+                // before the managed service exits and reloads its runtime.
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                let _ = shutdown_tx.send(true);
+            });
+            Ok(ProviderSwitchStatus {
+                active_provider: provider,
+                available_providers,
+                switchable: false,
+                restart_required: true,
+                detail:
+                    "Provider selection saved. BILDR is restarting with the new isolated runtime."
+                        .to_owned(),
+            })
+        })
+    });
+    ProviderSwitchControl::configured(active_provider, available_providers, handler)
 }
 
 async fn doctor(
@@ -448,7 +549,11 @@ async fn probe_observer_isolation(paths: &ResolvedPaths) -> Result<EvaluationIso
 fn codex_settings(config: &HarnessConfig, paths: &ResolvedPaths) -> CodexSettings {
     CodexSettings {
         binary: PathBuf::from(&config.codex.binary),
-        codex_home: env::var_os("CODEX_HOME").map(PathBuf::from),
+        codex_home: config
+            .codex
+            .codex_home
+            .clone()
+            .or_else(|| env::var_os("CODEX_HOME").map(PathBuf::from)),
         managed_account_root: Some(paths.data_dir.join("codex-accounts")),
         required_version: nonempty(&config.codex.required_version),
         required_schema_sha256: nonempty(&config.codex.required_protocol_schema_sha256),

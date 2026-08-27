@@ -35,6 +35,7 @@ import type {
   OperatorPresence,
   OperatorPresenceMode,
   OperatorSettings,
+  ProviderSwitchStatus,
   Repository,
   RepositoryDiscovery,
   RunModelCatalog,
@@ -127,6 +128,9 @@ class HarnessApi {
 
   runtime = () => this.get<RuntimeStatus>("/runtime");
   runModelCatalog = () => this.get<RunModelCatalog>("/models");
+  providerSwitchStatus = () => this.get<ProviderSwitchStatus>("/provider");
+  switchProvider = (provider: string) =>
+    this.post<ProviderSwitchStatus>("/provider", { provider });
   codexAccounts = (force = false) =>
     this.get<CodexAccountsSnapshot>(
       `/codex/accounts${force ? "?force=true" : ""}`,

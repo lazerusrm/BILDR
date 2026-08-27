@@ -3,6 +3,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   LiveTurnTelemetry,
+  AccountBar,
   PonytailPanel,
   RegisterModal,
   SettingsView,
@@ -214,6 +215,34 @@ describe("workspace presentation helpers", () => {
     expect(settings).toContain("They do not use, rotate, or require a Codex account");
     expect(settings).not.toContain("Signed-in Codex accounts");
     expect(settings).not.toContain("Automatic account handoff");
+  });
+
+  it("places the persisted Qwodex/hosted runtime switch in the account bar", () => {
+    const accountBar = renderToStaticMarkup(
+      createElement(AccountBar, {
+        snapshot: { accounts: [] },
+        modelCatalog: { provider: "qwen-local-switcher", models: [] },
+        providerSwitch: {
+          active_provider: "qwen-local-switcher",
+          available_providers: ["openai", "qwen-local-switcher"],
+          switchable: true,
+          restart_required: true,
+          detail: "Switch only when every run is terminal.",
+        },
+        history: {},
+        busy: false,
+        providerBusy: false,
+        onSelect: () => undefined,
+        onSwitchProvider: () => undefined,
+        onRefresh: () => undefined,
+        onAdd: () => undefined,
+        onReauthenticate: () => undefined,
+      }),
+    );
+    expect(accountBar).toContain('id="provider-switch-select"');
+    expect(accountBar).toContain("Qwodex · local");
+    expect(accountBar).toContain("OpenAI · hosted");
+    expect(accountBar).toContain("Switches runtime when no run is active");
   });
 
   it("offers a concrete recovery for an interrupted plan review before tasks exist", () => {

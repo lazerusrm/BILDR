@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
+    io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
@@ -30,6 +31,11 @@ pub struct HarnessConfig {
     pub server: ServerConfig,
     pub paths: PathsConfig,
     pub codex: CodexConfig,
+    /// Operator-provisioned App Server presets that may be selected from the
+    /// local console. The active preset is duplicated into `codex` so every
+    /// ordinary startup has one authoritative runtime configuration.
+    #[serde(default)]
+    pub provider_switch: Option<ProviderSwitchConfig>,
     pub orchestration: OrchestrationConfig,
     pub git: GitConfig,
     pub security: SecurityConfig,
@@ -63,10 +69,15 @@ pub struct PathsConfig {
     pub artifact_root: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CodexConfig {
     pub binary: String,
+    /// Optional provider-owned Codex home. This keeps a local Qwodex catalog
+    /// and hosted Codex credentials from sharing one ambient `CODEX_HOME`.
+    /// When absent, the daemon retains the operator environment's default.
+    #[serde(default)]
+    pub codex_home: Option<PathBuf>,
     /// The App Server provider selected by the operator-owned runtime config.
     /// A run may choose only models listed for this provider; it cannot name
     /// a provider or endpoint itself.
@@ -87,6 +98,16 @@ pub struct CodexConfig {
     pub required_protocol_schema_sha256: String,
     pub execution_on_schema_mismatch: String,
     pub reasoning_summary: String,
+}
+
+/// The complete, operator-owned runtime presets that a local BILDR instance
+/// may switch between. A run never selects one of these directly: it receives
+/// an immutable route from the daemon selected here before it is created.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderSwitchConfig {
+    pub active_provider: String,
+    pub providers: BTreeMap<String, CodexConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -418,6 +439,86 @@ impl HarnessConfig {
         Ok(config)
     }
 
+    /// Returns the provisioned providers in a deterministic display order.
+    #[must_use]
+    pub fn provider_switch_options(&self) -> Option<Vec<String>> {
+        self.provider_switch
+            .as_ref()
+            .map(|switch| switch.providers.keys().cloned().collect())
+    }
+
+    /// Produces the complete next daemon configuration for a provider switch.
+    /// The active runtime remains separate until the caller has atomically
+    /// persisted this value and restarted it, so no thread can be transplanted
+    /// across an App Server/provider boundary.
+    pub fn with_provider_selected(&self, provider: &str) -> Result<Self, ProfileError> {
+        let mut next = self.clone();
+        let switch = next.provider_switch.as_mut().ok_or_else(|| {
+            ProfileError::Validation(
+                "this BILDR configuration has no provisioned provider switch presets".to_owned(),
+            )
+        })?;
+        let preset = switch.providers.get(provider).cloned().ok_or_else(|| {
+            ProfileError::Validation(format!(
+                "provider {provider} is not provisioned for this local BILDR instance"
+            ))
+        })?;
+        if preset.model_provider != provider {
+            return Err(ProfileError::Validation(format!(
+                "provider preset {provider} declares model_provider {}",
+                preset.model_provider
+            )));
+        }
+        switch.active_provider = provider.to_owned();
+        next.codex = preset;
+        next.validate()?;
+        Ok(next)
+    }
+
+    /// Atomically replaces an operator-owned TOML configuration after it has
+    /// passed the same validation as startup. Existing file contents are never
+    /// partially rewritten, so a restart observes either the prior valid
+    /// provider or the complete new provider.
+    pub fn write_atomically(&self, path: &Path) -> Result<(), ProfileError> {
+        self.validate()?;
+        let serialized = toml::to_string_pretty(self)?;
+        let parent = path.parent().ok_or_else(|| {
+            ProfileError::Validation(format!(
+                "provider configuration path {} has no parent directory",
+                path.display()
+            ))
+        })?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                ProfileError::Validation(format!(
+                    "provider configuration path {} has no UTF-8 file name",
+                    path.display()
+                ))
+            })?;
+        let temporary = parent.join(format!(
+            ".{file_name}.{}.provider-switch.tmp",
+            std::process::id()
+        ));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        let write_result = (|| -> Result<(), std::io::Error> {
+            file.write_all(serialized.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&temporary, path)?;
+            fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        write_result?;
+        Ok(())
+    }
+
     fn apply_environment(&mut self) {
         if let Ok(value) = env::var("HARNESS_BIND") {
             self.server.bind = value;
@@ -432,7 +533,13 @@ impl HarnessConfig {
             self.paths.worktree_root = value;
         }
         if let Ok(value) = env::var("HARNESS_CODEX_BINARY") {
-            self.codex.binary = value;
+            // A provider preset owns the executable path. Preserve this
+            // legacy environment override only for the old single-provider
+            // configuration form; otherwise a restart could combine the
+            // newly selected catalog with the previous provider binary.
+            if self.provider_switch.is_none() {
+                self.codex.binary = value;
+            }
         }
     }
 
@@ -504,12 +611,8 @@ impl HarnessConfig {
                 "subscription usage must be labeled as API-equivalent cost".to_owned(),
             ));
         }
-        if self.codex.transport != "stdio" {
-            return Err(ProfileError::Validation(
-                "only Codex App Server stdio transport is supported".to_owned(),
-            ));
-        }
-        self.validate_codex_model_catalog()?;
+        self.validate_codex_config(&self.codex)?;
+        self.validate_provider_switch()?;
         if !matches!(
             self.security.approval_policy.as_str(),
             "untrusted" | "on-request" | "never"
@@ -561,8 +664,13 @@ impl HarnessConfig {
         Ok(())
     }
 
-    fn validate_codex_model_catalog(&self) -> Result<(), ProfileError> {
-        let provider = self.codex.model_provider.as_str();
+    fn validate_codex_config(&self, codex: &CodexConfig) -> Result<(), ProfileError> {
+        if codex.transport != "stdio" {
+            return Err(ProfileError::Validation(
+                "only Codex App Server stdio transport is supported".to_owned(),
+            ));
+        }
+        let provider = codex.model_provider.as_str();
         if !matches!(provider, "openai" | "qwen-local-switcher") {
             return Err(ProfileError::Validation(
                 "Codex model provider must be openai or qwen-local-switcher".to_owned(),
@@ -570,16 +678,15 @@ impl HarnessConfig {
         }
         match provider {
             "openai" => {
-                if self.codex.model_catalog_json.is_some() {
+                if codex.model_catalog_json.is_some() {
                     return Err(ProfileError::Validation(
                         "OpenAI controller configuration must not set a Qwodex model catalog path"
                             .to_owned(),
                     ));
                 }
-                validate_static_model_catalog(&self.codex.allowed_models)?;
+                validate_static_model_catalog(&codex.allowed_models)?;
                 let expected = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
-                if !self
-                    .codex
+                if !codex
                     .allowed_models
                     .iter()
                     .all(|model| expected.contains(&model.as_str()))
@@ -591,15 +698,50 @@ impl HarnessConfig {
                 }
             }
             "qwen-local-switcher" => {
-                if !self.codex.allowed_models.is_empty() {
+                if !codex.allowed_models.is_empty() {
                     return Err(ProfileError::Validation(
                         "Qwodex controller model catalog is discovered from model_catalog_json; allowed_models must be empty"
                             .to_owned(),
                     ));
                 }
-                validate_qwodex_model_catalog_path(self.codex.model_catalog_json.as_deref())?;
+                validate_qwodex_model_catalog_path(codex.model_catalog_json.as_deref())?;
             }
             _ => unreachable!("provider is checked above"),
+        }
+        Ok(())
+    }
+
+    fn validate_provider_switch(&self) -> Result<(), ProfileError> {
+        let Some(switch) = self.provider_switch.as_ref() else {
+            return Ok(());
+        };
+        if switch.providers.is_empty() {
+            return Err(ProfileError::Validation(
+                "provider switch configuration must provision at least one provider".to_owned(),
+            ));
+        }
+        let active = switch
+            .providers
+            .get(&switch.active_provider)
+            .ok_or_else(|| {
+                ProfileError::Validation(format!(
+                    "provider switch active_provider {} is not provisioned",
+                    switch.active_provider
+                ))
+            })?;
+        if self.codex != *active {
+            return Err(ProfileError::Validation(
+                "active codex configuration must exactly match the selected provider preset"
+                    .to_owned(),
+            ));
+        }
+        for (provider, preset) in &switch.providers {
+            if preset.model_provider != *provider {
+                return Err(ProfileError::Validation(format!(
+                    "provider preset {provider} must declare the same model_provider"
+                )));
+            }
+            self.validate_codex_config(preset)?;
         }
         Ok(())
     }
@@ -1239,6 +1381,8 @@ pub enum ProfileError {
     Io(#[from] std::io::Error),
     #[error("TOML error: {0}")]
     Toml(#[from] toml::de::Error),
+    #[error("TOML serialization error: {0}")]
+    TomlSerialize(#[from] toml::ser::Error),
     #[error("missing configuration file: {0}")]
     Missing(PathBuf),
     #[error("HOME is not defined")]
@@ -1304,6 +1448,7 @@ mod tests {
         fs::write(&catalog, r#"{"models":[{"slug":"future-local-model"}]}"#)
             .expect("Qwodex catalog writes");
         let mut config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
+        config.provider_switch = None;
         config.codex.model_provider = "qwen-local-switcher".to_owned();
         config.codex.allowed_models.clear();
         config.codex.model_catalog_json = Some(catalog);
@@ -1319,6 +1464,49 @@ mod tests {
         config
             .validate()
             .expect("Qwodex advisory supervision validates; the controller binds every role to the run route");
+    }
+
+    #[test]
+    fn provider_switch_presets_are_complete_and_persisted_atomically() {
+        let temp = TempDir::new().expect("temporary provider configuration root");
+        let catalog = temp.path().join("catalog.json");
+        fs::write(&catalog, r#"{"models":[{"slug":"local-model"}]}"#)
+            .expect("local catalog writes");
+        let mut config: HarnessConfig = toml::from_str(DEFAULT_CONFIG).expect("config parses");
+        let mut local = config.codex.clone();
+        local.binary = "qwodex".to_owned();
+        local.model_provider = "qwen-local-switcher".to_owned();
+        local.allowed_models.clear();
+        local.model_catalog_json = Some(catalog);
+        let switch = config
+            .provider_switch
+            .as_mut()
+            .expect("default provider switch is configured");
+        switch
+            .providers
+            .insert("qwen-local-switcher".to_owned(), local);
+        let switched = config
+            .with_provider_selected("qwen-local-switcher")
+            .expect("complete local preset switches");
+        assert_eq!(switched.codex.model_provider, "qwen-local-switcher");
+        assert_eq!(
+            switched.provider_switch_options(),
+            Some(vec!["openai".to_owned(), "qwen-local-switcher".to_owned()])
+        );
+        let path = temp.path().join("config.toml");
+        switched
+            .write_atomically(&path)
+            .expect("provider configuration persists atomically");
+        let loaded = HarnessConfig::load(Some(&path)).expect("persisted configuration reloads");
+        assert_eq!(loaded.codex, switched.codex);
+        assert_eq!(
+            loaded
+                .provider_switch
+                .as_ref()
+                .expect("switch config remains present")
+                .active_provider,
+            "qwen-local-switcher"
+        );
     }
 
     #[test]
