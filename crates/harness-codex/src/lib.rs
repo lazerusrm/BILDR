@@ -1634,7 +1634,10 @@ impl CodexRuntimeManager {
         }
         let manager = self.clone();
         tokio::spawn(async move {
-            let _guard = manager.switch_lock.lock().await;
+            // Telemetry probes use a snapshot of profiles and replace only
+            // their observation fields. They never alter the active App
+            // Server, so holding the switch lock here would let a routine
+            // dashboard refresh make an explicit account change appear frozen.
             if let Err(error) = manager.refresh_profiles(false).await {
                 warn!(%error, "passive Codex account telemetry refresh failed");
             }

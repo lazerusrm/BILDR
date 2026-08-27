@@ -2267,7 +2267,12 @@ impl Orchestrator {
             config.security.store_raw_reasoning,
         )?;
         let yolo_mode = stored_bool(&store, SETTING_YOLO_MODE, false)?;
-        if let Some(runtime) = runtime.as_ref()
+        // Qwodex is credential-free by construction. Probing the Codex
+        // account registry would spawn unnecessary local App Server probes,
+        // and used to make a Qwodex run look as if it needed an account.
+        let hosted_codex = config.codex.model_provider == "openai";
+        if hosted_codex
+            && let Some(runtime) = runtime.as_ref()
             && let Ok(snapshot) = runtime.codex_accounts().await
             && let Some(account_id) = snapshot.selected_account_id
         {

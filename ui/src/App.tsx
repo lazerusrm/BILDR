@@ -309,7 +309,6 @@ export default function App() {
       nextRuntime,
       nextRunModelCatalog,
       nextProviderSwitch,
-      nextAccounts,
       nextRepositories,
       nextRuns,
       nextApprovals,
@@ -325,13 +324,16 @@ export default function App() {
         restart_required: false,
         detail: "Provider switching is unavailable.",
       })),
-      api.codexAccounts().catch(() => ({ accounts: [] })),
       api.repositories(),
       api.runs(),
       api.approvals(),
       api.usageBreakdown(),
       api.settings().catch(() => undefined),
     ]);
+    const nextAccounts =
+      nextRunModelCatalog.provider === "qwen-local-switcher"
+        ? { accounts: [] }
+        : await api.codexAccounts().catch(() => ({ accounts: [] }));
     setRuntime(nextRuntime);
     setRunModelCatalog(nextRunModelCatalog);
     setProviderSwitch(nextProviderSwitch);
@@ -441,14 +443,19 @@ export default function App() {
   }, [loadGlobal]);
 
   useEffect(() => {
-    const timer = window.setInterval(() => {
+    if (runModelCatalog.provider === "qwen-local-switcher") {
+      setCodexAccounts({ accounts: [] });
+      return;
+    }
+    const refreshAccounts = () => {
       api
         .codexAccounts()
         .then(setCodexAccounts)
         .catch(() => undefined);
-    }, 30_000);
+    };
+    const timer = window.setInterval(refreshAccounts, 15_000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [runModelCatalog.provider]);
 
   useEffect(() => {
     setRateHistory((current) => recordRateLimitHistory(current, codexAccounts));
@@ -731,6 +738,42 @@ export default function App() {
     }
   };
 
+  const selectCodexAccount = async (accountId: string) => {
+    setBusy("codex-account-switch");
+    setError("");
+    try {
+      // Switching an App Server is necessarily asynchronous, but it must not
+      // reload every run/detail view. Keep the rest of BILDR interactive and
+      // let the normal telemetry loop fill in rate limits afterward.
+      setCodexAccounts(await api.selectCodexAccount(accountId));
+      setToast("Codex account selected");
+      window.setTimeout(() => setToast(""), 3200);
+      void api.codexAccounts().then(setCodexAccounts).catch(() => undefined);
+    } catch (caught) {
+      setError(message(caught));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const refreshCodexAccounts = () => {
+    if (busy.startsWith("codex-account")) return;
+    setBusy("codex-account-refresh");
+    setError("");
+    // A forced telemetry sweep may need to probe multiple homes. It runs
+    // independently so the account menu and the rest of the console do not
+    // stall while fresh limits arrive.
+    void api
+      .codexAccounts(true)
+      .then((snapshot) => {
+        setCodexAccounts(snapshot);
+        setToast("All detected Codex account limits refreshed");
+        window.setTimeout(() => setToast(""), 3200);
+      })
+      .catch((caught) => setError(message(caught)))
+      .finally(() => setBusy(""));
+  };
+
   const chooseRun = (id: string) => {
     if (id === selectedRunId) {
       setView("runs");
@@ -757,24 +800,11 @@ export default function App() {
         modelCatalog={runModelCatalog}
         providerSwitch={providerSwitch}
         history={rateHistory}
-        accountBusy={busy === "codex-account"}
+        accountBusy={busy.startsWith("codex-account")}
         providerBusy={busy === "provider-switch"}
         onSwitchProvider={switchProvider}
-        onSelectAccount={(accountId) =>
-          runAction(
-            "codex-account",
-            async () =>
-              setCodexAccounts(await api.selectCodexAccount(accountId)),
-            "Codex account selected",
-          )
-        }
-        onRefreshAccounts={() =>
-          runAction(
-            "codex-account",
-            async () => setCodexAccounts(await api.codexAccounts(true)),
-            "All detected Codex account limits refreshed",
-          )
-        }
+        onSelectAccount={selectCodexAccount}
+        onRefreshAccounts={refreshCodexAccounts}
         onAddAccount={() => {
           setAccountLoginTargetId(undefined);
           setModal("account-login");
