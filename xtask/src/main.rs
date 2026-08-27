@@ -992,16 +992,7 @@ fn load_schema_catalog(directory: &Path) -> Result<BTreeMap<String, SchemaDocume
                 path.display()
             )
         }
-        let discriminator = value
-            .pointer("/properties/schema/const")
-            .and_then(Value::as_str)
-            .with_context(|| {
-                format!(
-                    "schema {} has no string properties.schema.const discriminator",
-                    path.display()
-                )
-            })?;
-        let discriminator = discriminator.to_owned();
+        let discriminator = schema_discriminator(&value, &path)?;
         if let Some(first) = documents.insert(
             discriminator.clone(),
             SchemaDocument {
@@ -1020,6 +1011,59 @@ fn load_schema_catalog(directory: &Path) -> Result<BTreeMap<String, SchemaDocume
         bail!("no JSON schemas found under {}", directory.display())
     }
     Ok(documents)
+}
+
+/// Return the fixed `schema` discriminator that identifies a document.
+///
+/// Schemas commonly factor shared scalar definitions into `$defs`.  The
+/// catalog still requires an exact string constant; it merely follows local
+/// JSON Pointer references used to name that constant.
+fn schema_discriminator(value: &Value, path: &Path) -> Result<String> {
+    let mut definition = value.pointer("/properties/schema").with_context(|| {
+        format!(
+            "schema {} has no properties.schema discriminator",
+            path.display()
+        )
+    })?;
+    let mut references = BTreeSet::new();
+
+    loop {
+        if let Some(discriminator) = definition.get("const").and_then(Value::as_str) {
+            return Ok(discriminator.to_owned());
+        }
+
+        let reference = definition
+            .get("$ref")
+            .and_then(Value::as_str)
+            .with_context(|| {
+                format!(
+                    "schema {} properties.schema must resolve to a string const discriminator",
+                    path.display()
+                )
+            })?;
+        if !reference.starts_with('#') {
+            bail!(
+                "schema {} properties.schema uses non-local discriminator reference {reference}",
+                path.display()
+            )
+        }
+        if !references.insert(reference) {
+            bail!(
+                "schema {} properties.schema has a cyclic discriminator reference {reference}",
+                path.display()
+            )
+        }
+        definition = if reference == "#" {
+            value
+        } else {
+            value.pointer(&reference[1..]).with_context(|| {
+                format!(
+                    "schema {} properties.schema references missing discriminator definition {reference}",
+                    path.display()
+                )
+            })?
+        };
+    }
 }
 
 fn schema_registry(schemas: &BTreeMap<String, SchemaDocument>) -> Result<jsonschema::Registry<'_>> {
@@ -2050,6 +2094,24 @@ mod tests {
         )
         .unwrap();
         assert!(load_schema_catalog(missing_discriminator.path()).is_err());
+
+        let referenced_discriminator = tempfile::tempdir().unwrap();
+        fs::write(
+            referenced_discriminator.path().join("schema.json"),
+            json!({
+                "$schema": JSON_SCHEMA_2020_12,
+                "$id": "urn:harness:referenced-discriminator",
+                "properties": {"schema": {"$ref": "#/$defs/schema"}},
+                "$defs": {"schema": {"type": "string", "const": "harness.referenced.v1"}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            load_schema_catalog(referenced_discriminator.path())
+                .unwrap()
+                .contains_key("harness.referenced.v1")
+        );
 
         let duplicate_id = tempfile::tempdir().unwrap();
         for (name, discriminator) in [

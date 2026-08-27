@@ -73,6 +73,35 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/RunModelCatalog'}
+  /provider:
+    get:
+      tags: [Runtime]
+      operationId: getProviderSwitchStatus
+      description: Reports the active daemon provider and locally provisioned alternatives. Runs retain their immutable provider route after a later switch.
+      responses:
+        '200':
+          description: Provider-switch availability and active provider.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProviderSwitchStatus'}
+    post:
+      tags: [Runtime]
+      operationId: switchProvider
+      description: Persists a provisioned provider selection only when the daemon can safely restart. It cannot alter an existing run's immutable route.
+      parameters:
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProviderSwitchRequest'}
+      responses:
+        '200':
+          description: Provider selection accepted; the status states whether a restart is required.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProviderSwitchStatus'}
+        '409': {$ref: '#/components/responses/Conflict'}
   /codex/accounts:
     get:
       tags: [Runtime]
@@ -220,6 +249,46 @@ paths:
               schema:
                 type: array
                 items: {$ref: '#/components/schemas/RepositoryDiscovery'}
+  /repositories/new-local:
+    post:
+      tags: [Repositories]
+      operationId: createLocalProject
+      description: Initializes a local Git project with an immutable initial commit, then registers that checkout. No remote is configured or contacted.
+      parameters:
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateLocalProjectRequest'}
+      responses:
+        '201':
+          description: Local project initialized and registered.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Repository'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /repositories/managed-checkout:
+    post:
+      tags: [Repositories]
+      operationId: createManagedCheckout
+      description: Creates and registers a clean coordination checkout from `origin/<base_branch>` without registering or changing the selected source checkout. The source may contain user-owned uncommitted work.
+      parameters:
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateManagedCheckoutRequest'}
+      responses:
+        '201':
+          description: Clean managed checkout created and registered.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Repository'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
   /repositories/{repositoryId}:
     get:
       tags: [Repositories]
@@ -1274,6 +1343,21 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/OperationAccepted'}
         '409': {$ref: '#/components/responses/Conflict'}
+  /runs/{runId}/ponytail/audit:
+    post:
+      tags: [Runs]
+      operationId: requestPonytailAudit
+      description: Starts a bounded read-only, advisory minimality audit against the run's immutable base revision. It cannot change custody, tasks, code, or correctness gates.
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      responses:
+        '202':
+          description: The human-requested advisory audit was accepted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationAccepted'}
+        '409': {$ref: '#/components/responses/Conflict'}
   /supervisor-actions/{actionId}/apply:
     post:
       tags: [Runs]
@@ -1331,6 +1415,26 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Run'}
         '409': {$ref: '#/components/responses/Conflict'}
+  /runs/{runId}/pin:
+    post:
+      tags: [Runs]
+      operationId: setRunPin
+      description: Updates only the local presentation pin and records the operator action. It cannot alter run authority, schedule, or custody.
+      parameters:
+        - {$ref: '#/components/parameters/RunId'}
+        - {$ref: '#/components/parameters/CsrfToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RunPinRequest'}
+      responses:
+        '200':
+          description: Updated run presentation state.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Run'}
+        '404': {$ref: '#/components/responses/NotFound'}
   /runs/{runId}/approve-integration:
     post:
       tags: [Runs]
@@ -3655,6 +3759,48 @@ components:
           type: array
           minItems: 1
           items: {$ref: '#/components/schemas/RunModelDescriptor'}
+    ProviderSwitchRequest:
+      type: object
+      additionalProperties: false
+      required: [provider]
+      properties:
+        provider: {type: string, minLength: 1, maxLength: 64}
+    ProviderSwitchStatus:
+      type: object
+      additionalProperties: false
+      required: [active_provider, available_providers, switchable, restart_required, detail]
+      properties:
+        active_provider: {type: string}
+        available_providers: {type: array, items: {type: string}}
+        switchable: {type: boolean}
+        restart_required: {type: boolean}
+        detail: {type: string}
+    CreateLocalProjectRequest:
+      type: object
+      additionalProperties: false
+      required: [parent_path, project_name]
+      properties:
+        parent_path: {type: string, minLength: 1}
+        project_name: {type: string, minLength: 1, maxLength: 120}
+    CreateManagedCheckoutRequest:
+      type: object
+      additionalProperties: false
+      required: [source_path, destination_path, base_branch]
+      properties:
+        profile_id: {type: [string, 'null']}
+        source_path: {type: string, minLength: 1}
+        destination_path: {type: string, minLength: 1}
+        base_branch:
+          type: string
+          minLength: 1
+          maxLength: 240
+          description: Branch name resolved from the source checkout's origin remote; send `main`, not `origin/main`.
+    RunPinRequest:
+      type: object
+      additionalProperties: false
+      required: [pinned]
+      properties:
+        pinned: {type: boolean}
     RunModelDescriptor:
       type: object
       additionalProperties: false
@@ -3689,6 +3835,7 @@ components:
         started_at: {type: string, format: date-time}
         completed_at: {type: string, format: date-time}
         scheduler_paused: {type: boolean}
+        pinned: {type: boolean}
         run_token_budget: {type: integer, minimum: 500000, maximum: 1000000000}
         version: {type: integer}
     IntentBrief:

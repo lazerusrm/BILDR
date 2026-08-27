@@ -311,6 +311,35 @@ impl GitManager {
         profile: &RepositoryProfile,
     ) -> Result<RepositoryInspection, GitError> {
         let source = canonical_repo_root(source).await?;
+        let branch = if profile.default_branch == "auto" {
+            optional_git_text(&source, ["branch", "--show-current"])
+                .await?
+                .ok_or_else(|| {
+                    GitError::Policy(
+                        "source repository must be on a named branch for coordination cloning"
+                            .to_owned(),
+                    )
+                })?
+        } else {
+            profile.default_branch.clone()
+        };
+        self.create_coordination_clone_from_origin_branch(&source, destination, profile, &branch)
+            .await
+    }
+
+    /// Create a clean coordination checkout from one named branch of the
+    /// source checkout's `origin` remote. The source may be dirty: clone
+    /// acquisition uses only the remote branch and never stages, resets, or
+    /// modifies the source worktree.
+    pub async fn create_coordination_clone_from_origin_branch(
+        &self,
+        source: &Path,
+        destination: &Path,
+        profile: &RepositoryProfile,
+        branch: &str,
+    ) -> Result<RepositoryInspection, GitError> {
+        let source = canonical_repo_root(source).await?;
+        validate_branch(branch)?;
         if !destination.is_absolute()
             || destination
                 .components()
@@ -365,23 +394,11 @@ impl GitManager {
             std::process::id(),
             now_ms()
         ));
-        let branch = if profile.default_branch == "auto" {
-            optional_git_text(&source, ["branch", "--show-current"])
-                .await?
-                .ok_or_else(|| {
-                    GitError::Policy(
-                        "source repository must be on a named branch for coordination cloning"
-                            .to_owned(),
-                    )
-                })?
-        } else {
-            profile.default_branch.clone()
-        };
         let arguments = vec![
             "clone".to_owned(),
             "--single-branch".to_owned(),
             "--branch".to_owned(),
-            branch.clone(),
+            branch.to_owned(),
             "--reference-if-able".to_owned(),
             source.to_string_lossy().into_owned(),
             "--".to_owned(),
@@ -404,7 +421,7 @@ impl GitManager {
             }
         }
         let mut effective_profile = profile.clone();
-        effective_profile.default_branch = branch;
+        effective_profile.default_branch = branch.to_owned();
         let inspection = match self.inspect(&staging, &effective_profile).await {
             Ok(inspection) => inspection,
             Err(error) => {
@@ -1807,6 +1824,52 @@ mod tests {
         );
         assert!(!diagnostic.contains("token-value"));
         assert!(diagnostic.contains("https://<redacted>@example.com"));
+    }
+
+    #[tokio::test]
+    async fn origin_branch_clone_uses_a_clean_remote_base_without_touching_dirty_source() {
+        let temp = TempDir::new().unwrap();
+        let origin = temp.path().join("origin.git");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("bildr-copy");
+        fs::create_dir(&source).unwrap();
+        fixture_git(temp.path(), &["init", "--bare", origin.to_str().unwrap()]);
+        fixture_git(&source, &["init", "-b", "main"]);
+        fixture_git(&source, &["config", "user.name", "Harness Test"]);
+        fixture_git(
+            &source,
+            &["config", "user.email", "harness@example.invalid"],
+        );
+        fs::write(source.join("tracked.txt"), "remote base\n").unwrap();
+        fixture_git(&source, &["add", "tracked.txt"]);
+        fixture_git(&source, &["commit", "-m", "test: initialize source"]);
+        fixture_git(
+            &source,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        fixture_git(&source, &["push", "-u", "origin", "main"]);
+        fs::write(source.join("tracked.txt"), "dirty local edit\n").unwrap();
+
+        let profile = harness_profile::load_profile("general", Path::new("/nonexistent"))
+            .unwrap()
+            .profile;
+        let manager = GitManager::new(&temp.path().join("managed-worktrees")).unwrap();
+        let inspection = manager
+            .create_coordination_clone_from_origin_branch(&source, &destination, &profile, "main")
+            .await
+            .unwrap();
+
+        assert_eq!(inspection.root, fs::canonicalize(&destination).unwrap());
+        assert!(inspection.clean);
+        assert_eq!(inspection.current_branch.as_deref(), Some("main"));
+        assert_eq!(
+            fs::read_to_string(destination.join("tracked.txt")).unwrap(),
+            "remote base\n"
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("tracked.txt")).unwrap(),
+            "dirty local edit\n"
+        );
     }
 
     #[tokio::test]
