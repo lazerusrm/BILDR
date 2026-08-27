@@ -6172,9 +6172,16 @@ export function RegisterModal({
     : discoveries;
   return (
     <ModalFrame title="Set up a project" onClose={onClose} wide>
-      <form onSubmit={submit}>
-        <label className="field project-setup">
-          <span>Project setup</span>
+      <form className="project-setup-form" onSubmit={submit}>
+        <div className="project-setup-intro">
+          <strong>Choose where BILDR will work</strong>
+          <span>
+            Your source folder stays untouched. BILDR works from the project
+            you select or create here.
+          </span>
+        </div>
+        <label className="field project-setup-mode">
+          <span>Start with</span>
           <select
             value={mode}
             onChange={(event) => {
@@ -6182,13 +6189,16 @@ export function RegisterModal({
               setError("");
             }}
           >
-            <option value="existing">Use a clean checkout already on disk</option>
-            <option value="managed">Create a clean checkout from origin/main</option>
-            <option value="new">Create a new local Git project</option>
+            <option value="existing">An existing clean checkout</option>
+            <option value="managed">A clean copy of origin/main</option>
+            <option value="new">A new local Git project</option>
           </select>
           <small>
-            BILDR runs only from a clean coordination checkout. Your existing
-            source folder is never changed.
+            {mode === "existing"
+              ? "Use a checkout that is already clean and ready for BILDR."
+              : mode === "managed"
+                ? "Create a separate clean checkout from a remote branch."
+                : "Create a local Git project with a ready-to-use main branch."}
           </small>
         </label>
         {mode !== "new" ? (
@@ -6199,7 +6209,7 @@ export function RegisterModal({
                 <span>
                   {discoveries.length
                     ? `${discoveries.length} Git checkouts found`
-                    : "Choose a Git checkout or enter its local path."}
+                    : "Select a Git checkout, or enter its path below."}
                 </span>
               </div>
               <button
@@ -6280,10 +6290,10 @@ export function RegisterModal({
               </span>
               <small>
                 {mode === "managed"
-                  ? "BILDR reads this checkout only to obtain its origin remote. Local edits and untracked files are not copied."
+                  ? "BILDR only reads this checkout to find its origin remote. Local edits and untracked files are not copied."
                   : allowNativeBrowse
-                    ? "Use Browse to pick a clean local checkout. BILDR checks the active branch, Git identity, and repository instructions. A remote is optional for local-only work."
-                    : "BILDR checks the active branch, Git identity, and repository instructions. A remote is optional for local-only work."}
+                    ? "Use Browse to pick a clean checkout. BILDR checks its branch, Git identity, and repository instructions."
+                    : "BILDR checks its branch, Git identity, and repository instructions."}
               </small>
             </label>
             {mode === "managed" && (
@@ -6301,7 +6311,7 @@ export function RegisterModal({
                     />
                   </div>
                   <small>
-                    BILDR clones this exact remote branch into a new clean checkout.
+                    BILDR clones this remote branch into a separate clean checkout.
                   </small>
                 </label>
                 <label className="field">
@@ -6313,7 +6323,7 @@ export function RegisterModal({
                     required
                   />
                   <small>
-                    Must not exist. This becomes BILDR's registered project root.
+                    Must not exist yet. BILDR will register this folder as the project root.
                   </small>
                 </label>
               </div>
@@ -6322,8 +6332,8 @@ export function RegisterModal({
               <div className="pin-note">
                 <ShieldCheck size={15} />
                 <span>
-                  Your source checkout can stay dirty. BILDR creates a separate,
-                  clean checkout from <span className="mono">origin/{checkoutBranch || "main"}</span> and runs from that copy.
+                  Your source checkout can stay dirty. BILDR creates a separate
+                  checkout from <span className="mono">origin/{checkoutBranch || "main"}</span> and works there.
                 </span>
               </div>
             )}
@@ -6350,7 +6360,7 @@ export function RegisterModal({
                 )}
               </span>
               <small>
-                An existing absolute folder. BILDR creates one new child folder inside it.
+                Choose an existing folder. BILDR creates one new project folder inside it.
               </small>
             </label>
             <label className="field">
@@ -6363,13 +6373,14 @@ export function RegisterModal({
                 maxLength={120}
               />
               <small>
-                BILDR creates <span className="mono">{parentPath || "/parent"}/{projectName || "project"}</span>.
+                Creates <span className="mono">{parentPath || "/parent"}/{projectName || "project"}</span>.
               </small>
             </label>
             <div className="pin-note">
               <ShieldCheck size={15} />
               <span>
-                The new folder receives a local <span className="mono">main</span> branch, README, and initial commit so managed worktrees have an exact base. No remote is added and nothing is published.
+                Starts with a local <span className="mono">main</span> branch,
+                README, and first commit. No remote is added or published.
               </span>
             </div>
           </div>
