@@ -643,7 +643,7 @@ describe("desktop register helpers", () => {
     expect(markup).toContain("Browse");
     expect(markup).toContain("/home/src/app");
     expect(markup).toContain("bildr://pick-folder");
-    expect(markup).toContain("Create a clean checkout from origin/main");
-    expect(markup).toContain("Your existing source folder is never changed.");
+    expect(markup).toContain("A clean copy of origin/main");
+    expect(markup).toContain("Your source folder stays untouched.");
   });
 });
